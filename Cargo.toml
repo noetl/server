@@ -1,5 +1,5 @@
 [package]
-name = "noetl-control-plane"
+name = "noetl-server"
 version = "2.8.7"
 edition = "2021"
 license = "MIT"

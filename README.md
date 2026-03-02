@@ -1,10 +1,10 @@
-# NoETL Server (`noetl-control-plane`)
+# NoETL Server (`noetl-server`)
 
 Control-plane executable for distributed NoETL orchestration.
 
 ## Distribution Channels
 
-- **Crates.io**: `noetl-control-plane`
+- **Crates.io**: `noetl-server`
 - **Container image**: recommended primary runtime channel (GHCR/GCR)
 - **Cloud Build**: recommended for image builds and GKE deploy pipelines
 

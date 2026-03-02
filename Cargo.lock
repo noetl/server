@@ -1272,7 +1272,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "noetl-control-plane"
+name = "noetl-server"
 version = "2.8.7"
 dependencies = [
  "aes-gcm",

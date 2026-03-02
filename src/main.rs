@@ -13,7 +13,7 @@ use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use noetl_control_plane::{
+use noetl_server::{
     config::{AppConfig, DatabaseConfig},
     db::{create_pool, DbPool},
     handlers,
