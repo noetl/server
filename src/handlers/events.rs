@@ -18,16 +18,38 @@ use crate::sanitize::sanitize_sensitive_data;
 use crate::state::AppState;
 
 /// Worker event request.
+///
+/// R-1.2 PR-EE-2: aligned with the executor's `ExecutorEvent`
+/// shape per the cross-repo event envelope reconciliation tracked
+/// on noetl/ai-meta#30.  The legacy `name` field is renamed to
+/// `event_type` with a `#[serde(alias = "name")]` so existing
+/// worker / CLI clients sending `name` continue to deserialize
+/// without breakage during the migration window.  The new
+/// optional fields (`event_id`, `status`, `created_at`) align
+/// with `noetl_executor::events::ExecutorEvent 0.3.1`; producers
+/// that don't populate them get sensible server-side fallbacks
+/// (DB-side snowflake_id() for `event_id`, name-derived `status`,
+/// `Utc::now()` for `created_at`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventRequest {
-    /// Execution ID.
+    /// Execution ID.  Wire format is `String` (matches the Python
+    /// `EventEmitRequest` and avoids JSON-number precision loss
+    /// for large snowflakes in browser clients); parsed to `i64`
+    /// before the DB write.
     pub execution_id: String,
     /// Step name.
     pub step: String,
-    /// Event name (step.enter, call.done, step.exit, etc.).
-    pub name: String,
+    /// Event type (e.g. `step.enter`, `call.done`, `step.exit`,
+    /// `command.completed`).  R-1.2 PR-EE-2: renamed from `name`;
+    /// the alias keeps pre-PR-EE clients working.
+    #[serde(alias = "name")]
+    pub event_type: String,
     /// Event payload/result data.
-    #[serde(default)]
+    ///
+    /// R-1.2 PR-EE-2: `context` alias accepted so producers that
+    /// send the executor's `ExecutorEvent.context` field
+    /// deserialize cleanly into this `payload`.
+    #[serde(default, alias = "context")]
     pub payload: serde_json::Value,
     /// Additional metadata.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -50,6 +72,27 @@ pub struct EventRequest {
     /// If true, event is for logging/observability.
     #[serde(default = "default_true")]
     pub informative: bool,
+    /// Application-side snowflake ID for this event.  Per
+    /// `agents/rules/observability.md` Principle 3, the emitting
+    /// process generates this BEFORE the row hits the database so
+    /// spans / metrics / cross-component correlation can use it
+    /// immediately.  Wire format is `String` to avoid JSON-number
+    /// precision loss; parsed to `i64` for the DB write.
+    /// `None` falls back to the server-side `noetl.snowflake_id()`
+    /// function (the existing default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_id: Option<String>,
+    /// Lifecycle status (`STARTED` / `RUNNING` / `COMPLETED` /
+    /// `FAILED`).  `None` falls back to name-based derivation in
+    /// `event_status_from_name`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    /// Wall-clock when the event was produced.  `None` falls back
+    /// to `chrono::Utc::now()`.  Stamping at emit time preserves
+    /// per-component ordering across server-clock skew (matters
+    /// when multiple workers emit in tight bursts).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 fn default_result_kind() -> String {
@@ -100,14 +143,18 @@ pub struct ClaimResponse {
 }
 
 /// A single batched worker event.
+///
+/// R-1.2 PR-EE-2: same `name` → `event_type` rename + serde alias
+/// as `EventRequest`; same `context` alias for `payload`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BatchEventItem {
     /// Step name.
     pub step: String,
-    /// Event name.
-    pub name: String,
+    /// Event type.
+    #[serde(alias = "name")]
+    pub event_type: String,
     /// Event payload/result data.
-    #[serde(default)]
+    #[serde(default, alias = "context")]
     pub payload: serde_json::Value,
     /// If true, server should take action.
     #[serde(default)]
@@ -168,8 +215,8 @@ pub async fn handle_event(
     Json(request): Json<EventRequest>,
 ) -> Result<Json<EventResponse>, AppError> {
     debug!(
-        "Event received: execution_id={}, step={}, name={}",
-        request.execution_id, request.step, request.name
+        "Event received: execution_id={}, step={}, event_type={}",
+        request.execution_id, request.step, request.event_type
     );
 
     let execution_id: i64 = request
@@ -187,7 +234,7 @@ pub async fn handle_event(
     ];
 
     // For command.claimed, check if already claimed
-    if request.name == "command.claimed" {
+    if request.event_type == "command.claimed" {
         if let Some(command_id) = get_command_id(&request) {
             if check_already_claimed(&state, execution_id, &command_id, &request.worker_id).await? {
                 // Already claimed by same worker - idempotent success
@@ -205,8 +252,17 @@ pub async fn handle_event(
     // SECURITY: Sanitize result data to remove sensitive information (tokens, passwords, etc.)
     let result_obj = sanitize_sensitive_data(&result_obj_raw);
 
-    // Generate event ID
-    let event_id = generate_snowflake_id(&state).await?;
+    // Resolve event_id.  R-1.2 PR-EE-2: prefer the
+    // application-side snowflake from the request when present
+    // (per `agents/rules/observability.md` Principle 3); fall
+    // back to the server-side `noetl.snowflake_id()` function
+    // when omitted.
+    let event_id: i64 = match request.event_id.as_deref() {
+        Some(raw) => raw.parse().map_err(|_| {
+            AppError::Validation(format!("Invalid event_id: {raw}"))
+        })?,
+        None => generate_snowflake_id(&state).await?,
+    };
 
     // Get catalog_id from existing events
     let catalog_id = get_catalog_id(&state, execution_id).await?;
@@ -229,18 +285,18 @@ pub async fn handle_event(
     // SECURITY: Sanitize meta data to remove sensitive information
     let meta_obj = sanitize_sensitive_data(&meta_obj);
 
-    // Determine status based on event name
-    // "command.completed" indicates step finished successfully
-    let status = if request.name.contains("done")
-        || request.name.contains("exit")
-        || request.name.contains("completed")
-    {
-        "COMPLETED"
-    } else if request.name.contains("error") || request.name.contains("failed") {
-        "FAILED"
-    } else {
-        "RUNNING"
-    };
+    // Resolve status.  R-1.2 PR-EE-2: prefer the
+    // application-supplied status when present (so the worker can
+    // distinguish STARTED vs RUNNING explicitly); fall back to
+    // name-based derivation when omitted for pre-PR-EE clients.
+    let derived_status: String = request
+        .status
+        .clone()
+        .unwrap_or_else(|| event_status_from_name(&request.event_type).to_string());
+
+    // Resolve created_at — prefer the application-supplied stamp
+    // (avoids server-clock skew when ordering bursts).
+    let created_at = request.created_at.unwrap_or_else(chrono::Utc::now);
 
     // Persist the event
     sqlx::query(
@@ -254,34 +310,34 @@ pub async fn handle_event(
     .bind(event_id)
     .bind(execution_id)
     .bind(catalog_id)
-    .bind(&request.name)
+    .bind(&request.event_type)
     .bind(&request.step)
     .bind(&request.step)
-    .bind(status)
+    .bind(&derived_status)
     .bind(&result_obj)
     .bind(&meta_obj)
-    .bind(chrono::Utc::now())
+    .bind(created_at)
     .execute(&state.db)
     .await?;
 
     info!(
-        "Event persisted: event_id={}, execution_id={}, name={}",
-        event_id, execution_id, request.name
+        "Event persisted: event_id={}, execution_id={}, event_type={}",
+        event_id, execution_id, request.event_type
     );
 
     // Process through engine if applicable
-    let commands_generated = if !skip_engine_events.contains(&request.name.as_str()) {
+    let commands_generated = if !skip_engine_events.contains(&request.event_type.as_str()) {
         // TODO: Implement engine event handling
         // This would call the orchestrator to evaluate next steps
-        debug!("Would process through engine: event_type={}", request.name);
+        debug!("Would process through engine: event_type={}", request.event_type);
         0
     } else {
-        debug!("Skipped engine for administrative event: {}", request.name);
+        debug!("Skipped engine for administrative event: {}", request.event_type);
         0
     };
 
     // Trigger orchestrator for workflow progression on command.completed
-    if request.name == "command.completed" && request.step.to_lowercase() != "end" {
+    if request.event_type == "command.completed" && request.step.to_lowercase() != "end" {
         match trigger_orchestrator(&state, execution_id, event_id).await {
             Ok(cmds) => {
                 info!(
@@ -577,8 +633,11 @@ pub async fn handle_batch_events(
     let mut event_ids = Vec::with_capacity(request.events.len());
 
     for item in &request.events {
+        // Batch path uses server-side snowflake (app-side event_id
+        // per item isn't carried in BatchEventItem yet; left as a
+        // follow-up if batch becomes the worker's primary path).
         let event_id = generate_snowflake_id_with_tx(&mut tx).await?;
-        let status = event_status_from_name(&item.name);
+        let status = event_status_from_name(&item.event_type);
 
         let result_obj_raw = serde_json::json!({
             "kind": "data",
@@ -611,7 +670,7 @@ pub async fn handle_batch_events(
         .bind(event_id)
         .bind(execution_id)
         .bind(catalog_id)
-        .bind(&item.name)
+        .bind(&item.event_type)
         .bind(&item.step)
         .bind(&item.step)
         .bind(status)
@@ -797,23 +856,12 @@ async fn trigger_orchestrator(
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_event_request_defaults() {
-        let json = r#"{"execution_id": "123", "step": "step1", "name": "step.enter"}"#;
-        let request: EventRequest = serde_json::from_str(json).unwrap();
-
-        assert_eq!(request.result_kind, "data");
-        assert!(request.actionable);
-        assert!(request.informative);
-    }
-
-    #[test]
-    fn test_build_result_object_data() {
-        let request = EventRequest {
+    fn test_request_skeleton() -> EventRequest {
+        EventRequest {
             execution_id: "123".to_string(),
             step: "step1".to_string(),
-            name: "step.exit".to_string(),
-            payload: serde_json::json!({"output": "success"}),
+            event_type: "step.exit".to_string(),
+            payload: serde_json::json!({}),
             meta: None,
             worker_id: None,
             result_kind: "data".to_string(),
@@ -821,6 +869,82 @@ mod tests {
             event_ids: None,
             actionable: true,
             informative: true,
+            event_id: None,
+            status: None,
+            created_at: None,
+        }
+    }
+
+    #[test]
+    fn test_event_request_defaults() {
+        // New canonical field name `event_type`.
+        let json = r#"{"execution_id": "123", "step": "step1", "event_type": "step.enter"}"#;
+        let request: EventRequest = serde_json::from_str(json).unwrap();
+
+        assert_eq!(request.event_type, "step.enter");
+        assert_eq!(request.result_kind, "data");
+        assert!(request.actionable);
+        assert!(request.informative);
+        assert!(request.event_id.is_none());
+        assert!(request.status.is_none());
+        assert!(request.created_at.is_none());
+    }
+
+    #[test]
+    fn test_legacy_name_alias_deserializes_into_event_type() {
+        // R-1.2 PR-EE-2 back-compat: pre-PR-EE worker / CLI
+        // clients send `name` instead of `event_type`.  The
+        // alias means they deserialize cleanly without a server
+        // restart.
+        let json = r#"{"execution_id": "123", "step": "step1", "name": "step.exit"}"#;
+        let request: EventRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(request.event_type, "step.exit");
+    }
+
+    #[test]
+    fn test_context_alias_deserializes_into_payload() {
+        // Executor producers send the field as `context`; pre-PR
+        // clients send `payload`.  Both deserialize into the same
+        // field on the server side.
+        let json = r#"{
+            "execution_id": "123",
+            "step": "step1",
+            "event_type": "step.exit",
+            "context": {"result": 42}
+        }"#;
+        let request: EventRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(request.payload["result"], 42);
+    }
+
+    #[test]
+    fn test_new_optional_fields_accept_executor_event_shape() {
+        // Wire format matching noetl-executor 0.3.1 ExecutorEvent:
+        // event_id (snowflake as String), status, created_at, plus
+        // the `context` alias.
+        let json = r#"{
+            "execution_id": "478775660589088776",
+            "event_type": "command.completed",
+            "step": "fetch_calendar",
+            "status": "COMPLETED",
+            "created_at": "2026-05-31T03:14:15Z",
+            "context": {"items": 42},
+            "event_id": "478775660589088777",
+            "worker_id": "worker-prod-7",
+            "meta": {"attempts": 2}
+        }"#;
+        let request: EventRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(request.event_type, "command.completed");
+        assert_eq!(request.event_id.as_deref(), Some("478775660589088777"));
+        assert_eq!(request.status.as_deref(), Some("COMPLETED"));
+        assert_eq!(request.worker_id.as_deref(), Some("worker-prod-7"));
+        assert!(request.created_at.is_some());
+    }
+
+    #[test]
+    fn test_build_result_object_data() {
+        let request = EventRequest {
+            payload: serde_json::json!({"output": "success"}),
+            ..test_request_skeleton()
         };
 
         let result = build_result_object(&request);
@@ -831,23 +955,22 @@ mod tests {
     #[test]
     fn test_build_result_object_ref() {
         let request = EventRequest {
-            execution_id: "123".to_string(),
-            step: "step1".to_string(),
-            name: "step.exit".to_string(),
-            payload: serde_json::json!({}),
-            meta: None,
-            worker_id: None,
             result_kind: "ref".to_string(),
             result_uri: Some("gs://bucket/path/to/result".to_string()),
-            event_ids: None,
-            actionable: true,
-            informative: true,
+            ..test_request_skeleton()
         };
 
         let result = build_result_object(&request);
         assert_eq!(result["kind"], "ref");
         assert_eq!(result["store_tier"], "gcs");
         assert_eq!(result["logical_uri"], "gs://bucket/path/to/result");
+    }
+
+    #[test]
+    fn test_batch_event_item_legacy_name_alias() {
+        let json = r#"{"step": "s", "name": "call.done", "payload": {}}"#;
+        let item: BatchEventItem = serde_json::from_str(json).unwrap();
+        assert_eq!(item.event_type, "call.done");
     }
 
     #[test]
