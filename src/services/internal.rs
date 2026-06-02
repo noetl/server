@@ -265,11 +265,25 @@ pub async fn project_events(pool: &DbPool, events: &[EventEnvelope]) -> AppResul
 
     let payload = serde_json::to_value(events)?;
 
+    // noetl.event schema (kind 2026-06-02):
+    //   - PRIMARY KEY (event_id)
+    //   - NOT NULL: execution_id, catalog_id, event_id, created_at,
+    //               tenant_id, organization_id
+    //   - All others nullable.
+    //
+    // The projector accepts envelopes that may or may not carry
+    // catalog_id/tenant_id/organization_id (depends on the emitter).
+    // Defaults:
+    //   - catalog_id      → 0   (sentinel)
+    //   - tenant_id       → 'default'
+    //   - organization_id → 'default'
+    //   - created_at      → now()
     let result = sqlx::query(
         r#"
         INSERT INTO noetl.event (
             event_id,
             execution_id,
+            catalog_id,
             parent_event_id,
             event_type,
             node_id,
@@ -277,17 +291,19 @@ pub async fn project_events(pool: &DbPool, events: &[EventEnvelope]) -> AppResul
             node_type,
             status,
             duration,
-            timestamp,
             context,
             result,
             meta,
             error,
             stack_trace,
-            trace_component
+            tenant_id,
+            organization_id,
+            created_at
         )
         SELECT
             (row->>'event_id')::bigint,
-            NULLIF(row->>'execution_id', '')::bigint,
+            COALESCE(NULLIF(row->>'execution_id', '')::bigint, 0),
+            COALESCE(NULLIF(row->>'catalog_id', '')::bigint, 0),
             NULLIF(row->>'parent_event_id', '')::bigint,
             row->>'event_type',
             row->>'node_id',
@@ -295,15 +311,23 @@ pub async fn project_events(pool: &DbPool, events: &[EventEnvelope]) -> AppResul
             row->>'node_type',
             row->>'status',
             NULLIF(row->>'duration', '')::double precision,
-            NULLIF(row->>'timestamp', '')::timestamptz,
             NULLIF(row->'context', 'null'::jsonb),
             NULLIF(row->'result', 'null'::jsonb),
             NULLIF(row->'meta', 'null'::jsonb),
             row->>'error',
             row->>'stack_trace',
-            row->>'trace_component'
+            COALESCE(NULLIF(row->>'tenant_id', ''), 'default'),
+            COALESCE(NULLIF(row->>'organization_id', ''), 'default'),
+            COALESCE(NULLIF(row->>'timestamp', '')::timestamp,
+                     NULLIF(row->>'created_at', '')::timestamp,
+                     now())
         FROM jsonb_array_elements($1::jsonb) AS row
-        ON CONFLICT (event_id) DO NOTHING
+        -- noetl.event is partitioned (15 partitions); event_id alone
+        -- is not a partition-spanning unique constraint.  Using
+        -- ``ON CONFLICT DO NOTHING`` without a target catches any
+        -- uniqueness violation across partitions — sufficient for
+        -- projector idempotency.
+        ON CONFLICT DO NOTHING
         "#,
     )
     .bind(payload)
