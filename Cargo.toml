@@ -41,6 +41,9 @@ minijinja = { version = "2.5", features = ["loader"] }
 aes-gcm = "0.10"
 base64 = "0.22"
 rand = "0.8"
+# Constant-time comparison for bearer-token auth — see
+# src/handlers/internal.rs (the `/api/internal/*` route gate).
+subtle = "2.6"
 
 # Utilities
 uuid = { version = "1", features = ["serde", "v4"] }
@@ -56,6 +59,10 @@ sysinfo = "0.33"
 
 [dev-dependencies]
 tokio-test = "0.4"
+# Process-global env var tests serialise via #[serial] so concurrent
+# test threads don't race on NOETL_INTERNAL_API_TOKEN; see
+# src/handlers/internal.rs tests.
+serial_test = "3"
 
 [[bin]]
 name = "noetl-control-plane"

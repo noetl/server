@@ -196,6 +196,36 @@ fn build_router(
         )
         .with_state(db_pool.clone());
 
+    // Internal API — system worker pool only.  Gated by the
+    // ``RequireInternalApiToken`` extractor in
+    // ``handlers::internal`` which constant-time-compares the
+    // request bearer token to ``NOETL_INTERNAL_API_TOKEN``.  Mirror of
+    // the Python implementation in
+    // ``repos/noetl/noetl/server/api/internal/`` (noetl v4.10.0).
+    // Tracks noetl/server#11 → noetl/ai-meta#49 Phase C.
+    let internal_routes = Router::new()
+        .route(
+            "/api/internal/outbox/claim",
+            post(handlers::internal::outbox_claim),
+        )
+        .route(
+            "/api/internal/outbox/mark-published",
+            post(handlers::internal::outbox_mark_published),
+        )
+        .route(
+            "/api/internal/outbox/mark-failed",
+            post(handlers::internal::outbox_mark_failed),
+        )
+        .route(
+            "/api/internal/outbox/pending-count",
+            get(handlers::internal::outbox_pending_count),
+        )
+        .route(
+            "/api/internal/events/project",
+            post(handlers::internal::events_project),
+        )
+        .with_state(db_pool.clone());
+
     // System monitoring routes
     let system_routes = Router::new()
         .route("/api/status", get(handlers::system::get_status))
@@ -234,6 +264,7 @@ fn build_router(
         .merge(variable_routes)
         .merge(runtime_routes)
         .merge(database_routes)
+        .merge(internal_routes)
         .merge(system_routes)
         .merge(dashboard_routes)
         .layer(TraceLayer::new_for_http())

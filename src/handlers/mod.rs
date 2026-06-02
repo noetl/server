@@ -10,6 +10,7 @@ pub mod events;
 pub mod execute;
 pub mod executions;
 pub mod health;
+pub mod internal;
 pub mod keychain;
 pub mod runtime;
 pub mod system;
