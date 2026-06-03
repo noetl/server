@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.1.5](https://github.com/noetl/server/compare/v2.1.4...v2.1.5) (2026-06-03)
+
+### Bug Fixes
+
+* **schema:** align event_type literals + catalog column names with real DB ([dbd4e33](https://github.com/noetl/server/commit/dbd4e33acf0fcec5ad7e1531d965e3a49910c5d2)), closes [noetl/ai-meta#49](https://github.com/noetl/ai-meta/issues/49) [noetl/server#15](https://github.com/noetl/server/issues/15) [#16](https://github.com/noetl/server/issues/16) [noetl/ai-meta#49](https://github.com/noetl/ai-meta/issues/49)
+
 ## [2.1.4](https://github.com/noetl/server/compare/v2.1.3...v2.1.4) (2026-06-03)
 
 ### Bug Fixes
