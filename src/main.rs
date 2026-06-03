@@ -78,11 +78,11 @@ fn build_router(
         )
         .route("/api/credentials", get(handlers::credentials::list))
         .route(
-            "/api/credentials/:identifier",
+            "/api/credentials/{identifier}",
             get(handlers::credentials::get),
         )
         .route(
-            "/api/credentials/:identifier",
+            "/api/credentials/{identifier}",
             delete(handlers::credentials::delete),
         )
         .with_state(credential_service);
@@ -90,19 +90,19 @@ fn build_router(
     // Keychain routes
     let keychain_routes = Router::new()
         .route(
-            "/api/keychain/:catalog_id/:keychain_name",
+            "/api/keychain/{catalog_id}/{keychain_name}",
             get(handlers::keychain::get),
         )
         .route(
-            "/api/keychain/:catalog_id/:keychain_name",
+            "/api/keychain/{catalog_id}/{keychain_name}",
             post(handlers::keychain::set),
         )
         .route(
-            "/api/keychain/:catalog_id/:keychain_name",
+            "/api/keychain/{catalog_id}/{keychain_name}",
             delete(handlers::keychain::delete),
         )
         .route(
-            "/api/keychain/catalog/:catalog_id",
+            "/api/keychain/catalog/{catalog_id}",
             get(handlers::keychain::list_by_catalog),
         )
         .with_state(keychain_service);
@@ -115,9 +115,9 @@ fn build_router(
             "/api/events/batch",
             post(handlers::events::handle_batch_events),
         )
-        .route("/api/commands/:event_id", get(handlers::get_command))
+        .route("/api/commands/{event_id}", get(handlers::get_command))
         .route(
-            "/api/commands/:event_id/claim",
+            "/api/commands/{event_id}/claim",
             post(handlers::events::claim_command),
         )
         .with_state(state.clone());
@@ -126,41 +126,41 @@ fn build_router(
     let executions_routes = Router::new()
         .route("/api/executions", get(handlers::executions::list))
         .route(
-            "/api/executions/:execution_id",
+            "/api/executions/{execution_id}",
             get(handlers::executions::get),
         )
         .route(
-            "/api/executions/:execution_id/status",
+            "/api/executions/{execution_id}/status",
             get(handlers::executions::get_status),
         )
         .route(
-            "/api/executions/:execution_id/cancel",
+            "/api/executions/{execution_id}/cancel",
             post(handlers::executions::cancel),
         )
         .route(
-            "/api/executions/:execution_id/cancellation-check",
+            "/api/executions/{execution_id}/cancellation-check",
             get(handlers::executions::cancellation_check),
         )
         .route(
-            "/api/executions/:execution_id/finalize",
+            "/api/executions/{execution_id}/finalize",
             post(handlers::executions::finalize),
         )
         .with_state(execution_service);
 
     // Variable routes (transient table)
     let variable_routes = Router::new()
-        .route("/api/vars/:execution_id", get(handlers::variables::list))
-        .route("/api/vars/:execution_id", post(handlers::variables::set))
+        .route("/api/vars/{execution_id}", get(handlers::variables::list))
+        .route("/api/vars/{execution_id}", post(handlers::variables::set))
         .route(
-            "/api/vars/:execution_id",
+            "/api/vars/{execution_id}",
             delete(handlers::variables::cleanup),
         )
         .route(
-            "/api/vars/:execution_id/:var_name",
+            "/api/vars/{execution_id}/{var_name}",
             get(handlers::variables::get),
         )
         .route(
-            "/api/vars/:execution_id/:var_name",
+            "/api/vars/{execution_id}/{var_name}",
             delete(handlers::variables::delete_var),
         )
         .with_state(db_pool.clone());
