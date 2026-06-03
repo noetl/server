@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.4.1](https://github.com/noetl/server/compare/v2.4.0...v2.4.1) (2026-06-03)
+
+### Bug Fixes
+
+* **execute:** publish command notification to NATS + insert command row ([1c71b8c](https://github.com/noetl/server/commit/1c71b8caa5cc9dcddecaf15abcbf04d3848aa28a)), closes [noetl/server#26](https://github.com/noetl/server/issues/26) [noetl/server#21](https://github.com/noetl/server/issues/21) [noetl/ai-meta#49](https://github.com/noetl/ai-meta/issues/49) [noetl/server#21](https://github.com/noetl/server/issues/21) [noetl/server#26](https://github.com/noetl/server/issues/26) [noetl/server#21](https://github.com/noetl/server/issues/21) [noetl/ai-meta#49](https://github.com/noetl/ai-meta/issues/49)
+
 ## [2.4.0](https://github.com/noetl/server/compare/v2.3.0...v2.4.0) (2026-06-03)
 
 ### Features
