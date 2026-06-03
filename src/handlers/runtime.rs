@@ -12,17 +12,33 @@ use crate::error::AppError;
 use crate::services::runtime::{RegisterRuntimeRequest, RuntimeFilter, RuntimeService};
 
 /// Request for deregistering a runtime.
+///
+/// Accepts both `kind` (canonical) and `component_type` (what the
+/// Rust noetl-worker and the Python server send) — see
+/// noetl/ai-meta#53 Gap 2.  Defaults `kind` to `worker_pool` when
+/// neither is present.
 #[derive(Debug, Clone, Deserialize)]
 pub struct DeregisterRequest {
+    #[serde(default = "default_kind", alias = "component_type")]
     pub kind: String,
     pub name: String,
 }
 
 /// Request for heartbeat.
+///
+/// The Rust noetl-worker sends only `{name}` for heartbeats (the
+/// Python broker upserts by name alone), so `kind` is optional
+/// here and defaults to `worker_pool`.  The `component_type`
+/// alias is accepted too for clients that include it.
 #[derive(Debug, Clone, Deserialize)]
 pub struct HeartbeatRequest {
+    #[serde(default = "default_kind", alias = "component_type")]
     pub kind: String,
     pub name: String,
+}
+
+fn default_kind() -> String {
+    "worker_pool".to_string()
 }
 
 /// Response for runtime operations.
