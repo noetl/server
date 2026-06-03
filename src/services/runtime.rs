@@ -59,9 +59,20 @@ pub struct Runtime {
 }
 
 /// Request to register a runtime.
+///
+/// Wire shape compatible with both the Rust noetl-worker (which
+/// sends `component_type`) and the Python server's
+/// `RuntimeRegistrationRequest` (which also sends `component_type`
+/// — kept the same field name for parity).  The Rust server's
+/// canonical name for the routing dimension is `kind`, so the
+/// alias maps `component_type` onto it.  Defaulting `kind` to
+/// `worker_pool` lets handlers used downstream (e.g. heartbeat)
+/// accept the worker's minimal payload as well.  See
+/// noetl/ai-meta#53 Gap 2.
 #[derive(Debug, Clone, Deserialize)]
 pub struct RegisterRuntimeRequest {
     pub name: String,
+    #[serde(default = "default_kind", alias = "component_type")]
     pub kind: String,
     pub uri: Option<String>,
     #[serde(default = "default_status")]
@@ -70,6 +81,17 @@ pub struct RegisterRuntimeRequest {
     pub capabilities: Option<serde_json::Value>,
     pub capacity: Option<i32>,
     pub runtime: Option<serde_json::Value>,
+    // Accepted but not persisted — the worker sends a hostname for
+    // operator visibility; we just record it as a label below if
+    // labels are empty.  Captured here so serde doesn't reject the
+    // field as unknown when `deny_unknown_fields` is enabled in
+    // the future.
+    #[serde(default)]
+    pub hostname: Option<String>,
+}
+
+fn default_kind() -> String {
+    "worker_pool".to_string()
 }
 
 fn default_status() -> String {
@@ -448,6 +470,37 @@ mod tests {
         let json = r#"{"name": "worker-1", "kind": "worker_pool"}"#;
         let request: RegisterRuntimeRequest = serde_json::from_str(json).unwrap();
         assert_eq!(request.status, "active");
+    }
+
+    #[test]
+    fn test_register_accepts_component_type_alias() {
+        // noetl/ai-meta#53 Gap 2: the Rust noetl-worker sends
+        // `component_type` (matching the Python broker's wire
+        // shape), not `kind`.  The Rust server must accept it.
+        let json = r#"{
+            "name": "worker-rust-pod-1",
+            "component_type": "worker_pool",
+            "runtime": "rust",
+            "status": "ready",
+            "hostname": "noetl-worker-rust-abc",
+            "labels": {"pool_name": "worker-rust-pool"}
+        }"#;
+        let request: RegisterRuntimeRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(request.name, "worker-rust-pod-1");
+        assert_eq!(request.kind, "worker_pool");
+        assert_eq!(request.status, "ready");
+        assert_eq!(request.runtime, Some(serde_json::json!("rust")));
+        assert_eq!(request.hostname.as_deref(), Some("noetl-worker-rust-abc"));
+    }
+
+    #[test]
+    fn test_register_defaults_kind_when_missing() {
+        // If neither `kind` nor `component_type` is present, default
+        // to `worker_pool`.  This matches the Python broker's lax
+        // behaviour and unblocks heartbeat-style minimal payloads.
+        let json = r#"{"name": "worker-1"}"#;
+        let request: RegisterRuntimeRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(request.kind, "worker_pool");
     }
 
     #[test]
