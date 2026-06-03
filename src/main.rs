@@ -291,22 +291,72 @@ fn build_router(
 }
 
 /// Connect to NATS if configured.
+///
+/// `async_nats::connect()` only parses the addr portion of the
+/// URL — it does NOT pick up the `user:pass@` segment, so an
+/// account-authenticated server (the cluster's `NOETL` account
+/// with `noetl/noetl`) rejects the connection with
+/// "authorization violation".  Mirror the worker's
+/// `subscriber.rs` shape: strip the userinfo, build
+/// `ConnectOptions::with_user_and_password`, pass the cleaned
+/// URL.  See noetl/server#26 for the discovery (Phase B R3 of
+/// noetl/ai-meta#49 surfaced this — pre-existing but unnoticed
+/// since prior rounds didn't need a Rust-side NATS publish).
 async fn connect_nats(config: &AppConfig) -> Option<async_nats::Client> {
-    if let Some(ref nats_url) = config.nats_url {
-        match async_nats::connect(nats_url).await {
-            Ok(client) => {
-                tracing::info!(url = %nats_url, "Connected to NATS");
-                Some(client)
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, url = %nats_url, "Failed to connect to NATS, continuing without it");
-                None
-            }
-        }
-    } else {
+    let Some(ref nats_url) = config.nats_url else {
         tracing::info!("NATS not configured, running without messaging");
-        None
+        return None;
+    };
+
+    // Strip + parse userinfo if present.
+    let (clean_url, creds) = strip_nats_userinfo(nats_url);
+    let connect_future = match creds {
+        Some((user, password)) => async_nats::ConnectOptions::with_user_and_password(user, password)
+            .connect(&clean_url),
+        None => async_nats::ConnectOptions::new().connect(&clean_url),
+    };
+
+    match connect_future.await {
+        Ok(client) => {
+            tracing::info!(url = %clean_url, "Connected to NATS");
+            Some(client)
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, url = %clean_url, "Failed to connect to NATS, continuing without it");
+            None
+        }
     }
+}
+
+/// Strip the `user:pass@` portion from a NATS URL and return the
+/// cleaned URL alongside the parsed credentials, if any.
+///
+/// `async_nats::ConnectOptions` rejects URLs with embedded creds,
+/// so we feed it the cleaned form + the creds via
+/// `with_user_and_password`.  Mirrors the equivalent helper in
+/// `noetl-worker::nats::subscriber`.
+fn strip_nats_userinfo(url: &str) -> (String, Option<(String, String)>) {
+    // Match `<scheme>://<userinfo>@<rest>` — userinfo is the
+    // `user:password` pair the standard `host:port` URL parser
+    // ignores when it's embedded.
+    let scheme_sep = "://";
+    let Some(scheme_idx) = url.find(scheme_sep) else {
+        return (url.to_string(), None);
+    };
+    let after_scheme = &url[scheme_idx + scheme_sep.len()..];
+    let Some(at_idx) = after_scheme.find('@') else {
+        return (url.to_string(), None);
+    };
+    let userinfo = &after_scheme[..at_idx];
+    let rest = &after_scheme[at_idx + 1..];
+    let mut parts = userinfo.splitn(2, ':');
+    let user = parts.next().unwrap_or("").to_string();
+    let password = parts.next().unwrap_or("").to_string();
+    if user.is_empty() {
+        return (url.to_string(), None);
+    }
+    let cleaned = format!("{}{}{}", &url[..scheme_idx], scheme_sep, rest);
+    (cleaned, Some((user, password)))
 }
 
 /// Get encryption key from environment or use default.
