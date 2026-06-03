@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.3.0](https://github.com/noetl/server/compare/v2.2.1...v2.3.0) (2026-06-03)
+
+### Features
+
+* **metrics:** prometheus surface + instrument POST /api/events ([fc4a33a](https://github.com/noetl/server/commit/fc4a33aecadb3fb61fd5f24dc13dfb249e667597)), closes [noetl/ai-meta#49](https://github.com/noetl/ai-meta/issues/49) [noetl/server#21](https://github.com/noetl/server/issues/21) [#21](https://github.com/noetl/server/issues/21) [noetl/server#21](https://github.com/noetl/server/issues/21) [noetl/ai-meta#49](https://github.com/noetl/ai-meta/issues/49)
+
 ## [2.2.1](https://github.com/noetl/server/compare/v2.2.0...v2.2.1) (2026-06-03)
 
 ### Bug Fixes
