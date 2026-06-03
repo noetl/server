@@ -60,6 +60,10 @@ sysinfo = "0.33"
 # Regex (for ui_schema inline-directive scanning, etc.)
 regex = "1"
 
+# Prometheus metrics surface — exposed at GET /metrics per
+# agents/rules/observability.md (Principle 1, Principle 2).
+prometheus = "0.13"
+
 [dev-dependencies]
 tokio-test = "0.4"
 # Process-global env var tests serialise via #[serial] so concurrent

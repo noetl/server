@@ -54,11 +54,17 @@ fn build_router(
         .allow_headers(Any);
 
     // Health check routes (no auth required)
-    let health_routes = Router::new()
+    let mut health_routes = Router::new()
         .route("/health", get(handlers::health_check))
         .route("/api/health", get(handlers::api_health))
-        .route("/api/pool/status", get(handlers::health::pool_status))
-        .with_state(state.clone());
+        .route("/api/pool/status", get(handlers::health::pool_status));
+    // Prometheus metrics endpoint — gated by AppConfig.disable_metrics
+    // per agents/rules/observability.md.  Default-on; ingress / netpol
+    // can restrict reach in prod.
+    if !state.config.disable_metrics {
+        health_routes = health_routes.route("/metrics", get(handlers::health::metrics));
+    }
+    let health_routes = health_routes.with_state(state.clone());
 
     // Catalog routes
     let catalog_routes = Router::new()
