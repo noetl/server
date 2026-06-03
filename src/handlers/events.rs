@@ -278,8 +278,24 @@ async fn handle_event_inner(
         }
     }
 
-    // Build result object based on kind
-    let result_obj_raw = build_result_object(&request);
+    // Resolve status BEFORE building the result so the result
+    // envelope can include it (the DB constraint
+    // chk_event_result_shape requires every result row to carry
+    // a string `status` key at the top level).
+    //
+    // R-1.2 PR-EE-2: prefer the application-supplied status when
+    // present (so the worker can distinguish STARTED vs RUNNING
+    // explicitly); fall back to name-based derivation when
+    // omitted for pre-PR-EE clients.
+    let derived_status: String = request
+        .status
+        .clone()
+        .unwrap_or_else(|| event_status_from_name(&request.event_type).to_string());
+
+    // Build result object based on kind, embedding the resolved
+    // status.  See noetl/server#29 — previous shapes
+    // (`{kind, data}`, etc.) violated `chk_event_result_shape`.
+    let result_obj_raw = build_result_object(&request, &derived_status);
     // SECURITY: Sanitize result data to remove sensitive information (tokens, passwords, etc.)
     let result_obj = sanitize_sensitive_data(&result_obj_raw);
 
@@ -316,14 +332,10 @@ async fn handle_event_inner(
     // SECURITY: Sanitize meta data to remove sensitive information
     let meta_obj = sanitize_sensitive_data(&meta_obj);
 
-    // Resolve status.  R-1.2 PR-EE-2: prefer the
-    // application-supplied status when present (so the worker can
-    // distinguish STARTED vs RUNNING explicitly); fall back to
-    // name-based derivation when omitted for pre-PR-EE clients.
-    let derived_status: String = request
-        .status
-        .clone()
-        .unwrap_or_else(|| event_status_from_name(&request.event_type).to_string());
+    // `derived_status` is computed earlier (before the result
+    // envelope build) so the constraint-required top-level
+    // `status` key can be embedded; reused here as the `status`
+    // column value.
 
     // Resolve created_at — prefer the application-supplied stamp
     // (avoids server-clock skew when ordering bursts).
@@ -786,8 +798,30 @@ async fn check_already_claimed(
     Ok(false)
 }
 
-/// Build result object based on result_kind.
-fn build_result_object(request: &EventRequest) -> serde_json::Value {
+/// Build the `result` JSONB envelope for a `noetl.event` row.
+///
+/// Shape is constrained at the DB level by
+/// `chk_event_result_shape`: top-level keys are limited to
+/// `status` (required string), `reference` (optional object),
+/// `context` (optional object).  Anything else fails the
+/// constraint.  See noetl/server#29 for the history — the
+/// previous `{kind, data}` / `{kind, store_tier, logical_uri}` /
+/// `{kind, event_ids, total_parts}` envelopes all violated the
+/// constraint and caused every POST /api/events that reached
+/// the INSERT to 500.
+///
+/// Mapping:
+/// - `result_kind = "ref"`  + `result_uri` set
+///       → `{status, reference: {store_tier, logical_uri}}`
+/// - `result_kind = "refs"` + `event_ids` set
+///       → `{status, reference: {event_ids, total_parts}}`
+/// - default (`"data"` or unknown):
+///   - `payload` is a non-null object → `{status, context: <payload>}`
+///   - `payload` is null/non-object   → `{status}`
+fn build_result_object(request: &EventRequest, status: &str) -> serde_json::Value {
+    let mut result = serde_json::Map::new();
+    result.insert("status".to_string(), serde_json::Value::String(status.to_string()));
+
     match request.result_kind.as_str() {
         "ref" if request.result_uri.is_some() => {
             let uri = request.result_uri.as_ref().unwrap();
@@ -798,27 +832,36 @@ fn build_result_object(request: &EventRequest) -> serde_json::Value {
             } else {
                 "artifact"
             };
-            serde_json::json!({
-                "kind": "ref",
-                "store_tier": store_tier,
-                "logical_uri": uri,
-            })
+            result.insert(
+                "reference".to_string(),
+                serde_json::json!({
+                    "store_tier": store_tier,
+                    "logical_uri": uri,
+                }),
+            );
         }
         "refs" if request.event_ids.is_some() => {
             let event_ids = request.event_ids.as_ref().unwrap();
-            serde_json::json!({
-                "kind": "refs",
-                "event_ids": event_ids,
-                "total_parts": event_ids.len(),
-            })
+            result.insert(
+                "reference".to_string(),
+                serde_json::json!({
+                    "event_ids": event_ids,
+                    "total_parts": event_ids.len(),
+                }),
+            );
         }
         _ => {
-            serde_json::json!({
-                "kind": "data",
-                "data": request.payload,
-            })
+            // Constraint requires `context` (when present) to be
+            // an object.  Wire-format payload may be a primitive
+            // for some legacy clients — skip the key entirely in
+            // that case rather than corrupting the row.
+            if let serde_json::Value::Object(_) = request.payload {
+                result.insert("context".to_string(), request.payload.clone());
+            }
         }
     }
+
+    serde_json::Value::Object(result)
 }
 
 /// Get catalog_id from existing events.
@@ -971,6 +1014,11 @@ mod tests {
         assert!(request.created_at.is_some());
     }
 
+    // build_result_object — constraint-compliant shape per
+    // noetl/server#29.  The DB constraint allows only
+    // `status` (required string), `reference` (optional object),
+    // `context` (optional object); nothing else.
+
     #[test]
     fn test_build_result_object_data() {
         let request = EventRequest {
@@ -978,9 +1026,37 @@ mod tests {
             ..test_request_skeleton()
         };
 
-        let result = build_result_object(&request);
-        assert_eq!(result["kind"], "data");
-        assert_eq!(result["data"]["output"], "success");
+        let result = build_result_object(&request, "COMPLETED");
+        assert_eq!(result["status"], "COMPLETED");
+        assert_eq!(result["context"]["output"], "success");
+        // No disallowed top-level keys.
+        assert!(result.get("kind").is_none());
+        assert!(result.get("data").is_none());
+        assert!(result.get("reference").is_none());
+    }
+
+    #[test]
+    fn test_build_result_object_data_with_null_payload_omits_context() {
+        let request = EventRequest {
+            payload: serde_json::Value::Null,
+            ..test_request_skeleton()
+        };
+        let result = build_result_object(&request, "STARTED");
+        assert_eq!(result["status"], "STARTED");
+        assert!(result.get("context").is_none(),
+            "context must not be set when payload is non-object: {result}");
+    }
+
+    #[test]
+    fn test_build_result_object_data_with_primitive_payload_omits_context() {
+        // Constraint: when present, context must be an object.
+        // Wrap-it-or-omit-it — we chose omit.
+        let request = EventRequest {
+            payload: serde_json::json!("just a string"),
+            ..test_request_skeleton()
+        };
+        let result = build_result_object(&request, "RUNNING");
+        assert!(result.get("context").is_none());
     }
 
     #[test]
@@ -991,10 +1067,85 @@ mod tests {
             ..test_request_skeleton()
         };
 
-        let result = build_result_object(&request);
-        assert_eq!(result["kind"], "ref");
-        assert_eq!(result["store_tier"], "gcs");
-        assert_eq!(result["logical_uri"], "gs://bucket/path/to/result");
+        let result = build_result_object(&request, "COMPLETED");
+        assert_eq!(result["status"], "COMPLETED");
+        let reference = &result["reference"];
+        assert_eq!(reference["store_tier"], "gcs");
+        assert_eq!(reference["logical_uri"], "gs://bucket/path/to/result");
+        // No disallowed top-level keys.
+        assert!(result.get("kind").is_none());
+        assert!(result.get("store_tier").is_none());
+        assert!(result.get("logical_uri").is_none());
+    }
+
+    #[test]
+    fn test_build_result_object_refs() {
+        let request = EventRequest {
+            result_kind: "refs".to_string(),
+            event_ids: Some(vec![100, 200, 300]),
+            ..test_request_skeleton()
+        };
+
+        let result = build_result_object(&request, "COMPLETED");
+        assert_eq!(result["status"], "COMPLETED");
+        let reference = &result["reference"];
+        assert_eq!(reference["event_ids"][0], 100);
+        assert_eq!(reference["total_parts"], 3);
+        assert!(result.get("event_ids").is_none(),
+            "event_ids should be nested under reference, not top-level");
+    }
+
+    #[test]
+    fn test_build_result_object_constraint_top_level_keys_only() {
+        // The DB constraint allows ONLY {status, reference, context}
+        // at the top level.  Walk all output shapes and assert none
+        // emit anything else.
+        let allowed: std::collections::HashSet<&str> =
+            ["status", "reference", "context"].iter().copied().collect();
+
+        let cases: Vec<(&str, EventRequest)> = vec![
+            (
+                "data with object payload",
+                EventRequest {
+                    payload: serde_json::json!({"k": "v"}),
+                    ..test_request_skeleton()
+                },
+            ),
+            (
+                "data with null payload",
+                EventRequest {
+                    payload: serde_json::Value::Null,
+                    ..test_request_skeleton()
+                },
+            ),
+            (
+                "ref",
+                EventRequest {
+                    result_kind: "ref".to_string(),
+                    result_uri: Some("gs://foo".to_string()),
+                    ..test_request_skeleton()
+                },
+            ),
+            (
+                "refs",
+                EventRequest {
+                    result_kind: "refs".to_string(),
+                    event_ids: Some(vec![1, 2]),
+                    ..test_request_skeleton()
+                },
+            ),
+        ];
+        for (label, req) in cases {
+            let r = build_result_object(&req, "OK");
+            let obj = r.as_object().expect("result must be object");
+            for k in obj.keys() {
+                assert!(
+                    allowed.contains(k.as_str()),
+                    "[{label}] disallowed top-level key: {k} (full result: {r})"
+                );
+            }
+            assert_eq!(r["status"], "OK", "[{label}] status must be present");
+        }
     }
 
     #[test]
