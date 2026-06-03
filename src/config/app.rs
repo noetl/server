@@ -54,6 +54,16 @@ pub struct AppConfig {
     /// Runtime offline threshold in seconds
     #[serde(default = "default_offline_seconds")]
     pub runtime_offline_seconds: u64,
+
+    /// Publicly-reachable URL for this server, embedded in NATS
+    /// command notifications so workers know where to call back
+    /// (`GET /api/commands/{event_id}`).  Envy maps
+    /// `NOETL_PUBLIC_SERVER_URL`.  When unset, a localhost
+    /// fallback is used — fine for unit tests, won't work
+    /// cross-pod in kind / GKE so the deployment manifest must
+    /// override.
+    #[serde(default)]
+    pub public_server_url: Option<String>,
 }
 
 fn default_host() -> String {
@@ -108,6 +118,7 @@ impl Default for AppConfig {
             auto_recreate_runtime: true,
             runtime_sweep_interval: default_sweep_interval(),
             runtime_offline_seconds: default_offline_seconds(),
+            public_server_url: None,
         }
     }
 }

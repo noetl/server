@@ -339,10 +339,179 @@ async fn generate_initial_commands(
     .execute(&state.db)
     .await?;
 
-    // TODO: Publish to NATS for worker notification
-    // This would be implemented when NATS module is added
+    // Mirror noetl.command for replay + observability parity with
+    // the Python server.  The worker reads command details from
+    // noetl.event today (the `command.issued` row), so this insert
+    // isn't strictly required for the worker to claim — but the
+    // Python server populates the row and downstream tooling
+    // (replay, dashboards) expects it.  Best-effort: a failure
+    // here is logged but doesn't fail the execution (the event-log
+    // row is the source of truth).
+    if let Err(e) = insert_command_row(
+        state,
+        execution_id,
+        event_id,
+        catalog_id,
+        parent_event_id,
+        &start_step.step,
+        command.tool.kind.as_str(),
+        &cmd_context,
+        &cmd_meta,
+    )
+    .await
+    {
+        tracing::warn!(
+            error = %e,
+            execution_id,
+            event_id,
+            "Failed to insert noetl.command row (non-fatal — event log is source of truth)"
+        );
+    }
+
+    // Publish the command notification to NATS so the worker pool
+    // claims the work.  Without this, the `command.issued` event
+    // sits in noetl.event but no worker hears about it — exactly
+    // the noetl/server#26 failure mode.
+    publish_command_notification(
+        state,
+        execution_id,
+        event_id,
+        &command_id,
+        &start_step.step,
+        command.tool.kind.as_str(),
+        playbook,
+    )
+    .await?;
 
     Ok(1)
+}
+
+/// Insert a row into `noetl.command` mirroring the `command.issued`
+/// event row.  See [`generate_initial_commands`] for the rationale —
+/// the worker doesn't read from this table today but Python's server
+/// populates it and downstream tooling depends on it.
+#[allow(clippy::too_many_arguments)]
+async fn insert_command_row(
+    state: &AppState,
+    execution_id: i64,
+    event_id: i64,
+    catalog_id: i64,
+    parent_event_id: i64,
+    step_name: &str,
+    tool_kind: &str,
+    context: &serde_json::Value,
+    meta: &serde_json::Value,
+) -> AppResult<()> {
+    let command_id = generate_snowflake_id(state).await?;
+    // No ON CONFLICT clause: `noetl.command` is a partitioned
+    // table, so a PRIMARY KEY index on the partition root doesn't
+    // exist — only per-partition indexes do.  PG rejects
+    // `ON CONFLICT (command_id)` as "no unique or exclusion
+    // constraint matching the ON CONFLICT specification".  We use
+    // a fresh snowflake `command_id` per call so duplicate inserts
+    // can't happen on the happy path anyway; on retry the caller
+    // generates a new id.
+    sqlx::query(
+        r#"
+        INSERT INTO noetl.command (
+            command_id, event_id, execution_id, catalog_id,
+            step_name, tool_kind, status, attempt,
+            context, meta, latest_event_id
+        ) VALUES (
+            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11
+        )
+        "#,
+    )
+    .bind(command_id)
+    .bind(event_id)
+    .bind(execution_id)
+    .bind(catalog_id)
+    .bind(step_name)
+    .bind(tool_kind)
+    .bind("PENDING")
+    .bind(1_i32)
+    .bind(context)
+    .bind(meta)
+    .bind(parent_event_id)
+    .execute(&state.db)
+    .await?;
+    Ok(())
+}
+
+/// Publish a small notification to NATS so the Rust worker pool
+/// (subscribed to `noetl.commands.<segment>.>`) can claim the
+/// command.  The payload shape matches the Python
+/// `NATSEventPublisher.publish_command()` so the worker doesn't
+/// need to distinguish between servers — same wire format.
+///
+/// Subject derivation mirrors the path-based routing scheme in
+/// `repos/noetl/noetl/core/runtime/pool_routing.py`:
+///
+/// - `system/*` playbook paths → `noetl.commands.system.<execution_id>`
+/// - Everything else            → `noetl.commands.shared.<execution_id>`
+///
+/// When NATS isn't configured (e.g. local unit-test mode), the
+/// notification is skipped with a WARN — caller still records the
+/// `command.issued` event so dashboards work, but no worker will
+/// pick the command up.
+async fn publish_command_notification(
+    state: &AppState,
+    execution_id: i64,
+    event_id: i64,
+    command_id: &str,
+    step: &str,
+    _tool_kind: &str,
+    playbook: &crate::playbook::types::Playbook,
+) -> AppResult<()> {
+    let Some(nats_client) = state.nats.as_ref() else {
+        tracing::warn!(
+            execution_id,
+            event_id,
+            "NATS not configured; command notification skipped — worker won't claim this command"
+        );
+        return Ok(());
+    };
+
+    // Pool segment from the playbook's catalog path.  The
+    // `Playbook` type's `metadata.path` is `Option<String>`; if
+    // unset we default to `shared` (the same default Python uses).
+    let pool_segment = match playbook.metadata.path.as_deref() {
+        Some(p) if p.starts_with("system/") => "system",
+        _ => "shared",
+    };
+    let subject = format!("noetl.commands.{}.{}", pool_segment, execution_id);
+
+    let server_url = state
+        .config
+        .public_server_url
+        .clone()
+        .unwrap_or_else(|| "http://localhost:8082".to_string());
+
+    let notification = serde_json::json!({
+        "execution_id": execution_id,
+        "event_id": event_id,
+        "command_id": command_id,
+        "step": step,
+        "server_url": server_url,
+    });
+    let payload = serde_json::to_vec(&notification)
+        .map_err(|e| AppError::Internal(format!("Serialize command notification: {e}")))?;
+
+    let js = async_nats::jetstream::new((**nats_client).clone());
+    js.publish(subject.clone(), payload.into())
+        .await
+        .map_err(|e| AppError::Internal(format!("NATS publish failed: {e}")))?
+        .await
+        .map_err(|e| AppError::Internal(format!("NATS publish ack failed: {e}")))?;
+
+    tracing::info!(
+        execution_id,
+        event_id,
+        %subject,
+        command_id = %command_id,
+        "Published command notification to NATS"
+    );
+    Ok(())
 }
 
 #[cfg(test)]
