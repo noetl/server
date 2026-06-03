@@ -598,9 +598,14 @@ pub async fn claim_command(
     }
 
     let claim_event_id = generate_snowflake_id_with_tx(&mut tx).await?;
+    // Constraint-compliant `{status, context}` envelope — see
+    // noetl/server#29 for why `{kind, data}` was rejected.  The
+    // explicit claim path was missed in v2.4.3 because the load
+    // smoke only exercised handle_event; Phase D Round 2's
+    // multi-step kind validation surfaced it.
     let claim_result = serde_json::json!({
-        "kind": "data",
-        "data": {
+        "status": "RUNNING",
+        "context": {
             "command_id": command_id,
             "worker_id": request.worker_id,
         }
@@ -682,10 +687,19 @@ pub async fn handle_batch_events(
         let event_id = generate_snowflake_id_with_tx(&mut tx).await?;
         let status = event_status_from_name(&item.event_type);
 
-        let result_obj_raw = serde_json::json!({
-            "kind": "data",
-            "data": item.payload,
-        });
+        // Constraint-compliant `{status, context}` envelope per
+        // noetl/server#29.  Same shape rule as build_result_object
+        // in handle_event_inner: `context` only when payload is
+        // an object; otherwise emit `{status}` alone.
+        let mut result_map = serde_json::Map::new();
+        result_map.insert(
+            "status".to_string(),
+            serde_json::Value::String(status.to_string()),
+        );
+        if let serde_json::Value::Object(_) = item.payload {
+            result_map.insert("context".to_string(), item.payload.clone());
+        }
+        let result_obj_raw = serde_json::Value::Object(result_map);
         let result_obj = sanitize_sensitive_data(&result_obj_raw);
 
         let mut meta_obj = serde_json::json!({
@@ -728,6 +742,32 @@ pub async fn handle_batch_events(
     }
 
     tx.commit().await?;
+
+    // Trigger orchestrator for any command.completed in the batch
+    // whose step is not the playbook's terminal `end` block.  Mirrors
+    // the call site in `handle_event` above; runs once per qualifying
+    // event so a batch with multiple completions can still advance
+    // multi-step playbooks.  Errors are logged and swallowed so a
+    // bad-state evaluation doesn't fail the whole batch ingest.
+    for (idx, item) in request.events.iter().enumerate() {
+        if item.event_type == "command.completed" && item.step.to_lowercase() != "end" {
+            let trigger_event_id = event_ids[idx];
+            match trigger_orchestrator(&state, execution_id, trigger_event_id).await {
+                Ok(cmds) => {
+                    info!(
+                        "Orchestrator (batch) generated {} commands for execution {} step {}",
+                        cmds, execution_id, item.step
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        "Orchestrator error in batch for execution {} step {}: {}",
+                        execution_id, item.step, e
+                    );
+                }
+            }
+        }
+    }
 
     Ok(Json(BatchEventResponse {
         status: "ok".to_string(),
@@ -910,20 +950,251 @@ fn event_status_from_name(event_name: &str) -> &'static str {
 }
 
 /// Trigger orchestrator for workflow progression.
+///
+/// Phase D Round 2 of noetl/ai-meta#49 — wires the previously-
+/// stubbed orchestrator to the real
+/// [`crate::engine::WorkflowOrchestrator::evaluate`] pipeline.
+///
+/// Pipeline:
+///
+/// 1. Load all `noetl.event` rows for this execution (sorted by
+///    `event_id` so [`WorkflowState::from_events`] reconstructs
+///    state in the canonical order).
+/// 2. Resolve `catalog_id` from one of the events, load the
+///    playbook YAML, parse to [`Playbook`].
+/// 3. Call `orchestrator.evaluate(&events, &playbook,
+///    Some("command.completed"))`.
+/// 4. For each [`EventToEmit`] returned (e.g. `step.enter` rows
+///    for the next step), insert into `noetl.event`.
+/// 5. For each [`engine::Command`] returned, look up the matching
+///    [`Step`] in the playbook and call
+///    [`crate::handlers::execute::persist_engine_command`] —
+///    which inserts the `command.issued` event, the
+///    `noetl.command` row, and publishes the NATS notification
+///    (same code path the `/api/execute` first-command uses, so
+///    the wire format stays consistent).
+/// 6. If `result.should_complete` is set, emit a final
+///    `playbook.completed` or `playbook.failed` event so
+///    downstream consumers can observe terminal state.
+///
+/// `trigger_event_id` is the `event_id` of the event that
+/// triggered this evaluation pass (usually the `command.completed`
+/// row).  It's used as the `parent_event_id` for newly-inserted
+/// events so the event log forms a proper causal chain.
 async fn trigger_orchestrator(
-    _state: &AppState,
+    state: &AppState,
     execution_id: i64,
     trigger_event_id: i64,
 ) -> AppResult<i32> {
-    // This would be a full orchestrator implementation
-    // For now, just log and return 0
+    use crate::engine::WorkflowOrchestrator;
+    use sqlx::Row;
+
     debug!(
-        "Would trigger orchestrator for execution={}, trigger_event={}",
-        execution_id, trigger_event_id
+        execution_id,
+        trigger_event_id, "trigger_orchestrator: loading events"
     );
 
-    // TODO: Load playbook, reconstruct state from events, evaluate next steps
-    Ok(0)
+    // 1. Load all events for this execution.
+    //
+    // `attempt` is stored inside `meta` JSONB (no dedicated column on
+    // noetl.event today — same shape Python projector uses), so we
+    // source it via `meta->>'attempt'` cast to int.
+    let rows = sqlx::query(
+        r#"
+        SELECT event_id, execution_id, catalog_id,
+               parent_event_id, parent_execution_id,
+               event_type, node_id, node_name, node_type, status,
+               context, meta, result, worker_id,
+               NULLIF(meta->>'attempt', '')::int AS attempt,
+               created_at
+        FROM noetl.event
+        WHERE execution_id = $1
+        ORDER BY event_id ASC
+        "#,
+    )
+    .bind(execution_id)
+    .fetch_all(&state.db)
+    .await?;
+
+    let events: Vec<crate::db::models::Event> = rows
+        .into_iter()
+        .map(|r| crate::db::models::Event {
+            id: r.try_get("event_id").unwrap_or(0),
+            execution_id: r.try_get("execution_id").unwrap_or(0),
+            catalog_id: r.try_get("catalog_id").unwrap_or(0),
+            event_id: r.try_get("event_id").unwrap_or(0),
+            parent_event_id: r.try_get("parent_event_id").ok(),
+            parent_execution_id: r.try_get("parent_execution_id").ok(),
+            event_type: r.try_get("event_type").unwrap_or_default(),
+            node_id: r.try_get("node_id").ok(),
+            node_name: r.try_get("node_name").ok(),
+            node_type: r.try_get("node_type").ok(),
+            status: r.try_get("status").unwrap_or_default(),
+            context: r.try_get("context").ok(),
+            meta: r.try_get("meta").ok(),
+            result: r.try_get("result").ok(),
+            worker_id: r.try_get("worker_id").ok(),
+            attempt: r.try_get("attempt").ok(),
+            created_at: r.try_get("created_at").unwrap_or_else(|_| chrono::Utc::now()),
+        })
+        .collect();
+
+    if events.is_empty() {
+        debug!(execution_id, "No events to evaluate — orchestrator exit early");
+        return Ok(0);
+    }
+
+    // 2. Look up catalog_id + playbook content.
+    let catalog_id = events
+        .iter()
+        .find_map(|e| {
+            if e.catalog_id > 0 {
+                Some(e.catalog_id)
+            } else {
+                None
+            }
+        })
+        .ok_or_else(|| {
+            AppError::Internal(format!(
+                "No catalog_id found in events for execution {execution_id}"
+            ))
+        })?;
+
+    let playbook_yaml: String = sqlx::query_scalar(
+        "SELECT content FROM noetl.catalog WHERE catalog_id = $1",
+    )
+    .bind(catalog_id)
+    .fetch_one(&state.db)
+    .await
+    .map_err(|e| {
+        AppError::Internal(format!(
+            "Failed to load playbook for catalog_id {catalog_id}: {e}"
+        ))
+    })?;
+    let playbook = crate::playbook::parser::parse_playbook(&playbook_yaml)?;
+
+    // 3. Evaluate.
+    let orchestrator = WorkflowOrchestrator::new();
+    let result = orchestrator
+        .evaluate(&events, &playbook, Some("command.completed"))
+        .map_err(|e| AppError::Internal(format!("Orchestrator evaluate failed: {e}")))?;
+
+    info!(
+        execution_id,
+        trigger_event_id,
+        new_commands = result.commands.len(),
+        new_events = result.events_to_emit.len(),
+        should_complete = result.should_complete,
+        "Orchestrator evaluate complete"
+    );
+
+    // 4. Emit pure events (step.enter etc.) before issuing new
+    //    commands so the causal chain is correct.
+    for emit in &result.events_to_emit {
+        let event_id = generate_snowflake_id(state).await?;
+        let event_status = if emit.status.is_empty() {
+            "STARTED".to_string()
+        } else {
+            emit.status.clone()
+        };
+
+        // Compose the constraint-compliant {status, context} result
+        // envelope when context is present, else {status} alone.
+        let result_obj = match &emit.context {
+            Some(serde_json::Value::Object(_)) => serde_json::json!({
+                "status": event_status,
+                "context": emit.context.clone().unwrap(),
+            }),
+            _ => serde_json::json!({"status": event_status}),
+        };
+
+        sqlx::query(
+            r#"
+            INSERT INTO noetl.event (
+                event_id, execution_id, catalog_id, event_type,
+                node_id, node_name, status, result, meta, created_at, parent_event_id
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            "#,
+        )
+        .bind(event_id)
+        .bind(execution_id)
+        .bind(catalog_id)
+        .bind(&emit.event_type)
+        .bind(emit.node_name.as_deref())
+        .bind(emit.node_name.as_deref())
+        .bind(&event_status)
+        .bind(&result_obj)
+        .bind(serde_json::json!({"emitted_by": "orchestrator"}))
+        .bind(chrono::Utc::now())
+        .bind(trigger_event_id)
+        .execute(&state.db)
+        .await?;
+    }
+
+    // 5. Issue new commands via the shared persist + publish helper.
+    let mut commands_generated = 0i32;
+    for command in &result.commands {
+        let step = playbook.get_step(&command.step_name).ok_or_else(|| {
+            AppError::Internal(format!(
+                "Orchestrator returned command for unknown step '{}'",
+                command.step_name
+            ))
+        })?;
+
+        let render_context: std::collections::HashMap<String, serde_json::Value> =
+            command.context.clone().unwrap_or_default();
+
+        crate::handlers::execute::persist_engine_command(
+            state,
+            execution_id,
+            catalog_id,
+            trigger_event_id,
+            step,
+            command,
+            &render_context,
+            &playbook,
+        )
+        .await?;
+        commands_generated += 1;
+    }
+
+    // 6. Emit terminal playbook event when the orchestrator says so.
+    if result.should_complete {
+        let (event_type, status) = match &result.completion_status {
+            Some(cs) if cs.status == "FAILED" => ("playbook.failed", "FAILED"),
+            _ => ("playbook.completed", "COMPLETED"),
+        };
+        let event_id = generate_snowflake_id(state).await?;
+        let terminal_meta = serde_json::to_value(&result.completion_status).unwrap_or_default();
+        sqlx::query(
+            r#"
+            INSERT INTO noetl.event (
+                event_id, execution_id, catalog_id, event_type,
+                node_id, node_name, status, result, meta, created_at, parent_event_id
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            "#,
+        )
+        .bind(event_id)
+        .bind(execution_id)
+        .bind(catalog_id)
+        .bind(event_type)
+        .bind("playbook")
+        .bind("playbook")
+        .bind(status)
+        .bind(serde_json::json!({"status": status}))
+        .bind(terminal_meta)
+        .bind(chrono::Utc::now())
+        .bind(trigger_event_id)
+        .execute(&state.db)
+        .await?;
+        info!(
+            execution_id,
+            terminal_event = %event_type,
+            "Orchestrator marked execution as terminal"
+        );
+    }
+
+    Ok(commands_generated)
 }
 
 #[cfg(test)]
