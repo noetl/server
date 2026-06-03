@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.1.3](https://github.com/noetl/server/compare/v2.1.2...v2.1.3) (2026-06-03)
+
+### Bug Fixes
+
+* **credential:** SQL column is data_encrypted not data ([feebf7d](https://github.com/noetl/server/commit/feebf7d3f6c9b617a503da633eaea665d5cd07ed)), closes [noetl/ai-meta#49](https://github.com/noetl/ai-meta/issues/49) [#49](https://github.com/noetl/server/issues/49) [noetl/ai-meta#49](https://github.com/noetl/ai-meta/issues/49)
+
 ## [2.1.2](https://github.com/noetl/server/compare/v2.1.1...v2.1.2) (2026-06-03)
 
 ### Bug Fixes
