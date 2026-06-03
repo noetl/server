@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.7.0](https://github.com/noetl/server/compare/v2.6.0...v2.7.0) (2026-06-03)
+
+### Features
+
+* **orchestrator:** step.loop iterator fan-out + state aggregation ([2b1ba32](https://github.com/noetl/server/commit/2b1ba32366429127e76d3c7bdafbc6c23d230eae)), closes [noetl/server#22](https://github.com/noetl/server/issues/22) [noetl/ai-meta#49](https://github.com/noetl/ai-meta/issues/49) [noetl/server#22](https://github.com/noetl/server/issues/22) [noetl/ai-meta#49](https://github.com/noetl/ai-meta/issues/49)
+
 ## [2.6.0](https://github.com/noetl/server/compare/v2.5.0...v2.6.0) (2026-06-03)
 
 ### Features
