@@ -97,12 +97,18 @@ impl ExecutionService {
         let rows: Vec<(i64, i64, Option<String>, String, DateTime<Utc>, Option<DateTime<Utc>>, i64)> =
             sqlx::query_as(
                 r#"
+                -- noetl.event.created_at is TIMESTAMP (no tz); the
+                -- Rust struct uses DateTime<Utc> (TIMESTAMPTZ).
+                -- ``AT TIME ZONE 'UTC'`` reinterprets the naive
+                -- timestamp as UTC and produces a TIMESTAMPTZ that
+                -- sqlx can decode into DateTime<Utc>.  See
+                -- noetl/ai-meta#49 Phase A.
                 WITH execution_stats AS (
                     SELECT
                         execution_id,
                         catalog_id,
-                        MIN(created_at) as started_at,
-                        MAX(CASE WHEN status IN ('COMPLETED', 'FAILED', 'CANCELLED') THEN created_at END) as completed_at,
+                        MIN(created_at) AT TIME ZONE 'UTC' as started_at,
+                        MAX(CASE WHEN status IN ('COMPLETED', 'FAILED', 'CANCELLED') THEN created_at END) AT TIME ZONE 'UTC' as completed_at,
                         COUNT(*) as event_count,
                         MAX(CASE
                             WHEN event_type = 'playbook_completed' THEN 'COMPLETED'
@@ -172,11 +178,14 @@ impl ExecutionService {
         let info: Option<(i64, Option<i64>, Option<serde_json::Value>, DateTime<Utc>)> =
             sqlx::query_as(
                 r#"
+                -- created_at is TIMESTAMP (no tz); ``AT TIME ZONE 'UTC'``
+                -- reinterprets it as UTC so sqlx can decode into
+                -- DateTime<Utc>.  Mirror of the WITH-block in list().
                 SELECT
                     catalog_id,
                     parent_execution_id,
                     context->'workload' as workload,
-                    created_at
+                    created_at AT TIME ZONE 'UTC' as created_at
                 FROM noetl.event
                 WHERE execution_id = $1 AND event_type = 'playbook_started'
                 LIMIT 1
@@ -212,7 +221,7 @@ impl ExecutionService {
                     event_type,
                     node_name,
                     COALESCE(status, 'UNKNOWN') as status,
-                    created_at,
+                    created_at AT TIME ZONE 'UTC' as created_at,
                     result,
                     error
                 FROM noetl.event
