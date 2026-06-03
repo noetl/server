@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.4.2](https://github.com/noetl/server/compare/v2.4.1...v2.4.2) (2026-06-03)
+
+### Bug Fixes
+
+* **execute:** emit args:{} (not args:null) in command.issued context ([c2de98f](https://github.com/noetl/server/commit/c2de98f89eca397b725110f1d31f336361af9a50)), closes [noetl/server#27](https://github.com/noetl/server/issues/27) [noetl/server#27](https://github.com/noetl/server/issues/27) [noetl/server#21](https://github.com/noetl/server/issues/21) [noetl/ai-meta#49](https://github.com/noetl/ai-meta/issues/49)
+
 ## [2.4.1](https://github.com/noetl/server/compare/v2.4.0...v2.4.1) (2026-06-03)
 
 ### Bug Fixes
