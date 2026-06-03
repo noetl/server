@@ -210,7 +210,38 @@ pub struct CommandResponse {
 ///
 /// Worker reports completion with result (inline or ref).
 /// Engine evaluates case/when/then and generates next commands.
+///
+/// Instrumented per
+/// [`agents/rules/observability.md`](https://github.com/noetl/ai-meta/blob/main/agents/rules/observability.md)
+/// Principle 1: a counter (`noetl_events_ingested_total{event_type,status}`)
+/// and histogram (`noetl_event_ingest_duration_seconds{event_type}`) are
+/// recorded on every dispatch.  See [`handle_event_inner`] for the body
+/// of the handler.
 pub async fn handle_event(
+    state: State<AppState>,
+    request: Json<EventRequest>,
+) -> Result<Json<EventResponse>, AppError> {
+    let event_type_for_metrics = request.0.event_type.clone();
+    let started_at = std::time::Instant::now();
+
+    let result = handle_event_inner(state, request).await;
+
+    let status_label = if result.is_ok() { "ok" } else { "error" };
+    let duration_seconds = started_at.elapsed().as_secs_f64();
+    crate::metrics::record_event_ingest(
+        &event_type_for_metrics,
+        status_label,
+        duration_seconds,
+    );
+
+    result
+}
+
+/// Inner body of [`handle_event`] — same logic, no instrumentation.
+///
+/// Split out so the wrapper can record metrics on both Ok and Err
+/// paths without coupling the body to the recording call.
+async fn handle_event_inner(
     State(state): State<AppState>,
     Json(request): Json<EventRequest>,
 ) -> Result<Json<EventResponse>, AppError> {

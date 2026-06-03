@@ -48,6 +48,7 @@ pub mod db;
 pub mod engine;
 pub mod error;
 pub mod handlers;
+pub mod metrics;
 pub mod nats;
 pub mod playbook;
 pub mod result_ext;
