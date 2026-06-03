@@ -14,9 +14,35 @@ use crate::db::models::Event;
 use crate::error::{AppError, AppResult};
 use crate::playbook::types::{Playbook, Step};
 
-use super::commands::{Command, CommandBuilder};
+use super::commands::{Command, CommandBuilder, IteratorMetadata};
 use super::evaluator::ConditionEvaluator;
 use super::state::{ExecutionState, WorkflowState};
+
+/// Merge iterator metadata into the step-enter context so
+/// `state.apply_event` can stamp `iterations_expected` (and a
+/// readable iterator name) onto the resulting `StepInfo` during
+/// state reconstruction.  `with_params` is the existing transition
+/// context (if any); the helper returns a new JSON object that
+/// includes both that AND the iteration keys.
+fn merge_iteration_context(
+    with_params: Option<serde_json::Value>,
+    iterations_expected: i32,
+    iterator_var: &str,
+) -> serde_json::Value {
+    let mut obj = match with_params {
+        Some(serde_json::Value::Object(m)) => m,
+        _ => serde_json::Map::new(),
+    };
+    obj.insert(
+        "iterations_expected".to_string(),
+        serde_json::json!(iterations_expected),
+    );
+    obj.insert(
+        "iterator_var".to_string(),
+        serde_json::Value::String(iterator_var.to_string()),
+    );
+    serde_json::Value::Object(obj)
+}
 
 /// Result of orchestration evaluation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -413,6 +439,107 @@ impl WorkflowOrchestrator {
                         continue;
                     }
 
+                    // R3b iterator fan-out: if the landed step
+                    // declares `step.loop`, evaluate the loop
+                    // expression and emit one command per item.  The
+                    // single `step.enter` event carries
+                    // `iterations_expected` in its context so state
+                    // reconstruction can aggregate per-iteration
+                    // `command.completed` events into one
+                    // step-level completion (see
+                    // `state.rs::apply_event`).  Sequential and
+                    // parallel modes both fan out the same way at
+                    // this layer; concurrency is shaped downstream
+                    // by the worker pool.
+                    if let Some(loop_cfg) = current_step.r#loop.as_ref() {
+                        let items = self
+                            .evaluator
+                            .evaluate_loop(&loop_cfg.in_expr, &current_ctx)?;
+                        let total: usize = items.len();
+
+                        if total == 0 {
+                            // Empty collection — emit step.enter with
+                            // total=0 + a synthetic step.exit so
+                            // downstream transitions still fire.  No
+                            // command dispatched.
+                            info!(
+                                "Iterator step '{}' produced empty collection — short-circuiting",
+                                current_step_name
+                            );
+                            let enter_ctx = merge_iteration_context(
+                                current_with_params.clone(),
+                                0i32,
+                                &loop_cfg.iterator,
+                            );
+                            events_to_emit.push(EventToEmit {
+                                event_type: "step.enter".to_string(),
+                                node_name: Some(current_step_name.clone()),
+                                status: "ENTERED".to_string(),
+                                context: Some(enter_ctx),
+                                result: None,
+                                error: None,
+                            });
+                            events_to_emit.push(EventToEmit {
+                                event_type: "step.exit".to_string(),
+                                node_name: Some(current_step_name.clone()),
+                                status: "COMPLETED".to_string(),
+                                context: None,
+                                result: Some(serde_json::Value::Array(vec![])),
+                                error: None,
+                            });
+                            continue;
+                        }
+
+                        info!(
+                            "Fanning out {} iterations for step '{}' (iterator='{}')",
+                            total, current_step_name, loop_cfg.iterator
+                        );
+
+                        // One `step.enter` carries the total so
+                        // state.apply_event can stamp
+                        // iterations_expected onto the StepInfo.
+                        let enter_ctx = merge_iteration_context(
+                            current_with_params.clone(),
+                            total as i32,
+                            &loop_cfg.iterator,
+                        );
+                        events_to_emit.push(EventToEmit {
+                            event_type: "step.enter".to_string(),
+                            node_name: Some(current_step_name.clone()),
+                            status: "ENTERED".to_string(),
+                            context: Some(enter_ctx),
+                            result: None,
+                            error: None,
+                        });
+
+                        // One command per item via
+                        // build_iteration_command (which injects
+                        // `<iterator>`, `_index`, `_total` into the
+                        // command's render context).
+                        for (idx, item) in items.into_iter().enumerate() {
+                            let iter_meta = IteratorMetadata {
+                                parent_execution_id: state.execution_id,
+                                iterator_step: current_step_name.clone(),
+                                item_var: loop_cfg.iterator.clone(),
+                                item,
+                                index: idx,
+                                total,
+                            };
+                            let command = self.command_builder.build_iteration_command(
+                                0,
+                                state.execution_id,
+                                state.catalog_id,
+                                0,
+                                current_step,
+                                &current_ctx,
+                                iter_meta,
+                            )?;
+                            commands.push(command);
+                        }
+
+                        continue;
+                    }
+
                     info!("Transitioning to step: {}", current_step_name);
 
                     // Create step.enter event for the step we landed
@@ -794,6 +921,154 @@ mod tests {
             .iter()
             .any(|e| e.event_type == "step.skipped");
         assert!(!skipped, "should NOT emit step.skipped when guard passes");
+    }
+
+    #[test]
+    fn test_step_loop_fans_out_iterations() {
+        // Playbook: start → looped (loop.in=[1,2,3]) → end.
+        // Expectation: orchestrator emits one step.enter(looped)
+        // carrying iterations_expected=3 in context, and dispatches
+        // three commands (one per item) each with iterator metadata.
+        let orchestrator = WorkflowOrchestrator::new();
+
+        let start = make_step("start", Some("looped"));
+        let mut looped = make_step("looped", Some("end"));
+        looped.r#loop = Some(crate::playbook::types::Loop {
+            in_expr: "{{ [1, 2, 3] }}".to_string(),
+            iterator: "n".to_string(),
+            spec: None,
+        });
+        let end = make_step("end", None);
+
+        let events = vec![
+            {
+                let mut e = make_event("playbook_started", None);
+                e.context = Some(serde_json::json!({
+                    "workload": {},
+                    "path": "test",
+                    "version": "1"
+                }));
+                e
+            },
+            make_event("command.completed", Some("start")),
+        ];
+
+        let playbook = Playbook {
+            api_version: "noetl.io/v2".to_string(),
+            kind: "Playbook".to_string(),
+            metadata: Metadata {
+                name: "loop_test".to_string(),
+                path: Some("test/loop".to_string()),
+                description: None,
+                labels: None,
+                extra: HashMap::new(),
+            },
+            workload: None,
+            vars: None,
+            keychain: None,
+            workbook: None,
+            workflow: vec![start, looped, end],
+        };
+
+        let result = orchestrator
+            .evaluate(&events, &playbook, Some("command.completed"))
+            .unwrap();
+
+        // Three iteration commands.
+        assert_eq!(
+            result.commands.len(),
+            3,
+            "expected 3 iteration commands, got {}",
+            result.commands.len()
+        );
+        // All carry iterator metadata.
+        for (idx, cmd) in result.commands.iter().enumerate() {
+            let iter = cmd.iterator.as_ref().expect("iterator metadata present");
+            assert_eq!(iter.index, idx);
+            assert_eq!(iter.total, 3);
+            assert_eq!(iter.iterator_step, "looped");
+            assert_eq!(iter.item_var, "n");
+        }
+        // Exactly one step.enter, with iterations_expected=3.
+        let enters: Vec<_> = result
+            .events_to_emit
+            .iter()
+            .filter(|e| e.event_type == "step.enter")
+            .collect();
+        assert_eq!(enters.len(), 1);
+        assert_eq!(enters[0].node_name.as_deref(), Some("looped"));
+        let enter_ctx = enters[0].context.as_ref().unwrap();
+        assert_eq!(
+            enter_ctx.get("iterations_expected").and_then(|v| v.as_i64()),
+            Some(3)
+        );
+        assert_eq!(
+            enter_ctx.get("iterator_var").and_then(|v| v.as_str()),
+            Some("n")
+        );
+    }
+
+    #[test]
+    fn test_step_loop_empty_collection_short_circuits() {
+        // Loop expression evaluates to []; orchestrator should
+        // emit step.enter (iterations_expected=0) AND a synthetic
+        // step.exit so transitions downstream still fire.  No
+        // commands dispatched.
+        let orchestrator = WorkflowOrchestrator::new();
+
+        let start = make_step("start", Some("looped"));
+        let mut looped = make_step("looped", Some("end"));
+        looped.r#loop = Some(crate::playbook::types::Loop {
+            in_expr: "{{ [] }}".to_string(),
+            iterator: "x".to_string(),
+            spec: None,
+        });
+        let end = make_step("end", None);
+
+        let events = vec![
+            {
+                let mut e = make_event("playbook_started", None);
+                e.context = Some(serde_json::json!({
+                    "workload": {},
+                    "path": "test",
+                    "version": "1"
+                }));
+                e
+            },
+            make_event("command.completed", Some("start")),
+        ];
+
+        let playbook = Playbook {
+            api_version: "noetl.io/v2".to_string(),
+            kind: "Playbook".to_string(),
+            metadata: Metadata {
+                name: "loop_empty".to_string(),
+                path: Some("test/loop_empty".to_string()),
+                description: None,
+                labels: None,
+                extra: HashMap::new(),
+            },
+            workload: None,
+            vars: None,
+            keychain: None,
+            workbook: None,
+            workflow: vec![start, looped, end],
+        };
+
+        let result = orchestrator
+            .evaluate(&events, &playbook, Some("command.completed"))
+            .unwrap();
+        assert!(
+            result.commands.is_empty(),
+            "empty collection should dispatch no commands"
+        );
+        let types: Vec<&str> = result
+            .events_to_emit
+            .iter()
+            .map(|e| e.event_type.as_str())
+            .collect();
+        assert!(types.contains(&"step.enter"));
+        assert!(types.contains(&"step.exit"));
     }
 
     #[test]

@@ -274,7 +274,21 @@ pub(crate) async fn persist_engine_command(
     playbook: &crate::playbook::types::Playbook,
 ) -> AppResult<i64> {
     let event_id = generate_snowflake_id(state).await?;
-    let command_id = format!("{}:{}:{}", execution_id, step.step, event_id);
+
+    // R3b iterator fan-out: include the iteration index in
+    // command_id so each per-iteration command row has a unique
+    // identifier (the noetl.command primary key is per-execution
+    // command_id), and the worker can correlate its emitted events
+    // back to the right iteration.  Plain steps keep the
+    // pre-existing 3-segment shape `<exec>:<step>:<event>`.
+    let command_id = if let Some(iter) = command.iterator.as_ref() {
+        format!(
+            "{}:{}:{}:i{}",
+            execution_id, step.step, event_id, iter.index
+        )
+    } else {
+        format!("{}:{}:{}", execution_id, step.step, event_id)
+    };
 
     let cmd_args = match &step.args {
         Some(map) => serde_json::to_value(map).unwrap_or_else(|_| serde_json::json!({})),
@@ -286,7 +300,12 @@ pub(crate) async fn persist_engine_command(
         "render_context": render_context,
     });
 
-    let cmd_meta = serde_json::json!({
+    // Base meta — extended below with iteration_index/_total for
+    // iterator commands so `state.apply_event` (Phase D R3b state
+    // aggregation) sees the per-event iteration index on the
+    // matching `command.completed` row when the worker echoes
+    // meta forward.
+    let mut cmd_meta = serde_json::json!({
         "command_id": command_id,
         "step": step.step,
         "tool_kind": command.tool.kind,
@@ -296,6 +315,26 @@ pub(crate) async fn persist_engine_command(
         "catalog_id": catalog_id.to_string(),
         "actionable": true,
     });
+    if let Some(iter) = command.iterator.as_ref() {
+        if let serde_json::Value::Object(ref mut map) = cmd_meta {
+            map.insert(
+                "iteration_index".to_string(),
+                serde_json::json!(iter.index),
+            );
+            map.insert(
+                "iteration_total".to_string(),
+                serde_json::json!(iter.total),
+            );
+            map.insert(
+                "iterator_step".to_string(),
+                serde_json::json!(iter.iterator_step.clone()),
+            );
+            map.insert(
+                "item_var".to_string(),
+                serde_json::json!(iter.item_var.clone()),
+            );
+        }
+    }
 
     sqlx::query(
         r#"
