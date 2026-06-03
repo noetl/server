@@ -294,10 +294,25 @@ async fn generate_initial_commands(
     let event_id = generate_snowflake_id(state).await?;
     let command_id = format!("{}:{}:{}", execution_id, start_step.step, event_id);
 
-    // Build context for command execution
+    // Build context for command execution.
+    //
+    // `start_step.args` is `Option<HashMap<String, Value>>`.  We
+    // emit it as `args: {}` when unset, not `args: null`, because
+    // the worker's command-handling path (`command::execute_command`
+    // in `repos/worker/src/executor/`) copies a missing tool-side
+    // `args` from the top-level `args` key.  A `null` there
+    // surfaces inside the tool config and serde rejects it as
+    // "expected a map" when deserialising into `HashMap`.  Mirror
+    // Python's empty-map default (the Python server emits
+    // `input: {}` here — same intent, slightly different key
+    // naming that future Phase D work will reconcile).
+    let cmd_args = match &start_step.args {
+        Some(map) => serde_json::to_value(map).unwrap_or_else(|_| serde_json::json!({})),
+        None => serde_json::json!({}),
+    };
     let cmd_context = serde_json::json!({
         "tool_config": command.tool.config,
-        "args": start_step.args,
+        "args": cmd_args,
         "render_context": context,
     });
 
