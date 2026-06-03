@@ -10,6 +10,7 @@ pub mod execution;
 pub mod internal;
 pub mod keychain;
 pub mod runtime;
+pub mod ui_schema;
 
 pub use catalog::CatalogService;
 pub use credential::CredentialService;
