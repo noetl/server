@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.6.0](https://github.com/noetl/server/compare/v2.5.0...v2.6.0) (2026-06-03)
+
+### Features
+
+* **orchestrator:** wire step.when enable guard with skip chain ([7de832e](https://github.com/noetl/server/commit/7de832e6239ea1cc0e7dfb0bb946d0c73c57373d)), closes [noetl/server#22](https://github.com/noetl/server/issues/22) [noetl/ai-meta#49](https://github.com/noetl/ai-meta/issues/49) [noetl/server#22](https://github.com/noetl/server/issues/22) [noetl/ai-meta#49](https://github.com/noetl/ai-meta/issues/49)
+
 ## [2.5.0](https://github.com/noetl/server/compare/v2.4.3...v2.5.0) (2026-06-03)
 
 ### Features
