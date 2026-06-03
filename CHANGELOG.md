@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.4.3](https://github.com/noetl/server/compare/v2.4.2...v2.4.3) (2026-06-03)
+
+### Bug Fixes
+
+* **events:** result envelope must match chk_event_result_shape ([aae4000](https://github.com/noetl/server/commit/aae400031c3bff02f089d33e6ac590919ca2ac08)), closes [noetl/server#29](https://github.com/noetl/server/issues/29) [noetl/server#21](https://github.com/noetl/server/issues/21) [noetl/ai-meta#49](https://github.com/noetl/ai-meta/issues/49) [noetl/server#21](https://github.com/noetl/server/issues/21) [noetl/server#29](https://github.com/noetl/server/issues/29) [noetl/server#21](https://github.com/noetl/server/issues/21) [noetl/ai-meta#49](https://github.com/noetl/ai-meta/issues/49)
+
 ## [2.4.2](https://github.com/noetl/server/compare/v2.4.1...v2.4.2) (2026-06-03)
 
 ### Bug Fixes
