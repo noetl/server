@@ -180,7 +180,11 @@ fn build_router(
             post(handlers::runtime::heartbeat),
         )
         .route("/api/worker/pools", get(handlers::runtime::list_pools))
-        .route("/api/runtimes", get(handlers::runtime::list_all))
+        // NOTE: `/api/runtimes` (no-filter list) was a Rust-side innovation
+        // with no Python equivalent — removed for Phase A parity per #49
+        // constraint #2 ("byte-identical contracts during migration").
+        // Handler `runtime::list_all` retained for the eventual Python-side
+        // backport; see noetl/server follow-up issue.
         .with_state(runtime_service);
 
     // Database routes
