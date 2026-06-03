@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.2.1](https://github.com/noetl/server/compare/v2.2.0...v2.2.1) (2026-06-03)
+
+### Bug Fixes
+
+* **catalog:** emit null for optional response fields (Python parity) ([3c7e2c3](https://github.com/noetl/server/commit/3c7e2c383a41effc6628b99b79a1886401a1841b)), closes [noetl/ai-meta#49](https://github.com/noetl/ai-meta/issues/49) [noetl/ai-meta#49](https://github.com/noetl/ai-meta/issues/49)
+
 ## [2.2.0](https://github.com/noetl/server/compare/v2.1.6...v2.2.0) (2026-06-03)
 
 ### Features
