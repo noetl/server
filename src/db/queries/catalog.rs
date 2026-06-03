@@ -56,7 +56,7 @@ pub async fn insert_catalog_entry(
 pub async fn get_catalog_by_id(pool: &DbPool, id: i64) -> AppResult<Option<CatalogEntry>> {
     let entry = sqlx::query_as::<_, CatalogEntry>(
         r#"
-        SELECT id, path, kind, version, content, layout, payload, meta, created_at
+        SELECT catalog_id AS id, path, kind, version, content, layout, payload, meta, created_at AT TIME ZONE 'UTC' as created_at
         FROM noetl.catalog
         WHERE id = $1
         "#,
@@ -76,7 +76,7 @@ pub async fn get_catalog_by_path_version(
 ) -> AppResult<Option<CatalogEntry>> {
     let entry = sqlx::query_as::<_, CatalogEntry>(
         r#"
-        SELECT id, path, kind, version, content, layout, payload, meta, created_at
+        SELECT catalog_id AS id, path, kind, version, content, layout, payload, meta, created_at AT TIME ZONE 'UTC' as created_at
         FROM noetl.catalog
         WHERE path = $1 AND version = $2
         "#,
@@ -93,7 +93,7 @@ pub async fn get_catalog_by_path_version(
 pub async fn get_catalog_latest(pool: &DbPool, path: &str) -> AppResult<Option<CatalogEntry>> {
     let entry = sqlx::query_as::<_, CatalogEntry>(
         r#"
-        SELECT id, path, kind, version, content, layout, payload, meta, created_at
+        SELECT catalog_id AS id, path, kind, version, content, layout, payload, meta, created_at AT TIME ZONE 'UTC' as created_at
         FROM noetl.catalog
         WHERE path = $1
         ORDER BY version DESC
@@ -115,7 +115,7 @@ pub async fn list_catalog_entries(
     let entries = if let Some(k) = kind {
         sqlx::query_as::<_, CatalogEntry>(
             r#"
-            SELECT id, path, kind, version, content, layout, payload, meta, created_at
+            SELECT catalog_id AS id, path, kind, version, content, layout, payload, meta, created_at AT TIME ZONE 'UTC' as created_at
             FROM noetl.catalog
             WHERE kind = $1
             ORDER BY created_at DESC
@@ -127,7 +127,7 @@ pub async fn list_catalog_entries(
     } else {
         sqlx::query_as::<_, CatalogEntry>(
             r#"
-            SELECT id, path, kind, version, content, layout, payload, meta, created_at
+            SELECT catalog_id AS id, path, kind, version, content, layout, payload, meta, created_at AT TIME ZONE 'UTC' as created_at
             FROM noetl.catalog
             ORDER BY created_at DESC
             "#,
@@ -143,7 +143,7 @@ pub async fn list_catalog_entries(
 pub async fn get_catalog_all_versions(pool: &DbPool, path: &str) -> AppResult<Vec<CatalogEntry>> {
     let entries = sqlx::query_as::<_, CatalogEntry>(
         r#"
-        SELECT id, path, kind, version, content, layout, payload, meta, created_at
+        SELECT catalog_id AS id, path, kind, version, content, layout, payload, meta, created_at AT TIME ZONE 'UTC' as created_at
         FROM noetl.catalog
         WHERE path = $1
         ORDER BY version DESC

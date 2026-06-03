@@ -103,6 +103,16 @@ impl ExecutionService {
                 -- timestamp as UTC and produces a TIMESTAMPTZ that
                 -- sqlx can decode into DateTime<Utc>.  See
                 -- noetl/ai-meta#49 Phase A.
+                -- Event-type values follow the dot-style convention
+                -- written by the Python noetl-server (per
+                -- ``noetl/server/api/core/events.py``):
+                -- ``playbook.initialized`` / ``playbook.completed`` /
+                -- ``playbook.failed`` / ``playbook.cancelled``.
+                -- The legacy ``playbook_started`` / ``playbook_completed``
+                -- / ``playbook_failed`` / ``playbook_cancelled`` aliases
+                -- are accepted too — see ``engine/state.rs``'s match
+                -- arms for the same dual-shape acceptance.  See
+                -- noetl/ai-meta#49 Phase A.
                 WITH execution_stats AS (
                     SELECT
                         execution_id,
@@ -111,9 +121,9 @@ impl ExecutionService {
                         MAX(CASE WHEN status IN ('COMPLETED', 'FAILED', 'CANCELLED') THEN created_at END) AT TIME ZONE 'UTC' as completed_at,
                         COUNT(*) as event_count,
                         MAX(CASE
-                            WHEN event_type = 'playbook_completed' THEN 'COMPLETED'
-                            WHEN event_type = 'playbook_failed' THEN 'FAILED'
-                            WHEN event_type = 'playbook_cancelled' THEN 'CANCELLED'
+                            WHEN event_type IN ('playbook.completed', 'playbook_completed') THEN 'COMPLETED'
+                            WHEN event_type IN ('playbook.failed', 'playbook_failed') THEN 'FAILED'
+                            WHEN event_type IN ('playbook.cancelled', 'playbook_cancelled') THEN 'CANCELLED'
                             WHEN status = 'FAILED' THEN 'FAILED'
                             ELSE 'RUNNING'
                         END) as status
@@ -187,7 +197,8 @@ impl ExecutionService {
                     context->'workload' as workload,
                     created_at AT TIME ZONE 'UTC' as created_at
                 FROM noetl.event
-                WHERE execution_id = $1 AND event_type = 'playbook_started'
+                WHERE execution_id = $1
+                  AND event_type IN ('playbook.initialized', 'playbook_started')
                 LIMIT 1
                 "#,
             )
@@ -257,9 +268,15 @@ impl ExecutionService {
         let completed_at = events
             .iter()
             .filter(|e| {
-                e.event_type == "playbook_completed"
-                    || e.event_type == "playbook_failed"
-                    || e.event_type == "playbook_cancelled"
+                matches!(
+                    e.event_type.as_str(),
+                    "playbook.completed"
+                        | "playbook_completed"
+                        | "playbook.failed"
+                        | "playbook_failed"
+                        | "playbook.cancelled"
+                        | "playbook_cancelled"
+                )
             })
             .map(|e| e.created_at)
             .max();
@@ -331,7 +348,7 @@ impl ExecutionService {
             SELECT EXISTS(
                 SELECT 1 FROM noetl.event
                 WHERE execution_id = $1
-                  AND event_type = 'playbook_cancelled'
+                  AND event_type IN ('playbook.cancelled', 'playbook_cancelled')
             )
             "#,
         )
@@ -423,7 +440,7 @@ impl ExecutionService {
             SELECT EXISTS(
                 SELECT 1 FROM noetl.event
                 WHERE execution_id = $1
-                  AND event_type = 'playbook_cancelled'
+                  AND event_type IN ('playbook.cancelled', 'playbook_cancelled')
             )
             "#,
         )
@@ -499,9 +516,9 @@ impl ExecutionService {
     fn determine_status(&self, events: &[ExecutionEvent]) -> String {
         for event in events.iter().rev() {
             match event.event_type.as_str() {
-                "playbook_completed" => return "COMPLETED".to_string(),
-                "playbook_failed" => return "FAILED".to_string(),
-                "playbook_cancelled" => return "CANCELLED".to_string(),
+                "playbook.completed" | "playbook_completed" => return "COMPLETED".to_string(),
+                "playbook.failed" | "playbook_failed" => return "FAILED".to_string(),
+                "playbook.cancelled" | "playbook_cancelled" => return "CANCELLED".to_string(),
                 _ => {}
             }
             if event.status == "FAILED" {
