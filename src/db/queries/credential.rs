@@ -16,7 +16,8 @@ pub async fn insert_credential(
 ) -> AppResult<i64> {
     let result: (i64,) = sqlx::query_as(
         r#"
-        INSERT INTO noetl.credential (name, type, data, meta, tags, description)
+        INSERT INTO noetl.credential
+            (name, type, data_encrypted, meta, tags, description)
         VALUES ($1, $2, $3, $4, $5, $6)
         RETURNING id
         "#,
@@ -46,7 +47,12 @@ pub async fn update_credential(
     sqlx::query(
         r#"
         UPDATE noetl.credential
-        SET type = $2, data = $3, meta = $4, tags = $5, description = $6, updated_at = NOW()
+        SET type = $2,
+            data_encrypted = $3,
+            meta = $4,
+            tags = $5,
+            description = $6,
+            updated_at = NOW()
         WHERE id = $1
         "#,
     )
@@ -66,7 +72,8 @@ pub async fn update_credential(
 pub async fn get_credential_by_id(pool: &DbPool, id: i64) -> AppResult<Option<CredentialEntry>> {
     let entry = sqlx::query_as::<_, CredentialEntry>(
         r#"
-        SELECT id, name, type, data, meta, tags, description, created_at, updated_at
+        SELECT id, name, type, data_encrypted AS data,
+               meta, tags, description, created_at, updated_at
         FROM noetl.credential
         WHERE id = $1
         "#,
@@ -85,7 +92,8 @@ pub async fn get_credential_by_name(
 ) -> AppResult<Option<CredentialEntry>> {
     let entry = sqlx::query_as::<_, CredentialEntry>(
         r#"
-        SELECT id, name, type, data, meta, tags, description, created_at, updated_at
+        SELECT id, name, type, data_encrypted AS data,
+               meta, tags, description, created_at, updated_at
         FROM noetl.credential
         WHERE name = $1
         "#,
@@ -108,7 +116,8 @@ pub async fn list_credentials(
             let pattern = format!("%{}%", q);
             sqlx::query_as::<_, CredentialEntry>(
                 r#"
-                SELECT id, name, type, data, meta, tags, description, created_at, updated_at
+                SELECT id, name, type, data_encrypted AS data,
+                       meta, tags, description, created_at, updated_at
                 FROM noetl.credential
                 WHERE type = $1 AND (name ILIKE $2 OR description ILIKE $2)
                 ORDER BY created_at DESC
@@ -122,7 +131,8 @@ pub async fn list_credentials(
         (Some(t), None) => {
             sqlx::query_as::<_, CredentialEntry>(
                 r#"
-                SELECT id, name, type, data, meta, tags, description, created_at, updated_at
+                SELECT id, name, type, data_encrypted AS data,
+                       meta, tags, description, created_at, updated_at
                 FROM noetl.credential
                 WHERE type = $1
                 ORDER BY created_at DESC
@@ -136,7 +146,8 @@ pub async fn list_credentials(
             let pattern = format!("%{}%", q);
             sqlx::query_as::<_, CredentialEntry>(
                 r#"
-                SELECT id, name, type, data, meta, tags, description, created_at, updated_at
+                SELECT id, name, type, data_encrypted AS data,
+                       meta, tags, description, created_at, updated_at
                 FROM noetl.credential
                 WHERE name ILIKE $1 OR description ILIKE $1
                 ORDER BY created_at DESC
@@ -149,7 +160,8 @@ pub async fn list_credentials(
         (None, None) => {
             sqlx::query_as::<_, CredentialEntry>(
                 r#"
-                SELECT id, name, type, data, meta, tags, description, created_at, updated_at
+                SELECT id, name, type, data_encrypted AS data,
+                       meta, tags, description, created_at, updated_at
                 FROM noetl.credential
                 ORDER BY created_at DESC
                 "#,
