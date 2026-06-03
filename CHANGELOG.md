@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.1.6](https://github.com/noetl/server/compare/v2.1.5...v2.1.6) (2026-06-03)
+
+### Bug Fixes
+
+* **routes:** remove /api/runtimes route for Phase A parity ([c382787](https://github.com/noetl/server/commit/c382787957446b5b5fbe983ace61d36ecd8b3f6a)), closes [noetl/ai-meta#49](https://github.com/noetl/ai-meta/issues/49) [#2](https://github.com/noetl/server/issues/2) [noetl/server#18](https://github.com/noetl/server/issues/18) [noetl/ai-meta#49](https://github.com/noetl/ai-meta/issues/49)
+
 ## [2.1.5](https://github.com/noetl/server/compare/v2.1.4...v2.1.5) (2026-06-03)
 
 ### Bug Fixes
