@@ -45,6 +45,21 @@ use crate::services::CatalogService;
 /// }
 /// ```
 pub async fn register(
+    service: State<CatalogService>,
+    request: Json<CatalogRegisterRequest>,
+) -> AppResult<(StatusCode, Json<CatalogRegisterResponse>)> {
+    let started_at = std::time::Instant::now();
+    let result = register_inner(service, request).await;
+    let status_label = if result.is_ok() { "ok" } else { "error" };
+    crate::metrics::record_write_request(
+        crate::metrics::endpoint::CATALOG_REGISTER,
+        status_label,
+        started_at.elapsed().as_secs_f64(),
+    );
+    result
+}
+
+async fn register_inner(
     State(service): State<CatalogService>,
     Json(request): Json<CatalogRegisterRequest>,
 ) -> AppResult<(StatusCode, Json<CatalogRegisterResponse>)> {

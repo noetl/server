@@ -102,6 +102,22 @@ pub async fn get(
 /// }
 /// ```
 pub async fn set(
+    service: State<KeychainService>,
+    path: Path<(i64, String)>,
+    request: Json<KeychainSetRequest>,
+) -> AppResult<Json<KeychainSetResponse>> {
+    let started_at = std::time::Instant::now();
+    let result = set_inner(service, path, request).await;
+    let status_label = if result.is_ok() { "ok" } else { "error" };
+    crate::metrics::record_write_request(
+        crate::metrics::endpoint::KEYCHAIN_SET,
+        status_label,
+        started_at.elapsed().as_secs_f64(),
+    );
+    result
+}
+
+async fn set_inner(
     State(service): State<KeychainService>,
     Path((catalog_id, keychain_name)): Path<(i64, String)>,
     Json(request): Json<KeychainSetRequest>,
