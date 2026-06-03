@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.8.0](https://github.com/noetl/server/compare/v2.7.0...v2.8.0) (2026-06-03)
+
+### Features
+
+* **orchestrator:** defer end-step completion for parallel branches ([c906e64](https://github.com/noetl/server/commit/c906e64574930ae3f5d3448c34feb61ef25c924e)), closes [noetl/server#22](https://github.com/noetl/server/issues/22) [noetl/ai-meta#49](https://github.com/noetl/ai-meta/issues/49) [#32](https://github.com/noetl/server/issues/32) [#33](https://github.com/noetl/server/issues/33) [noetl/server#22](https://github.com/noetl/server/issues/22) [noetl/ai-meta#49](https://github.com/noetl/ai-meta/issues/49)
+
 ## [2.7.0](https://github.com/noetl/server/compare/v2.6.0...v2.7.0) (2026-06-03)
 
 ### Features
