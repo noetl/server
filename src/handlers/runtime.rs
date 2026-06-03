@@ -98,7 +98,11 @@ pub async fn list_pools(
 
 /// List all runtimes.
 ///
-/// GET /api/runtimes
+/// GET /api/runtimes (route unwired pending Python parity backport — see
+/// noetl/ai-meta#49 Phase A round 4 + the follow-up issue tracking the
+/// `/api/runtimes` Python addition).  Handler retained so re-wiring is a
+/// one-line `main.rs` edit when Python lands the equivalent endpoint.
+#[allow(dead_code)]
 pub async fn list_all(
     State(service): State<RuntimeService>,
     Query(query): Query<ListRuntimesQuery>,
