@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.2.0](https://github.com/noetl/server/compare/v2.1.6...v2.2.0) (2026-06-03)
+
+### Features
+
+* **catalog:** port /api/catalog/{path}/ui_schema from Python ([52c1f3a](https://github.com/noetl/server/commit/52c1f3aa14d4097dbc9e80c8ff0d8a8481940d44)), closes [noetl/server#18](https://github.com/noetl/server/issues/18) [noetl/ops#152](https://github.com/noetl/ops/issues/152) [noetl/ops#152](https://github.com/noetl/ops/issues/152) [noetl/server#18](https://github.com/noetl/server/issues/18) [noetl/ai-meta#49](https://github.com/noetl/ai-meta/issues/49)
+
 ## [2.1.6](https://github.com/noetl/server/compare/v2.1.5...v2.1.6) (2026-06-03)
 
 ### Bug Fixes
