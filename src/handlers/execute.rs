@@ -241,6 +241,123 @@ async fn emit_playbook_started_event(
     Ok(event_id)
 }
 
+/// Persist one engine-generated command + its `command.issued`
+/// event + its NATS notification.
+///
+/// Used both by `generate_initial_commands` (the `/api/execute`
+/// path that publishes the first command) and by
+/// `trigger_orchestrator` in `events.rs` (the state-machine path
+/// that publishes follow-up commands after `command.completed`
+/// events).  The helper is `pub(crate)` so the events module can
+/// call it without duplicating the wire-format logic that
+/// noetl/ai-meta#49 phases B+C+D-R1 carefully established.
+///
+/// `step` is read for `args` (which the worker copies into the
+/// tool config) and the canonical `step` name.  `command.tool`
+/// supplies the rendered tool kind + config.  The function
+/// generates a fresh `event_id` snowflake for the `command.issued`
+/// row, derives `command_id` from `(execution_id, step, event_id)`,
+/// and threads the notification through NATS via the path-based
+/// routing scheme.
+///
+/// Returns the new `event_id` so callers can attribute downstream
+/// events back to this command.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn persist_engine_command(
+    state: &AppState,
+    execution_id: i64,
+    catalog_id: i64,
+    parent_event_id: i64,
+    step: &crate::playbook::types::Step,
+    command: &crate::engine::commands::Command,
+    render_context: &HashMap<String, serde_json::Value>,
+    playbook: &crate::playbook::types::Playbook,
+) -> AppResult<i64> {
+    let event_id = generate_snowflake_id(state).await?;
+    let command_id = format!("{}:{}:{}", execution_id, step.step, event_id);
+
+    let cmd_args = match &step.args {
+        Some(map) => serde_json::to_value(map).unwrap_or_else(|_| serde_json::json!({})),
+        None => serde_json::json!({}),
+    };
+    let cmd_context = serde_json::json!({
+        "tool_config": command.tool.config,
+        "args": cmd_args,
+        "render_context": render_context,
+    });
+
+    let cmd_meta = serde_json::json!({
+        "command_id": command_id,
+        "step": step.step,
+        "tool_kind": command.tool.kind,
+        "max_attempts": 3,
+        "attempt": 1,
+        "execution_id": execution_id.to_string(),
+        "catalog_id": catalog_id.to_string(),
+        "actionable": true,
+    });
+
+    sqlx::query(
+        r#"
+        INSERT INTO noetl.event (
+            event_id, execution_id, catalog_id, event_type,
+            node_id, node_name, node_type, status,
+            context, meta, parent_event_id, created_at
+        ) VALUES (
+            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12
+        )
+        "#,
+    )
+    .bind(event_id)
+    .bind(execution_id)
+    .bind(catalog_id)
+    .bind("command.issued")
+    .bind(&step.step)
+    .bind(&step.step)
+    .bind(command.tool.kind.as_str())
+    .bind("PENDING")
+    .bind(&cmd_context)
+    .bind(&cmd_meta)
+    .bind(parent_event_id)
+    .bind(chrono::Utc::now())
+    .execute(&state.db)
+    .await?;
+
+    if let Err(e) = insert_command_row(
+        state,
+        execution_id,
+        event_id,
+        catalog_id,
+        parent_event_id,
+        &step.step,
+        command.tool.kind.as_str(),
+        &cmd_context,
+        &cmd_meta,
+    )
+    .await
+    {
+        tracing::warn!(
+            error = %e,
+            execution_id,
+            event_id,
+            "Failed to insert noetl.command row (non-fatal — event log is source of truth)"
+        );
+    }
+
+    publish_command_notification(
+        state,
+        execution_id,
+        event_id,
+        &command_id,
+        &step.step,
+        command.tool.kind.as_str(),
+        playbook,
+    )
+    .await?;
+
+    Ok(event_id)
+}
+
 /// Generate initial commands for the start step.
 #[allow(clippy::too_many_arguments)]
 async fn generate_initial_commands(
@@ -290,110 +407,17 @@ async fn generate_initial_commands(
         None,
     )?;
 
-    // Generate event_id for command.issued
-    let event_id = generate_snowflake_id(state).await?;
-    let command_id = format!("{}:{}:{}", execution_id, start_step.step, event_id);
-
-    // Build context for command execution.
-    //
-    // `start_step.args` is `Option<HashMap<String, Value>>`.  We
-    // emit it as `args: {}` when unset, not `args: null`, because
-    // the worker's command-handling path (`command::execute_command`
-    // in `repos/worker/src/executor/`) copies a missing tool-side
-    // `args` from the top-level `args` key.  A `null` there
-    // surfaces inside the tool config and serde rejects it as
-    // "expected a map" when deserialising into `HashMap`.  Mirror
-    // Python's empty-map default (the Python server emits
-    // `input: {}` here — same intent, slightly different key
-    // naming that future Phase D work will reconcile).
-    let cmd_args = match &start_step.args {
-        Some(map) => serde_json::to_value(map).unwrap_or_else(|_| serde_json::json!({})),
-        None => serde_json::json!({}),
-    };
-    let cmd_context = serde_json::json!({
-        "tool_config": command.tool.config,
-        "args": cmd_args,
-        "render_context": context,
-    });
-
-    let cmd_meta = serde_json::json!({
-        "command_id": command_id,
-        "step": start_step.step,
-        "tool_kind": command.tool.kind,
-        "max_attempts": 3,
-        "attempt": 1,
-        "execution_id": execution_id.to_string(),
-        "catalog_id": catalog_id.to_string(),
-        "actionable": true,
-    });
-
-    // Insert command.issued event
-    sqlx::query(
-        r#"
-        INSERT INTO noetl.event (
-            event_id, execution_id, catalog_id, event_type,
-            node_id, node_name, node_type, status,
-            context, meta, parent_event_id, created_at
-        ) VALUES (
-            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12
-        )
-        "#,
-    )
-    .bind(event_id)
-    .bind(execution_id)
-    .bind(catalog_id)
-    .bind("command.issued")
-    .bind(&start_step.step)
-    .bind(&start_step.step)
-    .bind(command.tool.kind.as_str())
-    .bind("PENDING")
-    .bind(&cmd_context)
-    .bind(&cmd_meta)
-    .bind(parent_event_id)
-    .bind(chrono::Utc::now())
-    .execute(&state.db)
-    .await?;
-
-    // Mirror noetl.command for replay + observability parity with
-    // the Python server.  The worker reads command details from
-    // noetl.event today (the `command.issued` row), so this insert
-    // isn't strictly required for the worker to claim — but the
-    // Python server populates the row and downstream tooling
-    // (replay, dashboards) expects it.  Best-effort: a failure
-    // here is logged but doesn't fail the execution (the event-log
-    // row is the source of truth).
-    if let Err(e) = insert_command_row(
+    // Persist + publish via the shared helper so the same wire-format
+    // logic feeds both the /api/execute path (this function) and the
+    // orchestrator-triggered transitions in events.rs::trigger_orchestrator.
+    persist_engine_command(
         state,
         execution_id,
-        event_id,
         catalog_id,
         parent_event_id,
-        &start_step.step,
-        command.tool.kind.as_str(),
-        &cmd_context,
-        &cmd_meta,
-    )
-    .await
-    {
-        tracing::warn!(
-            error = %e,
-            execution_id,
-            event_id,
-            "Failed to insert noetl.command row (non-fatal — event log is source of truth)"
-        );
-    }
-
-    // Publish the command notification to NATS so the worker pool
-    // claims the work.  Without this, the `command.issued` event
-    // sits in noetl.event but no worker hears about it — exactly
-    // the noetl/server#26 failure mode.
-    publish_command_notification(
-        state,
-        execution_id,
-        event_id,
-        &command_id,
-        &start_step.step,
-        command.tool.kind.as_str(),
+        start_step,
+        &command,
+        &context,
         playbook,
     )
     .await?;
