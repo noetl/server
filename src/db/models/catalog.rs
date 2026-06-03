@@ -98,7 +98,16 @@ pub struct CatalogEntries {
     pub entries: Vec<CatalogEntryResponse>,
 }
 
-/// Catalog entry response (subset of fields).
+/// Catalog entry response.
+///
+/// Optional JSON-bodied fields (`content`, `layout`, `payload`,
+/// `meta`) serialize as explicit `null` (not omitted) to match
+/// the Python pydantic `CatalogEntry` wire shape — pydantic v2
+/// has no `exclude_none` config on that model, so it always
+/// emits the keys.  Omitting them on the Rust side surfaced as
+/// DIFF lines in the noetl/ai-meta#49 Phase A parity harness;
+/// same `null`-vs-omit pattern as the `UiSchemaField` fix in
+/// v2.2.0.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CatalogEntryResponse {
     /// Catalog ID
@@ -114,15 +123,15 @@ pub struct CatalogEntryResponse {
     pub version: i16,
 
     /// Raw YAML content
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
 
+    /// Parsed layout/structure (JSON)
+    pub layout: Option<serde_json::Value>,
+
     /// Parsed payload/workload (JSON)
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub payload: Option<serde_json::Value>,
 
     /// Additional metadata (JSON)
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub meta: Option<serde_json::Value>,
 
     /// Creation timestamp
@@ -137,6 +146,7 @@ impl From<CatalogEntry> for CatalogEntryResponse {
             kind: entry.kind,
             version: entry.version,
             content: Some(entry.content),
+            layout: entry.layout,
             payload: entry.payload,
             meta: entry.meta,
             created_at: entry.created_at,
