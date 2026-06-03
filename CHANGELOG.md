@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.1.2](https://github.com/noetl/server/compare/v2.1.1...v2.1.2) (2026-06-03)
+
+### Bug Fixes
+
+* **routes:** migrate path syntax to axum 0.8 (`:param` → `{param}`) ([30c6254](https://github.com/noetl/server/commit/30c625440f3e93934bf1cef630a841ff75c891fa)), closes [noetl/ai-meta#49](https://github.com/noetl/ai-meta/issues/49)
+
 ## [2.1.1](https://github.com/noetl/server/compare/v2.1.0...v2.1.1) (2026-06-02)
 
 ### Bug Fixes
