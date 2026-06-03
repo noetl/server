@@ -306,14 +306,122 @@ impl WorkflowOrchestrator {
                         }
                     }
 
-                    info!("Transitioning to step: {}", next_step_name);
+                    // Iterative `step.when` enable-guard chain.  When a
+                    // step's `when` expression evaluates false we emit
+                    // `step.skipped` instead of `step.enter`, then walk
+                    // forward to that step's own `next` arcs and try
+                    // again — repeats until we land on either a step
+                    // whose guard passes (emit step.enter + command) or
+                    // a terminal/end transition (mark completion).
+                    //
+                    // Doing this inline in the same orchestrator pass
+                    // avoids the re-trigger gymnastics that would
+                    // otherwise be needed: `step.skipped` has no
+                    // `command.completed` to fire the next round on.
+                    let mut current_step: &Step = next_step;
+                    let mut current_step_name: String = next_step_name.clone();
+                    let mut current_with_params = result.with_params.clone();
+                    let mut current_ctx = step_context;
+                    let mut should_dispatch = true;
+                    let mut hit_end = false;
+                    let mut completion: Option<CompletionStatus> = None;
 
-                    // Create step.enter event
+                    loop {
+                        let guard_ok = self
+                            .evaluator
+                            .evaluate_step_when(current_step, &current_ctx)?;
+                        if guard_ok {
+                            break;
+                        }
+
+                        info!(
+                            "Step '{}' skipped (when guard false)",
+                            current_step_name
+                        );
+                        events_to_emit.push(EventToEmit {
+                            event_type: "step.skipped".to_string(),
+                            node_name: Some(current_step_name.clone()),
+                            status: "SKIPPED".to_string(),
+                            context: current_with_params.clone(),
+                            result: None,
+                            error: None,
+                        });
+
+                        // Follow the skipped step's transitions.  Pick
+                        // the first matched arc — once we've decided
+                        // to skip, we've already committed to the
+                        // single-path chain.
+                        let chained =
+                            self.evaluator.evaluate_next(current_step, &current_ctx)?;
+                        let next_after_skip = chained
+                            .into_iter()
+                            .find(|r| r.matched && r.next_step.is_some());
+
+                        let Some(arc) = next_after_skip else {
+                            // No further transition.  Treat the skipped
+                            // step as terminal — workflow ends here
+                            // unless another step is still running.
+                            should_dispatch = false;
+                            break;
+                        };
+                        let target_name = arc.next_step.expect("matched arc has next_step");
+
+                        if target_name == "end" {
+                            hit_end = true;
+                            should_dispatch = false;
+                            completion = Some(CompletionStatus {
+                                status: "COMPLETED".to_string(),
+                                error: None,
+                                failed_steps: None,
+                            });
+                            break;
+                        }
+
+                        let Some(target_step) = steps.get(target_name.as_str()) else {
+                            warn!(
+                                "Chained next step '{}' not found in workflow",
+                                target_name
+                            );
+                            should_dispatch = false;
+                            break;
+                        };
+
+                        // Merge any with_params from the chained arc
+                        // into the context for the next iteration.
+                        if let Some(serde_json::Value::Object(params)) = &arc.with_params {
+                            for (k, v) in params {
+                                current_ctx.insert(k.clone(), v.clone());
+                            }
+                        }
+
+                        current_step = *target_step;
+                        current_step_name = target_name;
+                        current_with_params = arc.with_params;
+                    }
+
+                    if hit_end {
+                        return Ok(OrchestrationResult {
+                            state: ExecutionState::InProgress,
+                            commands: vec![],
+                            should_complete: true,
+                            completion_status: completion,
+                            events_to_emit,
+                        });
+                    }
+
+                    if !should_dispatch {
+                        continue;
+                    }
+
+                    info!("Transitioning to step: {}", current_step_name);
+
+                    // Create step.enter event for the step we landed
+                    // on (after walking the skip chain, if any).
                     events_to_emit.push(EventToEmit {
                         event_type: "step.enter".to_string(),
-                        node_name: Some(next_step_name.clone()),
+                        node_name: Some(current_step_name.clone()),
                         status: "ENTERED".to_string(),
-                        context: result.with_params.clone(),
+                        context: current_with_params,
                         result: None,
                         error: None,
                     });
@@ -324,8 +432,8 @@ impl WorkflowOrchestrator {
                         state.execution_id,
                         state.catalog_id,
                         0,
-                        next_step,
-                        &step_context,
+                        current_step,
+                        &current_ctx,
                         None,
                     )?;
 
@@ -554,6 +662,138 @@ mod tests {
         let status = result.completion_status.unwrap();
         assert_eq!(status.status, "FAILED");
         assert!(status.error.is_some());
+    }
+
+    #[test]
+    fn test_step_when_guard_skips_step() {
+        // Playbook: start → middle (when=false) → end
+        // Expectation: orchestrator emits step.skipped(middle) and
+        // walks the chain forward to `end`, completing the workflow
+        // without ever dispatching a command for `middle`.
+        let orchestrator = WorkflowOrchestrator::new();
+
+        let mut start = make_step("start", Some("middle"));
+        // start has no guard
+        start.when = None;
+        let mut middle = make_step("middle", Some("end"));
+        middle.when = Some("{{ false }}".to_string());
+        let end = make_step("end", None);
+
+        let events = vec![
+            {
+                let mut e = make_event("playbook_started", None);
+                e.context = Some(serde_json::json!({
+                    "workload": {},
+                    "path": "test",
+                    "version": "1"
+                }));
+                e
+            },
+            make_event("command.completed", Some("start")),
+        ];
+
+        let playbook = Playbook {
+            api_version: "noetl.io/v2".to_string(),
+            kind: "Playbook".to_string(),
+            metadata: Metadata {
+                name: "skip_test".to_string(),
+                path: Some("test/skip".to_string()),
+                description: None,
+                labels: None,
+                extra: HashMap::new(),
+            },
+            workload: None,
+            vars: None,
+            keychain: None,
+            workbook: None,
+            workflow: vec![start, middle, end],
+        };
+
+        let result = orchestrator
+            .evaluate(&events, &playbook, Some("command.completed"))
+            .unwrap();
+
+        // No command dispatched (skip chain reached `end` directly).
+        assert!(
+            result.commands.is_empty(),
+            "skip chain should not dispatch any command, got {:?}",
+            result.commands
+        );
+        // Should complete with status=COMPLETED.
+        assert!(result.should_complete);
+        assert_eq!(
+            result.completion_status.as_ref().map(|c| c.status.as_str()),
+            Some("COMPLETED")
+        );
+        // A step.skipped event was emitted for `middle`.
+        let skipped: Vec<_> = result
+            .events_to_emit
+            .iter()
+            .filter(|e| e.event_type == "step.skipped")
+            .collect();
+        assert_eq!(skipped.len(), 1, "expected one step.skipped event");
+        assert_eq!(skipped[0].node_name.as_deref(), Some("middle"));
+    }
+
+    #[test]
+    fn test_step_when_guard_passes_dispatches_step() {
+        // Same shape but middle's when is true — orchestrator
+        // should dispatch a command for `middle` and emit
+        // step.enter(middle) (no step.skipped).
+        let orchestrator = WorkflowOrchestrator::new();
+
+        let start = make_step("start", Some("middle"));
+        let mut middle = make_step("middle", Some("end"));
+        middle.when = Some("{{ true }}".to_string());
+        let end = make_step("end", None);
+
+        let events = vec![
+            {
+                let mut e = make_event("playbook_started", None);
+                e.context = Some(serde_json::json!({
+                    "workload": {},
+                    "path": "test",
+                    "version": "1"
+                }));
+                e
+            },
+            make_event("command.completed", Some("start")),
+        ];
+
+        let playbook = Playbook {
+            api_version: "noetl.io/v2".to_string(),
+            kind: "Playbook".to_string(),
+            metadata: Metadata {
+                name: "guard_test".to_string(),
+                path: Some("test/guard".to_string()),
+                description: None,
+                labels: None,
+                extra: HashMap::new(),
+            },
+            workload: None,
+            vars: None,
+            keychain: None,
+            workbook: None,
+            workflow: vec![start, middle, end],
+        };
+
+        let result = orchestrator
+            .evaluate(&events, &playbook, Some("command.completed"))
+            .unwrap();
+
+        assert_eq!(result.commands.len(), 1, "should dispatch middle");
+        let enters: Vec<_> = result
+            .events_to_emit
+            .iter()
+            .filter(|e| e.event_type == "step.enter")
+            .collect();
+        assert_eq!(enters.len(), 1);
+        assert_eq!(enters[0].node_name.as_deref(), Some("middle"));
+        let skipped = result
+            .events_to_emit
+            .iter()
+            .any(|e| e.event_type == "step.skipped");
+        assert!(!skipped, "should NOT emit step.skipped when guard passes");
     }
 
     #[test]

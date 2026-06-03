@@ -383,11 +383,22 @@ impl WorkflowState {
     pub fn build_context(&self) -> serde_json::Value {
         let mut context = serde_json::Map::new();
 
-        // Add workload variables
+        // Add workload variables.  Each key is exposed both at the
+        // top level (so `{{ skip_middle }}` works) AND under the
+        // `workload` namespace (so `{{ workload.skip_middle }}`
+        // works) — matches the Python reference shape and the
+        // generate_initial_commands path in handlers/execute.rs.
+        // Without the `workload` namespace, step.when expressions
+        // that reference `workload.X` raise an undefined-value
+        // template error during transition evaluation.
         if let Some(serde_json::Value::Object(wl)) = &self.workload {
             for (k, v) in wl {
                 context.insert(k.clone(), v.clone());
             }
+            context.insert(
+                "workload".to_string(),
+                serde_json::Value::Object(wl.clone()),
+            );
         }
 
         // Add step results under 'steps' namespace
