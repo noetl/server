@@ -102,6 +102,42 @@ pub struct StepInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub completed_at: Option<DateTime<Utc>>,
     pub attempt: i32,
+
+    // -------- Iterator fan-out (Phase D R3b) --------
+    //
+    // A step with `step.loop` fans out into N iteration commands at
+    // dispatch time.  The orchestrator emits ONE `step.enter` (which
+    // records `iterations_expected` here) and N `command.issued`
+    // events, each with a per-iteration `command_id` of the shape
+    // `<exec>:<step>:<event>:i<index>` and `iteration_index` in
+    // meta.  Workers that act on those commands echo `command_id`
+    // forward in their emitted events but do NOT necessarily echo
+    // `iteration_index` (worker contract is per-command, not
+    // per-iteration), so `apply_event` deduplicates `command.completed`
+    // events by `command_id` instead of by iteration_index.  The
+    // step's `state` flips to `Completed` once we've seen
+    // `iterations_expected` distinct command_ids complete.
+    //
+    // Non-looped steps leave these at their defaults and behave
+    // exactly as before.
+    /// Total iterations expected when the step is a `step.loop` step.
+    /// `None` for non-looped steps; set from the `step.enter` event
+    /// context at fan-out time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iterations_expected: Option<i32>,
+
+    /// Distinct iteration command_ids observed as `command.completed`
+    /// (dedup so a dual-worker race emitting two `command.completed`
+    /// for the same command_id only counts once).  Always empty for
+    /// non-looped steps.
+    #[serde(default, skip_serializing_if = "std::collections::HashSet::is_empty")]
+    pub iteration_command_ids: std::collections::HashSet<String>,
+
+    /// Per-iteration result payloads collected in dispatch order.
+    /// Used to assemble the aggregate result the next step sees in
+    /// its render context.  Empty for non-looped steps.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub iteration_results: Vec<serde_json::Value>,
 }
 
 impl StepInfo {
@@ -115,7 +151,21 @@ impl StepInfo {
             entered_at: None,
             completed_at: None,
             attempt: 0,
+            iterations_expected: None,
+            iteration_command_ids: std::collections::HashSet::new(),
+            iteration_results: Vec::new(),
         }
+    }
+
+    /// True if this step was dispatched as a `step.loop` fan-out.
+    pub fn is_iterator(&self) -> bool {
+        self.iterations_expected.is_some()
+    }
+
+    /// Number of distinct iterations that have completed.  Always
+    /// `0` for non-iterator steps.
+    pub fn iterations_completed(&self) -> i32 {
+        self.iteration_command_ids.len() as i32
     }
 }
 
@@ -138,6 +188,37 @@ pub struct WorkflowState {
     pub completed_at: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_execution_id: Option<i64>,
+}
+
+/// Pull a `command_id` out of an event row.  Workers echo
+/// `command_id` forward through their emitted events; depending on
+/// the lifecycle slot it may live on `meta`, on `result.context`
+/// (constraint-compliant envelope), or — in older shapes — on
+/// `result.data`.  Returns the first match.  Used by R3b iterator
+/// state aggregation to deduplicate `command.completed` events.
+fn extract_command_id(event: &Event) -> Option<String> {
+    if let Some(meta) = &event.meta {
+        if let Some(s) = meta.get("command_id").and_then(|v| v.as_str()) {
+            return Some(s.to_string());
+        }
+    }
+    if let Some(result) = &event.result {
+        if let Some(s) = result
+            .get("context")
+            .and_then(|c| c.get("command_id"))
+            .and_then(|v| v.as_str())
+        {
+            return Some(s.to_string());
+        }
+        if let Some(s) = result
+            .get("data")
+            .and_then(|d| d.get("command_id"))
+            .and_then(|v| v.as_str())
+        {
+            return Some(s.to_string());
+        }
+    }
+    None
 }
 
 impl WorkflowState {
@@ -243,6 +324,19 @@ impl WorkflowState {
                         .or_insert_with(|| StepInfo::new(name));
                     step.state = StepState::Entered;
                     step.entered_at = Some(event.created_at);
+                    // R3b iterator fan-out: orchestrator stamps the
+                    // iteration total into the step.enter event
+                    // context so state reconstruction knows how many
+                    // command.completed events to wait for before
+                    // marking the step truly Completed.  Plain steps
+                    // omit this key and behave as before.
+                    if let Some(context) = &event.context {
+                        if let Some(total) =
+                            context.get("iterations_expected").and_then(|v| v.as_i64())
+                        {
+                            step.iterations_expected = Some(total as i32);
+                        }
+                    }
                 }
             }
             "command.issued" => {
@@ -281,9 +375,51 @@ impl WorkflowState {
                         .steps
                         .entry(name.clone())
                         .or_insert_with(|| StepInfo::new(name));
-                    step.state = StepState::Completed;
-                    step.completed_at = Some(event.created_at);
-                    step.result = event.result.clone();
+
+                    // R3b iterator-aware completion: if this step is
+                    // a loop step (iterations_expected set), count
+                    // each distinct `command_id` (sourced from meta
+                    // or result.context) toward completion.  Workers
+                    // emit multiple events per command (claimed →
+                    // started → call.done → completed), and a
+                    // dual-worker race may even emit two
+                    // `command.completed` events for the same
+                    // command_id — both are deduped by the HashSet.
+                    // Only flip state to Completed once we've seen
+                    // `iterations_expected` distinct command_ids
+                    // complete.  Non-iterator steps continue to
+                    // complete on the first command.completed.
+                    if let Some(expected) = step.iterations_expected {
+                        let command_id = extract_command_id(event);
+                        if let Some(cid) = command_id {
+                            // First time we've seen this iteration?
+                            // Append its result in arrival order.
+                            if step.iteration_command_ids.insert(cid) {
+                                if let Some(result) = event.result.clone() {
+                                    step.iteration_results.push(result);
+                                }
+                            }
+                        }
+                        if step.iterations_completed() >= expected {
+                            step.state = StepState::Completed;
+                            step.completed_at = Some(event.created_at);
+                            // Aggregate result = list of per-iteration
+                            // results in arrival order (may not match
+                            // dispatch index in parallel mode — see
+                            // R3b follow-up).
+                            step.result = Some(serde_json::Value::Array(
+                                step.iteration_results.clone(),
+                            ));
+                        }
+                        // Mid-iteration: leave step.state at whatever
+                        // command.started / command.claimed last set
+                        // it to so `is_step_completed` returns false.
+                    } else {
+                        // Plain (non-iterator) step.
+                        step.state = StepState::Completed;
+                        step.completed_at = Some(event.created_at);
+                        step.result = event.result.clone();
+                    }
                 }
             }
             "command.failed" | "action_failed" | "step_failed" => {
@@ -540,5 +676,135 @@ mod tests {
             state.steps.get("step1").unwrap().state,
             StepState::Completed
         );
+    }
+
+    #[test]
+    fn test_iterator_step_aggregates_completion() {
+        // Simulate the events an iterator step produces:
+        //   step.enter (iterations_expected=3)
+        //   command.completed (iteration_index=0)
+        //   command.completed (iteration_index=1)
+        //   command.completed (iteration_index=2)
+        //
+        // The step's state stays "not completed" until all 3
+        // iterations land, then flips to Completed with an
+        // aggregated array result.
+        let mut state = WorkflowState::new(1, 1);
+
+        let mut enter = make_event("step.enter", Some("looped"));
+        enter.context = Some(serde_json::json!({
+            "iterations_expected": 3,
+            "iterator_var": "item",
+        }));
+        state.apply_event(&enter);
+        let after_enter = state.steps.get("looped").unwrap();
+        assert_eq!(after_enter.state, StepState::Entered);
+        assert_eq!(after_enter.iterations_expected, Some(3));
+        assert_eq!(after_enter.iterations_completed(), 0);
+
+        for (idx, payload) in [(0, "a"), (1, "b"), (2, "c")] {
+            let mut ev = make_event("command.completed", Some("looped"));
+            ev.meta = Some(serde_json::json!({
+                "command_id": format!("e:looped:0:i{}", idx),
+                "iteration_index": idx,
+                "iteration_total": 3,
+            }));
+            ev.result = Some(serde_json::json!({ "value": payload }));
+            state.apply_event(&ev);
+        }
+
+        let info = state.steps.get("looped").unwrap();
+        assert_eq!(info.state, StepState::Completed);
+        assert_eq!(info.iterations_completed(), 3);
+        // Aggregate result is the per-iteration array in arrival order.
+        let agg = info.result.as_ref().unwrap();
+        assert_eq!(agg.as_array().map(|a| a.len()), Some(3));
+        let values: Vec<String> = agg
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.get("value").unwrap().as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(values, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn test_iterator_step_dedupes_duplicate_command_completed() {
+        // Two `command.completed` events for the same command_id
+        // (dual-worker race) should NOT double-count the iteration.
+        let mut state = WorkflowState::new(1, 1);
+        let mut enter = make_event("step.enter", Some("looped"));
+        enter.context = Some(serde_json::json!({
+            "iterations_expected": 2,
+        }));
+        state.apply_event(&enter);
+
+        for _ in 0..2 {
+            let mut ev = make_event("command.completed", Some("looped"));
+            ev.meta = Some(serde_json::json!({
+                "command_id": "e:looped:0:i0",
+            }));
+            ev.result = Some(serde_json::json!({"i": 0}));
+            state.apply_event(&ev);
+        }
+        // Only 1 distinct command_id seen.
+        let info = state.steps.get("looped").unwrap();
+        assert_eq!(info.iterations_completed(), 1);
+        assert_ne!(info.state, StepState::Completed);
+
+        // Now the second iteration's command_id completes.
+        let mut ev = make_event("command.completed", Some("looped"));
+        ev.meta = Some(serde_json::json!({
+            "command_id": "e:looped:0:i1",
+        }));
+        ev.result = Some(serde_json::json!({"i": 1}));
+        state.apply_event(&ev);
+        let info = state.steps.get("looped").unwrap();
+        assert_eq!(info.iterations_completed(), 2);
+        assert_eq!(info.state, StepState::Completed);
+    }
+
+    #[test]
+    fn test_iterator_step_partial_completion_stays_running() {
+        // Two of three iterations done — step should NOT be
+        // Completed yet (state is whatever the last event left it
+        // at, but `is_step_completed` returns false).
+        let mut state = WorkflowState::new(1, 1);
+
+        let mut enter = make_event("step.enter", Some("looped"));
+        enter.context = Some(serde_json::json!({
+            "iterations_expected": 3,
+        }));
+        state.apply_event(&enter);
+
+        for idx in 0..2 {
+            let mut ev = make_event("command.completed", Some("looped"));
+            ev.meta = Some(serde_json::json!({
+                "command_id": format!("e:looped:0:i{}", idx),
+            }));
+            ev.result = Some(serde_json::json!({"i": idx}));
+            state.apply_event(&ev);
+        }
+
+        let info = state.steps.get("looped").unwrap();
+        assert_ne!(info.state, StepState::Completed);
+        assert_eq!(info.iterations_completed(), 2);
+        assert!(!state.is_step_completed("looped"));
+    }
+
+    #[test]
+    fn test_plain_step_unaffected_by_iterator_logic() {
+        // A plain step (no iterations_expected) continues to
+        // complete on the first command.completed, same as before.
+        let mut state = WorkflowState::new(1, 1);
+        state.apply_event(&make_event("step.enter", Some("plain")));
+        let mut ev = make_event("command.completed", Some("plain"));
+        ev.result = Some(serde_json::json!({"ok": true}));
+        state.apply_event(&ev);
+        let info = state.steps.get("plain").unwrap();
+        assert_eq!(info.state, StepState::Completed);
+        assert_eq!(info.iterations_expected, None);
+        assert_eq!(info.iterations_completed(), 0);
+        assert_eq!(info.result, Some(serde_json::json!({"ok": true})));
     }
 }
