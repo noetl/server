@@ -248,6 +248,14 @@ impl WorkflowOrchestrator {
     ) -> AppResult<OrchestrationResult> {
         let mut commands = Vec::new();
         let mut events_to_emit = Vec::new();
+        // R3c parallel-branch completion: track whether the
+        // transition path saw a route to `end` so we can defer the
+        // completion decision until after every parallel branch is
+        // accounted for.  See `decide_completion` at the end of this
+        // function — completing on the first branch that hits `end`
+        // would falsely mark the playbook done while the other
+        // branches are still running.
+        let mut reached_end = false;
 
         // Only process transitions on completion events
         if !matches!(
@@ -288,20 +296,19 @@ impl WorkflowOrchestrator {
                 }
 
                 if let Some(next_step_name) = &result.next_step {
-                    // Check for 'end' step
+                    // R3c parallel-branch completion: hitting `end`
+                    // no longer short-circuits the per-result loop.
+                    // We mark `reached_end` and continue so that
+                    // sibling matched arcs in the SAME completion
+                    // round (and other parallel branches in flight)
+                    // are still considered.  The final
+                    // should_complete decision happens after the
+                    // loops finish, gated on no remaining commands
+                    // queued and no other steps still running.
                     if next_step_name == "end" {
-                        info!("Reached 'end' step, workflow completing");
-                        return Ok(OrchestrationResult {
-                            state: ExecutionState::InProgress,
-                            commands: vec![],
-                            should_complete: true,
-                            completion_status: Some(CompletionStatus {
-                                status: "COMPLETED".to_string(),
-                                error: None,
-                                failed_steps: None,
-                            }),
-                            events_to_emit,
-                        });
+                        debug!("Branch reached 'end'; deferring completion decision");
+                        reached_end = true;
+                        continue;
                     }
 
                     // Get next step definition
@@ -426,13 +433,20 @@ impl WorkflowOrchestrator {
                     }
 
                     if hit_end {
-                        return Ok(OrchestrationResult {
-                            state: ExecutionState::InProgress,
-                            commands: vec![],
-                            should_complete: true,
-                            completion_status: completion,
-                            events_to_emit,
-                        });
+                        // R3c: defer completion same as the direct
+                        // `end` arc above — sibling branches in this
+                        // same pass (or parallel branches in flight)
+                        // may still need to run.  Note the completion
+                        // status from the skip-chain (the caller
+                        // may have set it from a chained arc); if so,
+                        // remember it for the final decision.
+                        if reached_end {
+                            // Keep the existing reached_end flag.
+                        } else {
+                            reached_end = true;
+                        }
+                        let _ = completion;
+                        continue;
                     }
 
                     if !should_dispatch {
@@ -569,8 +583,21 @@ impl WorkflowOrchestrator {
             }
         }
 
-        // Check for completion conditions
-        let should_complete = self.check_completion(state, steps)?;
+        // R3c parallel-branch completion: complete when EITHER
+        // - check_completion returns true (existing semantic: every
+        //   step's terminal arc is satisfied + no running branches);
+        // - OR a branch reached `end` AND we didn't queue new commands
+        //   in this pass AND no other branches are still running.
+        // The second clause covers the case where multiple parallel
+        // branches converge on `end` — the LAST branch to arrive sees
+        // `reached_end == true` with everything else done and finalises
+        // the workflow.  The early-return that used to fire on the
+        // FIRST branch to hit `end` would have falsely completed the
+        // workflow while sibling branches were still in flight.
+        let check_says_done = self.check_completion(state, steps)?;
+        let reached_end_quiescent =
+            reached_end && commands.is_empty() && !state.has_running_steps();
+        let should_complete = check_says_done || reached_end_quiescent;
 
         let completion_status = if should_complete {
             // Check for failures
@@ -1069,6 +1096,220 @@ mod tests {
             .collect();
         assert!(types.contains(&"step.enter"));
         assert!(types.contains(&"step.exit"));
+    }
+
+    /// Helper: build a step with a Router-style `next` that has
+    /// multiple unconditional arcs (parallel fan-out) in inclusive
+    /// mode.
+    fn make_step_with_parallel_next(name: &str, targets: &[&str]) -> Step {
+        use crate::playbook::types::{NextArc, NextRouter, NextRouterSpec};
+        let mut step = make_step(name, None);
+        step.next = Some(NextSpec::Router(NextRouter {
+            spec: Some(NextRouterSpec {
+                mode: Some("inclusive".to_string()),
+            }),
+            arcs: targets
+                .iter()
+                .map(|t| NextArc {
+                    step: t.to_string(),
+                    when: None,
+                    args: None,
+                })
+                .collect(),
+        }));
+        step
+    }
+
+    #[test]
+    fn test_parallel_branches_dispatch_both_in_one_pass() {
+        // start → [branch_a, branch_b] (mode: inclusive)
+        // After start completes, orchestrator should emit 2 commands
+        // (one per branch) and 2 step.enter events; no step.skipped.
+        let orchestrator = WorkflowOrchestrator::new();
+
+        let start = make_step_with_parallel_next("start", &["branch_a", "branch_b"]);
+        let branch_a = make_step("branch_a", Some("end"));
+        let branch_b = make_step("branch_b", Some("end"));
+        let end = make_step("end", None);
+
+        let events = vec![
+            {
+                let mut e = make_event("playbook_started", None);
+                e.context = Some(serde_json::json!({
+                    "workload": {},
+                    "path": "test",
+                    "version": "1"
+                }));
+                e
+            },
+            make_event("command.completed", Some("start")),
+        ];
+
+        let playbook = Playbook {
+            api_version: "noetl.io/v2".to_string(),
+            kind: "Playbook".to_string(),
+            metadata: Metadata {
+                name: "parallel_test".to_string(),
+                path: Some("test/parallel".to_string()),
+                description: None,
+                labels: None,
+                extra: HashMap::new(),
+            },
+            workload: None,
+            vars: None,
+            keychain: None,
+            workbook: None,
+            workflow: vec![start, branch_a, branch_b, end],
+        };
+
+        let result = orchestrator
+            .evaluate(&events, &playbook, Some("command.completed"))
+            .unwrap();
+
+        // Both parallel branches must dispatch in the same pass.
+        assert_eq!(
+            result.commands.len(),
+            2,
+            "expected 2 parallel commands, got {}",
+            result.commands.len()
+        );
+        let dispatched: Vec<String> =
+            result.commands.iter().map(|c| c.step_name.clone()).collect();
+        assert!(dispatched.contains(&"branch_a".to_string()));
+        assert!(dispatched.contains(&"branch_b".to_string()));
+
+        // One step.enter event per branch.
+        let enters: Vec<&str> = result
+            .events_to_emit
+            .iter()
+            .filter(|e| e.event_type == "step.enter")
+            .filter_map(|e| e.node_name.as_deref())
+            .collect();
+        assert_eq!(enters.len(), 2);
+        assert!(enters.contains(&"branch_a"));
+        assert!(enters.contains(&"branch_b"));
+
+        // Workflow is NOT yet complete — both branches still need to
+        // run before `end` can finalise.
+        assert!(!result.should_complete);
+    }
+
+    #[test]
+    fn test_parallel_one_branch_done_defers_completion() {
+        // start → [branch_a, branch_b]; branch_a is completed but
+        // branch_b is still entered (running).  Orchestrator's
+        // evaluate should NOT mark the workflow done just because
+        // branch_a transitioned to `end`.
+        let orchestrator = WorkflowOrchestrator::new();
+
+        let start = make_step_with_parallel_next("start", &["branch_a", "branch_b"]);
+        let branch_a = make_step("branch_a", Some("end"));
+        let branch_b = make_step("branch_b", Some("end"));
+        let end = make_step("end", None);
+
+        let events = vec![
+            {
+                let mut e = make_event("playbook_started", None);
+                e.context = Some(serde_json::json!({
+                    "workload": {}, "path": "test", "version": "1"
+                }));
+                e
+            },
+            make_event("command.completed", Some("start")),
+            // branch_b is "entered" but not yet completed (state
+            // transitions: Entered → CommandIssued via subsequent
+            // events that we don't include here).
+            make_event("step.enter", Some("branch_b")),
+            make_event("command.issued", Some("branch_b")),
+            // branch_a completed.
+            make_event("step.enter", Some("branch_a")),
+            make_event("command.completed", Some("branch_a")),
+        ];
+
+        let playbook = Playbook {
+            api_version: "noetl.io/v2".to_string(),
+            kind: "Playbook".to_string(),
+            metadata: Metadata {
+                name: "parallel_defer".to_string(),
+                path: Some("test/parallel_defer".to_string()),
+                description: None,
+                labels: None,
+                extra: HashMap::new(),
+            },
+            workload: None,
+            vars: None,
+            keychain: None,
+            workbook: None,
+            workflow: vec![start, branch_a, branch_b, end],
+        };
+
+        let result = orchestrator
+            .evaluate(&events, &playbook, Some("command.completed"))
+            .unwrap();
+
+        // branch_a hit `end` but branch_b still pending — workflow
+        // should NOT be marked complete.
+        assert!(
+            !result.should_complete,
+            "workflow must not complete while branch_b is still running"
+        );
+    }
+
+    #[test]
+    fn test_parallel_all_branches_done_completes() {
+        // Both branches completed and both routed to `end` — the
+        // orchestrator's deferred completion should fire.
+        let orchestrator = WorkflowOrchestrator::new();
+
+        let start = make_step_with_parallel_next("start", &["branch_a", "branch_b"]);
+        let branch_a = make_step("branch_a", Some("end"));
+        let branch_b = make_step("branch_b", Some("end"));
+        let end = make_step("end", None);
+
+        let events = vec![
+            {
+                let mut e = make_event("playbook_started", None);
+                e.context = Some(serde_json::json!({
+                    "workload": {}, "path": "test", "version": "1"
+                }));
+                e
+            },
+            make_event("command.completed", Some("start")),
+            make_event("step.enter", Some("branch_a")),
+            make_event("command.completed", Some("branch_a")),
+            make_event("step.enter", Some("branch_b")),
+            make_event("command.completed", Some("branch_b")),
+        ];
+
+        let playbook = Playbook {
+            api_version: "noetl.io/v2".to_string(),
+            kind: "Playbook".to_string(),
+            metadata: Metadata {
+                name: "parallel_done".to_string(),
+                path: Some("test/parallel_done".to_string()),
+                description: None,
+                labels: None,
+                extra: HashMap::new(),
+            },
+            workload: None,
+            vars: None,
+            keychain: None,
+            workbook: None,
+            workflow: vec![start, branch_a, branch_b, end],
+        };
+
+        let result = orchestrator
+            .evaluate(&events, &playbook, Some("command.completed"))
+            .unwrap();
+
+        assert!(
+            result.should_complete,
+            "both branches done + both at end ⇒ complete"
+        );
+        assert_eq!(
+            result.completion_status.as_ref().map(|c| c.status.as_str()),
+            Some("COMPLETED")
+        );
     }
 
     #[test]
