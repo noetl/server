@@ -71,6 +71,21 @@ pub struct GetCredentialQuery {
 /// }
 /// ```
 pub async fn create_or_update(
+    service: State<CredentialService>,
+    request: Json<CredentialCreateRequest>,
+) -> AppResult<(StatusCode, Json<CredentialResponse>)> {
+    let started_at = std::time::Instant::now();
+    let result = create_or_update_inner(service, request).await;
+    let status_label = if result.is_ok() { "ok" } else { "error" };
+    crate::metrics::record_write_request(
+        crate::metrics::endpoint::CREDENTIALS_UPSERT,
+        status_label,
+        started_at.elapsed().as_secs_f64(),
+    );
+    result
+}
+
+async fn create_or_update_inner(
     State(service): State<CredentialService>,
     Json(request): Json<CredentialCreateRequest>,
 ) -> AppResult<(StatusCode, Json<CredentialResponse>)> {

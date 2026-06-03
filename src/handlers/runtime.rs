@@ -44,6 +44,21 @@ pub struct ListRuntimesQuery {
 ///
 /// POST /api/worker/pool/register
 pub async fn register_pool(
+    service: State<RuntimeService>,
+    request: Json<RegisterRuntimeRequest>,
+) -> Result<Json<crate::services::runtime::Runtime>, AppError> {
+    let started_at = std::time::Instant::now();
+    let result = register_pool_inner(service, request).await;
+    let status_label = if result.is_ok() { "ok" } else { "error" };
+    crate::metrics::record_write_request(
+        crate::metrics::endpoint::RUNTIME_REGISTER,
+        status_label,
+        started_at.elapsed().as_secs_f64(),
+    );
+    result
+}
+
+async fn register_pool_inner(
     State(service): State<RuntimeService>,
     Json(request): Json<RegisterRuntimeRequest>,
 ) -> Result<Json<crate::services::runtime::Runtime>, AppError> {
@@ -69,6 +84,21 @@ pub async fn deregister_pool(
 ///
 /// POST /api/worker/pool/heartbeat
 pub async fn heartbeat(
+    service: State<RuntimeService>,
+    request: Json<HeartbeatRequest>,
+) -> Result<Json<RuntimeOperationResponse>, AppError> {
+    let started_at = std::time::Instant::now();
+    let result = heartbeat_inner(service, request).await;
+    let status_label = if result.is_ok() { "ok" } else { "error" };
+    crate::metrics::record_write_request(
+        crate::metrics::endpoint::RUNTIME_HEARTBEAT,
+        status_label,
+        started_at.elapsed().as_secs_f64(),
+    );
+    result
+}
+
+async fn heartbeat_inner(
     State(service): State<RuntimeService>,
     Json(request): Json<HeartbeatRequest>,
 ) -> Result<Json<RuntimeOperationResponse>, AppError> {

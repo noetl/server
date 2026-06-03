@@ -23,17 +23,33 @@
 //!   blows up the registry); it lives on tracing spans only
 //!   per Principle 4.
 //!
-//! ## Round 1 surface (this file, this PR)
+//! ## Round 1 surface
 //!
 //! - `noetl_events_ingested_total{event_type, status}` —
 //!   counter; one increment per `POST /api/events` call.
+//!   `event_type` is a meaningful breakdown (15+ values) so it
+//!   warrants its own metric.
 //! - `noetl_event_ingest_duration_seconds{event_type}` —
 //!   histogram; the wall-clock time spent inside the handler.
 //!
-//! Future rounds add counters/histograms for the other write
-//! endpoints (catalog/register, credentials, keychain,
-//! worker/pool/register, worker/pool/heartbeat).  See
-//! noetl/server#21.
+//! ## Round 2 surface (the other 5 write endpoints)
+//!
+//! The remaining Phase B POST endpoints each have a single
+//! mode of operation (catalog/register = upsert, credentials =
+//! upsert, keychain = set, etc.) so they share a generic pair:
+//!
+//! - `noetl_write_requests_total{endpoint, status}` — counter.
+//! - `noetl_write_request_duration_seconds{endpoint}` —
+//!   histogram.
+//!
+//! `endpoint` label values (low-cardinality enum):
+//! - `catalog_register`
+//! - `credentials_upsert`
+//! - `keychain_set`
+//! - `runtime_register`
+//! - `runtime_heartbeat`
+//!
+//! See noetl/server#21 for the round breakdown.
 
 use std::sync::OnceLock;
 
@@ -107,6 +123,81 @@ pub fn record_event_ingest(event_type: &str, status: &str, duration_seconds: f64
         .inc();
     event_ingest_duration_seconds()
         .with_label_values(&[event_type])
+        .observe(duration_seconds);
+}
+
+// ---------------------------------------------------------------------------
+// Round 2 — generic write-endpoint surface
+// ---------------------------------------------------------------------------
+
+/// Canonical endpoint labels accepted by [`record_write_request`].
+///
+/// Kept as `&'static str` constants so a typo at a call site is a
+/// compile error rather than a runtime drift.  Add new entries here
+/// (and only here) when instrumenting future write endpoints.
+pub mod endpoint {
+    pub const CATALOG_REGISTER: &str = "catalog_register";
+    pub const CREDENTIALS_UPSERT: &str = "credentials_upsert";
+    pub const KEYCHAIN_SET: &str = "keychain_set";
+    pub const RUNTIME_REGISTER: &str = "runtime_register";
+    pub const RUNTIME_HEARTBEAT: &str = "runtime_heartbeat";
+}
+
+/// Counter: write-endpoint dispatches bucketed by canonical
+/// endpoint name and status.  Shared across the Round-2 endpoints
+/// because each has a single mode of operation; per-endpoint
+/// metrics would inflate the registry without adding signal.
+pub fn write_requests_total() -> &'static IntCounterVec {
+    static M: OnceLock<IntCounterVec> = OnceLock::new();
+    M.get_or_init(|| {
+        let counter = IntCounterVec::new(
+            Opts::new(
+                "noetl_write_requests_total",
+                "Total POST requests to write endpoints other than /api/events (counted once per handler call, Ok or Err).",
+            ),
+            &["endpoint", "status"],
+        )
+        .expect("static counter spec must be valid");
+        registry()
+            .register(Box::new(counter.clone()))
+            .expect("counter registration must succeed");
+        counter
+    })
+}
+
+/// Histogram: wall-clock time spent inside Round-2 write
+/// endpoints, bucketed by canonical endpoint label.
+pub fn write_request_duration_seconds() -> &'static HistogramVec {
+    static M: OnceLock<HistogramVec> = OnceLock::new();
+    M.get_or_init(|| {
+        let hist = HistogramVec::new(
+            HistogramOpts::new(
+                "noetl_write_request_duration_seconds",
+                "Wall-clock time spent inside POST write endpoints (other than /api/events).",
+            )
+            .buckets(EVENT_INGEST_BUCKETS.to_vec()),
+            &["endpoint"],
+        )
+        .expect("static histogram spec must be valid");
+        registry()
+            .register(Box::new(hist.clone()))
+            .expect("histogram registration must succeed");
+        hist
+    })
+}
+
+/// Record a single Round-2 write-endpoint outcome.
+///
+/// `endpoint` should be one of the constants under
+/// [`endpoint`].  `status` is `"ok"` on the success path,
+/// `"error"` on any `Err` return.  `duration_seconds` is
+/// wall-clock time inside the handler.
+pub fn record_write_request(endpoint: &str, status: &str, duration_seconds: f64) {
+    write_requests_total()
+        .with_label_values(&[endpoint, status])
+        .inc();
+    write_request_duration_seconds()
+        .with_label_values(&[endpoint])
         .observe(duration_seconds);
 }
 
@@ -190,5 +281,47 @@ mod tests {
             text.contains("status=\"error\""),
             "expected status=error label in text:\n{text}"
         );
+    }
+
+    // --- Round 2: generic write-request metrics ---
+
+    #[test]
+    fn write_request_counter_increments_by_label_set() {
+        record_write_request("test.write.counter", "ok", 0.01);
+        record_write_request("test.write.counter", "ok", 0.02);
+        let value = write_requests_total()
+            .with_label_values(&["test.write.counter", "ok"])
+            .get();
+        assert!(value >= 2, "expected at least 2 increments, got {value}");
+    }
+
+    #[test]
+    fn write_request_metric_names_appear_in_text() {
+        record_write_request("test.write.text", "ok", 0.05);
+        let text = gather_text().expect("gather_text must succeed");
+        assert!(
+            text.contains("noetl_write_requests_total"),
+            "expected counter name in text:\n{text}"
+        );
+        assert!(
+            text.contains("noetl_write_request_duration_seconds"),
+            "expected histogram name in text:\n{text}"
+        );
+        assert!(text.contains("endpoint=\"test.write.text\""));
+    }
+
+    #[test]
+    fn endpoint_constants_are_used_consistently() {
+        // Compile-time check: the constants exist and resolve.
+        let names = [
+            endpoint::CATALOG_REGISTER,
+            endpoint::CREDENTIALS_UPSERT,
+            endpoint::KEYCHAIN_SET,
+            endpoint::RUNTIME_REGISTER,
+            endpoint::RUNTIME_HEARTBEAT,
+        ];
+        // Sanity: they're all distinct and non-empty.
+        assert_eq!(names.iter().collect::<std::collections::HashSet<_>>().len(), names.len());
+        assert!(names.iter().all(|n| !n.is_empty()));
     }
 }
