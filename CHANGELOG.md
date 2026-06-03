@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.1.4](https://github.com/noetl/server/compare/v2.1.3...v2.1.4) (2026-06-03)
+
+### Bug Fixes
+
+* **execution:** noetl.event.created_at is TIMESTAMP, not TIMESTAMPTZ ([f450465](https://github.com/noetl/server/commit/f450465c9d16f7840fc5fcd873e2448103a5dd8d)), closes [noetl/ai-meta#49](https://github.com/noetl/ai-meta/issues/49) [noetl/ai-meta#49](https://github.com/noetl/ai-meta/issues/49)
+
 ## [2.1.3](https://github.com/noetl/server/compare/v2.1.2...v2.1.3) (2026-06-03)
 
 ### Bug Fixes
