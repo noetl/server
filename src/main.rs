@@ -68,6 +68,15 @@ fn build_router(
             "/api/catalog/resource",
             post(handlers::catalog::get_resource),
         )
+        // ui_schema route — wildcard tail because the Python contract
+        // `GET /api/catalog/{path:path}/ui_schema` accepts slash-bearing
+        // paths (e.g. `system/outbox_publisher`).  The handler routes
+        // by suffix: only requests whose tail ends with `/ui_schema`
+        // are served; everything else returns 404.
+        .route(
+            "/api/catalog/{*tail}",
+            get(handlers::catalog::ui_schema),
+        )
         .with_state(catalog_service);
 
     // Credential routes

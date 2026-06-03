@@ -126,7 +126,7 @@ impl CatalogService {
                         });
                 }
 
-                let version: i32 = version_str
+                let version: i16 = version_str
                     .parse()
                     .map_err(|_| AppError::Validation("Invalid version number".to_string()))?;
 

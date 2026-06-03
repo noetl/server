@@ -57,6 +57,9 @@ ctor = "0.2"
 # System info (for status endpoint)
 sysinfo = "0.33"
 
+# Regex (for ui_schema inline-directive scanning, etc.)
+regex = "1"
+
 [dev-dependencies]
 tokio-test = "0.4"
 # Process-global env var tests serialise via #[serial] so concurrent

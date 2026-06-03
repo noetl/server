@@ -19,8 +19,13 @@ pub struct CatalogEntry {
     /// Resource kind (e.g., "Playbook", "Tool", "Model")
     pub kind: String,
 
-    /// Version number (auto-incremented per path)
-    pub version: i32,
+    /// Version number (auto-incremented per path).
+    ///
+    /// `i16` matches the Postgres `smallint` column.  Older Rust
+    /// revisions used `i32`, which caused sqlx decode failures
+    /// against the real schema — same drift as v2.1.3 (credentials
+    /// data column) and v2.1.4 (executions timestamps).
+    pub version: i16,
 
     /// Raw YAML content
     pub content: String,
@@ -68,8 +73,8 @@ pub struct CatalogRegisterResponse {
     /// Resource path
     pub path: String,
 
-    /// Version number
-    pub version: i32,
+    /// Version number (Postgres `smallint`).
+    pub version: i16,
 
     /// Catalog ID
     pub catalog_id: String,
@@ -105,8 +110,8 @@ pub struct CatalogEntryResponse {
     /// Resource kind
     pub kind: String,
 
-    /// Version number
-    pub version: i32,
+    /// Version number (Postgres `smallint`).
+    pub version: i16,
 
     /// Raw YAML content
     #[serde(skip_serializing_if = "Option::is_none")]

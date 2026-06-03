@@ -5,10 +5,14 @@ use crate::db::DbPool;
 use crate::error::AppResult;
 
 /// Get the next version number for a path.
-pub async fn get_next_version(pool: &DbPool, path: &str) -> AppResult<i32> {
-    let result: Option<(i32,)> = sqlx::query_as(
+///
+/// `noetl.catalog.version` is Postgres `smallint`; using `i16` here
+/// matches the column type and avoids the sqlx decode mismatch that
+/// surfaced during noetl/ai-meta#49 Phase A ui_schema validation.
+pub async fn get_next_version(pool: &DbPool, path: &str) -> AppResult<i16> {
+    let result: Option<(i16,)> = sqlx::query_as(
         r#"
-        SELECT COALESCE(MAX(version), 0) + 1
+        SELECT COALESCE(MAX(version), 0)::smallint + 1
         FROM noetl.catalog
         WHERE path = $1
         "#,
@@ -26,7 +30,7 @@ pub async fn insert_catalog_entry(
     pool: &DbPool,
     path: &str,
     kind: &str,
-    version: i32,
+    version: i16,
     content: &str,
     layout: Option<&serde_json::Value>,
     payload: Option<&serde_json::Value>,
@@ -53,12 +57,18 @@ pub async fn insert_catalog_entry(
 }
 
 /// Get a catalog entry by ID.
+///
+/// Filters on `catalog_id` (the real PK column).  Older versions
+/// wrote `WHERE id = $1`, which would fail at runtime because the
+/// table has no `id` column — only `catalog_id` aliased as `id` in
+/// the SELECT list.  Same alias-vs-column drift as the v2.1.5
+/// catalog `list` fix.
 pub async fn get_catalog_by_id(pool: &DbPool, id: i64) -> AppResult<Option<CatalogEntry>> {
     let entry = sqlx::query_as::<_, CatalogEntry>(
         r#"
         SELECT catalog_id AS id, path, kind, version, content, layout, payload, meta, created_at AT TIME ZONE 'UTC' as created_at
         FROM noetl.catalog
-        WHERE id = $1
+        WHERE catalog_id = $1
         "#,
     )
     .bind(id)
@@ -72,7 +82,7 @@ pub async fn get_catalog_by_id(pool: &DbPool, id: i64) -> AppResult<Option<Catal
 pub async fn get_catalog_by_path_version(
     pool: &DbPool,
     path: &str,
-    version: i32,
+    version: i16,
 ) -> AppResult<Option<CatalogEntry>> {
     let entry = sqlx::query_as::<_, CatalogEntry>(
         r#"
