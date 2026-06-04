@@ -85,7 +85,12 @@ pub async fn health_check() -> Json<HealthCheckResponse> {
 /// - `200 OK` with detailed health status if all services are healthy
 /// - `503 Service Unavailable` if any critical service is unhealthy
 pub async fn api_health(State(state): State<AppState>) -> (StatusCode, Json<ApiHealthResponse>) {
-    let db_healthy = db_health_check(&state.db).await;
+    // Phase F R4-3c: probe the cluster pool — that's the
+    // "can this replica answer at all" check.  Per-shard health
+    // is a separate concern (a future /api/health/shards endpoint
+    // would iterate state.pools.all_shards() and probe each); not
+    // needed for the basic readiness signal.
+    let db_healthy = db_health_check(state.pools.cluster()).await;
 
     let nats_status = if state.has_nats() {
         Some("connected".to_string())
@@ -124,8 +129,16 @@ pub async fn api_health(State(state): State<AppState>) -> (StatusCode, Json<ApiH
 ///
 /// `GET /api/pool/status`
 pub async fn pool_status(State(state): State<AppState>) -> Json<PoolStatusResponse> {
-    let pool_size = u32::try_from(state.db.size()).unwrap_or(u32::MAX);
-    let pool_available = u32::try_from(state.db.num_idle()).unwrap_or(u32::MAX);
+    // Phase F R4-3c: report cluster pool stats here.  In
+    // single-pool fallback mode (NOETL_SHARDS empty) the cluster
+    // handle IS the only pool, so the numbers are unchanged from
+    // pre-R4.  In sharded mode this endpoint surfaces just the
+    // cluster pool — per-shard pool utilization belongs on
+    // /metrics (per-shard gauge labels) or a follow-up
+    // /api/pool/status/shards endpoint.
+    let cluster = state.pools.cluster();
+    let pool_size = u32::try_from(cluster.size()).unwrap_or(u32::MAX);
+    let pool_available = u32::try_from(cluster.num_idle()).unwrap_or(u32::MAX);
     let pool_max = pool_size.max(pool_available);
     let pool_min = 0;
     let active = pool_size.saturating_sub(pool_available);
