@@ -1,6 +1,6 @@
 [package]
 name = "noetl-server"
-version = "2.8.3"
+version = "2.9.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/noetl/noetl"
@@ -20,6 +20,24 @@ tower-http = { version = "0.6", features = ["cors", "trace"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_yaml = "0.9"
+
+# Shared event envelope (noetl/ai-meta#49 EE-4): the canonical
+# `ExecutorEvent` shape lives in the dedicated `noetl-events` crate
+# extracted from `noetl-executor::events` in noetl/cli#49 + #50.
+# Server takes a direct dep so the wire format the worker emits
+# (via `noetl-executor::events::ExecutorEvent`) and the wire format
+# the server's `POST /api/events` handler accepts as `EventRequest`
+# are anchored to a single source of truth — instead of being held
+# in sync by hand-aligned doc comments + parallel tests.
+#
+# The server's `EventRequest` legitimately carries extra fields
+# the canonical envelope doesn't expose (`result_kind`, `result_uri`,
+# `event_ids`, `actionable`, `informative`) and wire-encodes
+# `execution_id` / `event_id` as `String` for JSON-number precision
+# in browser clients, so it remains a distinct type.  The dep wires
+# in `From<ExecutorEvent>` / `TryFrom<&EventRequest>` conversions +
+# a wire-compat test that proves the shared subset round-trips.
+noetl-events = "0.1"
 
 # Database
 sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres", "chrono", "uuid", "json"] }
