@@ -453,6 +453,35 @@ impl WorkflowOrchestrator {
                         continue;
                     }
 
+                    // R3a skip-chain re-entry guard: after walking
+                    // forward through one or more skipped steps, the
+                    // chain target may itself already be Completed
+                    // or running.  Without this guard, every
+                    // subsequent command.completed event for any
+                    // later step in the workflow re-triggers the
+                    // orchestrator, which re-evaluates `start`'s
+                    // transitions, walks the skip chain again, and
+                    // emits a fresh step.enter + command.issued for
+                    // the chain target.  Surfaced by Phase D R3a
+                    // re-validation after noetl/ai-meta#53 unblocked
+                    // multi-trigger paths — the chain target was
+                    // `tail`, which got re-issued on every
+                    // tail.command.completed.
+                    if state.is_step_done(&current_step_name) {
+                        debug!(
+                            "Skip-chain target '{}' already done, suppressing re-dispatch",
+                            current_step_name
+                        );
+                        continue;
+                    }
+                    if state.running_steps().contains(&current_step_name.as_str()) {
+                        debug!(
+                            "Skip-chain target '{}' already running, suppressing re-dispatch",
+                            current_step_name
+                        );
+                        continue;
+                    }
+
                     // R3b iterator fan-out: if the landed step
                     // declares `step.loop`, evaluate the loop
                     // expression and emit one command per item.  The
