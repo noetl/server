@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.10.1](https://github.com/noetl/server/compare/v2.10.0...v2.10.1) (2026-06-04)
+
+### Bug Fixes
+
+* **config:** rename machine_id → server_machine_id (env: NOETL_SERVER_MACHINE_ID) ([a9533aa](https://github.com/noetl/server/commit/a9533aa3d9b22de41b7ca41a86296bf8b7ba8eb8)), closes [noetl/server#42](https://github.com/noetl/server/issues/42) [noetl/ai-meta#49](https://github.com/noetl/ai-meta/issues/49)
+
 ## [2.10.0](https://github.com/noetl/server/compare/v2.9.0...v2.10.0) (2026-06-04)
 
 ### Features
