@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.8.2](https://github.com/noetl/server/compare/v2.8.1...v2.8.2) (2026-06-04)
+
+### Bug Fixes
+
+* **orchestrator:** guard skip-chain target against re-dispatch on re-trigger ([b70e029](https://github.com/noetl/server/commit/b70e029c2219b73cf1a28242b3b2bfd804cd5061)), closes [noetl/ai-meta#53](https://github.com/noetl/ai-meta/issues/53) [noetl/ai-meta#49](https://github.com/noetl/ai-meta/issues/49) [noetl/ai-meta#53](https://github.com/noetl/ai-meta/issues/53)
+
 ## [2.8.1](https://github.com/noetl/server/compare/v2.8.0...v2.8.1) (2026-06-03)
 
 ### Bug Fixes
