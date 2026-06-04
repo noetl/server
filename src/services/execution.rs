@@ -6,7 +6,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::db::DbPool;
+use crate::db::{DbPool, DbPoolMap};
 use crate::error::{AppError, AppResult};
 
 /// Execution summary for listing.
@@ -77,105 +77,182 @@ pub struct ExecutionFilter {
 }
 
 /// Execution management service.
+///
+/// Phase F R4-4b moved this from a single `DbPool` to a
+/// [`DbPoolMap`]: per-execution methods (`get`, `get_status`,
+/// `cancel`, `is_cancelled`, `finalize`) route via
+/// `pools.pool_for(execution_id)`; the cluster-wide list
+/// endpoint fan-outs via `pools.for_each_shard` and resolves
+/// catalog paths against `pools.cluster()` in a single follow-up
+/// query.  In single-pool fallback mode (`NOETL_SHARDS` empty)
+/// every accessor returns the same handle as the legacy pool;
+/// behaviour bit-identical to pre-R4.
 #[derive(Clone)]
 pub struct ExecutionService {
-    db: DbPool,
+    pools: DbPoolMap,
     snowflake: std::sync::Arc<crate::snowflake::SnowflakeGenerator>,
 }
 
 impl ExecutionService {
     /// Create a new execution service.
     ///
+    /// Takes the [`DbPoolMap`] from `AppState.pools` so the
+    /// service can route per-execution queries via
+    /// `pools.pool_for(execution_id)` and the cluster-wide
+    /// `list()` fan-out via `pools.for_each_shard`.
+    ///
     /// `snowflake` is the application-side ID generator shared
     /// with `AppState` and the other services.  Phase F R1.5 of
     /// noetl/ai-meta#49 moved id generation out of the DB-side
     /// `noetl.snowflake_id()` function.
     pub fn new(
+        pools: DbPoolMap,
+        snowflake: std::sync::Arc<crate::snowflake::SnowflakeGenerator>,
+    ) -> Self {
+        Self { pools, snowflake }
+    }
+
+    /// Build an [`ExecutionService`] wrapping a single legacy
+    /// pool — for test / example code paths that don't have a
+    /// [`DbPoolMap`] in scope.  Internally wraps the pool via
+    /// [`DbPoolMap::from_single_pool`].
+    pub fn new_legacy(
         db: DbPool,
         snowflake: std::sync::Arc<crate::snowflake::SnowflakeGenerator>,
     ) -> Self {
-        Self { db, snowflake }
+        Self::new(DbPoolMap::from_single_pool(db), snowflake)
+    }
+
+    /// Borrow the per-execution pool for the given `execution_id`.
+    /// Internal helper to keep the per-method call sites short.
+    #[inline]
+    fn pool_for(&self, execution_id: i64) -> &DbPool {
+        self.pools.pool_for(execution_id)
     }
 
     /// List executions with optional filters.
+    ///
+    /// Phase F R4-4b: per-shard fan-out + cluster-master catalog
+    /// lookup, replacing the single-pool JOIN'd CTE this used to
+    /// be.  Each shard answers an `execution_stats` aggregation
+    /// over its own slice of `noetl.event`; results are merged,
+    /// catalog paths are looked up once on the cluster master,
+    /// stitched in, then path/status filters and pagination
+    /// apply post-merge.
+    ///
+    /// **Over-fetch**: in sharded mode each shard returns up to
+    /// `(limit + offset)` rows because any single shard could
+    /// contribute every row in the merged window after sorting
+    /// by `started_at DESC`.  Bounded by the request's own
+    /// `limit + offset` (default ≤ 50+50 = 100), so per-shard
+    /// I/O stays manageable.
+    ///
+    /// **Path filter quirk**: `c.path LIKE $2` is applied
+    /// post-merge after the cluster catalog lookup.  This means
+    /// when both `catalog_id` and `path` filters are unset, the
+    /// over-fetch returns all matching rows; with `path` set,
+    /// the effective row count after filtering could be smaller
+    /// than `limit`.  A future R4-5+ optimisation could push the
+    /// path filter into the cluster lookup as a pre-filter.
     #[allow(clippy::type_complexity)]
     pub async fn list(&self, filter: &ExecutionFilter) -> AppResult<Vec<ExecutionSummary>> {
         let limit = filter.limit.unwrap_or(50).min(100);
         let offset = filter.offset.unwrap_or(0);
+        let fetch_cap: i64 = (limit as i64) + (offset as i64);
 
-        let rows: Vec<(i64, i64, Option<String>, String, DateTime<Utc>, Option<DateTime<Utc>>, i64)> =
-            sqlx::query_as(
-                r#"
-                -- noetl.event.created_at is TIMESTAMP (no tz); the
-                -- Rust struct uses DateTime<Utc> (TIMESTAMPTZ).
-                -- ``AT TIME ZONE 'UTC'`` reinterprets the naive
-                -- timestamp as UTC and produces a TIMESTAMPTZ that
-                -- sqlx can decode into DateTime<Utc>.  See
-                -- noetl/ai-meta#49 Phase A.
-                -- Event-type values follow the dot-style convention
-                -- written by the Python noetl-server (per
-                -- ``noetl/server/api/core/events.py``):
-                -- ``playbook.initialized`` / ``playbook.completed`` /
-                -- ``playbook.failed`` / ``playbook.cancelled``.
-                -- The legacy ``playbook_started`` / ``playbook_completed``
-                -- / ``playbook_failed`` / ``playbook_cancelled`` aliases
-                -- are accepted too — see ``engine/state.rs``'s match
-                -- arms for the same dual-shape acceptance.  See
-                -- noetl/ai-meta#49 Phase A.
-                WITH execution_stats AS (
-                    SELECT
-                        execution_id,
-                        catalog_id,
-                        MIN(created_at) AT TIME ZONE 'UTC' as started_at,
-                        MAX(CASE WHEN status IN ('COMPLETED', 'FAILED', 'CANCELLED') THEN created_at END) AT TIME ZONE 'UTC' as completed_at,
-                        COUNT(*) as event_count,
-                        MAX(CASE
-                            WHEN event_type IN ('playbook.completed', 'playbook_completed') THEN 'COMPLETED'
-                            WHEN event_type IN ('playbook.failed', 'playbook_failed') THEN 'FAILED'
-                            WHEN event_type IN ('playbook.cancelled', 'playbook_cancelled') THEN 'CANCELLED'
-                            WHEN status = 'FAILED' THEN 'FAILED'
-                            ELSE 'RUNNING'
-                        END) as status
-                    FROM noetl.event
-                    WHERE ($1::BIGINT IS NULL OR catalog_id = $1)
-                    GROUP BY execution_id, catalog_id
-                )
-                SELECT
-                    e.execution_id,
-                    e.catalog_id,
-                    c.path,
-                    e.status,
-                    e.started_at,
-                    e.completed_at,
-                    e.event_count
-                FROM execution_stats e
-                LEFT JOIN noetl.catalog c ON e.catalog_id = c.catalog_id
-                WHERE ($2::TEXT IS NULL OR c.path LIKE $2)
-                  AND ($3::TEXT IS NULL OR e.status = $3)
-                ORDER BY e.started_at DESC
-                LIMIT $4 OFFSET $5
-                "#,
-            )
-            .bind(filter.catalog_id)
-            .bind(filter.path.as_ref().map(|p| format!("%{}%", p)))
-            .bind(&filter.status)
-            .bind(limit)
-            .bind(offset)
-            .fetch_all(&self.db)
+        // Stage 1 — per-shard execution_stats aggregation.  The
+        // per-shard query is the original CTE minus the catalog
+        // JOIN + path filter (those move to the post-merge
+        // cluster lookup).  Status filter stays in-shard because
+        // it's computed from per-execution events.
+        type StatsRow = (i64, i64, String, DateTime<Utc>, Option<DateTime<Utc>>, i64);
+        let per_shard: Vec<(u32, Vec<StatsRow>)> = self
+            .pools
+            .for_each_shard(|_idx, pool| {
+                let catalog_id = filter.catalog_id;
+                let status = filter.status.clone();
+                async move {
+                    sqlx::query_as::<_, StatsRow>(
+                        r#"
+                        WITH execution_stats AS (
+                            SELECT
+                                execution_id,
+                                catalog_id,
+                                MIN(created_at) AT TIME ZONE 'UTC' as started_at,
+                                MAX(CASE WHEN status IN ('COMPLETED', 'FAILED', 'CANCELLED') THEN created_at END) AT TIME ZONE 'UTC' as completed_at,
+                                COUNT(*) as event_count,
+                                MAX(CASE
+                                    WHEN event_type IN ('playbook.completed', 'playbook_completed') THEN 'COMPLETED'
+                                    WHEN event_type IN ('playbook.failed', 'playbook_failed') THEN 'FAILED'
+                                    WHEN event_type IN ('playbook.cancelled', 'playbook_cancelled') THEN 'CANCELLED'
+                                    WHEN status = 'FAILED' THEN 'FAILED'
+                                    ELSE 'RUNNING'
+                                END) as status
+                            FROM noetl.event
+                            WHERE ($1::BIGINT IS NULL OR catalog_id = $1)
+                            GROUP BY execution_id, catalog_id
+                        )
+                        SELECT
+                            execution_id,
+                            catalog_id,
+                            status,
+                            started_at,
+                            completed_at,
+                            event_count
+                        FROM execution_stats
+                        WHERE ($2::TEXT IS NULL OR status = $2)
+                        ORDER BY started_at DESC
+                        LIMIT $3
+                        "#,
+                    )
+                    .bind(catalog_id)
+                    .bind(&status)
+                    .bind(fetch_cap)
+                    .fetch_all(&pool)
+                    .await
+                }
+            })
             .await?;
 
-        Ok(rows
+        // Stage 2 — merge per-shard rows, sort by started_at DESC.
+        let mut merged: Vec<StatsRow> =
+            per_shard.into_iter().flat_map(|(_idx, rows)| rows).collect();
+        merged.sort_by(|a, b| b.3.cmp(&a.3));
+
+        // Stage 3 — cluster-master catalog lookup for the
+        // (deduped) catalog_id set.  One SELECT regardless of
+        // shard count.
+        let catalog_ids: Vec<i64> = {
+            let mut ids: Vec<i64> = merged.iter().map(|r| r.1).collect();
+            ids.sort_unstable();
+            ids.dedup();
+            ids
+        };
+        let catalog_paths: std::collections::HashMap<i64, String> = if catalog_ids.is_empty() {
+            std::collections::HashMap::new()
+        } else {
+            let rows: Vec<(i64, Option<String>)> = sqlx::query_as(
+                "SELECT catalog_id, path FROM noetl.catalog WHERE catalog_id = ANY($1)",
+            )
+            .bind(&catalog_ids)
+            .fetch_all(self.pools.cluster())
+            .await?;
+            rows.into_iter()
+                .filter_map(|(id, path)| path.map(|p| (id, p)))
+                .collect()
+        };
+
+        // Stage 4 — stitch paths in + apply path filter +
+        // paginate.
+        let path_pattern_lower = filter
+            .path
+            .as_ref()
+            .map(|p| p.to_lowercase());
+        let summaries = merged
             .into_iter()
             .map(
-                |(
-                    execution_id,
-                    catalog_id,
-                    path,
-                    status,
-                    started_at,
-                    completed_at,
-                    event_count,
-                )| {
+                |(execution_id, catalog_id, status, started_at, completed_at, event_count)| {
+                    let path = catalog_paths.get(&catalog_id).cloned();
                     ExecutionSummary {
                         execution_id,
                         catalog_id,
@@ -187,7 +264,18 @@ impl ExecutionService {
                     }
                 },
             )
-            .collect())
+            .filter(|s| match &path_pattern_lower {
+                None => true,
+                Some(needle) => s
+                    .path
+                    .as_ref()
+                    .is_some_and(|p| p.to_lowercase().contains(needle)),
+            })
+            .skip(offset as usize)
+            .take(limit as usize)
+            .collect();
+
+        Ok(summaries)
     }
 
     /// Get detailed execution information.
@@ -212,17 +300,17 @@ impl ExecutionService {
                 "#,
             )
             .bind(execution_id)
-            .fetch_optional(&self.db)
+            .fetch_optional(self.pool_for(execution_id))
             .await?;
 
         let (catalog_id, parent_execution_id, workload, started_at) = info
             .ok_or_else(|| AppError::NotFound(format!("Execution not found: {}", execution_id)))?;
 
-        // Get catalog path
+        // Get catalog path (cluster-wide table)
         let path: Option<(String,)> =
             sqlx::query_as("SELECT path FROM noetl.catalog WHERE catalog_id = $1")
                 .bind(catalog_id)
-                .fetch_optional(&self.db)
+                .fetch_optional(self.pools.cluster())
                 .await?;
 
         // Get all events for this execution
@@ -250,7 +338,7 @@ impl ExecutionService {
                 "#,
         )
         .bind(execution_id)
-        .fetch_all(&self.db)
+        .fetch_all(self.pool_for(execution_id))
         .await?;
 
         let events: Vec<ExecutionEvent> = event_rows
@@ -309,7 +397,7 @@ impl ExecutionService {
         let exists: Option<(i64,)> =
             sqlx::query_as("SELECT execution_id FROM noetl.event WHERE execution_id = $1 LIMIT 1")
                 .bind(execution_id)
-                .fetch_optional(&self.db)
+                .fetch_optional(self.pool_for(execution_id))
                 .await?;
 
         if exists.is_none() {
@@ -332,7 +420,7 @@ impl ExecutionService {
             "#,
         )
         .bind(execution_id)
-        .fetch_one(&self.db)
+        .fetch_one(self.pool_for(execution_id))
         .await?;
 
         // Get current step
@@ -348,7 +436,7 @@ impl ExecutionService {
             "#,
         )
         .bind(execution_id)
-        .fetch_optional(&self.db)
+        .fetch_optional(self.pool_for(execution_id))
         .await?;
 
         // Check for cancellation
@@ -362,7 +450,7 @@ impl ExecutionService {
             "#,
         )
         .bind(execution_id)
-        .fetch_one(&self.db)
+        .fetch_one(self.pool_for(execution_id))
         .await?;
 
         // Determine overall status
@@ -407,7 +495,7 @@ impl ExecutionService {
         let catalog_id: Option<(i64,)> =
             sqlx::query_as("SELECT catalog_id FROM noetl.event WHERE execution_id = $1 LIMIT 1")
                 .bind(execution_id)
-                .fetch_optional(&self.db)
+                .fetch_optional(self.pool_for(execution_id))
                 .await?;
 
         let catalog_id = catalog_id
@@ -435,7 +523,7 @@ impl ExecutionService {
         .bind("playbook")
         .bind("CANCELLED")
         .bind(Utc::now())
-        .execute(&self.db)
+        .execute(self.pool_for(execution_id))
         .await?;
 
         Ok(())
@@ -453,7 +541,7 @@ impl ExecutionService {
             "#,
         )
         .bind(execution_id)
-        .fetch_one(&self.db)
+        .fetch_one(self.pool_for(execution_id))
         .await?;
 
         Ok(is_cancelled)
@@ -478,7 +566,7 @@ impl ExecutionService {
         let catalog_id: Option<(i64,)> =
             sqlx::query_as("SELECT catalog_id FROM noetl.event WHERE execution_id = $1 LIMIT 1")
                 .bind(execution_id)
-                .fetch_optional(&self.db)
+                .fetch_optional(self.pool_for(execution_id))
                 .await?;
 
         let catalog_id = catalog_id
@@ -513,7 +601,7 @@ impl ExecutionService {
         .bind(status)
         .bind(error)
         .bind(Utc::now())
-        .execute(&self.db)
+        .execute(self.pool_for(execution_id))
         .await?;
 
         Ok(())
