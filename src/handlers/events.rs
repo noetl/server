@@ -19,16 +19,35 @@ use crate::state::AppState;
 
 /// Worker event request.
 ///
-/// R-1.2 PR-EE-2: aligned with the executor's `ExecutorEvent`
-/// shape per the cross-repo event envelope reconciliation tracked
-/// on noetl/ai-meta#30.  The legacy `name` field is renamed to
-/// `event_type` with a `#[serde(alias = "name")]` so existing
-/// worker / CLI clients sending `name` continue to deserialize
-/// without breakage during the migration window.  The new
-/// optional fields (`event_id`, `status`, `created_at`) align
-/// with `noetl_executor::events::ExecutorEvent 0.3.1`; producers
-/// that don't populate them get sensible server-side fallbacks
-/// (DB-side snowflake_id() for `event_id`, name-derived `status`,
+/// The shared subset of fields with the canonical
+/// [`noetl_events::ExecutorEvent`] envelope (from the
+/// `noetl-events` crate published off
+/// [noetl/cli](https://github.com/noetl/cli)) — `execution_id`,
+/// `step`, `event_type` (with `name` alias), `payload`/`context`,
+/// `meta`, `worker_id`, `event_id`, `status`, `created_at` — is
+/// wire-format compatible.  The wire-compat test
+/// `wire_compat_round_trips_shared_subset_with_executor_event`
+/// guards this property.  EE-4 (noetl/ai-meta#49) extracted the
+/// shared envelope into the dedicated `noetl-events` crate and
+/// added a direct dep on it here so the wire shape has a single
+/// source of truth instead of being held in sync by hand-aligned
+/// doc comments.
+///
+/// `EventRequest` keeps several server-only fields beyond the
+/// canonical envelope: `result_kind`, `result_uri`, `event_ids`
+/// (drive the constraint-compliant `{status, reference}` /
+/// `{status, context}` result shape per noetl/server#29);
+/// `actionable`, `informative` (control orchestrator dispatch +
+/// log-only persistence).  Wire-encodes `execution_id` /
+/// `event_id` as `String` for JSON-number precision in browser
+/// clients, vs the envelope's `i64` — the `From` / `TryFrom`
+/// impls below handle the conversion at the boundary.
+///
+/// Pre-EE-2 (`name`-field) worker / CLI clients keep working via
+/// `#[serde(alias = "name")]`; producers that omit
+/// `event_id` / `status` / `created_at` get sensible server-side
+/// fallbacks (DB-side `snowflake_id()` for `event_id`, the
+/// name-derived `status` returned by `event_status_from_name`,
 /// `Utc::now()` for `created_at`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventRequest {
@@ -101,6 +120,82 @@ fn default_result_kind() -> String {
 
 fn default_true() -> bool {
     true
+}
+
+/// Project the canonical `noetl_events::ExecutorEvent` envelope (the
+/// shape every NoETL Rust producer emits through `EventSink`) into
+/// the server's wire request shape.
+///
+/// Server-only fields (`result_kind`, `result_uri`, `event_ids`,
+/// `actionable`, `informative`) get the same defaults the handler
+/// applies when a producer omits them.  `execution_id` + `event_id`
+/// flip to `String` because that's the wire format the server has
+/// always exposed to browser clients (JSON-number precision).
+impl From<noetl_events::ExecutorEvent> for EventRequest {
+    fn from(ev: noetl_events::ExecutorEvent) -> Self {
+        Self {
+            execution_id: ev.execution_id.to_string(),
+            step: ev.step,
+            event_type: ev.event_type,
+            payload: ev.context,
+            meta: ev.meta,
+            worker_id: ev.worker_id,
+            result_kind: default_result_kind(),
+            result_uri: None,
+            event_ids: None,
+            actionable: true,
+            informative: true,
+            event_id: ev.event_id.map(|id| id.to_string()),
+            status: Some(ev.status),
+            created_at: Some(ev.created_at),
+        }
+    }
+}
+
+/// Inverse of [`From<noetl_events::ExecutorEvent>`].  `TryFrom`
+/// rather than `From` because the wire-shape `String` execution_id
+/// and `String` event_id can fail to parse — the server returns 400
+/// in that case in the actual handler.  Server-only fields
+/// (`result_kind`, `result_uri`, `event_ids`, `actionable`,
+/// `informative`) drop on the floor here — the canonical envelope
+/// doesn't model them.  When `status` / `created_at` are absent on
+/// the request, the conversion fills them with the same fallbacks
+/// the handler uses (`event_status_from_name`, `Utc::now()`).
+impl TryFrom<&EventRequest> for noetl_events::ExecutorEvent {
+    type Error = anyhow::Error;
+
+    fn try_from(req: &EventRequest) -> std::result::Result<Self, Self::Error> {
+        let execution_id: i64 = req.execution_id.parse().map_err(|e| {
+            anyhow::anyhow!(
+                "execution_id {:?} not parseable as i64: {e}",
+                req.execution_id
+            )
+        })?;
+        let event_id = req
+            .event_id
+            .as_deref()
+            .map(|s| s.parse::<i64>())
+            .transpose()
+            .map_err(|e| {
+                anyhow::anyhow!("event_id {:?} not parseable as i64: {e}", req.event_id)
+            })?;
+        let status = req
+            .status
+            .clone()
+            .unwrap_or_else(|| event_status_from_name(&req.event_type).to_string());
+        let created_at = req.created_at.unwrap_or_else(chrono::Utc::now);
+        Ok(Self {
+            execution_id,
+            event_type: req.event_type.clone(),
+            step: req.step.clone(),
+            status,
+            created_at,
+            context: req.payload.clone(),
+            event_id,
+            worker_id: req.worker_id.clone(),
+            meta: req.meta.clone(),
+        })
+    }
 }
 
 /// Response for event handling.
@@ -1453,5 +1548,117 @@ mod tests {
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("step1"));
         assert!(json.contains("python"));
+    }
+
+    // ---- EE-4 (noetl/ai-meta#49) wire-compat with noetl-events --------
+    //
+    // The server's `EventRequest` and the canonical
+    // `noetl_events::ExecutorEvent` share a subset of fields that
+    // make up the wire envelope every NoETL Rust producer emits.
+    // The four tests below pin the round-trip semantics so a future
+    // change to either type that breaks compat fails the build
+    // here instead of in a kind-validation cycle.
+
+    #[test]
+    fn ee4_executor_event_converts_into_event_request() {
+        let executor_event = noetl_events::ExecutorEvent {
+            execution_id: 478775660589088776,
+            event_type: "command.completed".to_string(),
+            step: "fetch_calendar".to_string(),
+            status: "COMPLETED".to_string(),
+            created_at: chrono::DateTime::parse_from_rfc3339("2026-05-31T03:14:15Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+            context: serde_json::json!({"items": 42}),
+            event_id: Some(478775660589088777),
+            worker_id: Some("worker-prod-7".to_string()),
+            meta: Some(serde_json::json!({"attempts": 2})),
+        };
+        let req: EventRequest = executor_event.clone().into();
+        // String wire format for browser precision.
+        assert_eq!(req.execution_id, "478775660589088776");
+        assert_eq!(req.event_id.as_deref(), Some("478775660589088777"));
+        // Shared subset round-trips field-for-field.
+        assert_eq!(req.event_type, executor_event.event_type);
+        assert_eq!(req.step, executor_event.step);
+        assert_eq!(req.status.as_deref(), Some(executor_event.status.as_str()));
+        assert_eq!(req.created_at, Some(executor_event.created_at));
+        assert_eq!(req.payload, executor_event.context);
+        assert_eq!(req.worker_id, executor_event.worker_id);
+        assert_eq!(req.meta, executor_event.meta);
+        // Server-only fields take handler defaults.
+        assert_eq!(req.result_kind, "data");
+        assert!(req.result_uri.is_none());
+        assert!(req.event_ids.is_none());
+        assert!(req.actionable);
+        assert!(req.informative);
+    }
+
+    #[test]
+    fn ee4_event_request_converts_into_executor_event() {
+        let req = EventRequest {
+            execution_id: "478775660589088776".to_string(),
+            step: "fetch_calendar".to_string(),
+            event_type: "command.completed".to_string(),
+            payload: serde_json::json!({"items": 42}),
+            meta: Some(serde_json::json!({"attempts": 2})),
+            worker_id: Some("worker-prod-7".to_string()),
+            result_kind: "data".to_string(),
+            result_uri: None,
+            event_ids: None,
+            actionable: true,
+            informative: true,
+            event_id: Some("478775660589088777".to_string()),
+            status: Some("COMPLETED".to_string()),
+            created_at: Some(
+                chrono::DateTime::parse_from_rfc3339("2026-05-31T03:14:15Z")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc),
+            ),
+        };
+        let ev: noetl_events::ExecutorEvent =
+            (&req).try_into().expect("convert with explicit fields");
+        assert_eq!(ev.execution_id, 478775660589088776_i64);
+        assert_eq!(ev.event_id, Some(478775660589088777_i64));
+        assert_eq!(ev.status, "COMPLETED");
+        assert_eq!(ev.created_at, req.created_at.unwrap());
+        assert_eq!(ev.context, req.payload);
+        assert_eq!(ev.worker_id, req.worker_id);
+        assert_eq!(ev.meta, req.meta);
+    }
+
+    #[test]
+    fn ee4_try_from_event_request_fills_defaults_for_missing_status_and_created_at() {
+        // Producers that don't stamp `status` / `created_at` are
+        // valid on the wire; the conversion must apply the same
+        // fallbacks the handler uses, so callers building an
+        // `ExecutorEvent` for downstream emit don't see surprises.
+        let mut req = test_request_skeleton();
+        req.event_type = "command.completed".to_string();
+        req.status = None;
+        req.created_at = None;
+        let ev: noetl_events::ExecutorEvent =
+            (&req).try_into().expect("convert with defaults");
+        assert_eq!(ev.status, "COMPLETED"); // name-derived fallback
+        // created_at falls back to now(); just assert it's non-zero
+        // and recent enough to be sane.
+        let age = chrono::Utc::now() - ev.created_at;
+        assert!(age.num_seconds() >= 0 && age.num_seconds() < 60);
+    }
+
+    #[test]
+    fn ee4_try_from_event_request_rejects_non_numeric_execution_id() {
+        // The wire shape is "stringified i64".  Anything else is a
+        // bug at the producer; the conversion surfaces it instead of
+        // silently dropping the event into the log with execution_id=0.
+        let req = EventRequest {
+            execution_id: "not-a-number".to_string(),
+            ..test_request_skeleton()
+        };
+        let err = noetl_events::ExecutorEvent::try_from(&req).unwrap_err();
+        assert!(
+            err.to_string().contains("execution_id"),
+            "error should mention the field name: {err}"
+        );
     }
 }
