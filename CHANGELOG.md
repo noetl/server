@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.18.0](https://github.com/noetl/server/compare/v2.17.0...v2.18.0) (2026-06-04)
+
+### Features
+
+* **db,handlers:** cross-shard fan-out + event_id resolver (Phase F R4-4) ([86dea97](https://github.com/noetl/server/commit/86dea97e9eabf7460aac9b9186f83e727ebc2d16)), closes [noetl/server#48](https://github.com/noetl/server/issues/48) [noetl/ai-meta#49](https://github.com/noetl/ai-meta/issues/49) [noetl/server#48](https://github.com/noetl/server/issues/48) [noetl/ai-meta#49](https://github.com/noetl/ai-meta/issues/49)
+
 ## [2.17.0](https://github.com/noetl/server/compare/v2.16.0...v2.17.0) (2026-06-04)
 
 ### Features
