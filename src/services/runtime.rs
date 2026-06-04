@@ -110,12 +110,21 @@ pub struct RuntimeFilter {
 #[derive(Clone)]
 pub struct RuntimeService {
     db: DbPool,
+    snowflake: std::sync::Arc<crate::snowflake::SnowflakeGenerator>,
 }
 
 impl RuntimeService {
     /// Create a new runtime service.
-    pub fn new(db: DbPool) -> Self {
-        Self { db }
+    ///
+    /// `snowflake` is the application-side ID generator shared
+    /// with `AppState` and the other services.  Phase F R1.5 of
+    /// noetl/ai-meta#49 moved id generation out of the DB-side
+    /// `noetl.snowflake_id()` function.
+    pub fn new(
+        db: DbPool,
+        snowflake: std::sync::Arc<crate::snowflake::SnowflakeGenerator>,
+    ) -> Self {
+        Self { db, snowflake }
     }
 
     /// Register a new runtime (worker pool, server, or broker).
@@ -131,10 +140,11 @@ impl RuntimeService {
             }
         };
 
-        // Generate runtime_id
-        let runtime_id: (i64,) = sqlx::query_as("SELECT noetl.snowflake_id()")
-            .fetch_one(&self.db)
-            .await?;
+        // Generate runtime_id via the application-side snowflake
+        // generator (Phase F R1.5 of noetl/ai-meta#49).  Wrap in
+        // a 1-tuple to keep the existing destructuring shape
+        // below.
+        let runtime_id: (i64,) = (self.snowflake.generate()?,);
 
         let now = Utc::now();
 
