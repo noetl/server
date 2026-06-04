@@ -4,7 +4,7 @@
 //! using the `envy` crate for type-safe environment variable parsing.
 
 mod app;
-mod database;
+pub mod database;
 
 pub use app::AppConfig;
-pub use database::DatabaseConfig;
+pub use database::{DatabaseConfig, ShardConnection, ShardConnectionError, ShardingConfig};
