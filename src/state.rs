@@ -46,10 +46,10 @@ impl AppState {
     /// * `config` - Application configuration
     /// * `nats` - Optional NATS client
     ///
-    /// Reads `machine_id` from `config.machine_id` (envy:
-    /// `NOETL_SERVER_MACHINE_ID`).  When unset, derives a 10-bit
-    /// id from the process hostname via FNV-1a — fine for local
-    /// dev; the deployment manifest should set the env var
+    /// Reads `server_machine_id` from `config.server_machine_id`
+    /// (envy: `NOETL_SERVER_MACHINE_ID`).  When unset, derives a
+    /// 10-bit id from the process hostname via FNV-1a — fine for
+    /// local dev; the deployment manifest should set the env var
     /// explicitly per replica in production.
     ///
     /// # Returns
@@ -58,21 +58,21 @@ impl AppState {
     ///
     /// # Panics
     ///
-    /// Panics if the configured `machine_id` exceeds the 10-bit
-    /// max (1023).  The caller should validate at config-load
-    /// time; this is the last-resort guard.
+    /// Panics if the configured `server_machine_id` exceeds the
+    /// 10-bit max (1023).  The caller should validate at
+    /// config-load time; this is the last-resort guard.
     pub fn new(db: DbPool, config: AppConfig, nats: Option<async_nats::Client>) -> Self {
-        let machine_id = config.machine_id.unwrap_or_else(|| {
+        let machine_id = config.server_machine_id.unwrap_or_else(|| {
             let hostname = std::env::var("HOSTNAME")
                 .or_else(|_| std::env::var("COMPUTERNAME"))
                 .unwrap_or_else(|_| "noetl-server-local".to_string());
             derive_machine_id(&hostname)
         });
         let snowflake = SnowflakeGenerator::new(machine_id)
-            .expect("machine_id must fit in 10 bits; validate config at startup");
+            .expect("server_machine_id must fit in 10 bits; validate config at startup");
         tracing::info!(
             machine_id = snowflake.machine_id(),
-            source = if config.machine_id.is_some() {
+            source = if config.server_machine_id.is_some() {
                 "NOETL_SERVER_MACHINE_ID"
             } else {
                 "derived from HOSTNAME"
