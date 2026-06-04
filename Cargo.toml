@@ -1,6 +1,6 @@
 [package]
 name = "noetl-server"
-version = "2.10.1"
+version = "2.11.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/noetl/noetl"
@@ -81,6 +81,15 @@ regex = "1"
 # Prometheus metrics surface — exposed at GET /metrics per
 # agents/rules/observability.md (Principle 1, Principle 2).
 prometheus = "0.13"
+
+# Stable hash for the shard-routing helper in src/sharding.rs
+# (Phase F R2 of noetl/ai-meta#49).  Fixed-seed XxHash64; the
+# output is fixed by the crate major version and the seed
+# constant, so the shard assignment for a given execution_id +
+# shard_count is stable across Rust releases, server restarts,
+# and server replicas.  See the sharding-design page on the
+# noetl/server wiki for why a stable hash matters.
+twox-hash = "1.6"
 
 [dev-dependencies]
 tokio-test = "0.4"
