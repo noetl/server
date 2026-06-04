@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.12.0](https://github.com/noetl/server/compare/v2.11.0...v2.12.0) (2026-06-04)
+
+### Features
+
+* **sharding:** GET /api/runtime/shard-info diagnostic endpoint (Phase F R3b-1) ([6be4f3a](https://github.com/noetl/server/commit/6be4f3a3617b038aafeea5b825d38b0bdad47c1f)), closes [noetl/ai-meta#49](https://github.com/noetl/ai-meta/issues/49) [noetl/server#46](https://github.com/noetl/server/issues/46) [noetl/ai-meta#49](https://github.com/noetl/ai-meta/issues/49)
+
 ## [2.11.0](https://github.com/noetl/server/compare/v2.10.1...v2.11.0) (2026-06-04)
 
 ### Features
