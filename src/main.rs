@@ -202,6 +202,17 @@ fn build_router(
         // backport; see noetl/server follow-up issue.
         .with_state(runtime_service);
 
+    // Sharding diagnostic — Phase F R3b-1 of noetl/ai-meta#49.
+    // Public endpoint; pure math; no auth gate.  Pair with the
+    // gateway twin (Phase F R3b-2) and the integration test
+    // (R3b-3 in noetl/ops) for the end-to-end drift-guard.
+    let sharding_routes = Router::new()
+        .route(
+            "/api/runtime/shard-info",
+            get(handlers::sharding::get_shard_info),
+        )
+        .with_state(state.clone());
+
     // Database routes
     let database_routes = Router::new()
         .route(
@@ -282,6 +293,7 @@ fn build_router(
         .merge(executions_routes)
         .merge(variable_routes)
         .merge(runtime_routes)
+        .merge(sharding_routes)
         .merge(database_routes)
         .merge(internal_routes)
         .merge(system_routes)

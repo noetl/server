@@ -13,6 +13,7 @@ pub mod health;
 pub mod internal;
 pub mod keychain;
 pub mod runtime;
+pub mod sharding;
 pub mod system;
 pub mod variables;
 
