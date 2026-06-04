@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.11.0](https://github.com/noetl/server/compare/v2.10.1...v2.11.0) (2026-06-04)
+
+### Features
+
+* **sharding:** server-side shard_id() helper + ShardConfig (Phase F R2) ([daa1294](https://github.com/noetl/server/commit/daa129435f16164beba11c943795946184d5bf58)), closes [noetl/ai-meta#49](https://github.com/noetl/ai-meta/issues/49) [noetl/server#44](https://github.com/noetl/server/issues/44) [noetl/ai-meta#49](https://github.com/noetl/ai-meta/issues/49)
+
 ## [2.10.1](https://github.com/noetl/server/compare/v2.10.0...v2.10.1) (2026-06-04)
 
 ### Bug Fixes
