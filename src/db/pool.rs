@@ -192,6 +192,23 @@ impl DbPoolMap {
         })
     }
 
+    /// Build a single-pool fallback [`DbPoolMap`] from an
+    /// already-created [`DbPool`].  Sync constructor for callers
+    /// (tests, the legacy `main.rs` path) that already have a
+    /// pool in hand and don't want to re-resolve `ShardingConfig`.
+    ///
+    /// The result behaves identically to the single-pool branch
+    /// of [`DbPoolMap::new`]: one shard whose pool is also the
+    /// cluster pool; every accessor returns `pool`.
+    pub fn from_single_pool(pool: DbPool) -> Self {
+        Self {
+            shards: Arc::new(vec![pool.clone()]),
+            cluster: pool,
+            shard_count: 1,
+            single_pool_mode: true,
+        }
+    }
+
     /// Number of shard pools configured.  Always `>= 1`.
     pub fn shard_count(&self) -> u32 {
         self.shard_count
@@ -297,5 +314,49 @@ mod tests {
         assert_eq!(shard_for(42, 1), 0);
         assert_eq!(shard_for(9_999_999_999, 1), 0);
         assert_eq!(shard_for(-1, 1), 0);
+    }
+
+    // ----- DbPoolMap::from_single_pool (R4-2) ---------------------------------
+
+    // The `from_single_pool` constructor lets `AppState::new_legacy`
+    // (Phase F R4-2) wrap an already-created `DbPool` without
+    // re-resolving `ShardingConfig`.  These tests don't need a
+    // live Postgres — they exercise the struct shape only.
+    // Building a `PgPool` without connecting requires sqlx's
+    // `PgPoolOptions::connect_lazy_with`; we use that to fabricate
+    // a dummy pool whose accessor identity we then verify.
+
+    fn dummy_pool() -> DbPool {
+        use sqlx::postgres::PgConnectOptions;
+        PgPoolOptions::new()
+            .max_connections(1)
+            .connect_lazy_with(PgConnectOptions::new().host("localhost"))
+    }
+
+    #[tokio::test]
+    async fn from_single_pool_marks_fallback_mode() {
+        let pool = dummy_pool();
+        let map = DbPoolMap::from_single_pool(pool);
+        assert!(map.is_single_pool());
+        assert_eq!(map.shard_count(), 1);
+        // pool_for must short-circuit and not hash; the value
+        // we return for any execution_id is the only pool.
+        // (We don't compare the pool by identity here — sqlx
+        // doesn't expose Arc internals — but we do verify
+        // `shard_count() == 1` and that `all_shards()` yields
+        // exactly one entry.)
+        assert_eq!(map.all_shards().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn from_single_pool_pool_for_does_not_panic_on_negative_eid() {
+        // Regression guard: `shard_for(-1, 1)` short-circuits to
+        // 0; pool_for indexes into `shards[0]`.  Make sure the
+        // single-pool path is safe for the i64-extreme inputs
+        // the R3b drift-guard exercises.
+        let map = DbPoolMap::from_single_pool(dummy_pool());
+        let _ = map.pool_for(-1);
+        let _ = map.pool_for(i64::MAX);
+        let _ = map.pool_for(0);
     }
 }
