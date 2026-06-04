@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.10.0](https://github.com/noetl/server/compare/v2.9.0...v2.10.0) (2026-06-04)
+
+### Features
+
+* **snowflake:** app-side snowflake ID generation (Phase F R1.5) ([896d5a1](https://github.com/noetl/server/commit/896d5a13288decac088105f607ef4305bfb4888c)), closes [noetl/server#41](https://github.com/noetl/server/issues/41) [noetl/ai-meta#49](https://github.com/noetl/ai-meta/issues/49)
+
 ## [2.9.0](https://github.com/noetl/server/compare/v2.8.3...v2.9.0) (2026-06-04)
 
 ### Features
