@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.19.0](https://github.com/noetl/server/compare/v2.18.0...v2.19.0) (2026-06-04)
+
+### Features
+
+* **services:** ExecutionService takes DbPoolMap (Phase F R4-4b) ([18cfb74](https://github.com/noetl/server/commit/18cfb740eeb5214b5795286bb82161eba8624930)), closes [noetl/server#48](https://github.com/noetl/server/issues/48) [noetl/ai-meta#49](https://github.com/noetl/ai-meta/issues/49) [noetl/server#48](https://github.com/noetl/server/issues/48) [noetl/ai-meta#49](https://github.com/noetl/ai-meta/issues/49)
+
 ## [2.18.0](https://github.com/noetl/server/compare/v2.17.0...v2.18.0) (2026-06-04)
 
 ### Features
