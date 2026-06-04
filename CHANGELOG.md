@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.15.0](https://github.com/noetl/server/compare/v2.14.0...v2.15.0) (2026-06-04)
+
+### Features
+
+* **handlers:** cut events.rs over to DbPoolMap (Phase F R4-3a) ([515ed3d](https://github.com/noetl/server/commit/515ed3df0b9c51b7b7b22a054b8c3a6889d07c54)), closes [noetl/server#48](https://github.com/noetl/server/issues/48) [noetl/ai-meta#49](https://github.com/noetl/ai-meta/issues/49) [noetl/server#48](https://github.com/noetl/server/issues/48) [noetl/ai-meta#49](https://github.com/noetl/ai-meta/issues/49)
+
 ## [2.14.0](https://github.com/noetl/server/compare/v2.13.0...v2.14.0) (2026-06-04)
 
 ### Features
