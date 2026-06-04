@@ -455,7 +455,11 @@ async fn main() -> anyhow::Result<()> {
     let catalog_service = CatalogService::new(db_pool.clone());
     let credential_service = CredentialService::new(db_pool.clone(), &encryption_key)?;
     let keychain_service = KeychainService::new(db_pool.clone(), &encryption_key)?;
-    let execution_service = ExecutionService::new(db_pool.clone(), state.snowflake.clone());
+    // Phase F R4-4b: ExecutionService now takes the DbPoolMap so
+    // its per-execution methods route via pool_for(execution_id)
+    // and `list()` fan-outs via for_each_shard.  In single-pool
+    // fallback mode this is the same handle as db_pool.
+    let execution_service = ExecutionService::new(state.pools.clone(), state.snowflake.clone());
     let runtime_service = RuntimeService::new(db_pool.clone(), state.snowflake.clone());
 
     // Build the router
