@@ -36,7 +36,10 @@
 //!     let app_config = AppConfig::from_env()?;
 //!     let db_config = DatabaseConfig::from_env()?;
 //!     let db_pool = create_pool(&db_config).await?;
-//!     let state = AppState::new(db_pool, app_config, None);
+//!     // Single-pool fallback shim — production main.rs builds
+//!     // the DbPoolMap from ShardingConfig::from_env() for the
+//!     // sharded path; test / example code uses new_legacy.
+//!     let state = AppState::new_legacy(db_pool, app_config, None);
 //!     // ... build and run server
 //!     Ok(())
 //! }

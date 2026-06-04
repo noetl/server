@@ -4,7 +4,7 @@
 //! passed to all handlers via Axum's state management.
 
 use crate::config::AppConfig;
-use crate::db::DbPool;
+use crate::db::{DbPool, DbPoolMap};
 use crate::sharding::ShardConfig;
 use crate::snowflake::{derive_machine_id, SnowflakeGenerator};
 use std::sync::Arc;
@@ -15,8 +15,43 @@ use std::sync::Arc;
 /// It is wrapped in an `Arc` and passed to handlers via Axum's state.
 #[derive(Clone)]
 pub struct AppState {
-    /// Database connection pool
+    /// Legacy database connection pool.
+    ///
+    /// In single-pool fallback mode (Phase F R4-1's
+    /// `NOETL_SHARDS` empty), this IS the only pool — every
+    /// handler that hasn't migrated to [`Self::pools`] uses it.
+    /// In sharded mode, `db` is the cluster-wide pool (the
+    /// always-master pool for catalog / credential / keychain /
+    /// runtime / etc.) so handlers that read cluster-wide tables
+    /// keep working without R4-3 touching them.
+    ///
+    /// Phase F R4-3 migrates per-execution call sites to
+    /// `self.pools.pool_for(execution_id)`.  Until that round
+    /// lands, every handler reads from `db` regardless of which
+    /// table they touch — which is correct in fallback mode
+    /// (one pool everywhere) and incorrect-but-tolerated in
+    /// sharded mode (per-execution tables would still go to the
+    /// cluster master; this is why the kind validation in R4-5
+    /// only fires after R4-3 ships).
     pub db: DbPool,
+
+    /// Sharded pool map — N per-shard pools + 1 cluster pool.
+    ///
+    /// Phase F R4-2 of
+    /// [noetl/ai-meta#49](https://github.com/noetl/ai-meta/issues/49)
+    /// added this.  Use [`DbPoolMap::pool_for`] for per-execution
+    /// tables (`event`, `command`, `execution`, `outbox`,
+    /// `transient`, `stage`, `frame`, `projection`,
+    /// `projection_snapshot`, `result_ref`) and
+    /// [`DbPoolMap::cluster`] for cluster-wide tables
+    /// (`catalog`, `credential`, `keychain`, `runtime`,
+    /// `schedule`, `resource`, `manifest`, `manifest_part`).
+    ///
+    /// In single-pool fallback mode (NOETL_SHARDS empty), every
+    /// accessor returns the same pool as [`Self::db`] — handlers
+    /// that opt into `pools` get bit-identical behaviour to the
+    /// legacy path.
+    pub pools: DbPoolMap,
 
     /// Application configuration
     pub config: Arc<AppConfig>,
@@ -53,7 +88,13 @@ impl AppState {
     ///
     /// # Arguments
     ///
-    /// * `db` - Database connection pool
+    /// * `db` - Legacy database connection pool (kept for handlers
+    ///   not yet migrated to [`Self::pools`] — see field doc).
+    /// * `pools` - Sharded pool map.  In single-pool fallback
+    ///   mode this is constructed from the same `db` connection
+    ///   via [`DbPoolMap::new`] with an empty [`crate::config::ShardingConfig`];
+    ///   callers should use [`AppState::new_legacy`] when they
+    ///   don't have a separate `ShardingConfig` to pass.
     /// * `config` - Application configuration
     /// * `nats` - Optional NATS client
     ///
@@ -72,7 +113,12 @@ impl AppState {
     /// Panics if the configured `server_machine_id` exceeds the
     /// 10-bit max (1023).  The caller should validate at
     /// config-load time; this is the last-resort guard.
-    pub fn new(db: DbPool, config: AppConfig, nats: Option<async_nats::Client>) -> Self {
+    pub fn new(
+        db: DbPool,
+        pools: DbPoolMap,
+        config: AppConfig,
+        nats: Option<async_nats::Client>,
+    ) -> Self {
         let machine_id = config.server_machine_id.unwrap_or_else(|| {
             let hostname = std::env::var("HOSTNAME")
                 .or_else(|_| std::env::var("COMPUTERNAME"))
@@ -117,12 +163,32 @@ impl AppState {
 
         Self {
             db,
+            pools,
             config: Arc::new(config),
             nats: nats.map(Arc::new),
             snowflake: Arc::new(snowflake),
             shard: Arc::new(shard),
             start_time: std::time::Instant::now(),
         }
+    }
+
+    /// Convenience constructor for tests + paths that haven't
+    /// loaded a [`ShardingConfig`] yet.  Wraps the legacy `db`
+    /// pool in a single-pool [`DbPoolMap`] (no per-shard pools,
+    /// no separate cluster pool — the same `db` handle covers
+    /// every accessor).
+    ///
+    /// `main.rs` uses the full [`AppState::new`] with a pool map
+    /// built from [`ShardingConfig::from_env`] so the production
+    /// path honors `NOETL_SHARDS` if set.  Test code that
+    /// already has a `DbPool` in hand uses this shim.
+    pub fn new_legacy(
+        db: DbPool,
+        config: AppConfig,
+        nats: Option<async_nats::Client>,
+    ) -> Self {
+        let pools = DbPoolMap::from_single_pool(db.clone());
+        Self::new(db, pools, config, nats)
     }
 
     /// Get the server uptime in seconds.

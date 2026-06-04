@@ -14,8 +14,8 @@ use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use noetl_server::{
-    config::{AppConfig, DatabaseConfig},
-    db::{create_pool, DbPool},
+    config::{AppConfig, DatabaseConfig, ShardingConfig},
+    db::{create_pool, DbPool, DbPoolMap},
     handlers,
     services::{
         CatalogService, CredentialService, ExecutionService, KeychainService, RuntimeService,
@@ -410,8 +410,34 @@ async fn main() -> anyhow::Result<()> {
         "Configuration loaded"
     );
 
-    // Create database connection pool
+    // Create database connection pool (legacy single pool — kept
+    // as the cluster-wide pool in DbPoolMap's fallback branch
+    // and as `AppState.db` for handlers that haven't migrated
+    // to the pool map yet, per R4-2).
     let db_pool = create_pool(&db_config).await?;
+
+    // Phase F R4-2 of noetl/ai-meta#49: load sharding config
+    // and build the DbPoolMap.  When NOETL_SHARDS is empty
+    // (today's default), DbPoolMap::new short-circuits to a
+    // single-pool fallback that wraps `db_pool` itself —
+    // behaviour bit-identical to pre-R4 single-host deployments.
+    let sharding_config = ShardingConfig::from_env().unwrap_or_else(|e| {
+        tracing::warn!(
+            error = %e,
+            "Failed to parse NOETL_SHARDS / NOETL_CLUSTER_DSN; falling back to single-pool mode"
+        );
+        ShardingConfig::default()
+    });
+    let pools = if sharding_config.is_disabled() {
+        DbPoolMap::from_single_pool(db_pool.clone())
+    } else {
+        DbPoolMap::new(&db_config, &sharding_config).await?
+    };
+    tracing::info!(
+        shard_count = pools.shard_count(),
+        single_pool_mode = pools.is_single_pool(),
+        "Database pool map ready"
+    );
 
     // Connect to NATS (optional)
     let nats_client = connect_nats(&app_config).await;
@@ -423,7 +449,7 @@ async fn main() -> anyhow::Result<()> {
     // (Phase F R1.5 of noetl/ai-meta#49) is initialized once and
     // shared with the services below.  Services that need to mint
     // ids take a clone of `state.snowflake` (an `Arc`).
-    let state = AppState::new(db_pool.clone(), app_config.clone(), nats_client);
+    let state = AppState::new(db_pool.clone(), pools, app_config.clone(), nats_client);
 
     // Create services
     let catalog_service = CatalogService::new(db_pool.clone());
