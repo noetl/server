@@ -458,7 +458,7 @@ async fn handle_event_inner(
     .bind(&result_obj)
     .bind(&meta_obj)
     .bind(created_at)
-    .execute(&state.db)
+    .execute(state.pools.pool_for(execution_id))
     .await?;
 
     info!(
@@ -510,6 +510,15 @@ pub async fn get_command(
 ) -> Result<Json<CommandResponse>, AppError> {
     debug!("Getting command for event_id={}", event_id);
 
+    // Phase F R4-3: `GET /api/commands/{event_id}` is keyed by
+    // event_id alone — execution_id isn't known until after this
+    // lookup, so we can't pick a per-execution pool yet.  In
+    // single-pool fallback mode (today's default) `state.db` IS
+    // the only pool and this works as-is.  When sharding is on,
+    // this endpoint needs the R4-4 cluster-wide fan-out helper
+    // (query every shard, return the first hit).  TODO(R4-4):
+    // replace `state.db` with `state.pools.find_in_any_shard(...)`
+    // once that helper lands.
     let row: Option<(i64, String, String, serde_json::Value, serde_json::Value)> =
         sqlx::query_as::<_, (i64, String, String, serde_json::Value, serde_json::Value)>(
             r#"
@@ -551,6 +560,18 @@ pub async fn claim_command(
         event_id, request.worker_id
     );
 
+    // Phase F R4-3: `claim_command` is keyed by event_id alone —
+    // execution_id is read out of the first SELECT inside the
+    // transaction.  We can't open the tx on the per-execution
+    // pool until we know which shard owns this event_id.
+    // Pragmatic stance: open the tx on `state.db` (the only pool
+    // in fallback mode; the cluster pool in sharded mode).  In
+    // sharded mode this endpoint is non-functional until R4-4
+    // adds a fan-out resolver — the endpoint contract carries
+    // event_id but not execution_id, so a path-param redesign or
+    // a multi-shard probe is needed.  TODO(R4-4): resolve
+    // event_id → execution_id (via cross-shard probe or new path
+    // param), then `pool_for(execution_id).begin().await?`.
     let mut tx = state.db.begin().await?;
 
     let cmd_row = sqlx::query(
@@ -775,7 +796,8 @@ pub async fn handle_batch_events(
         .map_err(|_| AppError::Validation("Invalid execution_id".to_string()))?;
 
     let catalog_id = get_catalog_id(&state, execution_id).await?;
-    let mut tx = state.db.begin().await?;
+    // Phase F R4-3: batch writes land on this execution's shard.
+    let mut tx = state.pools.pool_for(execution_id).begin().await?;
     let mut event_ids = Vec::with_capacity(request.events.len());
 
     for item in &request.events {
@@ -910,7 +932,7 @@ async fn check_already_claimed(
         )
         .bind(execution_id)
         .bind(command_id)
-        .fetch_optional(&state.db)
+        .fetch_optional(state.pools.pool_for(execution_id))
         .await?;
 
     if let Some((existing_worker, meta)) = row {
@@ -1010,7 +1032,7 @@ async fn get_catalog_id(state: &AppState, execution_id: i64) -> AppResult<Option
         "SELECT catalog_id FROM noetl.event WHERE execution_id = $1 LIMIT 1",
     )
     .bind(execution_id)
-    .fetch_optional(&state.db)
+    .fetch_optional(state.pools.pool_for(execution_id))
     .await?;
 
     Ok(row.map(|(id,)| id))
@@ -1094,7 +1116,7 @@ async fn trigger_orchestrator(
         "#,
     )
     .bind(execution_id)
-    .fetch_all(&state.db)
+    .fetch_all(state.pools.pool_for(execution_id))
     .await?;
 
     let events: Vec<crate::db::models::Event> = rows
@@ -1141,11 +1163,12 @@ async fn trigger_orchestrator(
             ))
         })?;
 
+    // Phase F R4-3: noetl.catalog is a cluster-wide table.
     let playbook_yaml: String = sqlx::query_scalar(
         "SELECT content FROM noetl.catalog WHERE catalog_id = $1",
     )
     .bind(catalog_id)
-    .fetch_one(&state.db)
+    .fetch_one(state.pools.cluster())
     .await
     .map_err(|e| {
         AppError::Internal(format!(
@@ -1208,7 +1231,7 @@ async fn trigger_orchestrator(
         .bind(serde_json::json!({"emitted_by": "orchestrator"}))
         .bind(chrono::Utc::now())
         .bind(trigger_event_id)
-        .execute(&state.db)
+        .execute(state.pools.pool_for(execution_id))
         .await?;
     }
 
@@ -1266,7 +1289,7 @@ async fn trigger_orchestrator(
         .bind(terminal_meta)
         .bind(chrono::Utc::now())
         .bind(trigger_event_id)
-        .execute(&state.db)
+        .execute(state.pools.pool_for(execution_id))
         .await?;
         info!(
             execution_id,
