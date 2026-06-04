@@ -64,6 +64,21 @@ pub struct AppConfig {
     /// override.
     #[serde(default)]
     pub public_server_url: Option<String>,
+
+    /// 10-bit machine id for the application-side snowflake
+    /// generator.  Envy maps `NOETL_SERVER_MACHINE_ID`.  Each
+    /// noetl-server pod in a deployment must have a distinct
+    /// value (1024 distinct values possible).  When unset, the
+    /// id is derived from the pod hostname at startup — fine
+    /// for local dev / single-node deployments; the deployment
+    /// manifest should set it explicitly per replica in
+    /// production to avoid hash collisions.
+    ///
+    /// Phase F R1.5 of noetl/ai-meta#49 introduced this.  See
+    /// `src/snowflake.rs` for the id layout and the migration
+    /// rationale.
+    #[serde(default)]
+    pub machine_id: Option<u16>,
 }
 
 fn default_host() -> String {
@@ -119,6 +134,7 @@ impl Default for AppConfig {
             runtime_sweep_interval: default_sweep_interval(),
             runtime_offline_seconds: default_offline_seconds(),
             public_server_url: None,
+            machine_id: None,
         }
     }
 }

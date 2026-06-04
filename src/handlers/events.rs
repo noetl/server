@@ -394,16 +394,19 @@ async fn handle_event_inner(
     // SECURITY: Sanitize result data to remove sensitive information (tokens, passwords, etc.)
     let result_obj = sanitize_sensitive_data(&result_obj_raw);
 
-    // Resolve event_id.  R-1.2 PR-EE-2: prefer the
-    // application-side snowflake from the request when present
-    // (per `agents/rules/observability.md` Principle 3); fall
-    // back to the server-side `noetl.snowflake_id()` function
-    // when omitted.
+    // Resolve event_id.  Producers may stamp it client-side per
+    // `agents/rules/observability.md` Principle 3 (worker, CLI in
+    // distributed mode); when omitted, the server now stamps via
+    // its own application-side `SnowflakeGenerator` instead of
+    // the DB-side `noetl.snowflake_id()` function.  Phase F R1.5
+    // (noetl/ai-meta#49) moved the fallback path here so the id
+    // is available before the INSERT span opens and so per-shard
+    // generation can be controlled via `NOETL_SERVER_MACHINE_ID`.
     let event_id: i64 = match request.event_id.as_deref() {
         Some(raw) => raw.parse().map_err(|_| {
             AppError::Validation(format!("Invalid event_id: {raw}"))
         })?,
-        None => generate_snowflake_id(&state).await?,
+        None => state.snowflake.generate()?,
     };
 
     // Get catalog_id from existing events
@@ -692,7 +695,7 @@ pub async fn claim_command(
         }
     }
 
-    let claim_event_id = generate_snowflake_id_with_tx(&mut tx).await?;
+    let claim_event_id = state.snowflake.generate()?;
     // Constraint-compliant `{status, context}` envelope — see
     // noetl/server#29 for why `{kind, data}` was rejected.  The
     // explicit claim path was missed in v2.4.3 because the load
@@ -776,10 +779,12 @@ pub async fn handle_batch_events(
     let mut event_ids = Vec::with_capacity(request.events.len());
 
     for item in &request.events {
-        // Batch path uses server-side snowflake (app-side event_id
-        // per item isn't carried in BatchEventItem yet; left as a
-        // follow-up if batch becomes the worker's primary path).
-        let event_id = generate_snowflake_id_with_tx(&mut tx).await?;
+        // Batch path uses the application-side snowflake
+        // generator (Phase F R1.5 of noetl/ai-meta#49).  Per-item
+        // app-side event_id isn't carried in BatchEventItem yet;
+        // left as a follow-up if batch becomes the worker's
+        // primary path.
+        let event_id = state.snowflake.generate()?;
         let status = event_status_from_name(&item.event_type);
 
         // Constraint-compliant `{status, context}` envelope per
@@ -1011,25 +1016,6 @@ async fn get_catalog_id(state: &AppState, execution_id: i64) -> AppResult<Option
     Ok(row.map(|(id,)| id))
 }
 
-/// Generate a snowflake ID.
-async fn generate_snowflake_id(state: &AppState) -> AppResult<i64> {
-    let row: (i64,) = sqlx::query_as::<_, (i64,)>("SELECT noetl.snowflake_id()")
-        .fetch_one(&state.db)
-        .await?;
-
-    Ok(row.0)
-}
-
-/// Generate a snowflake ID using an existing transaction.
-async fn generate_snowflake_id_with_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-) -> AppResult<i64> {
-    let row: (i64,) = sqlx::query_as::<_, (i64,)>("SELECT noetl.snowflake_id()")
-        .fetch_one(&mut **tx)
-        .await?;
-    Ok(row.0)
-}
-
 /// Map event name to status.
 fn event_status_from_name(event_name: &str) -> &'static str {
     if event_name.contains("done")
@@ -1186,7 +1172,7 @@ async fn trigger_orchestrator(
     // 4. Emit pure events (step.enter etc.) before issuing new
     //    commands so the causal chain is correct.
     for emit in &result.events_to_emit {
-        let event_id = generate_snowflake_id(state).await?;
+        let event_id = state.snowflake.generate()?;
         let event_status = if emit.status.is_empty() {
             "STARTED".to_string()
         } else {
@@ -1259,7 +1245,7 @@ async fn trigger_orchestrator(
             Some(cs) if cs.status == "FAILED" => ("playbook.failed", "FAILED"),
             _ => ("playbook.completed", "COMPLETED"),
         };
-        let event_id = generate_snowflake_id(state).await?;
+        let event_id = state.snowflake.generate()?;
         let terminal_meta = serde_json::to_value(&result.completion_status).unwrap_or_default();
         sqlx::query(
             r#"

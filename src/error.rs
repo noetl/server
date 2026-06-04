@@ -146,6 +146,18 @@ impl From<envy::Error> for AppError {
     }
 }
 
+impl From<crate::snowflake::SnowflakeError> for AppError {
+    fn from(err: crate::snowflake::SnowflakeError) -> Self {
+        // Snowflake errors are always 500-class: either the
+        // system clock is broken (ClockBeforeEpoch), the state
+        // mutex was poisoned (a panic happened inside generate(),
+        // which shouldn't), or the config wasn't validated at
+        // startup (MachineIdOutOfRange — should be impossible
+        // here since AppState::new validates).
+        AppError::Internal(err.to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

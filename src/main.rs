@@ -407,15 +407,18 @@ async fn main() -> anyhow::Result<()> {
     // Get encryption key
     let encryption_key = get_encryption_key();
 
+    // Create application state first so the snowflake generator
+    // (Phase F R1.5 of noetl/ai-meta#49) is initialized once and
+    // shared with the services below.  Services that need to mint
+    // ids take a clone of `state.snowflake` (an `Arc`).
+    let state = AppState::new(db_pool.clone(), app_config.clone(), nats_client);
+
     // Create services
     let catalog_service = CatalogService::new(db_pool.clone());
     let credential_service = CredentialService::new(db_pool.clone(), &encryption_key)?;
     let keychain_service = KeychainService::new(db_pool.clone(), &encryption_key)?;
-    let execution_service = ExecutionService::new(db_pool.clone());
-    let runtime_service = RuntimeService::new(db_pool.clone());
-
-    // Create application state
-    let state = AppState::new(db_pool.clone(), app_config.clone(), nats_client);
+    let execution_service = ExecutionService::new(db_pool.clone(), state.snowflake.clone());
+    let runtime_service = RuntimeService::new(db_pool.clone(), state.snowflake.clone());
 
     // Build the router
     let app = build_router(

@@ -81,8 +81,11 @@ pub async fn execute(
     // Parse playbook
     let playbook = crate::playbook::parser::parse_playbook(&playbook_yaml)?;
 
-    // Generate execution_id
-    let execution_id = generate_snowflake_id(&state).await?;
+    // Generate execution_id via the application-side snowflake
+    // generator (Phase F R1.5 of noetl/ai-meta#49).  ID is
+    // available before any I/O so spans + metrics can use it
+    // immediately and retries stay idempotent.
+    let execution_id = state.snowflake.generate()?;
 
     // Build workload from payload
     let workload = serde_json::to_value(&request.payload)
@@ -180,15 +183,6 @@ async fn get_playbook_yaml(state: &AppState, catalog_id: i64) -> AppResult<Strin
     }
 }
 
-/// Generate a snowflake ID.
-async fn generate_snowflake_id(state: &AppState) -> AppResult<i64> {
-    let row: (i64,) = sqlx::query_as::<_, (i64,)>("SELECT noetl.snowflake_id()")
-        .fetch_one(&state.db)
-        .await?;
-
-    Ok(row.0)
-}
-
 /// Emit playbook_started event.
 async fn emit_playbook_started_event(
     state: &AppState,
@@ -198,7 +192,7 @@ async fn emit_playbook_started_event(
     workload: &serde_json::Value,
     parent_execution_id: Option<i64>,
 ) -> AppResult<i64> {
-    let event_id = generate_snowflake_id(state).await?;
+    let event_id = state.snowflake.generate()?;
 
     let context = serde_json::json!({
         "catalog_id": catalog_id.to_string(),
@@ -273,7 +267,7 @@ pub(crate) async fn persist_engine_command(
     render_context: &HashMap<String, serde_json::Value>,
     playbook: &crate::playbook::types::Playbook,
 ) -> AppResult<i64> {
-    let event_id = generate_snowflake_id(state).await?;
+    let event_id = state.snowflake.generate()?;
 
     // R3b iterator fan-out: include the iteration index in
     // command_id so each per-iteration command row has a unique
@@ -480,7 +474,7 @@ async fn insert_command_row(
     context: &serde_json::Value,
     meta: &serde_json::Value,
 ) -> AppResult<()> {
-    let command_id = generate_snowflake_id(state).await?;
+    let command_id = state.snowflake.generate()?;
     // No ON CONFLICT clause: `noetl.command` is a partitioned
     // table, so a PRIMARY KEY index on the partition root doesn't
     // exist — only per-partition indexes do.  PG rejects
