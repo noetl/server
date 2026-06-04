@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.13.0](https://github.com/noetl/server/compare/v2.12.0...v2.13.0) (2026-06-04)
+
+### Features
+
+* **config,db:** add ShardingConfig + DbPoolMap (Phase F R4-1) ([6b4000c](https://github.com/noetl/server/commit/6b4000ce25a722c5618d78fee1ef8859d845f4d1)), closes [noetl/server#48](https://github.com/noetl/server/issues/48) [noetl/ai-meta#49](https://github.com/noetl/ai-meta/issues/49) [noetl/server#48](https://github.com/noetl/server/issues/48) [noetl/ai-meta#49](https://github.com/noetl/ai-meta/issues/49)
+
 ## [2.12.0](https://github.com/noetl/server/compare/v2.11.0...v2.12.0) (2026-06-04)
 
 ### Features
