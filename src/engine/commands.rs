@@ -132,7 +132,32 @@ impl CommandBuilder {
         iter_context.insert("_total".to_string(), serde_json::json!(iterator.total));
 
         // Build tool command from definition with iterator context
-        let tool_command = self.build_tool_from_definition(&step.tool, &iter_context)?;
+        let mut tool_command = self.build_tool_from_definition(&step.tool, &iter_context)?;
+
+        // Phase D R3b-2: also inject the iteration variables into
+        // the tool's `args` map.  The worker's Python tool exposes
+        // `args` keys as Python globals via `globals().update(args)`
+        // — without this, a `step.loop` over `items: [1,2,3]` with
+        // a Python tool referencing `item` / `_index` / `_total`
+        // raises `NameError: name 'item' is not defined` on the
+        // worker side.  Other tool kinds (shell, http, duckdb)
+        // also benefit from getting the iter vars in `args` for the
+        // same Jinja-rendering reason — keys with templates like
+        // `{{ item }}` rendered earlier resolve correctly, but raw
+        // references in tool-specific runtimes (Python globals,
+        // shell `$item`, etc.) need the literal binding.  Safe for
+        // tools without an `args` convention — the field just goes
+        // unused.
+        if let Some(serde_json::Value::Object(cfg)) = tool_command.config.as_mut() {
+            let args_entry = cfg
+                .entry("args".to_string())
+                .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+            if let serde_json::Value::Object(args) = args_entry {
+                args.insert(iterator.item_var.clone(), iterator.item.clone());
+                args.insert("_index".to_string(), serde_json::json!(iterator.index));
+                args.insert("_total".to_string(), serde_json::json!(iterator.total));
+            }
+        }
 
         Ok(Command {
             command_id,
@@ -396,9 +421,17 @@ mod tests {
             .unwrap();
 
         assert!(command.iterator.is_some());
-        let iter = command.iterator.unwrap();
+        let iter = command.iterator.as_ref().unwrap();
         assert_eq!(iter.index, 2);
         assert_eq!(iter.total, 5);
+
+        // Phase D R3b-2: tool.config.args must carry the iteration
+        // variables so the worker's Python tool sees them as globals.
+        let tool_cfg = command.tool.config.as_ref().expect("tool config present");
+        let args = tool_cfg.get("args").expect("args injected");
+        assert_eq!(args.get("item"), Some(&serde_json::json!("test_value")));
+        assert_eq!(args.get("_index"), Some(&serde_json::json!(2)));
+        assert_eq!(args.get("_total"), Some(&serde_json::json!(5)));
     }
 
     #[test]

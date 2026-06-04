@@ -325,17 +325,37 @@ impl WorkflowState {
                     step.state = StepState::Entered;
                     step.entered_at = Some(event.created_at);
                     // R3b iterator fan-out: orchestrator stamps the
-                    // iteration total into the step.enter event
-                    // context so state reconstruction knows how many
+                    // iteration total onto the step.enter event so
+                    // state reconstruction knows how many
                     // command.completed events to wait for before
-                    // marking the step truly Completed.  Plain steps
-                    // omit this key and behave as before.
-                    if let Some(context) = &event.context {
-                        if let Some(total) =
-                            context.get("iterations_expected").and_then(|v| v.as_i64())
-                        {
-                            step.iterations_expected = Some(total as i32);
-                        }
+                    // marking the step truly Completed.  The
+                    // orchestrator emits `EventToEmit { context:
+                    // Some(...) }`, which `trigger_orchestrator`
+                    // persists by wrapping it inside the
+                    // constraint-compliant `{status, context}`
+                    // result envelope (per noetl/server#29) — so
+                    // the canonical storage location is
+                    // `event.result.context.iterations_expected`.
+                    // Older callers may have populated the event
+                    // row's `context` column directly; we accept
+                    // both shapes.  Workers' own per-iteration
+                    // step.enter events don't carry this key and
+                    // leave the previously-set value alone.
+                    let total = event
+                        .result
+                        .as_ref()
+                        .and_then(|r| r.get("context"))
+                        .and_then(|c| c.get("iterations_expected"))
+                        .and_then(|v| v.as_i64())
+                        .or_else(|| {
+                            event
+                                .context
+                                .as_ref()
+                                .and_then(|c| c.get("iterations_expected"))
+                                .and_then(|v| v.as_i64())
+                        });
+                    if let Some(total) = total {
+                        step.iterations_expected = Some(total as i32);
                     }
                 }
             }
@@ -789,6 +809,107 @@ mod tests {
         let info = state.steps.get("looped").unwrap();
         assert_ne!(info.state, StepState::Completed);
         assert_eq!(info.iterations_completed(), 2);
+        assert!(!state.is_step_completed("looped"));
+    }
+
+    #[test]
+    fn test_iterator_partial_with_worker_step_exit_does_not_complete() {
+        // Reproduces the R3b kind-val symptom: orchestrator emits
+        // step.enter(iterations_expected=3), 3 command.issued events
+        // fire, then ONE iteration's worker lifecycle arrives
+        // (command.claimed/started + worker's step.enter + call.done
+        // + step.exit + command.completed).  The looped step must
+        // NOT be marked Completed after only 1 iteration, even
+        // though step.exit AND command.completed both go through
+        // the iteration-aware match arm and both carry the same
+        // command_id in result.context.
+        let mut state = WorkflowState::new(1, 1);
+
+        // 1. Orchestrator's initial step.enter — populates
+        //    iterations_expected.  In production the orchestrator
+        //    persists this via `trigger_orchestrator`, which wraps
+        //    `EventToEmit.context` in a `{status, context}` result
+        //    envelope (per noetl/server#29's chk_event_result_shape
+        //    constraint).  So the canonical storage location is
+        //    `event.result.context.iterations_expected`, NOT the
+        //    event row's `context` column.  Earlier tests used the
+        //    `event.context` shape; we accept both via the
+        //    apply_event fallback, so this test uses the
+        //    production shape.
+        let mut enter = make_event("step.enter", Some("looped"));
+        enter.result = Some(serde_json::json!({
+            "status": "ENTERED",
+            "context": {
+                "iterations_expected": 3,
+                "iterator_var": "item",
+            },
+        }));
+        state.apply_event(&enter);
+
+        // 2. Three command.issued events — each with a distinct
+        //    per-iteration command_id in meta.
+        for idx in 0..3 {
+            let mut ev = make_event("command.issued", Some("looped"));
+            ev.meta = Some(serde_json::json!({
+                "command_id": format!("exec:looped:e0:i{}", idx),
+                "iteration_index": idx,
+                "iteration_total": 3,
+            }));
+            state.apply_event(&ev);
+        }
+
+        // 3. One iteration's worker lifecycle (only iter i2).
+        let cid = "exec:looped:e0:i2".to_string();
+        let mut claimed = make_event("command.claimed", Some("looped"));
+        claimed.meta = Some(serde_json::json!({"command_id": cid}));
+        state.apply_event(&claimed);
+
+        let mut started = make_event("command.started", Some("looped"));
+        started.meta = Some(serde_json::json!({"command_id": cid}));
+        state.apply_event(&started);
+
+        // Worker's per-iteration step.enter — no iterations_expected
+        // in context, so iterations_expected must stay Some(3).
+        let mut worker_enter = make_event("step.enter", Some("looped"));
+        worker_enter.context = Some(serde_json::json!({"status": "started"}));
+        state.apply_event(&worker_enter);
+
+        // call.done — not in any match arm, no state change.
+        let call_done = make_event("call.done", Some("looped"));
+        state.apply_event(&call_done);
+
+        // step.exit — IS in the command.completed arm.  Carries
+        // command_id in result.context.
+        let mut step_exit = make_event("step.exit", Some("looped"));
+        step_exit.result = Some(serde_json::json!({
+            "status": "COMPLETED",
+            "context": { "command_id": cid.clone(), "status": "COMPLETED" }
+        }));
+        state.apply_event(&step_exit);
+
+        // command.completed — same command_id (dedupes via HashSet).
+        let mut completed = make_event("command.completed", Some("looped"));
+        completed.result = Some(serde_json::json!({
+            "status": "COMPLETED",
+            "context": { "command_id": cid.clone(), "worker_id": "w" }
+        }));
+        state.apply_event(&completed);
+
+        let info = state.steps.get("looped").unwrap();
+        assert_eq!(info.iterations_expected, Some(3));
+        assert_eq!(
+            info.iterations_completed(),
+            1,
+            "only ONE distinct command_id observed across step.exit + command.completed; \
+             iteration_command_ids = {:?}",
+            info.iteration_command_ids
+        );
+        assert_ne!(
+            info.state,
+            StepState::Completed,
+            "looped must NOT be Completed after only 1 of 3 iterations; state = {:?}",
+            info.state
+        );
         assert!(!state.is_step_completed("looped"));
     }
 
