@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.9.0](https://github.com/noetl/server/compare/v2.8.3...v2.9.0) (2026-06-04)
+
+### Features
+
+* **events:** server adopts noetl-events as canonical envelope (EE-4 PR 3) ([3949fdf](https://github.com/noetl/server/commit/3949fdfc6065b4d66b9457dc2532b4c729dd3215)), closes [noetl/ai-meta#49](https://github.com/noetl/ai-meta/issues/49) [noetl/cli#49](https://github.com/noetl/cli/issues/49) [#50](https://github.com/noetl/server/issues/50) [noetl/server#29](https://github.com/noetl/server/issues/29) [noetl/cli#49](https://github.com/noetl/cli/issues/49) [noetl/cli#50](https://github.com/noetl/cli/issues/50) [noetl/ai-meta#49](https://github.com/noetl/ai-meta/issues/49)
+
 ## [2.8.3](https://github.com/noetl/server/compare/v2.8.2...v2.8.3) (2026-06-04)
 
 ### Bug Fixes
