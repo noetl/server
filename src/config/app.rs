@@ -76,9 +76,13 @@ pub struct AppConfig {
     ///
     /// Phase F R1.5 of noetl/ai-meta#49 introduced this.  See
     /// `src/snowflake.rs` for the id layout and the migration
-    /// rationale.
+    /// rationale.  The field name (`server_machine_id`) maps to
+    /// the env var `NOETL_SERVER_MACHINE_ID` via the
+    /// `envy::prefixed("NOETL_")` shape — more specific than a
+    /// bare `NOETL_MACHINE_ID` and easier to grep for in
+    /// deployment manifests.
     #[serde(default)]
-    pub machine_id: Option<u16>,
+    pub server_machine_id: Option<u16>,
 }
 
 fn default_host() -> String {
@@ -134,7 +138,7 @@ impl Default for AppConfig {
             runtime_sweep_interval: default_sweep_interval(),
             runtime_offline_seconds: default_offline_seconds(),
             public_server_url: None,
-            machine_id: None,
+            server_machine_id: None,
         }
     }
 }
