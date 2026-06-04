@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.8.3](https://github.com/noetl/server/compare/v2.8.2...v2.8.3) (2026-06-04)
+
+### Bug Fixes
+
+* **orchestrator:** R3b iterator end-to-end — args injection + state reconstruction ([77ed29f](https://github.com/noetl/server/commit/77ed29f3012e74aaa13c791beb04189af637624c)), closes [noetl/ai-meta#49](https://github.com/noetl/ai-meta/issues/49) [noetl/server#29](https://github.com/noetl/server/issues/29) [noetl/ai-meta#49](https://github.com/noetl/ai-meta/issues/49)
+
 ## [2.8.2](https://github.com/noetl/server/compare/v2.8.1...v2.8.2) (2026-06-04)
 
 ### Bug Fixes
