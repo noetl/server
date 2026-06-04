@@ -5,6 +5,7 @@
 
 use crate::config::AppConfig;
 use crate::db::DbPool;
+use crate::sharding::ShardConfig;
 use crate::snowflake::{derive_machine_id, SnowflakeGenerator};
 use std::sync::Arc;
 
@@ -32,6 +33,16 @@ pub struct AppState {
     /// deployment manifest.  See `src/snowflake.rs` for the id
     /// layout and migration rationale.
     pub snowflake: Arc<SnowflakeGenerator>,
+
+    /// Shard routing configuration.  Phase F R2 of
+    /// [noetl/ai-meta#49](https://github.com/noetl/ai-meta/issues/49)
+    /// added this.  Single-shard default (no enforcement) when
+    /// `NOETL_SHARD_INDEX` + `NOETL_SHARD_COUNT` are unset, so
+    /// current deployments continue working unchanged.  See
+    /// `src/sharding.rs` for the hash-function choice and the
+    /// routing semantics; the cross-component design lives on
+    /// the [noetl/server wiki sharding-design page](https://github.com/noetl/server/wiki/sharding-design).
+    pub shard: Arc<ShardConfig>,
 
     /// Server start time for uptime calculation
     pub start_time: std::time::Instant,
@@ -79,11 +90,37 @@ impl AppState {
             },
             "Snowflake generator initialized"
         );
+
+        // Phase F R2: shard configuration.  Single-shard default
+        // (no enforcement) when neither env var is set — that
+        // keeps current single-replica deployments working
+        // without any change.  Validation: shard_index <
+        // shard_count must hold; startup panics otherwise so we
+        // fail fast on a config bug rather than silently
+        // mis-routing requests.
+        let shard_count = config.shard_count.unwrap_or(1);
+        let shard_index = config.shard_index.unwrap_or(0);
+        let shard = ShardConfig::new(shard_index, shard_count).unwrap_or_else(|e| {
+            panic!("invalid shard config (NOETL_SHARD_INDEX / NOETL_SHARD_COUNT): {e}")
+        });
+        tracing::info!(
+            shard_index = shard.shard_index,
+            shard_count = shard.shard_count,
+            sharding_enabled = shard.shard_count > 1,
+            source = if config.shard_index.is_some() || config.shard_count.is_some() {
+                "NOETL_SHARD_INDEX / NOETL_SHARD_COUNT"
+            } else {
+                "default (no sharding)"
+            },
+            "Shard configuration initialized"
+        );
+
         Self {
             db,
             config: Arc::new(config),
             nats: nats.map(Arc::new),
             snowflake: Arc::new(snowflake),
+            shard: Arc::new(shard),
             start_time: std::time::Instant::now(),
         }
     }

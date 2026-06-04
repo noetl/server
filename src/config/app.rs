@@ -83,6 +83,25 @@ pub struct AppConfig {
     /// deployment manifests.
     #[serde(default)]
     pub server_machine_id: Option<u16>,
+
+    /// Phase F R2 of noetl/ai-meta#49 — shard index this replica
+    /// owns.  Envy maps `NOETL_SHARD_INDEX`.  When unset, defaults
+    /// to `0` (single-shard, no enforcement).  Must satisfy
+    /// `shard_index < shard_count`; startup validates and panics
+    /// otherwise.
+    #[serde(default)]
+    pub shard_index: Option<u32>,
+
+    /// Phase F R2 of noetl/ai-meta#49 — total cluster shard count.
+    /// Envy maps `NOETL_SHARD_COUNT`.  When unset (or `1`),
+    /// sharding is disabled — every replica owns every
+    /// execution_id and `ShardConfig::owns` short-circuits to
+    /// `true`.  Set cluster-wide; every replica MUST agree on
+    /// this value or routing diverges.  See
+    /// [sharding-design](https://github.com/noetl/server/wiki/sharding-design)
+    /// for the layout.
+    #[serde(default)]
+    pub shard_count: Option<u32>,
 }
 
 fn default_host() -> String {
@@ -139,6 +158,8 @@ impl Default for AppConfig {
             runtime_offline_seconds: default_offline_seconds(),
             public_server_url: None,
             server_machine_id: None,
+            shard_index: None,
+            shard_count: None,
         }
     }
 }
