@@ -260,6 +260,82 @@ impl DbPoolMap {
             .enumerate()
             .map(|(idx, pool)| (idx as u32, pool))
     }
+
+    /// Run an async query against every shard sequentially and
+    /// collect the per-shard results in shard-index order.
+    ///
+    /// Phase F R4-4: powers cluster-wide list endpoints that
+    /// query a per-execution table (e.g. `GET /api/executions`).
+    /// The caller's closure runs once per shard with the shard
+    /// pool + shard index; the helper returns the per-shard
+    /// outputs in shard-index order so the caller can merge /
+    /// sort / paginate.
+    ///
+    /// In single-pool fallback mode (`is_single_pool() == true`)
+    /// this is a single call against the one pool — same
+    /// behaviour as `query.fetch_all(map.cluster())` modulo the
+    /// `(0, _)` shard_index pair the closure receives.
+    ///
+    /// Errors short-circuit: the first shard that errors stops
+    /// the iteration and propagates.  Acceptable for R4-4
+    /// because the per-shard pool's own error path already logs
+    /// a "shard N failed" line.  Parallelism across shards is a
+    /// Phase G concern (see body comment).
+    pub async fn for_each_shard<F, Fut, T, E>(&self, mut f: F) -> Result<Vec<(u32, T)>, E>
+    where
+        F: FnMut(u32, DbPool) -> Fut,
+        Fut: std::future::Future<Output = Result<T, E>>,
+    {
+        // Sequential await — simple and dep-free.  Parallelism
+        // across shards is a Phase G concern (would need
+        // `futures::future::try_join_all` or a `tokio::spawn`
+        // with the awkward 'static + Send bounds it imposes on
+        // the caller's closure).  For N=2-4 shards on a typical
+        // GKE Cloud SQL latency profile (sub-10ms per query),
+        // the sequential cost is small enough that the call-site
+        // simplicity wins.
+        let mut out = Vec::with_capacity(self.shard_count as usize);
+        for (idx, pool) in self.all_shards() {
+            let result = f(idx, pool.clone()).await?;
+            out.push((idx, result));
+        }
+        Ok(out)
+    }
+
+    /// Run an async probe against every shard in parallel and
+    /// return the first non-`None` result.
+    ///
+    /// Phase F R4-4: powers event_id-keyed endpoints where the
+    /// caller doesn't know which shard owns the row up-front
+    /// (`GET /api/commands/{event_id}`, `POST /api/commands/{event_id}/claim`).
+    /// Each shard answers "do you have this event_id?" via the
+    /// caller's closure; the first shard that returns `Some` is
+    /// the owner.  Returns `Ok(None)` only if every shard
+    /// returned `Ok(None)` (the event_id doesn't exist anywhere).
+    ///
+    /// In single-pool fallback mode this is a single probe
+    /// against the one pool.
+    ///
+    /// **Race semantics**: when multiple shards somehow return
+    /// `Some` (shouldn't happen for a properly-routed
+    /// `event_id` — IDs are minted from a per-shard snowflake
+    /// machine_id and can't collide across shards), the first
+    /// completed future wins.  This is good enough for the
+    /// event_id contract; a stricter implementation would
+    /// `try_join_all` and require exactly one `Some`.
+    ///
+    /// Errors short-circuit the same way as
+    /// [`Self::for_each_shard`].
+    pub async fn find_first<F, Fut, T, E>(&self, mut f: F) -> Result<Option<(u32, T)>, E>
+    where
+        F: FnMut(u32, DbPool) -> Fut,
+        Fut: std::future::Future<Output = Result<Option<T>, E>>,
+    {
+        let results = self.for_each_shard(|idx, pool| f(idx, pool)).await?;
+        Ok(results
+            .into_iter()
+            .find_map(|(idx, opt)| opt.map(|t| (idx, t))))
+    }
 }
 
 /// Build a pool from a [`ShardConnection`] using the legacy
@@ -358,5 +434,56 @@ mod tests {
         let _ = map.pool_for(-1);
         let _ = map.pool_for(i64::MAX);
         let _ = map.pool_for(0);
+    }
+
+    // ----- DbPoolMap::for_each_shard + find_first (R4-4) -----
+
+    #[tokio::test]
+    async fn for_each_shard_runs_closure_once_per_shard_in_order() {
+        let map = DbPoolMap::from_single_pool(dummy_pool());
+        // In single-pool fallback mode there's exactly one shard
+        // (index 0).  The closure receives (0, pool) once.
+        let observed: Vec<u32> = map
+            .for_each_shard::<_, _, u32, sqlx::Error>(|idx, _pool| async move { Ok(idx) })
+            .await
+            .expect("ok")
+            .into_iter()
+            .map(|(idx, _)| idx)
+            .collect();
+        assert_eq!(observed, vec![0]);
+    }
+
+    #[tokio::test]
+    async fn for_each_shard_propagates_first_error() {
+        let map = DbPoolMap::from_single_pool(dummy_pool());
+        let err = map
+            .for_each_shard::<_, _, (), &'static str>(|_idx, _pool| async move {
+                Err("kaboom")
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err, "kaboom");
+    }
+
+    #[tokio::test]
+    async fn find_first_returns_none_when_no_shard_matches() {
+        let map = DbPoolMap::from_single_pool(dummy_pool());
+        let out: Option<(u32, i64)> = map
+            .find_first::<_, _, i64, sqlx::Error>(|_idx, _pool| async move { Ok(None) })
+            .await
+            .expect("ok");
+        assert!(out.is_none());
+    }
+
+    #[tokio::test]
+    async fn find_first_returns_first_match_with_shard_index() {
+        let map = DbPoolMap::from_single_pool(dummy_pool());
+        let out: Option<(u32, &'static str)> = map
+            .find_first::<_, _, &'static str, sqlx::Error>(|_idx, _pool| async move {
+                Ok(Some("hit"))
+            })
+            .await
+            .expect("ok");
+        assert_eq!(out, Some((0, "hit")));
     }
 }

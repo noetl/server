@@ -510,26 +510,27 @@ pub async fn get_command(
 ) -> Result<Json<CommandResponse>, AppError> {
     debug!("Getting command for event_id={}", event_id);
 
-    // Phase F R4-3: `GET /api/commands/{event_id}` is keyed by
-    // event_id alone — execution_id isn't known until after this
-    // lookup, so we can't pick a per-execution pool yet.  In
-    // single-pool fallback mode (today's default) `state.db` IS
-    // the only pool and this works as-is.  When sharding is on,
-    // this endpoint needs the R4-4 cluster-wide fan-out helper
-    // (query every shard, return the first hit).  TODO(R4-4):
-    // replace `state.db` with `state.pools.find_in_any_shard(...)`
-    // once that helper lands.
-    let row: Option<(i64, String, String, serde_json::Value, serde_json::Value)> =
-        sqlx::query_as::<_, (i64, String, String, serde_json::Value, serde_json::Value)>(
-            r#"
-            SELECT execution_id, node_name, node_type, context, meta
-            FROM noetl.event
-            WHERE event_id = $1 AND event_type = 'command.issued'
-            "#,
-        )
-        .bind(event_id)
-        .fetch_optional(&state.db)
+    // Phase F R4-4: `GET /api/commands/{event_id}` is keyed by
+    // event_id alone — execution_id isn't known until after the
+    // lookup.  Use the cross-shard resolver: probe every shard,
+    // first hit wins.  In single-pool fallback mode this is a
+    // single probe against the one pool.
+    let found = state
+        .pools
+        .find_first(|_shard_idx, pool| async move {
+            sqlx::query_as::<_, (i64, String, String, serde_json::Value, serde_json::Value)>(
+                r#"
+                SELECT execution_id, node_name, node_type, context, meta
+                FROM noetl.event
+                WHERE event_id = $1 AND event_type = 'command.issued'
+                "#,
+            )
+            .bind(event_id)
+            .fetch_optional(&pool)
+            .await
+        })
         .await?;
+    let row = found.map(|(_shard_idx, r)| r);
 
     match row {
         Some((execution_id, node_name, node_type, context, meta)) => Ok(Json(CommandResponse {
@@ -560,19 +561,43 @@ pub async fn claim_command(
         event_id, request.worker_id
     );
 
-    // Phase F R4-3: `claim_command` is keyed by event_id alone —
-    // execution_id is read out of the first SELECT inside the
-    // transaction.  We can't open the tx on the per-execution
-    // pool until we know which shard owns this event_id.
-    // Pragmatic stance: open the tx on `state.db` (the only pool
-    // in fallback mode; the cluster pool in sharded mode).  In
-    // sharded mode this endpoint is non-functional until R4-4
-    // adds a fan-out resolver — the endpoint contract carries
-    // event_id but not execution_id, so a path-param redesign or
-    // a multi-shard probe is needed.  TODO(R4-4): resolve
-    // event_id → execution_id (via cross-shard probe or new path
-    // param), then `pool_for(execution_id).begin().await?`.
-    let mut tx = state.db.begin().await?;
+    // Phase F R4-4: resolve event_id -> execution_id via the
+    // cross-shard probe, then open the tx on the per-execution
+    // pool.  Two round trips in sharded mode (one probe + one tx
+    // open) is the right trade-off vs. holding the tx open
+    // across a fan-out scan — keeping shard-locality on the
+    // claim transaction means the second SELECT (terminal-row
+    // check) and any subsequent INSERTs all hit the same shard
+    // and stay within the same tx scope.
+    //
+    // In single-pool fallback mode the resolver short-circuits
+    // (one pool, one probe).
+    let resolved_execution_id: Option<i64> = state
+        .pools
+        .find_first(|_shard_idx, pool| async move {
+            sqlx::query_scalar::<_, i64>(
+                r#"
+                SELECT execution_id
+                FROM noetl.event
+                WHERE event_id = $1 AND event_type = 'command.issued'
+                "#,
+            )
+            .bind(event_id)
+            .fetch_optional(&pool)
+            .await
+        })
+        .await?
+        .map(|(_shard_idx, eid)| eid);
+
+    let resolved_execution_id = resolved_execution_id.ok_or_else(|| {
+        AppError::NotFound(format!("command.issued event not found: {}", event_id))
+    })?;
+
+    let mut tx = state
+        .pools
+        .pool_for(resolved_execution_id)
+        .begin()
+        .await?;
 
     let cmd_row = sqlx::query(
         r#"
