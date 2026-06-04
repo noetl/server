@@ -128,23 +128,23 @@ pub async fn execute(
 /// Resolve catalog entry from path or catalog_id.
 async fn resolve_catalog(state: &AppState, request: &ExecuteRequest) -> AppResult<(i64, String)> {
     if let Some(catalog_id) = request.catalog_id {
-        // Lookup by catalog_id
+        // Lookup by catalog_id (Phase F R4-3: noetl.catalog is cluster-wide)
         let entry = sqlx::query_as::<_, (i64, String)>(
             "SELECT catalog_id, path FROM noetl.catalog WHERE catalog_id = $1",
         )
         .bind(catalog_id)
-        .fetch_optional(&state.db)
+        .fetch_optional(state.pools.cluster())
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Catalog entry not found: {}", catalog_id)))?;
 
         Ok(entry)
     } else if let Some(path) = &request.path {
-        // Lookup by path (latest version)
+        // Lookup by path (latest version; Phase F R4-3: cluster-wide)
         let entry = sqlx::query_as::<_, (i64, String)>(
             "SELECT catalog_id, path FROM noetl.catalog WHERE path = $1 ORDER BY version DESC LIMIT 1",
         )
         .bind(path)
-        .fetch_optional(&state.db)
+        .fetch_optional(state.pools.cluster())
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Playbook not found: {}", path)))?;
 
@@ -159,12 +159,13 @@ async fn resolve_catalog(state: &AppState, request: &ExecuteRequest) -> AppResul
 /// Get playbook YAML from catalog.
 async fn get_playbook_yaml(state: &AppState, catalog_id: i64) -> AppResult<String> {
     // Try to get content first (raw YAML), fall back to payload (JSON)
+    // Phase F R4-3: noetl.catalog is cluster-wide.
     let row: (Option<String>, Option<serde_json::Value>) =
         sqlx::query_as::<_, (Option<String>, Option<serde_json::Value>)>(
             "SELECT content, payload FROM noetl.catalog WHERE catalog_id = $1",
         )
         .bind(catalog_id)
-        .fetch_optional(&state.db)
+        .fetch_optional(state.pools.cluster())
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Catalog entry not found: {}", catalog_id)))?;
 
@@ -229,7 +230,7 @@ async fn emit_playbook_started_event(
     .bind(&context)
     .bind(&meta)
     .bind(chrono::Utc::now())
-    .execute(&state.db)
+    .execute(state.pools.pool_for(execution_id))
     .await?;
 
     Ok(event_id)
@@ -353,7 +354,7 @@ pub(crate) async fn persist_engine_command(
     .bind(&cmd_meta)
     .bind(parent_event_id)
     .bind(chrono::Utc::now())
-    .execute(&state.db)
+    .execute(state.pools.pool_for(execution_id))
     .await?;
 
     if let Err(e) = insert_command_row(
@@ -505,7 +506,7 @@ async fn insert_command_row(
     .bind(context)
     .bind(meta)
     .bind(parent_event_id)
-    .execute(&state.db)
+    .execute(state.pools.pool_for(execution_id))
     .await?;
     Ok(())
 }
