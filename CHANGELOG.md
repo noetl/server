@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.19.3](https://github.com/noetl/server/compare/v2.19.2...v2.19.3) (2026-06-05)
+
+### Bug Fixes
+
+* **orchestrator:** emit playbook.failed on command.failed instead of stalling ([cabf470](https://github.com/noetl/server/commit/cabf47019253a0f53c98abc468083c1c1ce4d94a)), closes [noetl/server#62](https://github.com/noetl/server/issues/62) [noetl/ai-meta#58](https://github.com/noetl/ai-meta/issues/58)
+* **parser:** resolve tool.kind:workbook references to inline actions ([e7d0de3](https://github.com/noetl/server/commit/e7d0de39ff0a87466795cba9bddb3e2db3ef148f)), closes [ai-meta#56](https://github.com/noetl/ai-meta/issues/56) [noetl/cli#54](https://github.com/noetl/cli/issues/54) [noetl/server#64](https://github.com/noetl/server/issues/64) [noetl/ai-meta#59](https://github.com/noetl/ai-meta/issues/59)
+* **playbook:** accept flat (name-as-field) pipeline shape ([09e0e47](https://github.com/noetl/server/commit/09e0e47d67f91ab86515f1382ea0e534fb48ae3d)), closes [noetl/cli#53](https://github.com/noetl/cli/issues/53) [noetl/server#60](https://github.com/noetl/server/issues/60) [noetl/ai-meta#57](https://github.com/noetl/ai-meta/issues/57)
+
 ## [2.19.2](https://github.com/noetl/server/compare/v2.19.1...v2.19.2) (2026-06-05)
 
 ### Bug Fixes
