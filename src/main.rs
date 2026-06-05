@@ -501,10 +501,14 @@ async fn main() -> anyhow::Result<()> {
     // ids take a clone of `state.snowflake` (an `Arc`).
     let state = AppState::new(db_pool.clone(), pools, app_config.clone(), nats_client);
 
-    // Create services
+    // Create services. The wallet's envelope cipher is built once over the
+    // configured KEK provider (NOETL_KMS_PROVIDER: `local` default, or
+    // `gcp-kms` over Cloud KMS — noetl/ai-meta#61 Phase 2) and shared between
+    // the credential and keychain services.
     let catalog_service = CatalogService::new(db_pool.clone());
-    let credential_service = CredentialService::new(db_pool.clone(), &encryption_key)?;
-    let keychain_service = KeychainService::new(db_pool.clone(), &encryption_key)?;
+    let wallet_cipher = noetl_server::crypto::build_envelope_cipher(&encryption_key)?;
+    let credential_service = CredentialService::new(db_pool.clone(), wallet_cipher.clone());
+    let keychain_service = KeychainService::new(db_pool.clone(), wallet_cipher);
     // Phase F R4-4b: ExecutionService now takes the DbPoolMap so
     // its per-execution methods route via pool_for(execution_id)
     // and `list()` fan-outs via for_each_shard.  In single-pool

@@ -5,11 +5,9 @@
 //! wallet primitives as credentials (per-record DEK wrapped by the KEK) and
 //! stored as the self-describing envelope JSON. Forward-only — no legacy path.
 
-use std::sync::Arc;
-
 use chrono::{Duration, Utc};
 
-use crate::crypto::{EnvelopeCipher, LocalDevKms};
+use crate::crypto::EnvelopeCipher;
 use crate::db::models::{
     KeychainDeleteResponse, KeychainEntrySummary, KeychainGetResponse, KeychainListResponse,
     KeychainSetRequest, KeychainSetResponse,
@@ -28,15 +26,10 @@ pub struct KeychainService {
 impl KeychainService {
     /// Create a new keychain service.
     ///
-    /// # Arguments
-    ///
-    /// * `pool` - Database connection pool
-    /// * `encryption_key` - Base64-encoded 32-byte master key (KEK for the
-    ///   in-process [`LocalDevKms`]).
-    pub fn new(pool: DbPool, encryption_key: &str) -> AppResult<Self> {
-        let kms = LocalDevKms::from_master_key_base64(encryption_key)?;
-        let cipher = EnvelopeCipher::new(Arc::new(kms));
-        Ok(Self { pool, cipher })
+    /// `cipher` is the wallet's [`EnvelopeCipher`] (shared with the credential
+    /// service), built once over the configured KEK provider.
+    pub fn new(pool: DbPool, cipher: EnvelopeCipher) -> Self {
+        Self { pool, cipher }
     }
 
     /// Get a keychain entry.
