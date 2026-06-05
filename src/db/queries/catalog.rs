@@ -10,9 +10,14 @@ use crate::error::AppResult;
 /// matches the column type and avoids the sqlx decode mismatch that
 /// surfaced during noetl/ai-meta#49 Phase A ui_schema validation.
 pub async fn get_next_version(pool: &DbPool, path: &str) -> AppResult<i16> {
+    // `smallint + integer-literal` returns `INT4` in Postgres, so we cast
+    // the entire expression back to `smallint` to match the `i16` binding
+    // the sqlx decoder expects.  Without the outer cast sqlx errors with
+    // `Rust type 'i16' (as SQL type 'INT2') is not compatible with SQL
+    // type 'INT4'`.
     let result: Option<(i16,)> = sqlx::query_as(
         r#"
-        SELECT COALESCE(MAX(version), 0)::smallint + 1
+        SELECT (COALESCE(MAX(version), 0)::smallint + 1)::smallint
         FROM noetl.catalog
         WHERE path = $1
         "#,
