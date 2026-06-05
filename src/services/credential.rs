@@ -1,8 +1,14 @@
 //! Credential service for managing encrypted credentials.
+//!
+//! Credentials are stored under **envelope encryption** (Secrets Wallet
+//! Phase 1, noetl/ai-meta#61): each record's data is sealed with a per-record
+//! DEK that is wrapped by the KEK. The on-storage value is the self-describing
+//! envelope JSON (see `crypto::envelope`). Forward-only — there is no legacy
+//! single-master-key path; a pre-wallet record must be re-registered.
 
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use std::sync::Arc;
 
-use crate::crypto::Encryptor;
+use crate::crypto::{EnvelopeCipher, LocalDevKms};
 use crate::db::models::{
     CredentialCreateRequest, CredentialEntry, CredentialFilter, CredentialListResponse,
     CredentialResponse,
@@ -15,7 +21,7 @@ use crate::error::{AppError, AppResult};
 #[derive(Clone)]
 pub struct CredentialService {
     pool: DbPool,
-    encryptor: Encryptor,
+    cipher: EnvelopeCipher,
 }
 
 impl CredentialService {
@@ -24,10 +30,13 @@ impl CredentialService {
     /// # Arguments
     ///
     /// * `pool` - Database connection pool
-    /// * `encryption_key` - Base64-encoded 32-byte encryption key
+    /// * `encryption_key` - Base64-encoded 32-byte master key (the KEK for the
+    ///   in-process [`LocalDevKms`]; a KMS-backed `KeyManager` replaces it in
+    ///   Phase 2 without changing the stored record format).
     pub fn new(pool: DbPool, encryption_key: &str) -> AppResult<Self> {
-        let encryptor = Encryptor::from_base64(encryption_key)?;
-        Ok(Self { pool, encryptor })
+        let kms = LocalDevKms::from_master_key_base64(encryption_key)?;
+        let cipher = EnvelopeCipher::new(Arc::new(kms));
+        Ok(Self { pool, cipher })
     }
 
     /// Create or update a credential.
@@ -35,10 +44,9 @@ impl CredentialService {
         &self,
         request: CredentialCreateRequest,
     ) -> AppResult<CredentialResponse> {
-        // Encrypt the data, then base64-armor the AES-GCM bytes so
-        // they round-trip through the TEXT `data_encrypted` column.
-        let encrypted_bytes = self.encryptor.encrypt_json(&request.data)?;
-        let encrypted_data = BASE64.encode(&encrypted_bytes);
+        // Envelope-seal the data into the self-describing storage string
+        // (UTF-8 JSON) for the TEXT `data_encrypted` column.
+        let encrypted_data = self.cipher.seal_json_to_storage(&request.data).await?;
 
         // Check if credential already exists
         if let Some(existing) = queries::get_credential_by_name(&self.pool, &request.name).await? {
@@ -89,12 +97,9 @@ impl CredentialService {
         let entry = self.find_credential(identifier).await?;
 
         let data = if include_data {
-            // `entry.data` is the base64-armored AES-GCM blob from the
-            // TEXT column — decode back to bytes before decrypting.
-            let cipher_bytes = BASE64
-                .decode(entry.data.as_bytes())
-                .map_err(|e| AppError::Internal(format!("credential base64 decode: {e}")))?;
-            Some(self.encryptor.decrypt_json(&cipher_bytes)?)
+            // `entry.data` is the self-describing envelope JSON from the
+            // TEXT column — unwrap the DEK + decrypt.
+            Some(self.cipher.open_storage_json(&entry.data).await?)
         } else {
             None
         };
