@@ -6,9 +6,7 @@
 //! envelope JSON (see `crypto::envelope`). Forward-only — there is no legacy
 //! single-master-key path; a pre-wallet record must be re-registered.
 
-use std::sync::Arc;
-
-use crate::crypto::{EnvelopeCipher, LocalDevKms};
+use crate::crypto::EnvelopeCipher;
 use crate::db::models::{
     CredentialCreateRequest, CredentialEntry, CredentialFilter, CredentialListResponse,
     CredentialResponse,
@@ -27,16 +25,11 @@ pub struct CredentialService {
 impl CredentialService {
     /// Create a new credential service.
     ///
-    /// # Arguments
-    ///
-    /// * `pool` - Database connection pool
-    /// * `encryption_key` - Base64-encoded 32-byte master key (the KEK for the
-    ///   in-process [`LocalDevKms`]; a KMS-backed `KeyManager` replaces it in
-    ///   Phase 2 without changing the stored record format).
-    pub fn new(pool: DbPool, encryption_key: &str) -> AppResult<Self> {
-        let kms = LocalDevKms::from_master_key_base64(encryption_key)?;
-        let cipher = EnvelopeCipher::new(Arc::new(kms));
-        Ok(Self { pool, cipher })
+    /// `cipher` is the wallet's [`EnvelopeCipher`], built once at startup over
+    /// the configured KEK provider (`crypto::build_envelope_cipher`) — local
+    /// master key in dev, GCP Cloud KMS in production.
+    pub fn new(pool: DbPool, cipher: EnvelopeCipher) -> Self {
+        Self { pool, cipher }
     }
 
     /// Create or update a credential.
