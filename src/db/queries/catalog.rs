@@ -41,11 +41,15 @@ pub async fn insert_catalog_entry(
     payload: Option<&serde_json::Value>,
     meta: Option<&serde_json::Value>,
 ) -> AppResult<i64> {
+    // `noetl.catalog` has no `id` column — the PK is `catalog_id`.
+    // Older code returned `id`, which would 500 with `column "id" does
+    // not exist` at runtime.  Same alias-vs-column drift as the
+    // v2.1.5 catalog `list` fix and the comment on get_catalog_by_id.
     let result: (i64,) = sqlx::query_as(
         r#"
         INSERT INTO noetl.catalog (path, kind, version, content, layout, payload, meta)
         VALUES ($1, $2, $3, $4, $5, $6, $7)
-        RETURNING id
+        RETURNING catalog_id
         "#,
     )
     .bind(path)
