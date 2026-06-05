@@ -181,11 +181,28 @@ impl CommandBuilder {
         match tool {
             ToolDefinition::Single(spec) => self.build_tool_command(spec, context),
             ToolDefinition::Pipeline(tasks) => {
-                // For pipelines, create a task_sequence tool command
-                // The worker will execute each task in sequence
+                // For pipelines, create a task_sequence tool command.
+                // The worker dispatches each sub-task through the
+                // task_sequence tool, which re-renders every sub-task's
+                // config against its own context (the command's
+                // render_context PLUS the runtime `_prev` / `_results`
+                // it injects per task).  So we render `{{ pg_auth }}`,
+                // `{{ item }}`, `{{ execution_id }}`, step results, etc.
+                // now (the worker's keychain-alias resolution needs the
+                // credential alias resolved to a string), but we must
+                // PRESERVE `{{ _prev.* }}` / `{{ _results.* }}` — those
+                // are undefined at command-build time and (with the
+                // Chainable undefined behavior) would otherwise render
+                // to empty strings, producing malformed sub-task configs
+                // (e.g. empty SQL VALUES).  See noetl/server#72 /
+                // noetl/ai-meta#54.
                 let pipeline_config = serde_json::to_value(tasks).ok();
                 let config = if let Some(cfg) = pipeline_config {
-                    Some(self.renderer.render_value(&cfg, context)?)
+                    Some(self.renderer.render_value_deferring(
+                        &cfg,
+                        context,
+                        &["_prev", "_results"],
+                    )?)
                 } else {
                     None
                 };
