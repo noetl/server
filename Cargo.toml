@@ -59,6 +59,8 @@ minijinja = { version = "2.5", features = ["loader"] }
 aes-gcm = "0.10"
 base64 = "0.22"
 rand = "0.8"
+async-trait = "0.1"
+zeroize = "1"
 # Constant-time comparison for bearer-token auth — see
 # src/handlers/internal.rs (the `/api/internal/*` route gate).
 subtle = "2.6"

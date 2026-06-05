@@ -1298,6 +1298,7 @@ dependencies = [
  "aes-gcm",
  "anyhow",
  "async-nats",
+ "async-trait",
  "axum",
  "base64",
  "chrono",
@@ -1326,6 +1327,7 @@ dependencies = [
  "tracing-subscriber",
  "twox-hash",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
