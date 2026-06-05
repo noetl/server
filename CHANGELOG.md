@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.21.0](https://github.com/noetl/server/compare/v2.20.0...v2.21.0) (2026-06-05)
+
+### Features
+
+* **crypto:** envelope-encrypt credential + keychain storage (forward-only) ([b089036](https://github.com/noetl/server/commit/b089036f4a8946705bbecb839a42a6972a6174b1)), closes [noetl/ai-meta#61](https://github.com/noetl/ai-meta/issues/61) [noetl/server#78](https://github.com/noetl/server/issues/78) [noetl/ai-meta#61](https://github.com/noetl/ai-meta/issues/61)
+
 ## [2.20.0](https://github.com/noetl/server/compare/v2.19.8...v2.20.0) (2026-06-05)
 
 ### Features
