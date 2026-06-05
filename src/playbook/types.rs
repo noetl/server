@@ -145,8 +145,24 @@ pub struct ToolSpec {
     #[serde(default)]
     pub libs: Option<serde_json::Value>,
 
-    /// Default arguments.
-    #[serde(default)]
+    /// Default arguments / inputs passed to the tool runtime.
+    ///
+    /// The canonical NoETL v10 playbook YAML writes this as
+    /// `input:` at the step's `tool:` block.  The Rust internal
+    /// name stays `args` because that's what the noetl-tools
+    /// registry's `ToolConfig` consumes (PythonTool, ShellTool,
+    /// etc. expose this to user code as `args` / `globals()` /
+    /// shell env).  The serde alias means both forms decode into
+    /// the same field; `input:` is the form playbooks should
+    /// write, `args:` stays accepted for back-compat with
+    /// existing fixtures.
+    ///
+    /// Without the alias, `input:` is silently dropped by serde,
+    /// the worker's Python wrapper's `globals().update(args)`
+    /// gets an empty dict, and any user code referencing the
+    /// workload by name (e.g. `print(f"hello {message}")`) raises
+    /// `NameError`.  See noetl/ai-meta#56 for the e2e finding.
+    #[serde(default, alias = "input")]
     pub args: Option<serde_json::Value>,
 
     /// Python code (for python tool).
@@ -1023,6 +1039,52 @@ workflow:
         let call = ToolCall::from_spec(&spec);
         assert_eq!(call.kind, ToolKind::Python);
         assert!(call.config.contains_key("code"));
+    }
+
+    #[test]
+    fn test_tool_spec_accepts_input_alias_for_args() {
+        // Canonical NoETL v10 playbook YAML writes `input:` on the
+        // tool block.  Without the serde alias, this is silently
+        // dropped and the worker's Python wrapper's
+        // `globals().update(args)` gets an empty dict.  See
+        // noetl/ai-meta#56 — surfaced via hello_world e2e on the
+        // Rust-only stack: `NameError: name 'message' is not
+        // defined` because `input: { message: "{{ message }}" }`
+        // never reached the wrapper.
+        let yaml = r#"
+kind: python
+input:
+  message: "Hello World"
+  count: 42
+code: |
+  print(f"hello {message}")
+"#;
+        let spec: ToolSpec = serde_yaml::from_str(yaml).unwrap();
+        let args = spec.args.clone().expect("input alias should decode into args");
+        assert_eq!(args.get("message").and_then(|v| v.as_str()), Some("Hello World"));
+        assert_eq!(args.get("count").and_then(|v| v.as_i64()), Some(42));
+
+        let call = ToolCall::from_spec(&spec);
+        let call_args = call
+            .config
+            .get("args")
+            .expect("ToolCall::from_spec should propagate args");
+        assert_eq!(call_args.get("message").and_then(|v| v.as_str()), Some("Hello World"));
+    }
+
+    #[test]
+    fn test_tool_spec_accepts_args_field_directly() {
+        // Back-compat: existing fixtures that use `args:` keep
+        // working alongside the new `input:` alias.
+        let yaml = r#"
+kind: python
+args:
+  x: 10
+code: "print(x * 2)"
+"#;
+        let spec: ToolSpec = serde_yaml::from_str(yaml).unwrap();
+        let args = spec.args.expect("args field decodes");
+        assert_eq!(args.get("x").and_then(|v| v.as_i64()), Some(10));
     }
 
     #[test]
