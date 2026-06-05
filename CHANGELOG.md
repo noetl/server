@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.22.0](https://github.com/noetl/server/compare/v2.21.0...v2.22.0) (2026-06-05)
+
+### Features
+
+* **crypto:** GCP Cloud KMS KeyManager + runtime provider selection ([b6b5104](https://github.com/noetl/server/commit/b6b51047aefa27de5f91ac2c783e516b3d453d5e)), closes [noetl/ai-meta#61](https://github.com/noetl/ai-meta/issues/61) [noetl/server#80](https://github.com/noetl/server/issues/80) [noetl/ai-meta#61](https://github.com/noetl/ai-meta/issues/61)
+
 ## [2.21.0](https://github.com/noetl/server/compare/v2.20.0...v2.21.0) (2026-06-05)
 
 ### Features
