@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.19.6](https://github.com/noetl/server/compare/v2.19.5...v2.19.6) (2026-06-05)
+
+### Bug Fixes
+
+* **credential:** base64-armor encrypted data for TEXT data_encrypted column ([fe3f572](https://github.com/noetl/server/commit/fe3f572ec1a59acdaba2a227bbcf550c3e5615d3)), closes [noetl/ai-meta#54](https://github.com/noetl/ai-meta/issues/54) [noetl/server#70](https://github.com/noetl/server/issues/70) [noetl/ai-meta#54](https://github.com/noetl/ai-meta/issues/54)
+
 ## [2.19.5](https://github.com/noetl/server/compare/v2.19.4...v2.19.5) (2026-06-05)
 
 ### Bug Fixes
