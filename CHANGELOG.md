@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.19.7](https://github.com/noetl/server/compare/v2.19.6...v2.19.7) (2026-06-05)
+
+### Bug Fixes
+
+* **template:** defer task_sequence _prev/_results refs at command build ([15fd689](https://github.com/noetl/server/commit/15fd689b3c73eff0c7672dda4d17677152dd3ec6)), closes [noetl/ai-meta#54](https://github.com/noetl/ai-meta/issues/54) [noetl/server#72](https://github.com/noetl/server/issues/72) [noetl/ai-meta#54](https://github.com/noetl/ai-meta/issues/54)
+
 ## [2.19.6](https://github.com/noetl/server/compare/v2.19.5...v2.19.6) (2026-06-05)
 
 ### Bug Fixes
