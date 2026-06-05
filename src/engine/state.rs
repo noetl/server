@@ -438,7 +438,44 @@ impl WorkflowState {
                         // Plain (non-iterator) step.
                         step.state = StepState::Completed;
                         step.completed_at = Some(event.created_at);
-                        step.result = event.result.clone();
+                        // Only overwrite step.result with command.completed's
+                        // envelope if the user-data hasn't been written yet
+                        // (e.g. by an earlier `call.done`).  command.completed
+                        // carries only `{status, command_id}`, no data — so
+                        // overwriting would lose the rich payload that
+                        // next.arcs / step.when need.  See noetl/ai-meta#60
+                        // for the orchestrator-template gap that surfaced
+                        // this.
+                        if step.result.is_none() {
+                            step.result = event.result.clone();
+                        }
+                    }
+                }
+            }
+            "call.done" | "action_done" => {
+                // The worker emits `call.done` between
+                // `command.started` and `command.completed` to carry
+                // the user-code result.  Capture step.result here so
+                // the orchestrator's template context (built via
+                // `build_context`) can expose `{{ step_name.field }}`
+                // for next.arcs / step.when evaluation.
+                //
+                // The state stays at CommandStarted — `command.completed`
+                // (above) flips to Completed.  This event's purpose
+                // here is data attachment only.
+                if let Some(name) = &event.node_name {
+                    let step = self
+                        .steps
+                        .entry(name.clone())
+                        .or_insert_with(|| StepInfo::new(name));
+                    // For iterator steps the iteration-aware branch
+                    // in command.completed builds the per-iteration
+                    // result array; leave it alone here.  Plain steps
+                    // get their data attached.
+                    if step.iterations_expected.is_none() {
+                        if let Some(result) = event.result.clone() {
+                            step.result = Some(result);
+                        }
                     }
                 }
             }
@@ -576,11 +613,33 @@ impl WorkflowState {
             );
         }
 
-        // Add step results under 'steps' namespace
+        // Add step results under TWO shapes, matching the Python
+        // reference and the canonical v10 playbook YAML:
+        //
+        // - `steps.<name>` carries the FULL envelope as-stored
+        //   (back-compat for `{{ steps.eval_flag.status }}`-style
+        //   references and admin tooling that wants the wrapper
+        //   metadata).
+        // - `<name>` at the TOP level carries the UNWRAPPED user
+        //   data — the dict the tool's user code assigned to
+        //   `result = {...}`.  This is the shape next.arcs /
+        //   step.when guards read via `{{ eval_flag.is_hot }}`
+        //   (no `steps.` / no `.data.` prefix needed).
+        //
+        // The envelope shape stored on `info.result` after wrapping
+        // by `apply_event` is:
+        //   { status, context: { result: { status, context: {
+        //       data: <USER_DATA>, status, stdout, stderr, ... } } } }
+        // — `extract_user_data` walks the envelope and returns the
+        // inner `data` value.  See noetl/ai-meta#60 for the e2e
+        // finding that surfaced this orchestrator template gap.
         let mut steps = serde_json::Map::new();
         for (name, info) in &self.steps {
             if let Some(result) = &info.result {
                 steps.insert(name.clone(), result.clone());
+                if let Some(user_data) = extract_user_data(result) {
+                    context.insert(name.clone(), user_data);
+                }
             }
         }
         context.insert("steps".to_string(), serde_json::Value::Object(steps));
@@ -604,6 +663,61 @@ impl WorkflowState {
 
         serde_json::Value::Object(context)
     }
+}
+
+/// Unwrap a step result envelope to the inner user data dict.
+///
+/// The wrap layers come from `apply_event`'s standard envelope:
+///
+/// ```text
+/// outer = {
+///   status: "COMPLETED",
+///   context: {
+///     result: {
+///       status: "success",
+///       context: {
+///         data: <USER_DATA>,
+///         status, stdout, stderr, ...
+///       }
+///     },
+///     ...
+///   }
+/// }
+/// ```
+///
+/// Returns the inner `data` value when the wrapper shape matches.
+/// Falls back to the outer value (or any partially-unwrapped layer)
+/// when the wrapper is absent — handles tooling that emitted a
+/// flat result without going through the worker's envelope path.
+/// Returns None only when the input is JSON null.
+///
+/// Tracks noetl/ai-meta#60 — without this unwrap, v10 playbooks
+/// that reference `{{ step_name.field }}` in next.arcs / step.when
+/// see an undefined value because the envelope's `status` /
+/// `context` keys swallowed the user fields.
+fn extract_user_data(result: &serde_json::Value) -> Option<serde_json::Value> {
+    if result.is_null() {
+        return None;
+    }
+    // Try outer.context.result.context.data — the standard
+    // wrapper shape.  Each step is optional so a partial
+    // unwrap still yields a useful value for back-compat.
+    let inner = result
+        .get("context")
+        .and_then(|v| v.get("result"))
+        .and_then(|v| v.get("context"))
+        .and_then(|v| v.get("data"));
+    if let Some(data) = inner {
+        return Some(data.clone());
+    }
+    // Single-layer wrappers (e.g. {status, context}).
+    if let Some(ctx) = result.get("context") {
+        if let Some(data) = ctx.get("data") {
+            return Some(data.clone());
+        }
+        return Some(ctx.clone());
+    }
+    Some(result.clone())
 }
 
 #[cfg(test)]
@@ -946,5 +1060,93 @@ mod tests {
         assert_eq!(info.iterations_expected, None);
         assert_eq!(info.iterations_completed(), 0);
         assert_eq!(info.result, Some(serde_json::json!({"ok": true})));
+    }
+
+    #[test]
+    fn test_extract_user_data_unwraps_standard_envelope() {
+        // Standard wrapper shape emitted by apply_event after
+        // the worker's PythonTool result-capture (noetl/tools#17).
+        // The orchestrator's template context needs the inner
+        // `data` exposed so `{{ step_name.field }}` resolves.
+        let envelope = serde_json::json!({
+            "status": "COMPLETED",
+            "context": {
+                "result": {
+                    "status": "success",
+                    "context": {
+                        "data": {"is_hot": true, "message": "hot"},
+                        "status": "success",
+                        "stdout": "",
+                        "stderr": "",
+                    },
+                },
+                "call_index": 0,
+            },
+        });
+        let data = extract_user_data(&envelope).expect("unwrap should succeed");
+        assert_eq!(
+            data.get("is_hot").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            data.get("message").and_then(|v| v.as_str()),
+            Some("hot")
+        );
+    }
+
+    #[test]
+    fn test_extract_user_data_handles_flat_result() {
+        // Back-compat: a tool that emitted a flat result without
+        // going through the wrapper.  No `context.result.context.data`
+        // path → fall back through the partial-unwrap branches and
+        // ultimately return the input.
+        let flat = serde_json::json!({"is_hot": false});
+        let data = extract_user_data(&flat).expect("flat result preserved");
+        assert_eq!(data, flat);
+    }
+
+    #[test]
+    fn test_extract_user_data_null_returns_none() {
+        let null = serde_json::Value::Null;
+        assert!(extract_user_data(&null).is_none());
+    }
+
+    #[test]
+    fn test_build_context_exposes_step_data_at_top_level() {
+        // noetl/ai-meta#60 — workflow YAML uses `{{ eval_flag.is_hot }}`
+        // (no `steps.` prefix), so the build_context must expose
+        // each step's unwrapped data at the top level alongside the
+        // back-compat `steps.<name>` shape.
+        let mut state = WorkflowState::new(1, 1);
+        state.workload = Some(serde_json::json!({"temp": 30}));
+        let mut info = StepInfo::new("eval_flag");
+        info.result = Some(serde_json::json!({
+            "status": "COMPLETED",
+            "context": {
+                "result": {
+                    "status": "success",
+                    "context": {
+                        "data": {"is_hot": true, "message": "hot"},
+                    },
+                },
+            },
+        }));
+        state.steps.insert("eval_flag".to_string(), info);
+
+        let ctx = state.build_context();
+        // Top-level: `eval_flag.is_hot` resolves to the user data.
+        let eval_flag = ctx.get("eval_flag").expect("top-level step data exposed");
+        assert_eq!(
+            eval_flag.get("is_hot").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        // Back-compat: `steps.eval_flag` still holds the full envelope.
+        let steps = ctx.get("steps").expect("steps namespace present");
+        assert!(
+            steps.get("eval_flag").is_some(),
+            "back-compat steps namespace populated"
+        );
+        // Workload still at top level (from earlier build_context behavior).
+        assert_eq!(ctx.get("temp").and_then(|v| v.as_i64()), Some(30));
     }
 }
