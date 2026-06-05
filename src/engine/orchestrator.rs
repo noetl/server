@@ -257,6 +257,74 @@ impl WorkflowOrchestrator {
         // branches are still running.
         let mut reached_end = false;
 
+        // command.failed gets its own dedicated short-circuit path
+        // BEFORE the transition-trigger filter — a failed step must
+        // not have its next.arcs evaluated, and the orchestrator
+        // must emit `playbook.failed` once all in-flight work is
+        // drained (the existing completion path waited for every
+        // branch to reach `end`, which a failed branch never does).
+        // See noetl/ai-meta#58 for the e2e finding (control_flow_workbook
+        // stalled at `command.failed` with no terminal event).
+        if matches!(trigger_event_type, Some("command.failed")) {
+            // Detect failed steps via the durable `state` field
+            // (set by apply_event when `command.failed` or
+            // `step_failed` lands), not via `info.error.is_some()`.
+            // The error-string extraction at apply_event time only
+            // catches top-level `result.error`; many tools emit
+            // their failure context under `result.context.error`,
+            // so step.error stays None even on real failures.
+            // step.state is the reliable signal.
+            let failed_steps: Vec<String> = state
+                .steps
+                .iter()
+                .filter(|(_, info)| matches!(info.state, crate::engine::state::StepState::Failed))
+                .map(|(name, _)| name.clone())
+                .collect();
+
+            // No failed step recorded yet (race between event ingest
+            // and apply_event) — keep waiting; the next trigger
+            // round will see it.
+            if failed_steps.is_empty() {
+                return Ok(OrchestrationResult {
+                    state: ExecutionState::InProgress,
+                    commands,
+                    should_complete: false,
+                    completion_status: None,
+                    events_to_emit,
+                });
+            }
+
+            // Sibling parallel branches still running — defer the
+            // terminal decision so each in-flight branch gets to
+            // emit its own outcome event into the log.  When the
+            // last running branch finishes, that branch's
+            // command.completed or command.failed will re-trigger
+            // us and we'll re-check this condition.
+            if state.has_running_steps() {
+                return Ok(OrchestrationResult {
+                    state: ExecutionState::InProgress,
+                    commands,
+                    should_complete: false,
+                    completion_status: None,
+                    events_to_emit,
+                });
+            }
+
+            // All in-flight work drained, at least one step failed
+            // — emit the terminal playbook.failed event.
+            return Ok(OrchestrationResult {
+                state: ExecutionState::Failed,
+                commands: vec![],
+                should_complete: true,
+                completion_status: Some(CompletionStatus {
+                    status: "FAILED".to_string(),
+                    error: Some(format!("Failed steps: {}", failed_steps.join(", "))),
+                    failed_steps: Some(failed_steps),
+                }),
+                events_to_emit,
+            });
+        }
+
         // Only process transitions on completion events
         if !matches!(
             trigger_event_type,
@@ -845,6 +913,151 @@ mod tests {
         let status = result.completion_status.unwrap();
         assert_eq!(status.status, "FAILED");
         assert!(status.error.is_some());
+    }
+
+    #[test]
+    fn test_command_failed_emits_terminal_playbook_failed() {
+        // noetl/ai-meta#58 — process_in_progress used to early-return
+        // on command.failed and never emit the terminal playbook.failed
+        // event.  Execution would stall mid-flight forever.  With the
+        // fix, a command.failed trigger drains in-flight work and
+        // (when nothing is still running) marks the playbook as
+        // FAILED with the failed_steps list populated.
+        let orchestrator = WorkflowOrchestrator::new();
+
+        let start = make_step("start", Some("eval_flag"));
+        let eval_flag = make_step("eval_flag", Some("end"));
+        let end = make_step("end", None);
+
+        let events = vec![
+            {
+                let mut e = make_event("playbook_started", None);
+                e.context = Some(serde_json::json!({
+                    "workload": {}, "path": "test", "version": "1"
+                }));
+                e
+            },
+            make_event("command.completed", Some("start")),
+            make_event("step.enter", Some("eval_flag")),
+            {
+                let mut e = make_event("call.error", Some("eval_flag"));
+                e.result = Some(serde_json::json!({"error": "Tool not found: workbook"}));
+                e
+            },
+            {
+                let mut e = make_event("command.failed", Some("eval_flag"));
+                e.result = Some(serde_json::json!({"error": "Tool not found: workbook"}));
+                e
+            },
+        ];
+
+        let playbook = Playbook {
+            api_version: "noetl.io/v2".to_string(),
+            kind: "Playbook".to_string(),
+            metadata: Metadata {
+                name: "fail_terminal".to_string(),
+                path: Some("test/fail_terminal".to_string()),
+                description: None,
+                labels: None,
+                extra: HashMap::new(),
+            },
+            workload: None,
+            vars: None,
+            keychain: None,
+            workbook: None,
+            workflow: vec![start, eval_flag, end],
+        };
+
+        let result = orchestrator
+            .evaluate(&events, &playbook, Some("command.failed"))
+            .unwrap();
+
+        assert!(
+            result.should_complete,
+            "command.failed must terminate the playbook when no other steps are running"
+        );
+        assert_eq!(result.state, ExecutionState::Failed);
+        let status = result
+            .completion_status
+            .expect("completion_status must be populated on terminal failure");
+        assert_eq!(status.status, "FAILED");
+        assert_eq!(status.failed_steps.as_ref().unwrap(), &vec!["eval_flag".to_string()]);
+        assert!(status
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("eval_flag"));
+    }
+
+    #[test]
+    fn test_command_failed_defers_terminal_while_sibling_running() {
+        // Parallel-branch case: branch_a fails while branch_b is
+        // still in flight.  The orchestrator must NOT mark the
+        // playbook FAILED yet — wait for branch_b to drain so the
+        // event log carries every branch's outcome.  When branch_b
+        // eventually finishes (success or failure), the next trigger
+        // round re-checks and emits the terminal event then.
+        let orchestrator = WorkflowOrchestrator::new();
+
+        let start = make_step_with_parallel_next("start", &["branch_a", "branch_b"]);
+        let branch_a = make_step("branch_a", Some("end"));
+        let branch_b = make_step("branch_b", Some("end"));
+        let end = make_step("end", None);
+
+        let events = vec![
+            {
+                let mut e = make_event("playbook_started", None);
+                e.context = Some(serde_json::json!({
+                    "workload": {}, "path": "test", "version": "1"
+                }));
+                e
+            },
+            make_event("command.completed", Some("start")),
+            // Both branches entered + claimed.
+            make_event("step.enter", Some("branch_a")),
+            make_event("command.issued", Some("branch_a")),
+            make_event("step.enter", Some("branch_b")),
+            make_event("command.issued", Some("branch_b")),
+            // branch_a fails; branch_b still running.
+            {
+                let mut e = make_event("call.error", Some("branch_a"));
+                e.result = Some(serde_json::json!({"error": "branch_a blew up"}));
+                e
+            },
+            {
+                let mut e = make_event("command.failed", Some("branch_a"));
+                e.result = Some(serde_json::json!({"error": "branch_a blew up"}));
+                e
+            },
+        ];
+
+        let playbook = Playbook {
+            api_version: "noetl.io/v2".to_string(),
+            kind: "Playbook".to_string(),
+            metadata: Metadata {
+                name: "fail_with_sibling".to_string(),
+                path: Some("test/fail_with_sibling".to_string()),
+                description: None,
+                labels: None,
+                extra: HashMap::new(),
+            },
+            workload: None,
+            vars: None,
+            keychain: None,
+            workbook: None,
+            workflow: vec![start, branch_a, branch_b, end],
+        };
+
+        let result = orchestrator
+            .evaluate(&events, &playbook, Some("command.failed"))
+            .unwrap();
+
+        assert!(
+            !result.should_complete,
+            "playbook must NOT terminate while branch_b is still running"
+        );
+        // State stays InProgress for the deferred outcome.
+        assert_eq!(result.state, ExecutionState::InProgress);
     }
 
     #[test]

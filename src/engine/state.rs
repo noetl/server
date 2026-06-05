@@ -450,9 +450,28 @@ impl WorkflowState {
                         .or_insert_with(|| StepInfo::new(name));
                     step.state = StepState::Failed;
                     step.completed_at = Some(event.created_at);
-                    // Extract error from result or use status
+                    // Extract error from result.  Two shapes seen in
+                    // the wild — top-level `result.error` and the
+                    // nested `result.context.error` (the worker's
+                    // standard envelope wraps the tool's
+                    // `{status, error, ...}` output under
+                    // `result.context`).  Try the top-level form
+                    // first, then fall back to the nested form so
+                    // step.error gets populated regardless of which
+                    // tool emitted the failure.  See
+                    // noetl/ai-meta#58 for the orchestrator-side
+                    // failure-termination fix that depends on this.
                     if let Some(result) = &event.result {
-                        if let Some(error) = result.get("error").and_then(|v| v.as_str()) {
+                        let err_value = result
+                            .get("error")
+                            .and_then(|v| v.as_str())
+                            .or_else(|| {
+                                result
+                                    .get("context")
+                                    .and_then(|c| c.get("error"))
+                                    .and_then(|v| v.as_str())
+                            });
+                        if let Some(error) = err_value {
                             step.error = Some(error.to_string());
                         }
                     }

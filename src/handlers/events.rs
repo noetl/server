@@ -631,8 +631,21 @@ async fn handle_event_inner(
         0
     };
 
-    // Trigger orchestrator for workflow progression on command.completed
-    if request.event_type == "command.completed" && request.step.to_lowercase() != "end" {
+    // Trigger orchestrator for workflow progression.
+    //
+    // `command.completed` advances the workflow to the next step;
+    // `command.failed` checks whether the failure should terminate
+    // the playbook (noetl/ai-meta#58 — without this trigger, failed
+    // steps stalled the execution forever because the orchestrator
+    // never got a chance to emit `playbook.failed`).
+    //
+    // The `step != "end"` guard stays in place: the sentinel `end`
+    // step's completion fires its own `playbook.completed` path on
+    // the orchestrator's natural-completion branch.
+    let should_trigger_orchestrator = (request.event_type == "command.completed"
+        || request.event_type == "command.failed")
+        && request.step.to_lowercase() != "end";
+    if should_trigger_orchestrator {
         match trigger_orchestrator(&state, execution_id, event_id).await {
             Ok(cmds) => {
                 info!(
@@ -1357,9 +1370,22 @@ async fn trigger_orchestrator(
     let playbook = crate::playbook::parser::parse_playbook(&playbook_yaml)?;
 
     // 3. Evaluate.
+    //
+    // Resolve the real trigger event's type from the loaded events
+    // list instead of hard-coding `command.completed` — the same
+    // path serves `command.failed` triggers (noetl/ai-meta#58) and
+    // future trigger sources (e.g. `iterator_completed`,
+    // `step.exit`).  Without this lookup, a failure trigger would
+    // be misreported as a completion to the orchestrator, and the
+    // failure-termination branch would never run.
+    let trigger_event_type = events
+        .iter()
+        .find(|e| e.event_id == trigger_event_id)
+        .map(|e| e.event_type.as_str())
+        .unwrap_or("command.completed");
     let orchestrator = WorkflowOrchestrator::new();
     let result = orchestrator
-        .evaluate(&events, &playbook, Some("command.completed"))
+        .evaluate(&events, &playbook, Some(trigger_event_type))
         .map_err(|e| AppError::Internal(format!("Orchestrator evaluate failed: {e}")))?;
 
     info!(
