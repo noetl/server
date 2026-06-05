@@ -87,9 +87,33 @@ pub async fn execute(
     // immediately and retries stay idempotent.
     let execution_id = state.snowflake.generate()?;
 
-    // Build workload from payload
-    let workload = serde_json::to_value(&request.payload)
-        .map_err(|e| AppError::Internal(format!("Failed to serialize payload: {}", e)))?;
+    // Build the effective workload by merging playbook YAML
+    // `workload:` defaults with the request's `payload:` overrides.
+    // The orchestrator persists this as the `workload` key on the
+    // `playbook_started` event; ExecutionState::handle_event reads
+    // it back on every subsequent orchestrator pass so downstream
+    // steps see the same workload the start step did.
+    //
+    // Without this merge, the playbook YAML's `workload:` defaults
+    // never reached anything past the start step:
+    // generate_initial_commands does its own merge (below) for the
+    // start step's command context, but the playbook_started event
+    // captured only the request payload — so when state.workload is
+    // hydrated from that event, downstream steps' build_context
+    // returned an empty `{}` and Jinja templates referencing
+    // workload fields rendered to None.  See noetl/ai-meta#56.
+    let mut merged_workload = serde_json::Map::new();
+    if let Some(playbook_workload) = &playbook.workload {
+        if let serde_json::Value::Object(map) = playbook_workload {
+            for (k, v) in map {
+                merged_workload.insert(k.clone(), v.clone());
+            }
+        }
+    }
+    for (k, v) in &request.payload {
+        merged_workload.insert(k.clone(), v.clone());
+    }
+    let workload = serde_json::Value::Object(merged_workload);
 
     // Emit playbook_started event
     let start_event_id = emit_playbook_started_event(
