@@ -138,20 +138,37 @@ fn validate_tool_definition(tool: &ToolDefinition, step_name: &str) -> AppResult
             }
 
             for (idx, task) in tasks.iter().enumerate() {
-                // Each task should have exactly one key (the label)
-                if task.len() != 1 {
-                    return Err(AppError::Validation(format!(
-                        "Step '{}': pipeline task[{}] must have exactly one labeled entry (got {})",
-                        step_name,
-                        idx,
-                        task.len()
-                    )));
-                }
+                // Normalize both YAML pipeline shapes to a (label, spec)
+                // tuple list for validation.  Flat form uses the
+                // `name` field on the spec as the label; nested form
+                // uses the single map key.
+                let entries: Vec<(String, &crate::playbook::types::ToolSpec)> = match task {
+                    crate::playbook::types::PipelineItem::Flat(spec) => {
+                        let label = spec
+                            .extra
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        vec![(label, spec)]
+                    }
+                    crate::playbook::types::PipelineItem::Nested(map) => {
+                        if map.len() != 1 {
+                            return Err(AppError::Validation(format!(
+                                "Step '{}': pipeline task[{}] must have exactly one labeled entry (got {})",
+                                step_name,
+                                idx,
+                                map.len()
+                            )));
+                        }
+                        map.iter().map(|(k, v)| (k.clone(), v)).collect()
+                    }
+                };
 
                 // Validate eval conditions in each task
-                for (label, spec) in task {
+                for (label, spec) in entries {
                     if let Some(ref eval) = spec.eval {
-                        validate_eval_conditions_for_task(eval, step_name, label)?;
+                        validate_eval_conditions_for_task(eval, step_name, &label)?;
                     }
                 }
             }
