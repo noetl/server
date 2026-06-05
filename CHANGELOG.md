@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.19.4](https://github.com/noetl/server/compare/v2.19.3...v2.19.4) (2026-06-05)
+
+### Bug Fixes
+
+* **orchestrator:** expose step data at top level + capture call.done ([0e23091](https://github.com/noetl/server/commit/0e230915969d75c2e42ed76f7b26e71bd1915223)), closes [noetl/server#66](https://github.com/noetl/server/issues/66) [noetl/ai-meta#60](https://github.com/noetl/ai-meta/issues/60)
+
 ## [2.19.3](https://github.com/noetl/server/compare/v2.19.2...v2.19.3) (2026-06-05)
 
 ### Bug Fixes
