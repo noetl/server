@@ -1199,4 +1199,68 @@ mod tests {
         // Workload still at top level (from earlier build_context behavior).
         assert_eq!(ctx.get("temp").and_then(|v| v.as_i64()), Some(30));
     }
+
+    #[test]
+    fn test_extract_user_data_flattens_task_sequence_wrap() {
+        // Real e2e payload from `test_start_with_action`'s call.done
+        // event on the Rust kind cluster (Phase F R5).  task_sequence
+        // wraps the single Python tool's result under the tool's
+        // label (`init_action`), so the unwrapped envelope `data` is
+        // `{init_action: {data: {executed: true}, ...}}` rather than
+        // the user's assigned dict.  After the flatten:
+        //   - `start.init_action.data.executed` still works (back-compat)
+        //   - `start.data.executed` ALSO works (the YAML template's expectation)
+        let envelope = serde_json::json!({
+            "status": "COMPLETED",
+            "context": {
+                "call_index": 0,
+                "command_id": "321180039523602432:start:321180039552962560",
+                "result": {
+                    "status": "success",
+                    "context": {
+                        "data": {
+                            "init_action": {
+                                "data": {
+                                    "executed": true,
+                                    "input": {"test_value": "hello"}
+                                },
+                                "message": "Start step executed with action type",
+                                "status": "success"
+                            }
+                        },
+                        "duration_ms": 79,
+                        "exit_code": 0,
+                        "status": "success",
+                        "stderr": "",
+                        "stdout": ""
+                    }
+                }
+            }
+        });
+        let unwrapped = extract_user_data(&envelope).expect("envelope unwraps");
+        // Flat reference — the failing YAML template path:
+        assert_eq!(
+            unwrapped
+                .get("data")
+                .and_then(|v| v.get("executed"))
+                .and_then(|v| v.as_bool()),
+            Some(true),
+            "start.data.executed must resolve after flatten"
+        );
+        assert_eq!(
+            unwrapped.get("status").and_then(|v| v.as_str()),
+            Some("success"),
+            "start.status must resolve after flatten"
+        );
+        // Labeled reference — back-compat:
+        assert_eq!(
+            unwrapped
+                .get("init_action")
+                .and_then(|v| v.get("data"))
+                .and_then(|v| v.get("executed"))
+                .and_then(|v| v.as_bool()),
+            Some(true),
+            "start.init_action.data.executed must still resolve"
+        );
+    }
 }
