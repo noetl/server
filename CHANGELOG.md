@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.19.5](https://github.com/noetl/server/compare/v2.19.4...v2.19.5) (2026-06-05)
+
+### Bug Fixes
+
+* **catalog:** cast smallint+1 back to smallint to avoid INT4 promotion ([52d8ca9](https://github.com/noetl/server/commit/52d8ca9c4de282b0c1e2bf00cd205626b25aae20)), closes [noetl/ai-meta#54](https://github.com/noetl/ai-meta/issues/54) [noetl/server#68](https://github.com/noetl/server/issues/68) [noetl/ai-meta#54](https://github.com/noetl/ai-meta/issues/54)
+* **catalog:** insert_catalog_entry RETURNING uses catalog_id, not id ([0763c81](https://github.com/noetl/server/commit/0763c81e4be7e15b6fe641c0a5c65acd5198f315)), closes [noetl/server#68](https://github.com/noetl/server/issues/68) [noetl/ai-meta#54](https://github.com/noetl/ai-meta/issues/54)
+* **events:** trigger orchestrator on end step's command.completed ([a50d718](https://github.com/noetl/server/commit/a50d7186eeaea11d2a83c94f6e8bd23476293b70)), closes [noetl/ai-meta#58](https://github.com/noetl/ai-meta/issues/58) [noetl/ai-meta#54](https://github.com/noetl/ai-meta/issues/54) [noetl/server#68](https://github.com/noetl/server/issues/68) [noetl/ai-meta#54](https://github.com/noetl/ai-meta/issues/54)
+* **orchestrator:** end step with action runs + task_sequence data flatten ([e1e71ee](https://github.com/noetl/server/commit/e1e71ee19e70045dfbd999f0ab3fd71bebdd822a)), closes [noetl/ai-meta#54](https://github.com/noetl/ai-meta/issues/54) [noetl/server#68](https://github.com/noetl/server/issues/68) [noetl/ai-meta#54](https://github.com/noetl/ai-meta/issues/54)
+* **playbook:** ToolSpec Option fields skip serialize when None ([d673be0](https://github.com/noetl/server/commit/d673be0bcb9015d1dcafcabf9cab713b2eef6e95)), closes [noetl/server#68](https://github.com/noetl/server/issues/68) [noetl/ai-meta#54](https://github.com/noetl/ai-meta/issues/54)
+* **template:** use Chainable undefined behavior + add e2e flatten test ([d9cebe3](https://github.com/noetl/server/commit/d9cebe36efe2dd351f9685ef4a63a4a69193aa2b)), closes [noetl/server#68](https://github.com/noetl/server/issues/68) [noetl/ai-meta#54](https://github.com/noetl/ai-meta/issues/54)
+
 ## [2.19.4](https://github.com/noetl/server/compare/v2.19.3...v2.19.4) (2026-06-05)
 
 ### Bug Fixes
