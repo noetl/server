@@ -708,16 +708,66 @@ fn extract_user_data(result: &serde_json::Value) -> Option<serde_json::Value> {
         .and_then(|v| v.get("context"))
         .and_then(|v| v.get("data"));
     if let Some(data) = inner {
-        return Some(data.clone());
+        return Some(flatten_task_sequence_data(data));
     }
     // Single-layer wrappers (e.g. {status, context}).
     if let Some(ctx) = result.get("context") {
         if let Some(data) = ctx.get("data") {
-            return Some(data.clone());
+            return Some(flatten_task_sequence_data(data));
         }
         return Some(ctx.clone());
     }
     Some(result.clone())
+}
+
+/// Flatten task_sequence's label-keyed result map so that the
+/// user-facing `{{ step.field }}` references resolve.
+///
+/// Every v10 step uses the `tool: [...]` list shape, which the
+/// server wraps as a `task_sequence` pipeline even when the step
+/// has a single tool.  `task_sequence` then aggregates the
+/// sub-task results as `{label1: <data1>, label2: <data2>, ...}`,
+/// so the unwrapped envelope data ends up as
+/// `{init_action: {data: {executed: true}, status, message}}`
+/// rather than the user-assigned dict the YAML template
+/// expects (`{data: {executed: true}, status, message}`).
+///
+/// Strategy: when `data` is a non-empty object whose values are
+/// ALL objects (the task_sequence labeled-results signature),
+/// merge each task's fields at the top level — last-task-wins on
+/// key collisions, matching the `_prev` convention inside the
+/// pipeline.  The original labeled shape is preserved so
+/// `{{ step.label.field }}` references still work alongside the
+/// flat `{{ step.field }}` form.
+///
+/// For non-task_sequence data (a single tool that wasn't wrapped,
+/// or a tool that returned a scalar / array / mixed map) this is
+/// a no-op — the returned value equals the input.
+fn flatten_task_sequence_data(data: &serde_json::Value) -> serde_json::Value {
+    let map = match data.as_object() {
+        Some(m) if !m.is_empty() => m,
+        _ => return data.clone(),
+    };
+    // Heuristic: labeled-results shape has every value as an
+    // object.  A user-assigned dict that happens to be
+    // `{data: ..., status: ...}` has scalar / string values for
+    // some keys, so this won't accidentally merge it.
+    let all_objects = map.values().all(|v| v.is_object());
+    if !all_objects {
+        return data.clone();
+    }
+    // Build merged shape: labeled-keys at top + flat keys from
+    // each task's value.  Iterate in insertion order so the last
+    // task's keys win on collision (matches `_prev`).
+    let mut merged = map.clone();
+    for value in map.values() {
+        if let serde_json::Value::Object(task_map) = value {
+            for (k, v) in task_map {
+                merged.insert(k.clone(), v.clone());
+            }
+        }
+    }
+    serde_json::Value::Object(merged)
 }
 
 #[cfg(test)]
