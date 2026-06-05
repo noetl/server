@@ -17,6 +17,143 @@ use crate::error::{AppError, AppResult};
 use crate::sanitize::sanitize_sensitive_data;
 use crate::state::AppState;
 
+/// Deserialize a snowflake-id field that may arrive on the wire as
+/// either a JSON string (the historical browser-facing shape) or a
+/// JSON integer (the shape `noetl-events::ExecutorEvent` emits over
+/// `.json(&event)`).  Both decode to `String` so the rest of the
+/// handler is unchanged.
+///
+/// Why the lax decoder: the worker's canonical envelope types
+/// `execution_id` / `event_id` as `i64`, the Rust server's request
+/// shape kept them as `String` for browser JSON-number precision,
+/// and the Python server (Pydantic v2 lax mode) coerced int→str
+/// silently for over a year — so the drift only manifested once
+/// Rust-on-both-ends went through the same path.  See
+/// `noetl/ai-meta#55` for the surfacing in Phase F R5.
+fn deserialize_string_or_i64<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{self, Visitor};
+    use std::fmt;
+
+    struct StringOrI64;
+
+    impl<'de> Visitor<'de> for StringOrI64 {
+        type Value = String;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            formatter.write_str("a string or signed/unsigned integer representing a snowflake id")
+        }
+
+        fn visit_str<E>(self, v: &str) -> std::result::Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(v.to_string())
+        }
+
+        fn visit_string<E>(self, v: String) -> std::result::Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(v)
+        }
+
+        fn visit_i64<E>(self, v: i64) -> std::result::Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(v.to_string())
+        }
+
+        fn visit_u64<E>(self, v: u64) -> std::result::Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(v.to_string())
+        }
+    }
+
+    deserializer.deserialize_any(StringOrI64)
+}
+
+/// `Option<String>` variant of [`deserialize_string_or_i64`] for
+/// optional id fields like `EventRequest.event_id`.  Accepts
+/// missing / null / string / integer.
+fn deserialize_optional_string_or_i64<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{self, Visitor};
+    use std::fmt;
+
+    struct OptStringOrI64;
+
+    impl<'de> Visitor<'de> for OptStringOrI64 {
+        type Value = Option<String>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            formatter.write_str(
+                "null, a string, or a signed/unsigned integer representing an optional snowflake id",
+            )
+        }
+
+        fn visit_none<E>(self) -> std::result::Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_unit<E>(self) -> std::result::Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_some<D2>(self, deserializer: D2) -> std::result::Result<Self::Value, D2::Error>
+        where
+            D2: serde::Deserializer<'de>,
+        {
+            deserialize_string_or_i64(deserializer).map(Some)
+        }
+
+        fn visit_str<E>(self, v: &str) -> std::result::Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(Some(v.to_string()))
+        }
+
+        fn visit_string<E>(self, v: String) -> std::result::Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(Some(v))
+        }
+
+        fn visit_i64<E>(self, v: i64) -> std::result::Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(Some(v.to_string()))
+        }
+
+        fn visit_u64<E>(self, v: u64) -> std::result::Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(Some(v.to_string()))
+        }
+    }
+
+    deserializer.deserialize_any(OptStringOrI64)
+}
+
 /// Worker event request.
 ///
 /// The shared subset of fields with the canonical
@@ -55,6 +192,12 @@ pub struct EventRequest {
     /// `EventEmitRequest` and avoids JSON-number precision loss
     /// for large snowflakes in browser clients); parsed to `i64`
     /// before the DB write.
+    ///
+    /// The `deserialize_with` adapter accepts the worker's canonical
+    /// `noetl-events::ExecutorEvent.execution_id: i64` wire shape
+    /// as well, so Rust-on-both-ends doesn't fail at the boundary.
+    /// See `noetl/ai-meta#55` for the drift this fixes.
+    #[serde(deserialize_with = "deserialize_string_or_i64")]
     pub execution_id: String,
     /// Step name.
     pub step: String,
@@ -99,7 +242,15 @@ pub struct EventRequest {
     /// precision loss; parsed to `i64` for the DB write.
     /// `None` falls back to the server-side `noetl.snowflake_id()`
     /// function (the existing default).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ///
+    /// Accepts both the `String` wire shape (browser clients) and
+    /// the `i64` wire shape (worker's canonical envelope).  See
+    /// `noetl/ai-meta#55`.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_string_or_i64"
+    )]
     pub event_id: Option<String>,
     /// Lifecycle status (`STARTED` / `RUNNING` / `COMPLETED` /
     /// `FAILED`).  `None` falls back to name-based derivation in
@@ -262,7 +413,10 @@ pub struct BatchEventItem {
 /// Request for batched event ingestion.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BatchEventRequest {
-    /// Execution ID.
+    /// Execution ID.  Accepts both string (browser clients) and
+    /// integer (worker's `noetl-events::ExecutorEvent`) wire
+    /// shapes.  See `noetl/ai-meta#55`.
+    #[serde(deserialize_with = "deserialize_string_or_i64")]
     pub execution_id: String,
     /// Worker ID.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1412,6 +1566,107 @@ mod tests {
         assert_eq!(request.status.as_deref(), Some("COMPLETED"));
         assert_eq!(request.worker_id.as_deref(), Some("worker-prod-7"));
         assert!(request.created_at.is_some());
+    }
+
+    #[test]
+    fn test_event_request_accepts_integer_execution_id() {
+        // noetl/ai-meta#55 — the Rust worker emits
+        // `noetl-events::ExecutorEvent` whose `execution_id` is
+        // `i64`, so the wire shape is a JSON integer.  Without the
+        // `deserialize_string_or_i64` adapter, strict serde rejects
+        // it with "invalid type: integer, expected a string", and
+        // every Rust-on-both-ends event emission fails.
+        let json = r#"{
+            "execution_id": 321079436235509760,
+            "step": "start",
+            "event_type": "step.start"
+        }"#;
+        let request: EventRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(request.execution_id, "321079436235509760");
+        assert_eq!(request.step, "start");
+    }
+
+    #[test]
+    fn test_event_request_accepts_string_execution_id() {
+        // Legacy browser-client wire shape (snowflake as JSON
+        // string).  Confirms the lax decoder didn't regress the
+        // documented `String` wire format that EE-2 / EE-4 kept
+        // for browser JSON-number precision.
+        let json = r#"{
+            "execution_id": "321079436235509760",
+            "step": "start",
+            "event_type": "step.start"
+        }"#;
+        let request: EventRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(request.execution_id, "321079436235509760");
+    }
+
+    #[test]
+    fn test_event_request_accepts_integer_event_id() {
+        // event_id is optional + `Option<String>`; the worker emits
+        // `Option<i64>` from `noetl-events`.  Same drift as
+        // execution_id, same fix.
+        let json = r#"{
+            "execution_id": "1",
+            "step": "s",
+            "event_type": "e",
+            "event_id": 478775660589088777
+        }"#;
+        let request: EventRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(request.event_id.as_deref(), Some("478775660589088777"));
+    }
+
+    #[test]
+    fn test_event_request_event_id_null_is_none() {
+        // Explicit null should land as None.  Optional decoder
+        // sanity check.
+        let json = r#"{
+            "execution_id": "1",
+            "step": "s",
+            "event_type": "e",
+            "event_id": null
+        }"#;
+        let request: EventRequest = serde_json::from_str(json).unwrap();
+        assert!(request.event_id.is_none());
+    }
+
+    #[test]
+    fn test_batch_event_request_accepts_integer_execution_id() {
+        // BatchEventRequest is the second worker→server inbound
+        // type with execution_id on it (the worker uses it for
+        // batched event emission).  Same drift as the per-event
+        // shape; same lax decoder.
+        let json = r#"{
+            "execution_id": 321079436235509760,
+            "worker_id": "worker-rust-pool-0",
+            "events": [
+                {
+                    "step": "start",
+                    "event_type": "step.start"
+                }
+            ]
+        }"#;
+        let request: BatchEventRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(request.execution_id, "321079436235509760");
+        assert_eq!(request.events.len(), 1);
+    }
+
+    #[test]
+    fn test_event_request_rejects_garbage_execution_id() {
+        // The lax decoder should still reject obviously-bogus
+        // shapes (arrays, objects, floats) — only `string` and
+        // `integer` are valid for a snowflake id field.  Floats
+        // are rejected because the precision loss makes them
+        // ambiguous (a Pythonish `12345.0` decodes via visit_f64
+        // which we don't implement).
+        let bogus_shapes = [
+            r#"{"execution_id": [1,2,3], "step": "s", "event_type": "e"}"#,
+            r#"{"execution_id": {"id": 1}, "step": "s", "event_type": "e"}"#,
+        ];
+        for json in bogus_shapes {
+            let result: std::result::Result<EventRequest, _> = serde_json::from_str(json);
+            assert!(result.is_err(), "Expected reject for {}", json);
+        }
     }
 
     // build_result_object — constraint-compliant shape per
