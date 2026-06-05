@@ -16,13 +16,121 @@ pub fn parse_playbook(yaml_content: &str) -> AppResult<Playbook> {
     // First check for deprecated case blocks before full parse
     validate_no_case_blocks(yaml_content)?;
 
-    let playbook: Playbook =
+    let mut playbook: Playbook =
         serde_yaml::from_str(yaml_content).map_err(|e| AppError::Parse(e.to_string()))?;
+
+    // Resolve `tool.kind: workbook` references before validation —
+    // any workflow step whose tool's kind is `workbook` is rewritten
+    // in-place to use the inline action defined in the playbook's
+    // top-level `workbook:` list.  The rest of the pipeline (parser
+    // validation, orchestrator command-build, worker dispatch) then
+    // sees a regular tool spec and never has to know about workbook
+    // references.  See noetl/ai-meta#59 for the e2e finding.
+    resolve_workbook_references(&mut playbook)?;
 
     // Validate the playbook
     validate_playbook(&playbook)?;
 
     Ok(playbook)
+}
+
+/// Substitute every `tool.kind: workbook` reference with the
+/// resolved inline action from `playbook.workbook`.
+///
+/// A reference has shape:
+///
+/// ```yaml
+/// tool:
+///   kind: workbook
+///   name: compute_flag    # action label in playbook.workbook[]
+///   input: { ... }        # overrides workbook task's `input:` defaults
+/// ```
+///
+/// After substitution the step's tool is the workbook task's tool
+/// spec with `input` keys merged (step input wins over workbook
+/// input defaults).
+fn resolve_workbook_references(playbook: &mut crate::playbook::types::Playbook) -> AppResult<()> {
+    use crate::playbook::types::{ToolDefinition, ToolKind};
+
+    // Snapshot the workbook list once so we can index without holding
+    // a mutable borrow on `playbook` while iterating workflow steps.
+    let workbook_index: std::collections::HashMap<String, _> = playbook
+        .workbook
+        .as_ref()
+        .map(|tasks| {
+            tasks
+                .iter()
+                .map(|t| (t.name.clone(), t.tool.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    for step in playbook.workflow.iter_mut() {
+        let ToolDefinition::Single(spec) = &mut step.tool else {
+            continue;
+        };
+        if spec.kind != ToolKind::Workbook {
+            continue;
+        }
+
+        // Pull the action label out of `extra["name"]` (the field
+        // doesn't have a dedicated slot on ToolSpec — the v10 YAML
+        // writes `name:` on the tool block alongside `kind: workbook`,
+        // which lands in the catch-all `extra:` map).
+        let action_name = spec
+            .extra
+            .get("name")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .ok_or_else(|| {
+                AppError::Validation(format!(
+                    "Step '{}': tool.kind=workbook requires a 'name' field referencing a workbook action",
+                    step.step
+                ))
+            })?;
+
+        let resolved_tool = workbook_index.get(&action_name).cloned().ok_or_else(|| {
+            AppError::Validation(format!(
+                "Step '{}': workbook action '{}' not found in playbook.workbook[] \
+                 (available: [{}])",
+                step.step,
+                action_name,
+                workbook_index
+                    .keys()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+        })?;
+
+        // Merge the step's input over the workbook task's defaults.
+        // The step's input — already aliased into spec.args by the
+        // serde alias on ToolSpec.args — is the override layer.
+        // Both shapes are JSON objects in practice (Jinja templates,
+        // literals, etc.); if either side isn't an object, the step
+        // input replaces wholesale.
+        let merged_args = match (&resolved_tool.args, &spec.args) {
+            (Some(serde_json::Value::Object(base)), Some(serde_json::Value::Object(over))) => {
+                let mut merged = base.clone();
+                for (k, v) in over {
+                    merged.insert(k.clone(), v.clone());
+                }
+                Some(serde_json::Value::Object(merged))
+            }
+            (_, Some(step_input)) => Some(step_input.clone()),
+            (base, None) => base.clone(),
+        };
+
+        // Substitute the resolved tool with merged args.  Keep the
+        // step's tool kind from the workbook (e.g. python), drop the
+        // `name:` field from extra so downstream serialization
+        // doesn't carry the now-resolved reference.
+        let mut substituted = resolved_tool;
+        substituted.args = merged_args;
+        step.tool = ToolDefinition::Single(substituted);
+    }
+
+    Ok(())
 }
 
 /// Check for deprecated case blocks in YAML content.
@@ -395,6 +503,98 @@ pub fn extract_metadata(yaml_content: &str) -> AppResult<(String, Option<String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_workbook_reference_resolves_to_inline_action() {
+        // noetl/ai-meta#59 — `tool.kind: workbook` with a `name:`
+        // referring to a playbook.workbook[] entry must rewrite
+        // the step's tool to the inline action's tool spec, merging
+        // the step's input over the workbook's defaults.  Without
+        // this resolution the worker errors with "Tool not found:
+        // workbook" and the orchestrator stalls.
+        let yaml = r#"
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata:
+  name: workbook_ref_test
+workload:
+  temperature_c: 30
+workbook:
+  - name: compute_flag
+    tool:
+      kind: python
+      input:
+        temperature_c: null
+      code: "result = {'is_hot': float(temperature_c) >= 25.0}"
+workflow:
+  - step: start
+    tool:
+      kind: workbook
+      name: compute_flag
+      input:
+        temperature_c: "{{ temperature_c }}"
+"#;
+        let playbook = parse_playbook(yaml).expect("workbook ref must parse");
+        let start = playbook.get_step("start").expect("start step present");
+        match &start.tool {
+            crate::playbook::types::ToolDefinition::Single(spec) => {
+                assert_eq!(spec.kind, crate::playbook::types::ToolKind::Python,
+                    "workbook ref should be rewritten to the inline action's tool kind");
+                assert_eq!(spec.code.as_deref(), Some("result = {'is_hot': float(temperature_c) >= 25.0}"),
+                    "workbook ref should carry the inline action's code");
+                let args = spec.args.as_ref().expect("merged input present");
+                let temp = args.get("temperature_c").and_then(|v| v.as_str());
+                assert_eq!(temp, Some("{{ temperature_c }}"),
+                    "step's input overrides workbook's default");
+            }
+            other => panic!("expected ToolDefinition::Single, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_workbook_reference_unknown_action_errors() {
+        let yaml = r#"
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata:
+  name: workbook_unknown
+workbook:
+  - name: compute_flag
+    tool:
+      kind: python
+      code: "result = {}"
+workflow:
+  - step: start
+    tool:
+      kind: workbook
+      name: missing_action
+"#;
+        let err = parse_playbook(yaml).expect_err("missing workbook action should be rejected");
+        let msg = format!("{:?}", err);
+        assert!(msg.contains("missing_action"), "error must name the missing action: {}", msg);
+        assert!(msg.contains("compute_flag"), "error must list available actions: {}", msg);
+    }
+
+    #[test]
+    fn test_workbook_reference_missing_name_errors() {
+        let yaml = r#"
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata:
+  name: workbook_no_name
+workbook:
+  - name: x
+    tool:
+      kind: python
+      code: "result = {}"
+workflow:
+  - step: start
+    tool:
+      kind: workbook
+"#;
+        let err = parse_playbook(yaml).expect_err("workbook ref without name must error");
+        assert!(format!("{:?}", err).contains("requires a 'name'"));
+    }
 
     #[test]
     fn test_parse_valid_playbook() {
