@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.19.2](https://github.com/noetl/server/compare/v2.19.1...v2.19.2) (2026-06-05)
+
+### Bug Fixes
+
+* **execute:** playbook workload reaches all steps via input alias + merge ([d218326](https://github.com/noetl/server/commit/d218326dc482bdc9ecb611b41e33a50adcb9eb9e)), closes [noetl/ai-meta#56](https://github.com/noetl/ai-meta/issues/56)
+
 ## [2.19.1](https://github.com/noetl/server/compare/v2.19.0...v2.19.1) (2026-06-05)
 
 ### Bug Fixes
