@@ -1,5 +1,7 @@
 //! Credential service for managing encrypted credentials.
 
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+
 use crate::crypto::Encryptor;
 use crate::db::models::{
     CredentialCreateRequest, CredentialEntry, CredentialFilter, CredentialListResponse,
@@ -33,8 +35,10 @@ impl CredentialService {
         &self,
         request: CredentialCreateRequest,
     ) -> AppResult<CredentialResponse> {
-        // Encrypt the data
-        let encrypted_data = self.encryptor.encrypt_json(&request.data)?;
+        // Encrypt the data, then base64-armor the AES-GCM bytes so
+        // they round-trip through the TEXT `data_encrypted` column.
+        let encrypted_bytes = self.encryptor.encrypt_json(&request.data)?;
+        let encrypted_data = BASE64.encode(&encrypted_bytes);
 
         // Check if credential already exists
         if let Some(existing) = queries::get_credential_by_name(&self.pool, &request.name).await? {
@@ -85,7 +89,12 @@ impl CredentialService {
         let entry = self.find_credential(identifier).await?;
 
         let data = if include_data {
-            Some(self.encryptor.decrypt_json(&entry.data)?)
+            // `entry.data` is the base64-armored AES-GCM blob from the
+            // TEXT column — decode back to bytes before decrypting.
+            let cipher_bytes = BASE64
+                .decode(entry.data.as_bytes())
+                .map_err(|e| AppError::Internal(format!("credential base64 decode: {e}")))?;
+            Some(self.encryptor.decrypt_json(&cipher_bytes)?)
         } else {
             None
         };

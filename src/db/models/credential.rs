@@ -19,8 +19,16 @@ pub struct CredentialEntry {
     #[sqlx(rename = "type")]
     pub credential_type: String,
 
-    /// Encrypted credential data (JSON)
-    pub data: Vec<u8>,
+    /// Encrypted credential data, base64-armored.
+    ///
+    /// `noetl.credential.data_encrypted` is a Postgres `TEXT` column
+    /// (the Python server stored the encrypted blob as text).  The
+    /// Rust encryptor produces raw AES-GCM bytes, so the service
+    /// layer base64-encodes on write + decodes on read.  Modelling
+    /// this as `Vec<u8>` (BYTEA) made sqlx reject the decode with
+    /// `Rust type Vec<u8> (BYTEA) is not compatible with SQL type
+    /// TEXT`.  See noetl/ai-meta#54 Phase F R5 e2e finding.
+    pub data: String,
 
     /// Additional metadata (JSON)
     #[sqlx(default)]
