@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.20.0](https://github.com/noetl/server/compare/v2.19.8...v2.20.0) (2026-06-05)
+
+### Features
+
+* **crypto:** envelope-encryption core (KeyManager + LocalDevKms + EnvelopeCipher) ([5539573](https://github.com/noetl/server/commit/5539573e92c10ddf282ebc7cd5228fb50b9056d8)), closes [noetl/ai-meta#61](https://github.com/noetl/ai-meta/issues/61) [noetl/server#76](https://github.com/noetl/server/issues/76) [noetl/ai-meta#61](https://github.com/noetl/ai-meta/issues/61)
+
 ## [2.19.8](https://github.com/noetl/server/compare/v2.19.7...v2.19.8) (2026-06-05)
 
 ### Bug Fixes
