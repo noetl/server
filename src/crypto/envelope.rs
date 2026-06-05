@@ -12,12 +12,14 @@
 
 use std::sync::Arc;
 
+use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use rand::RngCore;
+use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
 use crate::crypto::encryption::Encryptor;
 use crate::crypto::keymanager::{KeyManager, WrappedDek};
-use crate::error::AppResult;
+use crate::error::{AppError, AppResult};
 
 /// The current envelope-encryption format version stored in `enc_version`.
 /// `0` (or NULL) means a legacy single-master-key record (pre-Phase-1).
@@ -37,6 +39,77 @@ pub struct EnvelopeRecord {
     pub enc_alg: String,
     /// Envelope format version (`ENC_VERSION`).
     pub enc_version: i16,
+}
+
+/// On-storage JSON form of an [`EnvelopeRecord`]: the bytes that go into the
+/// `data_encrypted` (TEXT) / `data` (BYTEA) column. Self-describing (carries
+/// the KEK identity + format version) so the re-encrypt / rotation job can act
+/// on it. Forward-only: there is no legacy fallback — a stored value that does
+/// not parse as this shape is an error (re-register the secret).
+#[derive(Serialize, Deserialize)]
+struct StoredEnvelope {
+    /// Envelope format version.
+    v: i16,
+    /// Content-encryption algorithm.
+    alg: String,
+    /// base64 `nonce || ciphertext`.
+    ct: String,
+    /// Wrapped DEK + the KEK that wrapped it.
+    dek: StoredDek,
+}
+
+#[derive(Serialize, Deserialize)]
+struct StoredDek {
+    /// KEK provider (`local`, `gcp-kms`, …).
+    p: String,
+    /// KEK key id.
+    kid: String,
+    /// KEK key version.
+    kv: String,
+    /// base64 wrapped-DEK bytes.
+    ct: String,
+}
+
+impl EnvelopeRecord {
+    /// Serialise to the on-storage JSON string (UTF-8; safe for TEXT + BYTEA).
+    pub fn to_storage_string(&self) -> String {
+        let s = StoredEnvelope {
+            v: self.enc_version,
+            alg: self.enc_alg.clone(),
+            ct: B64.encode(&self.ciphertext),
+            dek: StoredDek {
+                p: self.wrapped.provider.clone(),
+                kid: self.wrapped.key_id.clone(),
+                kv: self.wrapped.key_version.clone(),
+                ct: B64.encode(&self.wrapped.ciphertext),
+            },
+        };
+        serde_json::to_string(&s).expect("StoredEnvelope serialises")
+    }
+
+    /// Parse an on-storage value. Errors (rather than falling back) if the
+    /// value is not a valid envelope — forward-only, no legacy path.
+    pub fn from_storage_str(raw: &str) -> AppResult<EnvelopeRecord> {
+        let s: StoredEnvelope = serde_json::from_str(raw.trim())
+            .map_err(|e| AppError::Encryption(format!("not a wallet envelope record: {e}")))?;
+        let ciphertext = B64
+            .decode(s.ct.as_bytes())
+            .map_err(|e| AppError::Encryption(format!("envelope ct base64: {e}")))?;
+        let dek_ct = B64
+            .decode(s.dek.ct.as_bytes())
+            .map_err(|e| AppError::Encryption(format!("envelope dek base64: {e}")))?;
+        Ok(EnvelopeRecord {
+            ciphertext,
+            wrapped: WrappedDek {
+                provider: s.dek.p,
+                key_id: s.dek.kid,
+                key_version: s.dek.kv,
+                ciphertext: dek_ct,
+            },
+            enc_alg: s.alg,
+            enc_version: s.v,
+        })
+    }
 }
 
 /// Seals/opens secrets with envelope encryption over a [`KeyManager`].
@@ -93,6 +166,18 @@ impl EnvelopeCipher {
         serde_json::from_slice(&bytes)
             .map_err(|e| crate::error::AppError::Encryption(format!("deserialize: {e}")))
     }
+
+    /// Seal a JSON value directly into the on-storage string form (the value to
+    /// persist in `data_encrypted` / `data`).
+    pub async fn seal_json_to_storage(&self, value: &serde_json::Value) -> AppResult<String> {
+        Ok(self.seal_json(value).await?.to_storage_string())
+    }
+
+    /// Open an on-storage value into JSON.
+    pub async fn open_storage_json(&self, raw: &str) -> AppResult<serde_json::Value> {
+        let record = EnvelopeRecord::from_storage_str(raw)?;
+        self.open_json(&record).await
+    }
 }
 
 #[cfg(test)]
@@ -145,5 +230,24 @@ mod tests {
         let c2 = cipher();
         let rec = c1.seal(b"secret").await.unwrap();
         assert!(c2.open(&rec).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn storage_string_round_trips() {
+        let c = cipher();
+        let v = serde_json::json!({"db_host": "pg", "db_password": "p@ss;'"});
+        let stored = c.seal_json_to_storage(&v).await.unwrap();
+        // Self-describing JSON carrying the format version + KEK identity.
+        assert!(stored.contains("\"v\":1"));
+        assert!(stored.contains("\"local\""));
+        let out = c.open_storage_json(&stored).await.unwrap();
+        assert_eq!(out, v);
+    }
+
+    #[tokio::test]
+    async fn non_envelope_storage_value_errors() {
+        let c = cipher();
+        // A legacy/garbage value is not a wallet envelope → error (forward-only).
+        assert!(c.open_storage_json("AAAAlegacy-base64==").await.is_err());
     }
 }

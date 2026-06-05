@@ -1,21 +1,28 @@
 //! Keychain service for token/credential caching.
+//!
+//! The keychain is the per-execution cache of resolved secrets / minted tokens
+//! (noetl/ai-meta#61). Cached values are envelope-encrypted with the same
+//! wallet primitives as credentials (per-record DEK wrapped by the KEK) and
+//! stored as the self-describing envelope JSON. Forward-only — no legacy path.
+
+use std::sync::Arc;
 
 use chrono::{Duration, Utc};
 
-use crate::crypto::Encryptor;
+use crate::crypto::{EnvelopeCipher, LocalDevKms};
 use crate::db::models::{
     KeychainDeleteResponse, KeychainEntrySummary, KeychainGetResponse, KeychainListResponse,
     KeychainSetRequest, KeychainSetResponse,
 };
 use crate::db::queries::keychain as queries;
 use crate::db::DbPool;
-use crate::error::AppResult;
+use crate::error::{AppError, AppResult};
 
 /// Service for keychain operations.
 #[derive(Clone)]
 pub struct KeychainService {
     pool: DbPool,
-    encryptor: Encryptor,
+    cipher: EnvelopeCipher,
 }
 
 impl KeychainService {
@@ -24,10 +31,12 @@ impl KeychainService {
     /// # Arguments
     ///
     /// * `pool` - Database connection pool
-    /// * `encryption_key` - Base64-encoded 32-byte encryption key
+    /// * `encryption_key` - Base64-encoded 32-byte master key (KEK for the
+    ///   in-process [`LocalDevKms`]).
     pub fn new(pool: DbPool, encryption_key: &str) -> AppResult<Self> {
-        let encryptor = Encryptor::from_base64(encryption_key)?;
-        Ok(Self { pool, encryptor })
+        let kms = LocalDevKms::from_master_key_base64(encryption_key)?;
+        let cipher = EnvelopeCipher::new(Arc::new(kms));
+        Ok(Self { pool, cipher })
     }
 
     /// Get a keychain entry.
@@ -70,8 +79,10 @@ impl KeychainService {
         // Increment access count
         queries::increment_access_count(&self.pool, entry.id).await?;
 
-        // Decrypt data
-        let data = self.encryptor.decrypt_json(&entry.data)?;
+        // Decrypt data: `entry.data` (BYTEA) holds the UTF-8 envelope JSON.
+        let stored = std::str::from_utf8(&entry.data)
+            .map_err(|e| AppError::Encryption(format!("keychain data not UTF-8: {e}")))?;
+        let data = self.cipher.open_storage_json(stored).await?;
 
         Ok(KeychainGetResponse {
             status: "found".to_string(),
@@ -103,8 +114,13 @@ impl KeychainService {
                 .map(|seconds| Utc::now() + Duration::seconds(seconds))
         });
 
-        // Encrypt data
-        let encrypted_data = self.encryptor.encrypt_json(&request.data)?;
+        // Envelope-seal data into the self-describing JSON, stored as UTF-8
+        // bytes in the BYTEA `data` column.
+        let encrypted_data = self
+            .cipher
+            .seal_json_to_storage(&request.data)
+            .await?
+            .into_bytes();
 
         // Upsert entry
         queries::upsert_keychain_entry(
