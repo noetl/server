@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.19.8](https://github.com/noetl/server/compare/v2.19.7...v2.19.8) (2026-06-05)
+
+### Bug Fixes
+
+* **crypto:** remove all-zeros default encryption key, fail closed ([48b4a6f](https://github.com/noetl/server/commit/48b4a6f82b604cb02ec040bf5f06fc013fbb3b28)), closes [noetl/ai-meta#61](https://github.com/noetl/ai-meta/issues/61) [noetl/server#74](https://github.com/noetl/server/issues/74) [noetl/ai-meta#61](https://github.com/noetl/ai-meta/issues/61)
+
 ## [2.19.7](https://github.com/noetl/server/compare/v2.19.6...v2.19.7) (2026-06-05)
 
 ### Bug Fixes
