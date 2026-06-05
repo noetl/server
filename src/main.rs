@@ -23,8 +23,10 @@ use noetl_server::{
     state::AppState,
 };
 
-/// Default encryption key for development (should be overridden in production).
-const DEFAULT_ENCRYPTION_KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+// NOTE (noetl/ai-meta#61, Phase 1a): the hardcoded all-zeros
+// DEFAULT_ENCRYPTION_KEY was REMOVED.  A publicly-known / shared default key
+// is equivalent to no encryption and fails security review.  The server now
+// fails closed when no key is configured (see `resolve_encryption_key`).
 
 /// Initialize tracing/logging.
 fn init_tracing() {
@@ -371,12 +373,60 @@ fn strip_nats_userinfo(url: &str) -> (String, Option<(String, String)>) {
     (cleaned, Some((user, password)))
 }
 
-/// Get encryption key from environment or use default.
-fn get_encryption_key() -> String {
-    std::env::var("NOETL_ENCRYPTION_KEY").unwrap_or_else(|_| {
-        tracing::warn!("NOETL_ENCRYPTION_KEY not set, using default (not secure for production)");
-        DEFAULT_ENCRYPTION_KEY.to_string()
-    })
+/// Resolve the at-rest encryption key (noetl/ai-meta#61, Phase 1a).
+///
+/// Security policy:
+/// - `NOETL_ENCRYPTION_KEY` (base64-encoded 32-byte key) is the supported
+///   source of a real key. When set + non-empty, it is used.
+/// - When absent/empty, the server **fails closed** (refuses to start) —
+///   the old silent fallback to a hardcoded all-zeros key is removed.
+/// - The only exception is the explicit non-production escape hatch
+///   `NOETL_ALLOW_INSECURE_DEFAULT_KEY=true` (for kind / local dev), which
+///   generates a **random ephemeral** key (never a shared/known constant)
+///   and logs a loud warning. Credentials encrypted under it do NOT survive
+///   a restart — set `NOETL_ENCRYPTION_KEY` for stable dev data.
+///
+/// Pure helper (env-free) so it is unit-testable without mutating process env.
+fn resolve_encryption_key(key_env: Option<String>, allow_insecure: bool) -> anyhow::Result<String> {
+    if let Some(k) = key_env {
+        if !k.trim().is_empty() {
+            return Ok(k);
+        }
+    }
+    if allow_insecure {
+        use base64::Engine as _;
+        use rand::RngCore;
+        let mut key = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut key);
+        let b64 = base64::engine::general_purpose::STANDARD.encode(key);
+        tracing::warn!(
+            "NOETL_ENCRYPTION_KEY is not set and NOETL_ALLOW_INSECURE_DEFAULT_KEY is \
+             enabled: generated a RANDOM ephemeral key for this process. Encrypted \
+             credentials will NOT decrypt after a restart. Never use in production."
+        );
+        return Ok(b64);
+    }
+    anyhow::bail!(
+        "NOETL_ENCRYPTION_KEY is not set. Refusing to start: the insecure all-zeros \
+         default key was removed (noetl/ai-meta#61). Provide a base64-encoded 32-byte \
+         key via NOETL_ENCRYPTION_KEY (production), or set \
+         NOETL_ALLOW_INSECURE_DEFAULT_KEY=true for ephemeral non-production use."
+    )
+}
+
+/// Read the encryption key from the environment, applying the fail-closed
+/// policy in `resolve_encryption_key`.
+fn get_encryption_key() -> anyhow::Result<String> {
+    let key_env = std::env::var("NOETL_ENCRYPTION_KEY").ok();
+    let allow_insecure = std::env::var("NOETL_ALLOW_INSECURE_DEFAULT_KEY")
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false);
+    resolve_encryption_key(key_env, allow_insecure)
 }
 
 #[tokio::main]
@@ -442,8 +492,8 @@ async fn main() -> anyhow::Result<()> {
     // Connect to NATS (optional)
     let nats_client = connect_nats(&app_config).await;
 
-    // Get encryption key
-    let encryption_key = get_encryption_key();
+    // Get encryption key (fails closed if unset; see resolve_encryption_key).
+    let encryption_key = get_encryption_key()?;
 
     // Create application state first so the snowflake generator
     // (Phase F R1.5 of noetl/ai-meta#49) is initialized once and
@@ -515,5 +565,42 @@ async fn shutdown_signal() {
         _ = terminate => {
             tracing::info!("Received SIGTERM, starting graceful shutdown");
         }
+    }
+}
+
+#[cfg(test)]
+mod encryption_key_tests {
+    use super::resolve_encryption_key;
+
+    #[test]
+    fn uses_explicit_key_when_present() {
+        let k = resolve_encryption_key(Some("dGVzdC1rZXk=".to_string()), false).unwrap();
+        assert_eq!(k, "dGVzdC1rZXk=");
+    }
+
+    #[test]
+    fn fails_closed_when_absent_and_not_insecure() {
+        assert!(resolve_encryption_key(None, false).is_err());
+    }
+
+    #[test]
+    fn fails_closed_when_empty_and_not_insecure() {
+        assert!(resolve_encryption_key(Some("   ".to_string()), false).is_err());
+    }
+
+    #[test]
+    fn insecure_escape_hatch_generates_a_key() {
+        // Random ephemeral key (base64 of 32 bytes) when the explicit flag is on.
+        let k = resolve_encryption_key(None, true).unwrap();
+        assert!(!k.is_empty());
+        // Two calls produce different keys (random, not a shared constant).
+        let k2 = resolve_encryption_key(None, true).unwrap();
+        assert_ne!(k, k2);
+    }
+
+    #[test]
+    fn explicit_key_wins_over_insecure_flag() {
+        let k = resolve_encryption_key(Some("ZXhwbGljaXQ=".to_string()), true).unwrap();
+        assert_eq!(k, "ZXhwbGljaXQ=");
     }
 }
