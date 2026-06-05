@@ -503,7 +503,10 @@ mod tests {
             args: None,
             vars: None,
             r#loop: None,
-            tool: ToolDefinition::Pipeline(vec![fetch_task, transform_task]),
+            tool: ToolDefinition::Pipeline(vec![
+                crate::playbook::types::PipelineItem::Nested(fetch_task),
+                crate::playbook::types::PipelineItem::Nested(transform_task),
+            ]),
             next: None,
         };
 

@@ -239,8 +239,89 @@ pub enum ToolDefinition {
     Single(ToolSpec),
 
     /// Pipeline - list of labeled tasks.
-    /// Each item is a map with single key (label) -> tool spec.
-    Pipeline(Vec<HashMap<String, ToolSpec>>),
+    ///
+    /// Two YAML shapes are accepted on input, both map to the same
+    /// internal representation (label-as-key) before serialization
+    /// for the worker's `task_sequence` consumer:
+    ///
+    /// **Flat / name-as-field** (the dominant v10 form in e2e
+    /// fixtures: ~5 fixtures with this shape under
+    /// `repos/e2e/fixtures/playbooks/`):
+    /// ```yaml
+    /// tool:
+    /// - name: init_action
+    ///   kind: python
+    ///   input: { ... }
+    ///   code: ...
+    /// ```
+    ///
+    /// **Nested / label-as-key** (the existing Rust internal
+    /// shape, also used in some hand-written fixtures):
+    /// ```yaml
+    /// tool:
+    /// - init_action:
+    ///     kind: python
+    ///     input: { ... }
+    ///     code: ...
+    /// ```
+    ///
+    /// See `noetl/ai-meta#57` for the e2e finding that surfaced
+    /// the flat form being rejected by the strict Rust decoder.
+    Pipeline(Vec<PipelineItem>),
+}
+
+/// One item in a pipeline.  Untagged so serde tries each variant
+/// in declaration order and picks the first that decodes.
+///
+/// `Flat` is tried first because the v10 dominant form has a
+/// top-level `kind:` field (a required field on `ToolSpec`); the
+/// nested label-as-key form has no `kind:` at the top level
+/// (the key IS the label), so it cleanly falls through to
+/// `Nested`.  The serializer round-trips through the nested form
+/// so the wire shape downstream (worker's `task_sequence` consumer)
+/// stays unchanged.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum PipelineItem {
+    /// Flat shape: `{ name: "label", kind: "python", code: "...", ... }`.
+    /// The pipeline-item label lives in the `name` field; the rest of
+    /// the fields are an inline `ToolSpec`.  Stored via `ToolSpec.extra`
+    /// (the `#[serde(flatten)] HashMap` catch-all), so no schema change
+    /// is needed on ToolSpec itself.
+    Flat(ToolSpec),
+
+    /// Nested shape: `{ "label": { kind: "python", code: "...", ... } }`.
+    /// Single-key map — the key is the label, the value is the spec.
+    Nested(HashMap<String, ToolSpec>),
+}
+
+impl serde::Serialize for PipelineItem {
+    /// Normalize on the wire to the nested shape so the worker's
+    /// `task_sequence` consumer (which has historically seen only
+    /// the nested shape) doesn't have to dual-decode.  The `Flat`
+    /// form's pipeline-item label is read from `ToolSpec.extra["name"]`
+    /// if present; missing/non-string `name` falls back to the empty
+    /// string, which is the same fallback the downstream config has
+    /// always used.
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            PipelineItem::Flat(spec) => {
+                let label = spec
+                    .extra
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let mut map = HashMap::new();
+                map.insert(label, spec.clone());
+                map.serialize(serializer)
+            }
+            PipelineItem::Nested(map) => map.serialize(serializer),
+        }
+    }
 }
 
 // ============================================================================
@@ -968,8 +1049,62 @@ workflow:
 
         if let ToolDefinition::Pipeline(tasks) = &step.tool {
             assert_eq!(tasks.len(), 2);
-            assert!(tasks[0].contains_key("fetch"));
-            assert!(tasks[1].contains_key("transform"));
+            // Nested form (label-as-key) — the existing back-compat shape.
+            match &tasks[0] {
+                PipelineItem::Nested(map) => assert!(map.contains_key("fetch")),
+                PipelineItem::Flat(_) => panic!("Expected Nested form for label-as-key YAML"),
+            }
+            match &tasks[1] {
+                PipelineItem::Nested(map) => assert!(map.contains_key("transform")),
+                PipelineItem::Flat(_) => panic!("Expected Nested form for label-as-key YAML"),
+            }
+        } else {
+            panic!("Expected ToolDefinition::Pipeline");
+        }
+    }
+
+    #[test]
+    fn test_parse_pipeline_with_name_as_field_shape() {
+        // noetl/ai-meta#57 — the v10 canonical fixtures write
+        // pipeline items in flat form with `name:` as a field
+        // (not as the outer label-as-key map).  Both shapes must
+        // decode into a Pipeline of the right cardinality with
+        // labels addressable downstream.
+        let yaml = r#"
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata:
+  name: pipeline_flat
+workflow:
+  - step: fetch_transform
+    tool:
+      - name: fetch
+        kind: http
+        url: "https://api.example.com"
+      - name: transform
+        kind: python
+        code: "result = {'ok': True}"
+"#;
+        let playbook: Playbook = serde_yaml::from_str(yaml).unwrap();
+        let step = playbook.get_step("fetch_transform").unwrap();
+        if let ToolDefinition::Pipeline(tasks) = &step.tool {
+            assert_eq!(tasks.len(), 2);
+            // Flat form — pipeline-item label lives in spec.extra["name"].
+            for (i, expected_label) in [(0usize, "fetch"), (1usize, "transform")] {
+                match &tasks[i] {
+                    PipelineItem::Flat(spec) => {
+                        let name = spec
+                            .extra
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        assert_eq!(name, expected_label);
+                    }
+                    PipelineItem::Nested(_) => {
+                        panic!("Expected Flat form for name-as-field YAML")
+                    }
+                }
+            }
         } else {
             panic!("Expected ToolDefinition::Pipeline");
         }
