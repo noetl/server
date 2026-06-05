@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.19.1](https://github.com/noetl/server/compare/v2.19.0...v2.19.1) (2026-06-05)
+
+### Bug Fixes
+
+* **events:** accept i64 wire shape for execution_id / event_id ([7e65712](https://github.com/noetl/server/commit/7e6571276dddaf0f535d36da1a467f6d88c0bb49)), closes [noetl/ai-meta#55](https://github.com/noetl/ai-meta/issues/55)
+
 ## [2.19.0](https://github.com/noetl/server/compare/v2.18.0...v2.19.0) (2026-06-04)
 
 ### Features
