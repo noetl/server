@@ -4,7 +4,7 @@
 //! supporting variables, filters, and control structures.
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-use minijinja::{value::ValueKind, Environment, Error, ErrorKind, Value};
+use minijinja::{value::ValueKind, Environment, Error, ErrorKind, UndefinedBehavior, Value};
 use std::collections::HashMap;
 
 use crate::error::{AppError, AppResult};
@@ -24,6 +24,20 @@ impl TemplateRenderer {
     /// Create a new template renderer with custom filters.
     pub fn new() -> Self {
         let mut env = Environment::new();
+
+        // Allow `{{ undefined.attribute }}` style chains to resolve
+        // to undefined rather than throwing.  The default `Lenient`
+        // behaviour fails attribute access on an undefined parent —
+        // so a template like
+        //   `{{ ctx.from_start | default(start.data.executed) }}`
+        // throws "undefined value" when `ctx` isn't populated (e.g.
+        // arc `set:` block isn't processed), even though the
+        // `default()` filter would otherwise catch the missing
+        // value.  `Chainable` returns undefined for the missing
+        // attribute, lets `default()` see it, and matches the
+        // Python reference impl's permissive Jinja2 behavior.
+        // See noetl/ai-meta#54 Phase F R5 e2e finding.
+        env.set_undefined_behavior(UndefinedBehavior::Chainable);
 
         // Add custom filters
         env.add_filter("b64encode", filter_b64encode);

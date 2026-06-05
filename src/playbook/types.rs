@@ -134,15 +134,15 @@ pub struct ToolSpec {
 
     /// Tool-level flow control (canonical format).
     /// Evaluated after tool execution.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub eval: Option<Vec<EvalEntry>>,
 
     /// Authentication configuration.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<serde_json::Value>,
 
     /// Libraries/dependencies.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub libs: Option<serde_json::Value>,
 
     /// Default arguments / inputs passed to the tool runtime.
@@ -162,43 +162,43 @@ pub struct ToolSpec {
     /// gets an empty dict, and any user code referencing the
     /// workload by name (e.g. `print(f"hello {message}")`) raises
     /// `NameError`.  See noetl/ai-meta#56 for the e2e finding.
-    #[serde(default, alias = "input")]
+    #[serde(default, alias = "input", skip_serializing_if = "Option::is_none")]
     pub args: Option<serde_json::Value>,
 
     /// Python code (for python tool).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code: Option<String>,
 
     /// URL (for http tool).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
 
     /// HTTP method (for http tool).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub method: Option<String>,
 
     /// Query/SQL (for database tools).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub query: Option<String>,
 
     /// Command (for database/shell tools).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
 
     /// Connection string or credential reference.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub connection: Option<String>,
 
     /// HTTP params.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub params: Option<HashMap<String, serde_json::Value>>,
 
     /// HTTP headers.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub headers: Option<HashMap<String, String>>,
 
     /// Output selection strategy (for result externalization).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_select: Option<serde_json::Value>,
 
     /// Additional tool-specific configuration.

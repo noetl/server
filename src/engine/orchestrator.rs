@@ -256,6 +256,17 @@ impl WorkflowOrchestrator {
         // would falsely mark the playbook done while the other
         // branches are still running.
         let mut reached_end = false;
+        // Steps already dispatched in THIS pass.  `is_step_done` /
+        // `running_steps` read from the events DB, so two sibling
+        // arcs whose `next_step` resolves to the same target would
+        // otherwise both queue commands in the same orchestrator
+        // round (neither has a persisted event yet).  Track here so
+        // the second arc skips dispatch.  Surfaced as part of the
+        // `end`-step-with-action fix (noetl/ai-meta#54): parallel
+        // branches converging on `end` would double-queue without
+        // this guard.
+        let mut dispatched_in_pass: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
 
         // command.failed gets its own dedicated short-circuit path
         // BEFORE the transition-trigger filter — a failed step must
@@ -376,7 +387,26 @@ impl WorkflowOrchestrator {
                     if next_step_name == "end" {
                         debug!("Branch reached 'end'; deferring completion decision");
                         reached_end = true;
-                        continue;
+
+                        // If `end` is defined as a real step in the
+                        // workflow (the canonical v10 shape — an
+                        // aggregator that may carry its own cleanup
+                        // tool), fall through to the normal dispatch
+                        // path below so the end step's action runs.
+                        // Without this, every `end:` step with a
+                        // `tool:` block (e.g. `test_end_with_action`'s
+                        // cleanup Python) was silently skipped — the
+                        // orchestrator went straight to
+                        // `playbook.completed` without executing the
+                        // end step.
+                        //
+                        // Skip dispatch only when `end` is not a
+                        // defined step (legacy "pure terminal" case);
+                        // `reached_end_quiescent` then handles the
+                        // completion transition.
+                        if !steps.contains_key("end") {
+                            continue;
+                        }
                     }
 
                     // Get next step definition
@@ -396,6 +426,16 @@ impl WorkflowOrchestrator {
 
                     if state.running_steps().contains(&next_step_name.as_str()) {
                         debug!("Step '{}' already running, skipping", next_step_name);
+                        continue;
+                    }
+
+                    // Same-pass dedup: a sibling arc may have just
+                    // queued a command for this step in this round.
+                    if dispatched_in_pass.contains(next_step_name) {
+                        debug!(
+                            "Step '{}' already dispatched in this pass, skipping",
+                            next_step_name
+                        );
                         continue;
                     }
 
@@ -676,6 +716,7 @@ impl WorkflowOrchestrator {
                     )?;
 
                     commands.push(command);
+                    dispatched_in_pass.insert(current_step_name.clone());
                 }
             }
         }
@@ -1498,9 +1539,13 @@ mod tests {
     }
 
     #[test]
-    fn test_parallel_all_branches_done_completes() {
-        // Both branches completed and both routed to `end` — the
-        // orchestrator's deferred completion should fire.
+    fn test_parallel_all_branches_done_dispatches_end_once() {
+        // Both branches completed and both routed to `end`.  With
+        // the noetl/ai-meta#54 fix, `end` is now a real dispatchable
+        // step (not a pure terminal sentinel) — the orchestrator
+        // queues a single command for it, and same-pass dedup
+        // prevents the second branch's arc from double-dispatching.
+        // Completion happens later, on `end`'s own command.completed.
         let orchestrator = WorkflowOrchestrator::new();
 
         let start = make_step_with_parallel_next("start", &["branch_a", "branch_b"]);
@@ -1544,9 +1589,70 @@ mod tests {
             .evaluate(&events, &playbook, Some("command.completed"))
             .unwrap();
 
+        assert_eq!(
+            result.commands.len(),
+            1,
+            "end step must be dispatched exactly once, not duplicated by sibling arcs"
+        );
+        assert!(
+            !result.should_complete,
+            "should not complete until end's own command.completed lands"
+        );
+    }
+
+    #[test]
+    fn test_parallel_all_branches_plus_end_completed_finalises() {
+        // Follow-on round: once `end`'s own command.completed is in
+        // the event log, check_completion fires and the workflow
+        // terminates with status COMPLETED.
+        let orchestrator = WorkflowOrchestrator::new();
+
+        let start = make_step_with_parallel_next("start", &["branch_a", "branch_b"]);
+        let branch_a = make_step("branch_a", Some("end"));
+        let branch_b = make_step("branch_b", Some("end"));
+        let end = make_step("end", None);
+
+        let events = vec![
+            {
+                let mut e = make_event("playbook_started", None);
+                e.context = Some(serde_json::json!({
+                    "workload": {}, "path": "test", "version": "1"
+                }));
+                e
+            },
+            make_event("command.completed", Some("start")),
+            make_event("step.enter", Some("branch_a")),
+            make_event("command.completed", Some("branch_a")),
+            make_event("step.enter", Some("branch_b")),
+            make_event("command.completed", Some("branch_b")),
+            make_event("step.enter", Some("end")),
+            make_event("command.completed", Some("end")),
+        ];
+
+        let playbook = Playbook {
+            api_version: "noetl.io/v2".to_string(),
+            kind: "Playbook".to_string(),
+            metadata: Metadata {
+                name: "parallel_done_end".to_string(),
+                path: Some("test/parallel_done_end".to_string()),
+                description: None,
+                labels: None,
+                extra: HashMap::new(),
+            },
+            workload: None,
+            vars: None,
+            keychain: None,
+            workbook: None,
+            workflow: vec![start, branch_a, branch_b, end],
+        };
+
+        let result = orchestrator
+            .evaluate(&events, &playbook, Some("command.completed"))
+            .unwrap();
+
         assert!(
             result.should_complete,
-            "both branches done + both at end ⇒ complete"
+            "all branches done + end's own command.completed ⇒ COMPLETED"
         );
         assert_eq!(
             result.completion_status.as_ref().map(|c| c.status.as_str()),

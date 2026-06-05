@@ -639,12 +639,16 @@ async fn handle_event_inner(
     // steps stalled the execution forever because the orchestrator
     // never got a chance to emit `playbook.failed`).
     //
-    // The `step != "end"` guard stays in place: the sentinel `end`
-    // step's completion fires its own `playbook.completed` path on
-    // the orchestrator's natural-completion branch.
-    let should_trigger_orchestrator = (request.event_type == "command.completed"
-        || request.event_type == "command.failed")
-        && request.step.to_lowercase() != "end";
+    // The earlier `step != "end"` guard treated `end` as a sentinel
+    // whose completion fired playbook.completed implicitly.  After
+    // the noetl/ai-meta#54 orchestrator change (end is a real step
+    // with its own `tool:` block), end's command.completed MUST
+    // trigger the orchestrator — that's the pass where
+    // `check_completion` sees end as done and emits
+    // `playbook.completed`.  Without this trigger the playbook
+    // stalled at `command.completed [end]` with no terminal event.
+    let should_trigger_orchestrator =
+        request.event_type == "command.completed" || request.event_type == "command.failed";
     if should_trigger_orchestrator {
         match trigger_orchestrator(&state, execution_id, event_id).await {
             Ok(cmds) => {
@@ -1057,14 +1061,16 @@ pub async fn handle_batch_events(
 
     tx.commit().await?;
 
-    // Trigger orchestrator for any command.completed in the batch
-    // whose step is not the playbook's terminal `end` block.  Mirrors
-    // the call site in `handle_event` above; runs once per qualifying
+    // Trigger orchestrator for any command.completed in the batch,
+    // including end (end is now a real dispatched step per
+    // noetl/ai-meta#54 — its command.completed is the trigger that
+    // makes check_completion emit playbook.completed).  Mirrors the
+    // call site in `handle_event` above; runs once per qualifying
     // event so a batch with multiple completions can still advance
     // multi-step playbooks.  Errors are logged and swallowed so a
     // bad-state evaluation doesn't fail the whole batch ingest.
     for (idx, item) in request.events.iter().enumerate() {
-        if item.event_type == "command.completed" && item.step.to_lowercase() != "end" {
+        if item.event_type == "command.completed" {
             let trigger_event_id = event_ids[idx];
             match trigger_orchestrator(&state, execution_id, trigger_event_id).await {
                 Ok(cmds) => {
