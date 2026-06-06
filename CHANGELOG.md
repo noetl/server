@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.36.0](https://github.com/noetl/server/compare/v2.35.0...v2.36.0) (2026-06-06)
+
+### Features
+
+* **secrets:** residency-policy gate (Phase 6c) ([0f4bc14](https://github.com/noetl/server/commit/0f4bc14574a110c0818a39a693a3d4de9abb9da9)), closes [#114](https://github.com/noetl/server/issues/114) [noetl/ai-meta#61](https://github.com/noetl/ai-meta/issues/61)
+
 ## [2.35.0](https://github.com/noetl/server/compare/v2.34.0...v2.35.0) (2026-06-06)
 
 ### Features
