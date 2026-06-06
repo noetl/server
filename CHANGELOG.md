@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.30.0](https://github.com/noetl/server/compare/v2.29.0...v2.30.0) (2026-06-06)
+
+### Features
+
+* **tls:** opt-in TLS/mTLS listener for the control-plane API ([85a805d](https://github.com/noetl/server/commit/85a805d914c599329d9d16fac3319d47ea977d50)), closes [noetl/ai-meta#61](https://github.com/noetl/ai-meta/issues/61) [#102](https://github.com/noetl/server/issues/102) [noetl/ai-meta#61](https://github.com/noetl/ai-meta/issues/61)
+
 ## [2.29.0](https://github.com/noetl/server/compare/v2.28.1...v2.29.0) (2026-06-06)
 
 ### Features
