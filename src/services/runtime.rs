@@ -230,6 +230,65 @@ impl RuntimeService {
         Ok(())
     }
 
+    /// Look up the X25519 sealing public key a worker registered with itself.
+    ///
+    /// Secrets Wallet Phase 5b (noetl/ai-meta#61).  Workers opt into sealed
+    /// credential delivery by including a base64 32-byte X25519 public key in
+    /// the `runtime` JSON blob they pass to register, e.g.:
+    ///
+    /// ```json
+    /// {
+    ///   "worker_public_key": "<base64(32-byte-x25519-pub)>"
+    /// }
+    /// ```
+    ///
+    /// This is the JSON shape the server already persists as the `runtime`
+    /// column; no schema migration is needed and workers that don't opt in
+    /// keep working unchanged (the sealing endpoint just returns
+    /// `BadRequest` for those workers).
+    ///
+    /// Returns `Ok(Some(pk))` when the lookup succeeds, `Ok(None)` when the
+    /// worker exists but didn't register a key, and an error when the
+    /// `worker_pool` runtime row doesn't exist or the key is malformed.
+    pub async fn get_worker_public_key(
+        &self,
+        worker_name: &str,
+    ) -> AppResult<Option<[u8; 32]>> {
+        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+
+        let row: Option<(Option<serde_json::Value>,)> = sqlx::query_as(
+            "SELECT runtime FROM noetl.runtime WHERE kind = 'worker_pool' AND name = $1",
+        )
+        .bind(worker_name)
+        .fetch_optional(&self.db)
+        .await?;
+        let runtime_json = match row {
+            Some((Some(v),)) => v,
+            Some((None,)) | None => {
+                // Row missing entirely, OR runtime metadata column is NULL —
+                // either way the worker did not opt into sealing.  The
+                // caller surfaces the right error message.
+                return Ok(None);
+            }
+        };
+        let encoded = match runtime_json.get("worker_public_key").and_then(|v| v.as_str()) {
+            Some(s) if !s.is_empty() => s,
+            _ => return Ok(None),
+        };
+        let bytes = B64
+            .decode(encoded)
+            .map_err(|e| AppError::BadRequest(format!(
+                "worker '{worker_name}' worker_public_key base64: {e}"
+            )))?;
+        let array: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
+            AppError::BadRequest(format!(
+                "worker '{worker_name}' worker_public_key must be 32 bytes, got {}",
+                bytes.len()
+            ))
+        })?;
+        Ok(Some(array))
+    }
+
     /// Update heartbeat for a runtime.
     pub async fn heartbeat(&self, kind: &str, name: &str) -> AppResult<()> {
         let result = sqlx::query(
