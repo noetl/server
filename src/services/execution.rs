@@ -159,6 +159,17 @@ impl ExecutionService {
         let limit = filter.limit.unwrap_or(50).min(100);
         let offset = filter.offset.unwrap_or(0);
         let fetch_cap: i64 = (limit as i64) + (offset as i64);
+        // Candidate window for stage 1 (noetl/ai-meta#62).  Without a status
+        // filter the N most-recent *executions* are exactly the answer, so the
+        // candidate cap equals `fetch_cap`.  With a status filter the matching
+        // rows are a subset of the candidates, so over-fetch a bounded window
+        // (the status filter then applies post-aggregation within the most-
+        // recent `candidate_cap` executions — a paginated-recent-list semantic).
+        let candidate_cap: i64 = if filter.status.is_none() {
+            fetch_cap
+        } else {
+            fetch_cap.saturating_mul(10).min(2_000)
+        };
 
         // Stage 1 — per-shard execution_stats aggregation.  The
         // per-shard query is the original CTE minus the catalog
@@ -172,42 +183,72 @@ impl ExecutionService {
                 let catalog_id = filter.catalog_id;
                 let status = filter.status.clone();
                 async move {
+                    // noetl/ai-meta#62: candidate-first.  The old query
+                    // GROUP BY'd the entire `noetl.event` table (O(all events)
+                    // — a ~3.2M-row parallel seq scan, 7-8s) just to find the
+                    // N most-recent executions.  Instead, stage `recent` picks
+                    // the N most-recent executions from their per-execution
+                    // start event (indexed by `event_type`), then stage `stats`
+                    // aggregates status/completed/count over *only* those
+                    // candidates' events (indexed by `execution_id`).  The
+                    // start event is the execution's first event, so
+                    // `MIN(created_at)` over start events equals it over all
+                    // events — `started_at` (and the ordering) are identical to
+                    // the old query.
                     sqlx::query_as::<_, StatsRow>(
                         r#"
-                        WITH execution_stats AS (
+                        WITH recent AS (
                             SELECT
                                 execution_id,
                                 catalog_id,
-                                MIN(created_at) AT TIME ZONE 'UTC' as started_at,
-                                MAX(CASE WHEN status IN ('COMPLETED', 'FAILED', 'CANCELLED') THEN created_at END) AT TIME ZONE 'UTC' as completed_at,
-                                COUNT(*) as event_count,
-                                MAX(CASE
-                                    WHEN event_type IN ('playbook.completed', 'playbook_completed') THEN 'COMPLETED'
-                                    WHEN event_type IN ('playbook.failed', 'playbook_failed') THEN 'FAILED'
-                                    WHEN event_type IN ('playbook.cancelled', 'playbook_cancelled') THEN 'CANCELLED'
-                                    WHEN status = 'FAILED' THEN 'FAILED'
-                                    ELSE 'RUNNING'
-                                END) as status
+                                MIN(created_at) AT TIME ZONE 'UTC' as started_at
                             FROM noetl.event
-                            WHERE ($1::BIGINT IS NULL OR catalog_id = $1)
+                            WHERE event_type IN ('playbook.initialized', 'playbook_started', 'playbook.started')
+                              AND ($1::BIGINT IS NULL OR catalog_id = $1)
                             GROUP BY execution_id, catalog_id
+                            ORDER BY started_at DESC
+                            LIMIT $4
+                        ),
+                        stats AS (
+                            SELECT
+                                e.execution_id,
+                                MAX(CASE WHEN e.status IN ('COMPLETED', 'FAILED', 'CANCELLED') THEN e.created_at END) AT TIME ZONE 'UTC' as completed_at,
+                                COUNT(*) as event_count,
+                                -- Terminal-state priority (noetl/ai-meta#62).  The old
+                                -- `MAX(CASE … ELSE 'RUNNING')` is a string MAX, and
+                                -- 'RUNNING' > 'FAILED' > 'COMPLETED' > 'CANCELLED'
+                                -- alphabetically — so ANY execution with a non-terminal
+                                -- event reported RUNNING even after it completed (the
+                                -- list-vs-detail status drift).  `bool_or` over a
+                                -- prioritized CASE picks the terminal state when present.
+                                CASE
+                                    WHEN bool_or(e.event_type IN ('playbook.completed', 'playbook_completed')) THEN 'COMPLETED'
+                                    WHEN bool_or(e.event_type IN ('playbook.failed', 'playbook_failed') OR e.status = 'FAILED') THEN 'FAILED'
+                                    WHEN bool_or(e.event_type IN ('playbook.cancelled', 'playbook_cancelled')) THEN 'CANCELLED'
+                                    ELSE 'RUNNING'
+                                END as status
+                            FROM noetl.event e
+                            WHERE e.execution_id IN (SELECT execution_id FROM recent)
+                            GROUP BY e.execution_id
                         )
                         SELECT
-                            execution_id,
-                            catalog_id,
-                            status,
-                            started_at,
-                            completed_at,
-                            event_count
-                        FROM execution_stats
-                        WHERE ($2::TEXT IS NULL OR status = $2)
-                        ORDER BY started_at DESC
+                            r.execution_id,
+                            r.catalog_id,
+                            s.status,
+                            r.started_at,
+                            s.completed_at,
+                            s.event_count
+                        FROM recent r
+                        JOIN stats s ON s.execution_id = r.execution_id
+                        WHERE ($2::TEXT IS NULL OR s.status = $2)
+                        ORDER BY r.started_at DESC
                         LIMIT $3
                         "#,
                     )
                     .bind(catalog_id)
                     .bind(&status)
                     .bind(fetch_cap)
+                    .bind(candidate_cap)
                     .fetch_all(&pool)
                     .await
                 }
