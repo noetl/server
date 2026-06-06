@@ -286,6 +286,80 @@ pub fn record_secret_resolve(provider: &str, region: &str, status: &str) {
         .inc();
 }
 
+/// Secrets-Wallet Phase 6b: per-`(provider, region)` provider-build counter.
+///
+/// `status`:
+/// - `cache_hit` — the registry returned an existing entry.
+/// - `ok` — a new provider was built and inserted.
+/// - `error` — `build_secret_provider_for_region` failed; the cache is
+///   unchanged.
+///
+/// Together with [`secret_resolve_total`] this answers two operator questions:
+/// "Is the cache effective?" (`cache_hit / (ok + cache_hit)` ratio) and
+/// "Is a region's provider down?" (`error` per-region rate).
+pub fn secret_provider_build_total() -> &'static IntCounterVec {
+    static M: OnceLock<IntCounterVec> = OnceLock::new();
+    M.get_or_init(|| {
+        let counter = IntCounterVec::new(
+            Opts::new(
+                "noetl_secret_provider_build_total",
+                "ProviderRegistry get_or_build outcomes per (provider, region).",
+            ),
+            &["provider", "region", "status"],
+        )
+        .expect("static counter spec must be valid");
+        registry()
+            .register(Box::new(counter.clone()))
+            .expect("counter registration must succeed");
+        counter
+    })
+}
+
+/// Increment [`secret_provider_build_total`] by 1.
+pub fn record_secret_provider_build(provider: &str, region: &str, status: &str) {
+    let region_label = if region.is_empty() { "-" } else { region };
+    secret_provider_build_total()
+        .with_label_values(&[provider, region_label, status])
+        .inc();
+}
+
+/// Secrets-Wallet Phase 6b: histogram of secret-resolve wall-clock latency,
+/// keyed by `(provider, region)`.  Bucketed to span the 5 ms – 5 s range
+/// where cloud secret managers and Vault clusters actually live.
+///
+/// `execution_id` is NOT a label — it lives on the matching `secret.resolve`
+/// span per [`agents/rules/observability.md`] Principle 4.
+pub fn secret_resolve_duration_seconds() -> &'static HistogramVec {
+    static M: OnceLock<HistogramVec> = OnceLock::new();
+    M.get_or_init(|| {
+        let h = HistogramVec::new(
+            HistogramOpts::new(
+                "noetl_secret_resolve_duration_seconds",
+                "Wall-clock seconds spent resolving one keychain entry against \
+                 its provider.",
+            )
+            .buckets(vec![
+                0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0,
+            ]),
+            &["provider", "region"],
+        )
+        .expect("static histogram spec must be valid");
+        registry()
+            .register(Box::new(h.clone()))
+            .expect("histogram registration must succeed");
+        h
+    })
+}
+
+/// Observe one resolve duration on the [`secret_resolve_duration_seconds`]
+/// histogram.
+pub fn record_secret_resolve_duration(provider: &str, region: &str, seconds: f64) {
+    let region_label = if region.is_empty() { "-" } else { region };
+    secret_resolve_duration_seconds()
+        .with_label_values(&[provider, region_label])
+        .observe(seconds);
+}
+
 /// Render the global registry as Prometheus text-exposition
 /// format.  Used by the `GET /metrics` handler.
 pub fn gather_text() -> Result<String, prometheus::Error> {

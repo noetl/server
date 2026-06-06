@@ -17,6 +17,7 @@ mod aws;
 mod azure;
 mod gcp;
 mod k8s;
+mod registry;
 mod resolver;
 mod vault;
 
@@ -24,6 +25,7 @@ pub use aws::AwsSmSecretProvider;
 pub use azure::AzureKeyVaultProvider;
 pub use gcp::GcpSecretManager;
 pub use k8s::K8sSecretProvider;
+pub use registry::get_provider;
 pub use resolver::resolve_keychain_entry;
 pub use vault::VaultSecretProvider;
 

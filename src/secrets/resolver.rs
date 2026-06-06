@@ -11,7 +11,7 @@ use std::collections::HashMap;
 
 use super::{SecretProvider, SecretRef, server_region};
 use crate::error::AppResult;
-use crate::metrics::record_secret_resolve;
+use crate::metrics::{record_secret_resolve, record_secret_resolve_duration};
 use crate::playbook::types::KeychainDef;
 use crate::template::TemplateRenderer;
 
@@ -41,6 +41,8 @@ pub async fn resolve_keychain_entry(
     let renderer = TemplateRenderer::new();
     let region = effective_region(kc);
     let provider_id = provider.provider();
+    // Phase 6b — record wall-clock latency for the whole entry resolution.
+    let started = std::time::Instant::now();
     let result = match &kc.map {
         Some(map) => {
             let mut out = serde_json::Map::with_capacity(map.len());
@@ -91,6 +93,11 @@ pub async fn resolve_keychain_entry(
     if result.is_ok() {
         record_secret_resolve(provider_id, &region, "ok");
     }
+    // Phase 6b — observe the resolve latency regardless of outcome so a
+    // dashboard surfaces "everything's slow" + "everything's failing"
+    // independently.  Duration is meaningful even on the error path
+    // (timeouts dominate failure mode wall-clock).
+    record_secret_resolve_duration(provider_id, &region, started.elapsed().as_secs_f64());
     result
 }
 
