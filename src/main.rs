@@ -131,6 +131,19 @@ fn build_router(
             credentials: credential_service,
         });
 
+    // Secret-audit query endpoint (Secrets Wallet Phase 7b.2,
+    // noetl/ai-meta#61).  GET /api/internal/secret-audit returns
+    // bounded rows from `noetl.secret_audit` (table created at
+    // startup via `db::queries::secret_audit::ensure_table`).
+    let secret_audit_routes = Router::new()
+        .route(
+            "/api/internal/secret-audit",
+            get(handlers::secret_audit::query),
+        )
+        .with_state(handlers::secret_audit::SecretAuditDeps {
+            pool: db_pool.clone(),
+        });
+
     // Keychain routes
     let keychain_routes = Router::new()
         .route(
@@ -319,6 +332,7 @@ fn build_router(
         .merge(credential_routes)
         .merge(sealed_credential_routes)
         .merge(cross_region_routes)
+        .merge(secret_audit_routes)
         .merge(keychain_routes)
         .merge(execution_routes)
         .merge(executions_routes)
@@ -537,6 +551,12 @@ async fn main() -> anyhow::Result<()> {
     // the credential and keychain services.
     let catalog_service = CatalogService::new(db_pool.clone());
     let wallet_cipher = noetl_server::crypto::build_envelope_cipher(&encryption_key)?;
+
+    // Secrets Wallet Phase 7b.2 — `noetl.secret_audit` table is owned
+    // entirely by noetl/server (no other component writes to it), so a
+    // CREATE TABLE IF NOT EXISTS at startup is the right shape — no
+    // out-of-band migration step required for first-boot deployments.
+    noetl_server::db::queries::secret_audit::ensure_table(&db_pool).await?;
     // Keychain is the execution-scoped cache for credential resolution
     // (Secrets Wallet Phase 3c), so it is built first + shared into the
     // credential service.
