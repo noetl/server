@@ -578,6 +578,16 @@ pub struct KeychainDef {
     #[serde(default)]
     pub map: Option<HashMap<String, String>>,
 
+    /// Secrets Wallet Phase 6a — home region of this secret (e.g.
+    /// `us-east-1`, `europe-west4`).  When set, the resolver passes it to the
+    /// chosen [`crate::secrets::SecretProvider`]: AWS uses it as the regional
+    /// endpoint host; Azure / Vault use it for vault / cluster routing; GCP
+    /// uses it as part of the resource id.  `None` falls back to the server's
+    /// `NOETL_SERVER_REGION` env.  Per `agents/rules/safety.md`, the region is
+    /// a routing hint, not a secret — public-safe.
+    #[serde(default)]
+    pub region: Option<String>,
+
     /// Auto-renew flag.
     #[serde(default)]
     pub auto_renew: bool,

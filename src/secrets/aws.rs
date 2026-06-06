@@ -187,9 +187,17 @@ impl SecretProvider for AwsSmSecretProvider {
 
     async fn fetch(&self, secret: &SecretRef) -> AppResult<SecretValue> {
         let parsed = parse_ref(&secret.name)?;
+        // Region precedence (most-specific wins):
+        //   1. `<region>:` prefix inside the ref string (parsed).
+        //   2. SecretRef.region — Secrets Wallet Phase 6a, set by the
+        //      resolver from KeychainDef.region or NOETL_SERVER_REGION.
+        //   3. SecretRef.project — legacy overload; kept for back-compat
+        //      with pre-6a callers that stashed region into `project`.
+        //   4. Provider's default_region from AWS_REGION env.
         let region = parsed
             .region
             .clone()
+            .or_else(|| secret.region.clone().filter(|r| !r.is_empty()))
             .or_else(|| secret.project.clone())
             .unwrap_or_else(|| self.default_region.clone());
         let endpoint = self.endpoint_for(&region);
@@ -582,10 +590,12 @@ mod tests {
             .map(|(_, v)| v.clone())
             .unwrap();
         assert!(auth.contains("x-amz-security-token"));
-        assert!(signed
-            .headers
-            .iter()
-            .any(|(k, _)| k == "X-Amz-Security-Token"));
+        assert!(
+            signed
+                .headers
+                .iter()
+                .any(|(k, _)| k == "X-Amz-Security-Token")
+        );
     }
 
     #[test]
