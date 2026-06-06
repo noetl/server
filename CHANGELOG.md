@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.28.1](https://github.com/noetl/server/compare/v2.28.0...v2.28.1) (2026-06-06)
+
+### Performance Improvements
+
+* **executions:** candidate-first list query + fix status aggregation ([d04fc94](https://github.com/noetl/server/commit/d04fc94e8188a6f2aed674c5ca28ed582206f06e)), closes [noetl/ai-meta#62](https://github.com/noetl/ai-meta/issues/62) [#98](https://github.com/noetl/server/issues/98) [noetl/ai-meta#62](https://github.com/noetl/ai-meta/issues/62)
+
 ## [2.28.0](https://github.com/noetl/server/compare/v2.27.2...v2.28.0) (2026-06-06)
 
 ### Features
