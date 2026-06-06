@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.38.0](https://github.com/noetl/server/compare/v2.37.0...v2.38.0) (2026-06-06)
+
+### Features
+
+* **secrets:** cross-region broker (Phase 6e — closes Phase 6) ([19b58b9](https://github.com/noetl/server/commit/19b58b949b9b5d74d749059c6a84250faba2a81c)), closes [#118](https://github.com/noetl/server/issues/118) [noetl/ai-meta#61](https://github.com/noetl/ai-meta/issues/61)
+
 ## [2.37.0](https://github.com/noetl/server/compare/v2.36.0...v2.37.0) (2026-06-06)
 
 ### Features
