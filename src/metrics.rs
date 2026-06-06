@@ -399,6 +399,74 @@ pub fn record_secret_residency_check(policy: &str, decision: &str) {
         .inc();
 }
 
+/// Secrets-Wallet Phase 6d: histogram of issuer-reported dynamic-secret
+/// time-to-expiry at resolution time.
+///
+/// Buckets span the common cloud-token TTLs:
+/// `[60, 300, 900, 3600, 14400, 43200]` seconds = 1 min / 5 min / 15 min /
+/// 1 h / 4 h / 12 h.  An operator watching this dashboard sees whether
+/// their fleet is hot-pathing through short-lived creds (most calls
+/// landing in the 1 min – 15 min buckets) or running off long-lived ones
+/// (12 h+).
+///
+/// No labels: the metric tells a fleet-wide story; per-credential
+/// inspection lives on the matching `secret.resolve` tracing span.
+pub fn secret_dynamic_ttl_seconds() -> &'static prometheus::Histogram {
+    static M: OnceLock<prometheus::Histogram> = OnceLock::new();
+    M.get_or_init(|| {
+        let h = prometheus::Histogram::with_opts(
+            HistogramOpts::new(
+                "noetl_secret_dynamic_ttl_seconds",
+                "Issuer-reported time-to-expiry of resolved dynamic secrets (Phase 6d).",
+            )
+            .buckets(vec![60.0, 300.0, 900.0, 3600.0, 14400.0, 43200.0]),
+        )
+        .expect("static histogram spec must be valid");
+        registry()
+            .register(Box::new(h.clone()))
+            .expect("histogram registration must succeed");
+        h
+    })
+}
+
+/// Observe one issuer-reported TTL (seconds).  Caller filters to the
+/// dynamic-secret case (i.e. only when `SecretValue.expires_at` was set).
+pub fn record_secret_dynamic_ttl(seconds: f64) {
+    secret_dynamic_ttl_seconds().observe(seconds);
+}
+
+/// Secrets-Wallet Phase 6d: counter for keychain-cache writes the
+/// resolver skipped.
+///
+/// `reason` is a bounded enum:
+/// - `already_expired` — issuer's `expires_at` already in the past or
+///   within the safety margin.  Caching would store something already
+///   dead.
+///
+/// Future 6d-follow-up reasons may include `unsupported_scope`, etc.
+pub fn secret_cache_skip_total() -> &'static IntCounterVec {
+    static M: OnceLock<IntCounterVec> = OnceLock::new();
+    M.get_or_init(|| {
+        let counter = IntCounterVec::new(
+            Opts::new(
+                "noetl_secret_cache_skip_total",
+                "Keychain-cache writes skipped by reason (Phase 6d).",
+            ),
+            &["reason"],
+        )
+        .expect("static counter spec must be valid");
+        registry()
+            .register(Box::new(counter.clone()))
+            .expect("counter registration must succeed");
+        counter
+    })
+}
+
+/// Increment [`secret_cache_skip_total`] by 1.
+pub fn record_secret_cache_skip(reason: &str) {
+    secret_cache_skip_total().with_label_values(&[reason]).inc();
+}
+
 /// Render the global registry as Prometheus text-exposition
 /// format.  Used by the `GET /metrics` handler.
 pub fn gather_text() -> Result<String, prometheus::Error> {

@@ -11,16 +11,16 @@ use std::collections::HashMap;
 use chrono::Utc;
 
 use crate::crypto::EnvelopeCipher;
+use crate::db::DbPool;
 use crate::db::models::{
     CredentialCreateRequest, CredentialEntry, CredentialFilter, CredentialListResponse,
     CredentialResponse, KeychainSetRequest,
 };
 use crate::db::queries::catalog as catalog_queries;
 use crate::db::queries::credential as queries;
-use crate::db::DbPool;
 use crate::error::{AppError, AppResult};
 use crate::playbook::types::Playbook;
-use crate::secrets::{build_secret_provider, resolve_keychain_entry};
+use crate::secrets::{build_secret_provider, dynamic, resolve_keychain_entry_with_meta};
 use crate::services::keychain::KeychainService;
 
 /// TTL (seconds) for a keychain-resolved secret cached after a provider fetch.
@@ -231,21 +231,50 @@ impl CredentialService {
             provider = provider_id,
             "keychain.resolve"
         );
-        let data = resolve_keychain_entry(kc, &workload_map, &*provider).await?;
+        let (data, expires_at) =
+            resolve_keychain_entry_with_meta(kc, &workload_map, &*provider).await?;
 
-        // Cache write (Phase 3c): envelope-encrypted, execution-scoped, TTL —
-        // best-effort, a cache failure must not fail the resolution.
-        let set_req = KeychainSetRequest {
-            data: data.clone(),
-            scope_type: KEYCHAIN_CACHE_SCOPE.to_string(),
-            execution_id: Some(execution_id),
-            expires_at: None,
-            expires_in: Some(KEYCHAIN_CACHE_TTL_SECS),
-            auto_renew: false,
-            renew_config: None,
-        };
-        if let Err(e) = self.keychain.set(catalog_id, alias, set_req).await {
-            tracing::warn!(execution_id, alias, error = %e, "keychain.cache_write failed");
+        // Phase 6d — honour the issuer-reported expiry when one was
+        // supplied.  The decision helper returns CacheFor(secs) for
+        // normal-case secrets, and SkipCacheAlreadyExpired for tokens
+        // whose deadline already passed (or sits inside the operator's
+        // safety margin) — caching something already dead would force
+        // the next worker fetch into a 401.  The Phase-3c cache write
+        // is best-effort, so the skip path just logs and proceeds with
+        // the live response.
+        let now = Utc::now();
+        let cache_decision = dynamic::effective_cache_ttl(
+            expires_at,
+            std::time::Duration::from_secs(KEYCHAIN_CACHE_TTL_SECS as u64),
+            now,
+        );
+        if let Some(exp) = expires_at {
+            let remaining = (exp - now).num_seconds().max(0) as f64;
+            crate::metrics::record_secret_dynamic_ttl(remaining);
+        }
+        match cache_decision {
+            dynamic::CacheDecision::CacheFor(ttl_secs) => {
+                let set_req = KeychainSetRequest {
+                    data: data.clone(),
+                    scope_type: KEYCHAIN_CACHE_SCOPE.to_string(),
+                    execution_id: Some(execution_id),
+                    expires_at,
+                    expires_in: Some(ttl_secs as i64),
+                    auto_renew: false,
+                    renew_config: None,
+                };
+                if let Err(e) = self.keychain.set(catalog_id, alias, set_req).await {
+                    tracing::warn!(execution_id, alias, error = %e, "keychain.cache_write failed");
+                }
+            }
+            dynamic::CacheDecision::SkipCacheAlreadyExpired => {
+                tracing::warn!(
+                    execution_id,
+                    alias,
+                    "keychain.cache_skip: issuer expires_at already in the past or within safety margin"
+                );
+                crate::metrics::record_secret_cache_skip("already_expired");
+            }
         }
 
         Ok(Some(data))

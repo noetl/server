@@ -15,6 +15,7 @@
 
 mod aws;
 mod azure;
+pub mod dynamic;
 mod gcp;
 mod k8s;
 mod registry;
@@ -27,7 +28,7 @@ pub use azure::AzureKeyVaultProvider;
 pub use gcp::GcpSecretManager;
 pub use k8s::K8sSecretProvider;
 pub use registry::get_provider;
-pub use resolver::resolve_keychain_entry;
+pub use resolver::{resolve_keychain_entry, resolve_keychain_entry_with_meta};
 pub use vault::VaultSecretProvider;
 
 use std::sync::{Arc, OnceLock};
@@ -40,11 +41,16 @@ use crate::error::{AppError, AppResult};
 ///
 /// `value` is the secret material as a UTF-8 string; `version` is the
 /// provider's resolved version identifier when the backend reports one
-/// (e.g. the concrete version number behind a `latest` alias).
-#[derive(Debug, Clone)]
+/// (e.g. the concrete version number behind a `latest` alias);
+/// `expires_at` is Secrets-Wallet Phase 6d — the issuer's reported expiry
+/// for short-lived dynamic secrets (AWS STS / AAD bearer / GCP access
+/// tokens / OAuth2 access tokens with `expires_in`).  `None` for
+/// long-lived API keys whose lifetime is operator-controlled.
+#[derive(Debug, Clone, Default)]
 pub struct SecretValue {
     pub value: String,
     pub version: Option<String>,
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// A request to fetch one secret from a provider.
