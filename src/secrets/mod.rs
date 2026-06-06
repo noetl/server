@@ -13,11 +13,15 @@
 //! pattern with). AWS Secrets Manager, Azure Key Vault, HashiCorp Vault, and
 //! Kubernetes Secrets follow behind the same [`SecretProvider`] trait.
 
+mod aws;
+mod azure;
 mod gcp;
 mod k8s;
 mod resolver;
 mod vault;
 
+pub use aws::AwsSmSecretProvider;
+pub use azure::AzureKeyVaultProvider;
 pub use gcp::GcpSecretManager;
 pub use k8s::K8sSecretProvider;
 pub use resolver::resolve_keychain_entry;
@@ -76,8 +80,10 @@ pub fn build_secret_provider(provider: &str) -> AppResult<Arc<dyn SecretProvider
         "gcp" => Ok(Arc::new(GcpSecretManager::from_env()?)),
         "k8s" | "kubernetes" => Ok(Arc::new(K8sSecretProvider::from_env()?)),
         "vault" => Ok(Arc::new(VaultSecretProvider::from_env()?)),
+        "aws" | "aws_sm" => Ok(Arc::new(AwsSmSecretProvider::from_env()?)),
+        "azure" | "azure_kv" => Ok(Arc::new(AzureKeyVaultProvider::from_env()?)),
         other => Err(AppError::Config(format!(
-            "unsupported keychain secret provider '{other}' (supported: gcp, k8s, vault)"
+            "unsupported keychain secret provider '{other}' (supported: gcp, k8s, vault, aws, azure)"
         ))),
     }
 }

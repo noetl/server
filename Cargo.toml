@@ -70,6 +70,12 @@ zeroize = "1"
 # Constant-time comparison for bearer-token auth — see
 # src/handlers/internal.rs (the `/api/internal/*` route gate).
 subtle = "2.6"
+# AWS SigV4 signing primitives for the AWS Secrets Manager provider
+# (src/secrets/aws.rs).  All three are already in the lockfile as
+# transitive deps; pin them directly so the provider compiles standalone.
+sha2 = "0.10"
+hmac = "0.12"
+hex = "0.4"
 
 # Utilities
 uuid = { version = "1", features = ["serde", "v4"] }
