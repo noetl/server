@@ -1390,9 +1390,36 @@ async fn trigger_orchestrator(
         .map(|e| e.event_type.as_str())
         .unwrap_or("command.completed");
     let orchestrator = WorkflowOrchestrator::new();
-    let result = orchestrator
-        .evaluate(&events, &playbook, Some(trigger_event_type))
-        .map_err(|e| AppError::Internal(format!("Orchestrator evaluate failed: {e}")))?;
+    let result = match orchestrator.evaluate(&events, &playbook, Some(trigger_event_type)) {
+        Ok(r) => r,
+        Err(e) => {
+            // A deterministic orchestrator evaluate failure (invalid
+            // template in a step body, unknown step in a `next` arc,
+            // malformed routing) fails identically on every retry.
+            // Emitting only a WARN here strands the execution in RUNNING
+            // forever — the next step is never issued and no terminal
+            // event is written, so `/api/executions/{id}` reports RUNNING
+            // indefinitely.  Instead write a terminal `playbook.failed`
+            // event so the run resolves to FAILED with the error surfaced
+            // to the client.
+            //
+            // noetl/ai-meta#54 (e2e regression sweep): `test_vars_template_access`
+            // hung after `set_variables` because an invalid `{{ ctx.* }}`
+            // template in a downstream step's `code` body tripped minijinja
+            // inside `evaluate`, and the WARN-only path left no terminal
+            // event.  This mirrors the noetl/ai-meta#58 `command.failed`
+            // stall class — a deterministic failure must still produce a
+            // terminal event.
+            let msg = format!("Orchestrator evaluate failed: {e}");
+            warn!(
+                execution_id,
+                error = %msg,
+                "Orchestrator evaluate error is deterministic — terminating execution as FAILED"
+            );
+            emit_playbook_failed(state, execution_id, catalog_id, trigger_event_id, &msg).await?;
+            return Ok(0);
+        }
+    };
 
     info!(
         execution_id,
@@ -1510,6 +1537,53 @@ async fn trigger_orchestrator(
     }
 
     Ok(commands_generated)
+}
+
+/// Emit a terminal `playbook.failed` event for an execution that hit a
+/// deterministic, non-retryable orchestrator error during evaluate.
+///
+/// Without this an evaluate failure (invalid template in a step body,
+/// unknown step in a `next` arc) leaves only a WARN in the server log
+/// and strands the execution in RUNNING forever — no terminal event is
+/// ever written.  The list-status aggregation in `list_executions`
+/// maps `playbook.failed` -> FAILED, so writing this event resolves the
+/// run and surfaces `error` to API readers.  Parented on the trigger
+/// event so the causal chain stays intact.
+async fn emit_playbook_failed(
+    state: &AppState,
+    execution_id: i64,
+    catalog_id: i64,
+    trigger_event_id: i64,
+    error: &str,
+) -> AppResult<()> {
+    let event_id = state.snowflake.generate()?;
+    sqlx::query(
+        r#"
+        INSERT INTO noetl.event (
+            event_id, execution_id, catalog_id, event_type,
+            node_id, node_name, status, result, meta, created_at, parent_event_id
+        ) VALUES ($1, $2, $3, 'playbook.failed', 'playbook', 'playbook', 'FAILED', $4, $5, $6, $7)
+        "#,
+    )
+    .bind(event_id)
+    .bind(execution_id)
+    .bind(catalog_id)
+    .bind(serde_json::json!({"status": "FAILED", "context": {"error": error}}))
+    .bind(serde_json::json!({
+        "emitted_by": "orchestrator",
+        "reason": "evaluate_error",
+        "error": error,
+    }))
+    .bind(chrono::Utc::now())
+    .bind(trigger_event_id)
+    .execute(state.pools.pool_for(execution_id))
+    .await?;
+    info!(
+        execution_id,
+        terminal_event = "playbook.failed",
+        "Orchestrator evaluate error → execution terminated as FAILED"
+    );
+    Ok(())
 }
 
 #[cfg(test)]

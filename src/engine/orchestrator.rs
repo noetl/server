@@ -940,6 +940,81 @@ mod tests {
     }
 
     #[test]
+    fn test_evaluate_errors_on_invalid_template_in_step_body() {
+        // noetl/ai-meta#54 (e2e regression sweep): a step whose tool
+        // `code` body carries an invalid Jinja expression (`{{ ctx.* }}`)
+        // must make `evaluate` return `Err` — deterministically, not
+        // `Ok`-with-no-commands and not a panic.  `handlers::events::
+        // trigger_orchestrator` relies on this contract to emit a
+        // terminal `playbook.failed` event instead of stranding the
+        // execution in RUNNING forever (the original symptom:
+        // `test_vars_template_access` hung after `set_variables`).
+        let orchestrator = WorkflowOrchestrator::new();
+
+        // `start` has completed; evaluate must now build the command for
+        // `bad_step`, which renders its invalid-template code body.
+        let events = vec![
+            {
+                let mut e = make_event("playbook_started", None);
+                e.context = Some(serde_json::json!({
+                    "workload": {}, "path": "test", "version": "1"
+                }));
+                e
+            },
+            make_event("command.completed", Some("start")),
+        ];
+
+        let bad_step = {
+            let mut s = make_step("bad_step", Some("end"));
+            s.tool = ToolDefinition::Single(ToolSpec {
+                kind: ToolKind::Python,
+                eval: None,
+                auth: None,
+                libs: None,
+                args: None,
+                code: Some("# uses {{ ctx.* }} templates\nresult = {}".to_string()),
+                url: None,
+                method: None,
+                query: None,
+                command: None,
+                connection: None,
+                params: None,
+                headers: None,
+                output_select: None,
+                extra: HashMap::new(),
+            });
+            s
+        };
+
+        let playbook = Playbook {
+            api_version: "noetl.io/v2".to_string(),
+            kind: "Playbook".to_string(),
+            metadata: Metadata {
+                name: "bad_template".to_string(),
+                path: Some("test/bad_template".to_string()),
+                description: None,
+                labels: None,
+                extra: HashMap::new(),
+            },
+            workload: None,
+            vars: None,
+            keychain: None,
+            workbook: None,
+            workflow: vec![
+                make_step("start", Some("bad_step")),
+                bad_step,
+                make_step("end", None),
+            ],
+        };
+
+        let result = orchestrator.evaluate(&events, &playbook, Some("command.completed"));
+        assert!(
+            result.is_err(),
+            "evaluate must return Err for an invalid template in a step body, got Ok"
+        );
+    }
+
+    #[test]
     fn test_handle_failure() {
         let orchestrator = WorkflowOrchestrator::new();
         let state = WorkflowState::new(12345, 67890);
