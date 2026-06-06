@@ -531,14 +531,38 @@ async fn main() -> anyhow::Result<()> {
 
     // Bind to address
     let addr: SocketAddr = app_config.bind_address().parse()?;
-    let listener = TcpListener::bind(addr).await?;
 
-    tracing::info!(address = %addr, "Server listening");
-
-    // Run the server with graceful shutdown
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    // Phase 4a (noetl/ai-meta#61): opt-in TLS / mTLS listener.  Plain HTTP
+    // (unchanged default) unless NOETL_TLS_CERT + NOETL_TLS_KEY are set;
+    // NOETL_TLS_CLIENT_CA additionally requires + verifies client certs (mTLS),
+    // so the worker↔server credential channel is authenticated + encrypted.
+    match noetl_server::tls::tls_params_from_env()? {
+        Some(params) => {
+            let mtls = params.mtls();
+            let server_config = noetl_server::tls::build_server_config(&params)?;
+            let rustls_config = axum_server::tls_rustls::RustlsConfig::from_config(
+                std::sync::Arc::new(server_config),
+            );
+            tracing::info!(address = %addr, tls = true, mtls, "Server listening (TLS)");
+            let handle = axum_server::Handle::new();
+            let shutdown_handle = handle.clone();
+            tokio::spawn(async move {
+                shutdown_signal().await;
+                shutdown_handle.graceful_shutdown(Some(std::time::Duration::from_secs(10)));
+            });
+            axum_server::bind_rustls(addr, rustls_config)
+                .handle(handle)
+                .serve(app.into_make_service())
+                .await?;
+        }
+        None => {
+            let listener = TcpListener::bind(addr).await?;
+            tracing::info!(address = %addr, "Server listening");
+            axum::serve(listener, app)
+                .with_graceful_shutdown(shutdown_signal())
+                .await?;
+        }
+    }
 
     tracing::info!("Server shutdown complete");
 
