@@ -16,10 +16,12 @@
 mod gcp;
 mod k8s;
 mod resolver;
+mod vault;
 
 pub use gcp::GcpSecretManager;
 pub use k8s::K8sSecretProvider;
 pub use resolver::resolve_keychain_entry;
+pub use vault::VaultSecretProvider;
 
 use std::sync::Arc;
 
@@ -73,8 +75,9 @@ pub fn build_secret_provider(provider: &str) -> AppResult<Arc<dyn SecretProvider
     match provider {
         "gcp" => Ok(Arc::new(GcpSecretManager::from_env()?)),
         "k8s" | "kubernetes" => Ok(Arc::new(K8sSecretProvider::from_env()?)),
+        "vault" => Ok(Arc::new(VaultSecretProvider::from_env()?)),
         other => Err(AppError::Config(format!(
-            "unsupported keychain secret provider '{other}' (supported: gcp, k8s)"
+            "unsupported keychain secret provider '{other}' (supported: gcp, k8s, vault)"
         ))),
     }
 }
