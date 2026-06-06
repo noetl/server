@@ -12,7 +12,7 @@
 
 use std::sync::Arc;
 
-use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
@@ -178,6 +178,64 @@ impl EnvelopeCipher {
         let record = EnvelopeRecord::from_storage_str(raw)?;
         self.open_json(&record).await
     }
+
+    /// Secrets Wallet Phase 7a — re-wrap one stored envelope under the
+    /// current KEK version.
+    ///
+    /// Parses `raw` as a stored envelope.  If `wrapped.key_version` already
+    /// equals the [`KeyManager::current_key_version`], returns
+    /// [`RewrapOutcome::Skipped`] (the row is already on the current key).
+    /// Otherwise unwraps the DEK under whichever historical version
+    /// produced it, then re-wraps under the current version, and returns
+    /// the new storage string in [`RewrapOutcome::Rewrapped`].
+    ///
+    /// The plaintext payload is **never reconstructed** — this is a
+    /// pure DEK re-wrap.  AES-GCM ciphertext bytes stay byte-identical;
+    /// only the `dek` field of the stored envelope changes.  Phase 7a's
+    /// rotation job iterates this primitive across the
+    /// `noetl.credential` + `noetl.keychain` tables under a per-batch
+    /// transaction; 7a.2 will land the actual scan + endpoint plumbing.
+    pub async fn rewrap_storage_string(&self, raw: &str) -> AppResult<RewrapOutcome> {
+        let record = EnvelopeRecord::from_storage_str(raw)?;
+        let current = self.km.current_key_version();
+        // Skip the no-op case — the row is already on the active version.
+        // This is the common path during a routine rotation sweep, so
+        // bailing out without touching the KEK matters.
+        if record.wrapped.key_version == current {
+            return Ok(RewrapOutcome::Skipped {
+                key_version: current.to_string(),
+            });
+        }
+        let dek = self.km.unwrap_dek(&record.wrapped).await?;
+        let new_wrapped = self.km.wrap_dek(&dek).await?;
+        let new_record = EnvelopeRecord {
+            ciphertext: record.ciphertext,
+            wrapped: new_wrapped,
+            enc_alg: record.enc_alg,
+            enc_version: record.enc_version,
+        };
+        Ok(RewrapOutcome::Rewrapped {
+            old_key_version: record.wrapped.key_version,
+            new_key_version: current.to_string(),
+            new_storage_string: new_record.to_storage_string(),
+        })
+    }
+}
+
+/// Outcome of a Phase-7a rotation pass over one stored envelope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RewrapOutcome {
+    /// The record was already wrapped under the current KEK version; no
+    /// KMS call happened.
+    Skipped { key_version: String },
+    /// The record was unwrapped under the old KEK version and re-wrapped
+    /// under the current one.  `new_storage_string` is the value to
+    /// persist back into the `data_encrypted` column.
+    Rewrapped {
+        old_key_version: String,
+        new_key_version: String,
+        new_storage_string: String,
+    },
 }
 
 #[cfg(test)]
@@ -249,5 +307,84 @@ mod tests {
         let c = cipher();
         // A legacy/garbage value is not a wallet envelope → error (forward-only).
         assert!(c.open_storage_json("AAAAlegacy-base64==").await.is_err());
+    }
+
+    // -------- Phase 7a: KEK rotation primitives --------
+
+    #[tokio::test]
+    async fn rewrap_skips_records_already_on_current_version() {
+        let c = cipher();
+        let v = serde_json::json!({"db_password": "p@ss"});
+        let stored = c.seal_json_to_storage(&v).await.unwrap();
+        // Same cipher → same KEK version → skip.
+        match c.rewrap_storage_string(&stored).await.unwrap() {
+            RewrapOutcome::Skipped { key_version } => {
+                assert_eq!(key_version, "v1");
+            }
+            other => panic!("expected Skipped, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn rewrap_emits_new_envelope_under_current_version_when_older() {
+        // Build a record under "v1" then move the manager to "v2" — same
+        // master key (LocalDevKms uses one Encryptor for all versions, so
+        // unwrap works across versions in this test); the rewrap primitive
+        // should produce a fresh storage string tagged "v2".
+        let key = Encryptor::generate_key_base64();
+        let km_v1 = LocalDevKms::from_master_key_base64(&key).unwrap();
+        let c_v1 = EnvelopeCipher::new(Arc::new(km_v1));
+        let stored_v1 = c_v1
+            .seal_json_to_storage(&serde_json::json!({"a": 1}))
+            .await
+            .unwrap();
+
+        // Build a "v2" manager via the test-only constructor.  The KEK
+        // bytes are identical (same master_key_base64), so unwrap still
+        // succeeds even though the version label differs — this models
+        // a KMS key-version bump where the previous version is still
+        // available for unwrap.
+        let km_v2 = LocalDevKms::from_master_key_base64_with_version(&key, "v2").unwrap();
+        let c_v2 = EnvelopeCipher::new(Arc::new(km_v2));
+
+        match c_v2.rewrap_storage_string(&stored_v1).await.unwrap() {
+            RewrapOutcome::Rewrapped {
+                old_key_version,
+                new_key_version,
+                new_storage_string,
+            } => {
+                assert_eq!(old_key_version, "v1");
+                assert_eq!(new_key_version, "v2");
+                // The new envelope decrypts to the same plaintext.
+                let opened = c_v2.open_storage_json(&new_storage_string).await.unwrap();
+                assert_eq!(opened, serde_json::json!({"a": 1}));
+                // The new storage string carries the new version tag.
+                assert!(new_storage_string.contains("\"kv\":\"v2\""));
+            }
+            other => panic!("expected Rewrapped, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn rewrap_rejects_non_envelope_storage_value() {
+        let c = cipher();
+        // Same forward-only contract as `open_storage_json` — bad input
+        // bubbles up as an Encryption error rather than silently being
+        // treated as up-to-date.
+        let err = c
+            .rewrap_storage_string("not-a-wallet-envelope")
+            .await
+            .unwrap_err();
+        assert!(format!("{err:?}").contains("not a wallet envelope"));
+    }
+
+    #[test]
+    fn local_kms_reports_its_key_version() {
+        let key = Encryptor::generate_key_base64();
+        let km = LocalDevKms::from_master_key_base64(&key).unwrap();
+        // Locked against accidental drift — Phase 7a's rotation primitive
+        // depends on this being the same string the manager tags
+        // `wrap_dek` outputs with.
+        assert_eq!(km.current_key_version(), "v1");
     }
 }
