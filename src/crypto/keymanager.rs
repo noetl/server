@@ -47,6 +47,19 @@ pub trait KeyManager: Send + Sync {
 
     /// Provider id stored alongside records (`local`, `gcp-kms`, …).
     fn provider(&self) -> &str;
+
+    /// Secrets Wallet Phase 7a — current KEK version the next `wrap_dek` call
+    /// will tag.  Wallet-level rotation primitives use this to decide whether
+    /// a stored record's `wrapped.key_version` is the same as the active
+    /// version (skip) or older (re-wrap).
+    ///
+    /// Default implementation reports `"unknown"` so the rotation primitive
+    /// treats every record as "different version, rewrap" — safe but
+    /// inefficient.  Real `KeyManager` implementations override this with
+    /// the version they actually use at `wrap_dek` time.
+    fn current_key_version(&self) -> &str {
+        "unknown"
+    }
 }
 
 /// In-process key manager that wraps DEKs with the server's AES-256-GCM master
@@ -71,6 +84,24 @@ impl LocalDevKms {
             kek,
             key_id: "env:NOETL_ENCRYPTION_KEY".to_string(),
             key_version: "v1".to_string(),
+        })
+    }
+
+    /// Build a `LocalDevKms` with an explicit `key_version` label.  Used
+    /// by Phase-7a rotation tests to simulate the "operator bumped the
+    /// version" path; production paths never need this (the version
+    /// comes from `from_master_key_base64`'s `"v1"` default until a
+    /// real KMS reports a different one).
+    #[cfg(test)]
+    pub fn from_master_key_base64_with_version(
+        master_key_base64: &str,
+        key_version: &str,
+    ) -> AppResult<Self> {
+        let kek = Encryptor::from_base64(master_key_base64)?;
+        Ok(Self {
+            kek,
+            key_id: "env:NOETL_ENCRYPTION_KEY".to_string(),
+            key_version: key_version.to_string(),
         })
     }
 }
@@ -100,6 +131,10 @@ impl KeyManager for LocalDevKms {
 
     fn provider(&self) -> &str {
         "local"
+    }
+
+    fn current_key_version(&self) -> &str {
+        &self.key_version
     }
 }
 

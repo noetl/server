@@ -550,6 +550,46 @@ pub fn record_cross_region_broker_call_duration(broker_region: &str, seconds: f6
         .observe(seconds);
 }
 
+/// Secrets-Wallet Phase 7a: wallet KEK-rotation pass outcomes.
+///
+/// `table` is `credential` or `keychain` (the two `noetl.*` tables that
+/// hold envelope-encrypted blobs).  `status` is a bounded enum:
+/// - `skipped` — record already wrapped under the current KEK version.
+/// - `rewrapped` — DEK was unwrapped under the old version and re-wrapped
+///   under the current.
+/// - `failed_unwrap` — provider can't produce the old KEK version (key
+///   compromise + delete-all rotation; operator must reseed).
+/// - `failed_wrap` — provider can't issue a fresh wrap (KMS reachability).
+/// - `parse_error` — stored value isn't a valid envelope (forward-only
+///   contract — re-register the record).
+///
+/// `failed_unwrap` is the alert-worthy combination — it means the
+/// rotation can't complete without operator intervention.
+pub fn wallet_rotate_total() -> &'static IntCounterVec {
+    static M: OnceLock<IntCounterVec> = OnceLock::new();
+    M.get_or_init(|| {
+        let counter = IntCounterVec::new(
+            Opts::new(
+                "noetl_wallet_rotate_total",
+                "Wallet KEK-rotation pass outcomes per table (Phase 7a).",
+            ),
+            &["table", "status"],
+        )
+        .expect("static counter spec must be valid");
+        registry()
+            .register(Box::new(counter.clone()))
+            .expect("counter registration must succeed");
+        counter
+    })
+}
+
+/// Increment [`wallet_rotate_total`] by 1.
+pub fn record_wallet_rotate(table: &str, status: &str) {
+    wallet_rotate_total()
+        .with_label_values(&[table, status])
+        .inc();
+}
+
 /// Render the global registry as Prometheus text-exposition
 /// format.  Used by the `GET /metrics` handler.
 pub fn gather_text() -> Result<String, prometheus::Error> {
