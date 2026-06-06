@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.42.0](https://github.com/noetl/server/compare/v2.41.0...v2.42.0) (2026-06-06)
+
+### Features
+
+* **wallet:** KEK rotation endpoint + DB scans + key-status (Phase 7a.2) ([d6b8723](https://github.com/noetl/server/commit/d6b872351c900bff257392438ac072246c102c6c)), closes [#126](https://github.com/noetl/server/issues/126) [noetl/ai-meta#61](https://github.com/noetl/ai-meta/issues/61)
+
 ## [2.41.0](https://github.com/noetl/server/compare/v2.40.0...v2.41.0) (2026-06-06)
 
 ### Features
