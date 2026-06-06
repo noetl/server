@@ -421,20 +421,32 @@ pub struct CanonicalNextTarget {
 }
 
 /// Next step specification - supports multiple formats for compatibility.
+///
+/// **Variant order is load-bearing.** `#[serde(untagged)]` tries variants top
+/// to bottom, and serde deserializes a YAML *sequence* into a struct
+/// positionally — so if `Router` (a struct) came first it would greedily eat
+/// the list form `next: [{step: x}]` into a `NextRouter` with `spec` taken from
+/// element 0 and `arcs` defaulting to `[]`, silently dropping every target (and
+/// defeating the unknown-step validation in `validate_next_refs`). The
+/// sequence-shaped variants are therefore declared before the struct `Router`,
+/// which is reached only for the canonical map form `{ spec, arcs }`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum NextSpec {
-    /// Canonical v10 router format: { spec: { mode: ... }, arcs: [...] }
-    Router(NextRouter),
-
-    /// List of step targets with optional when conditions (legacy canonical format).
+    /// List of step targets with optional `when` (legacy canonical): a
+    /// sequence of `{ step, when?, args? }` maps.
     Targets(Vec<CanonicalNextTarget>),
+
+    /// List of bare step names.
+    List(Vec<String>),
 
     /// Single step name.
     Single(String),
 
-    /// List of step names.
-    List(Vec<String>),
+    /// Canonical v10 router format: `{ spec: { mode: ... }, arcs: [...] }` — a
+    /// map. Declared last so a sequence never deserializes into it positionally
+    /// (see the type-level note above).
+    Router(NextRouter),
 }
 
 // ============================================================================
