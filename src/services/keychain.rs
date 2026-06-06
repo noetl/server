@@ -85,6 +85,45 @@ impl KeychainService {
         })
     }
 
+    /// Secrets Wallet Phase 7c.2 — should the cached row for
+    /// `(catalog_id, keychain_name, execution_id, scope_type)` be
+    /// refreshed in the background right now?
+    ///
+    /// Reads the row's `expires_at`, hands it to
+    /// [`crate::secrets::dynamic::should_refresh_default`] (which
+    /// honours `KEYCHAIN_CACHE_REFRESH_WINDOW_SECS`), and returns the
+    /// pure-function answer.
+    ///
+    /// Returns `false` when the row doesn't exist, the row has no
+    /// issuer-reported `expires_at`, the row is already expired
+    /// (eviction path), or the row's remaining lifetime is outside the
+    /// refresh window.  Returns `true` only when the cached row is
+    /// still valid AND inside the window.
+    ///
+    /// Bumps `noetl_secret_refresh_total{outcome="triggered"}` when
+    /// returning `true`.  The actual background spawn + per-(catalog_id,
+    /// alias) `tokio::sync::Mutex` stampede collapse + provider re-
+    /// resolution lives in Phase 7c.3.
+    pub async fn should_refresh(
+        &self,
+        catalog_id: i64,
+        keychain_name: &str,
+        execution_id: Option<i64>,
+        scope_type: &str,
+        now: chrono::DateTime<Utc>,
+    ) -> AppResult<bool> {
+        let cache_key =
+            queries::build_cache_key(keychain_name, catalog_id, scope_type, execution_id);
+        let Some(entry) = queries::get_keychain_by_cache_key(&self.pool, &cache_key).await? else {
+            return Ok(false);
+        };
+        let triggered = crate::secrets::dynamic::should_refresh_default(entry.expires_at, now);
+        if triggered {
+            crate::metrics::record_secret_refresh("triggered");
+        }
+        Ok(triggered)
+    }
+
     /// Set a keychain entry.
     pub async fn set(
         &self,
