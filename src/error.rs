@@ -88,6 +88,18 @@ pub enum AppError {
         entry_region: String,
         server_region: String,
     },
+
+    /// Secrets Wallet Phase 6e — cross-region broker is configured for
+    /// the credential's home region but unreachable / returned a non-2xx /
+    /// produced a malformed envelope.  HTTP 502 to the caller so they can
+    /// distinguish "policy says no" (403 from `ResidencyViolation`) from
+    /// "policy says yes via broker, but the broker is down" (transient).
+    ///
+    /// `cause` is a free-text reason — never a structured error chain
+    /// (we don't want `#[source]`-style trait-object plumbing inside an
+    /// HTTP-bounded error).
+    #[error("Cross-region broker {broker_url} unreachable: {cause}")]
+    CrossRegionUnreachable { broker_url: String, cause: String },
 }
 
 impl IntoResponse for AppError {
@@ -138,6 +150,10 @@ impl IntoResponse for AppError {
             AppError::ResidencyViolation { .. } => {
                 tracing::warn!(error = %self, "Residency violation");
                 (StatusCode::FORBIDDEN, self.to_string())
+            }
+            AppError::CrossRegionUnreachable { .. } => {
+                tracing::warn!(error = %self, "Cross-region broker unreachable");
+                (StatusCode::BAD_GATEWAY, self.to_string())
             }
         };
 

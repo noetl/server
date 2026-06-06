@@ -467,6 +467,89 @@ pub fn record_secret_cache_skip(reason: &str) {
     secret_cache_skip_total().with_label_values(&[reason]).inc();
 }
 
+/// Secrets-Wallet Phase 6e: cross-region broker call outcomes.
+///
+/// `broker_region` is the region the request was routed to (or `"-"`
+/// for diagnostics paths that don't know).  `outcome` is a bounded
+/// enum:
+/// - `ok` — broker sealed the response and returned it.
+/// - `unreachable` — network / DNS / TLS / 5xx from the broker.
+/// - `denied_by_broker` — broker rejected the request (its own region
+///   gate or local policy).
+/// - `wrong_region` — broker's `server_region()` didn't match the
+///   requested `expected_entry_region`.
+/// - `bad_pubkey` — requesting peer sent a malformed worker public key.
+/// - `resolve_error` / `serialize_error` / `seal_error` — broker-side
+///   pipeline errors.
+///
+/// `wrong_region` is the alert-worthy combination — it means a peer's
+/// broker registry is out of date.
+pub fn cross_region_broker_call_total() -> &'static IntCounterVec {
+    static M: OnceLock<IntCounterVec> = OnceLock::new();
+    M.get_or_init(|| {
+        let counter = IntCounterVec::new(
+            Opts::new(
+                "noetl_secret_broker_call_total",
+                "Cross-region broker call outcomes per broker_region (Phase 6e).",
+            ),
+            &["broker_region", "outcome"],
+        )
+        .expect("static counter spec must be valid");
+        registry()
+            .register(Box::new(counter.clone()))
+            .expect("counter registration must succeed");
+        counter
+    })
+}
+
+/// Increment [`cross_region_broker_call_total`] by 1.
+pub fn record_cross_region_broker_call(broker_region: &str, outcome: &str) {
+    let region_label = if broker_region.is_empty() {
+        "-"
+    } else {
+        broker_region
+    };
+    cross_region_broker_call_total()
+        .with_label_values(&[region_label, outcome])
+        .inc();
+}
+
+/// Secrets-Wallet Phase 6e: histogram of cross-region broker call
+/// wall-clock latency.  Buckets span the cross-region round-trip range
+/// (`[0.05, 0.1, 0.25, 0.5, 1, 2, 5]`).  Caller observes regardless of
+/// outcome so a dashboard shows "broker is slow" + "broker is failing"
+/// independently.
+pub fn cross_region_broker_call_duration_seconds() -> &'static HistogramVec {
+    static M: OnceLock<HistogramVec> = OnceLock::new();
+    M.get_or_init(|| {
+        let h = HistogramVec::new(
+            HistogramOpts::new(
+                "noetl_secret_broker_call_duration_seconds",
+                "Wall-clock seconds spent in a cross-region broker call.",
+            )
+            .buckets(vec![0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0]),
+            &["broker_region"],
+        )
+        .expect("static histogram spec must be valid");
+        registry()
+            .register(Box::new(h.clone()))
+            .expect("histogram registration must succeed");
+        h
+    })
+}
+
+/// Observe one cross-region broker call duration.
+pub fn record_cross_region_broker_call_duration(broker_region: &str, seconds: f64) {
+    let region_label = if broker_region.is_empty() {
+        "-"
+    } else {
+        broker_region
+    };
+    cross_region_broker_call_duration_seconds()
+        .with_label_values(&[region_label])
+        .observe(seconds);
+}
+
 /// Render the global registry as Prometheus text-exposition
 /// format.  Used by the `GET /metrics` handler.
 pub fn gather_text() -> Result<String, prometheus::Error> {

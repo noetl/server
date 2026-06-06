@@ -4,8 +4,8 @@
 //! handling workflow orchestration, catalog management, and event processing.
 
 use axum::{
-    routing::{delete, get, post},
     Router,
+    routing::{delete, get, post},
 };
 use std::net::SocketAddr;
 use tokio::net::TcpListener;
@@ -15,7 +15,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use noetl_server::{
     config::{AppConfig, DatabaseConfig, ShardingConfig},
-    db::{create_pool, DbPool, DbPoolMap},
+    db::{DbPool, DbPoolMap, create_pool},
     handlers,
     services::{
         CatalogService, CredentialService, ExecutionService, KeychainService, RuntimeService,
@@ -111,8 +111,24 @@ fn build_router(
             get(handlers::credentials::get_sealed),
         )
         .with_state(handlers::credentials::SealedCredentialDeps {
-            credentials: credential_service,
+            credentials: credential_service.clone(),
             runtime: runtime_service.clone(),
+        });
+
+    // Cross-region broker endpoint (Secrets Wallet Phase 6e, noetl/ai-meta#61).
+    // Peer-server side of the cross-region broker — receives a request from a
+    // sibling server whose local residency policy denied a credential,
+    // resolves the credential locally subject to ITS own residency + provider
+    // chain, and returns a SealedEnvelope addressed directly to the
+    // requesting worker's pubkey.  Cleartext never leaves this server's
+    // memory.  Internal-only endpoint; production gates via peer-cert mTLS.
+    let cross_region_routes = Router::new()
+        .route(
+            "/api/internal/cross-region/resolve",
+            post(handlers::cross_region::resolve),
+        )
+        .with_state(handlers::cross_region::CrossRegionDeps {
+            credentials: credential_service,
         });
 
     // Keychain routes
@@ -302,6 +318,7 @@ fn build_router(
         .merge(catalog_routes)
         .merge(credential_routes)
         .merge(sealed_credential_routes)
+        .merge(cross_region_routes)
         .merge(keychain_routes)
         .merge(execution_routes)
         .merge(executions_routes)

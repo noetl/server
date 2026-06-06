@@ -15,6 +15,7 @@
 
 mod aws;
 mod azure;
+pub mod broker;
 pub mod dynamic;
 mod gcp;
 mod k8s;

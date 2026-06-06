@@ -163,6 +163,7 @@ mod tests {
             region: region.map(|s| s.to_string()),
             residency,
             allowed_regions: allowed.iter().map(|s| s.to_string()).collect(),
+            no_broker_fallback: false,
             auto_renew: false,
             extra: Default::default(),
         }
