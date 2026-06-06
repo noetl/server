@@ -99,7 +99,21 @@ fn build_router(
             "/api/credentials/{identifier}",
             delete(handlers::credentials::delete),
         )
-        .with_state(credential_service);
+        .with_state(credential_service.clone());
+
+    // Sealed-credential endpoint (Secrets Wallet Phase 5b, noetl/ai-meta#61).
+    // Returns a SealedEnvelope (X25519-sealed credential JSON) addressed to
+    // the worker named via `?worker_id=<name>`.  Defense-in-depth on top of
+    // Phase-4 mTLS — cleartext never enters the response body.
+    let sealed_credential_routes = Router::new()
+        .route(
+            "/api/credentials/{identifier}/sealed",
+            get(handlers::credentials::get_sealed),
+        )
+        .with_state(handlers::credentials::SealedCredentialDeps {
+            credentials: credential_service,
+            runtime: runtime_service.clone(),
+        });
 
     // Keychain routes
     let keychain_routes = Router::new()
@@ -287,6 +301,7 @@ fn build_router(
         .merge(health_routes)
         .merge(catalog_routes)
         .merge(credential_routes)
+        .merge(sealed_credential_routes)
         .merge(keychain_routes)
         .merge(execution_routes)
         .merge(executions_routes)

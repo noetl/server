@@ -201,6 +201,44 @@ pub fn record_write_request(endpoint: &str, status: &str, duration_seconds: f64)
         .observe(duration_seconds);
 }
 
+/// Counter: sealed credential responses on `GET /api/credentials/{id}/sealed`,
+/// bucketed by outcome.
+///
+/// Secrets Wallet Phase 5b (noetl/ai-meta#61) — pairs with the `credential.seal`
+/// span in `handlers::credentials::get_sealed`.  Labels:
+///
+/// - `status` ∈ {`ok`, `no_pubkey`, `worker_not_found`, `seal_error`,
+///   `credential_error`} — the outcome bucket.
+///
+/// `noetl_credentials_sealed_total{status="ok"}` is the throughput counter;
+/// the other label values are failure modes worth grepping in Prometheus
+/// when a worker stops being able to fetch sealed credentials.  `execution_id`
+/// is NOT a label (cardinality) — it lives on the matching span.
+pub fn credentials_sealed_total() -> &'static IntCounterVec {
+    static M: OnceLock<IntCounterVec> = OnceLock::new();
+    M.get_or_init(|| {
+        let counter = IntCounterVec::new(
+            Opts::new(
+                "noetl_credentials_sealed_total",
+                "GET /api/credentials/{id}/sealed calls by outcome status.",
+            ),
+            &["status"],
+        )
+        .expect("static counter spec must be valid");
+        registry()
+            .register(Box::new(counter.clone()))
+            .expect("counter registration must succeed");
+        counter
+    })
+}
+
+/// Increment [`credentials_sealed_total`] by 1 for the given outcome.
+pub fn record_credential_seal(status: &str) {
+    credentials_sealed_total()
+        .with_label_values(&[status])
+        .inc();
+}
+
 /// Render the global registry as Prometheus text-exposition
 /// format.  Used by the `GET /metrics` handler.
 pub fn gather_text() -> Result<String, prometheus::Error> {
@@ -321,7 +359,10 @@ mod tests {
             endpoint::RUNTIME_HEARTBEAT,
         ];
         // Sanity: they're all distinct and non-empty.
-        assert_eq!(names.iter().collect::<std::collections::HashSet<_>>().len(), names.len());
+        assert_eq!(
+            names.iter().collect::<std::collections::HashSet<_>>().len(),
+            names.len()
+        );
         assert!(names.iter().all(|n| !n.is_empty()));
     }
 }
