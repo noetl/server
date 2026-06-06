@@ -148,7 +148,9 @@ pub async fn get(
     Path(identifier): Path<String>,
     Query(query): Query<GetCredentialQuery>,
 ) -> AppResult<Json<CredentialResponse>> {
-    let response = service.get(&identifier, query.include_data).await?;
+    let response = service
+        .get(&identifier, query.include_data, query.execution_id)
+        .await?;
     Ok(Json(response))
 }
 
