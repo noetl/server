@@ -81,10 +81,7 @@ fn build_router(
         // paths (e.g. `system/outbox_publisher`).  The handler routes
         // by suffix: only requests whose tail ends with `/ui_schema`
         // are served; everything else returns 404.
-        .route(
-            "/api/catalog/{*tail}",
-            get(handlers::catalog::ui_schema),
-        )
+        .route("/api/catalog/{*tail}", get(handlers::catalog::ui_schema))
         .with_state(catalog_service);
 
     // Credential routes
@@ -325,8 +322,9 @@ async fn connect_nats(config: &AppConfig) -> Option<async_nats::Client> {
     // Strip + parse userinfo if present.
     let (clean_url, creds) = strip_nats_userinfo(nats_url);
     let connect_future = match creds {
-        Some((user, password)) => async_nats::ConnectOptions::with_user_and_password(user, password)
-            .connect(&clean_url),
+        Some((user, password)) => {
+            async_nats::ConnectOptions::with_user_and_password(user, password).connect(&clean_url)
+        }
         None => async_nats::ConnectOptions::new().connect(&clean_url),
     };
 
@@ -507,8 +505,12 @@ async fn main() -> anyhow::Result<()> {
     // the credential and keychain services.
     let catalog_service = CatalogService::new(db_pool.clone());
     let wallet_cipher = noetl_server::crypto::build_envelope_cipher(&encryption_key)?;
-    let credential_service = CredentialService::new(db_pool.clone(), wallet_cipher.clone());
-    let keychain_service = KeychainService::new(db_pool.clone(), wallet_cipher);
+    // Keychain is the execution-scoped cache for credential resolution
+    // (Secrets Wallet Phase 3c), so it is built first + shared into the
+    // credential service.
+    let keychain_service = KeychainService::new(db_pool.clone(), wallet_cipher.clone());
+    let credential_service =
+        CredentialService::new(db_pool.clone(), wallet_cipher, keychain_service.clone());
     // Phase F R4-4b: ExecutionService now takes the DbPoolMap so
     // its per-execution methods route via pool_for(execution_id)
     // and `list()` fan-outs via for_each_shard.  In single-pool

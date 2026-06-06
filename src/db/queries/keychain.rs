@@ -40,25 +40,25 @@ pub async fn upsert_keychain_entry(
     keychain_name: &str,
     scope_type: &str,
     execution_id: Option<i64>,
-    data: &[u8],
+    data_encrypted: &str,
     expires_at: Option<DateTime<Utc>>,
     auto_renew: bool,
     renew_config: Option<&serde_json::Value>,
-) -> AppResult<i64> {
-    let result: (i64,) = sqlx::query_as(
+) -> AppResult<()> {
+    sqlx::query(
         r#"
+        -- `credential_type` + `cache_type` are NOT NULL on noetl.keychain but
+        -- aren't part of the cache contract; the 'secret' value also satisfies the cache_type CHECK ('secret'|'token') (the resolver only reads `data_encrypted`).
         INSERT INTO noetl.keychain (
-            cache_key, catalog_id, keychain_name, scope_type, execution_id,
-            data, expires_at, auto_renew, renew_config
+            cache_key, catalog_id, keychain_name, credential_type, cache_type,
+            scope_type, execution_id, data_encrypted, expires_at, auto_renew, renew_config
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        VALUES ($1, $2, $3, 'secret', 'secret', $4, $5, $6, $7, $8, $9)
         ON CONFLICT (cache_key) DO UPDATE SET
-            data = EXCLUDED.data,
+            data_encrypted = EXCLUDED.data_encrypted,
             expires_at = EXCLUDED.expires_at,
             auto_renew = EXCLUDED.auto_renew,
-            renew_config = EXCLUDED.renew_config,
-            updated_at = NOW()
-        RETURNING id
+            renew_config = EXCLUDED.renew_config
         "#,
     )
     .bind(cache_key)
@@ -66,14 +66,14 @@ pub async fn upsert_keychain_entry(
     .bind(keychain_name)
     .bind(scope_type)
     .bind(execution_id)
-    .bind(data)
+    .bind(data_encrypted)
     .bind(expires_at)
     .bind(auto_renew)
     .bind(renew_config)
-    .fetch_one(pool)
+    .execute(pool)
     .await?;
 
-    Ok(result.0)
+    Ok(())
 }
 
 /// Get a keychain entry by cache key.
@@ -83,9 +83,9 @@ pub async fn get_keychain_by_cache_key(
 ) -> AppResult<Option<KeychainEntry>> {
     let entry = sqlx::query_as::<_, KeychainEntry>(
         r#"
-        SELECT id, cache_key, catalog_id, keychain_name, scope_type, execution_id,
-               data, expires_at, auto_renew, renew_config, access_count, accessed_at,
-               created_at, updated_at
+        SELECT cache_key, catalog_id, keychain_name, scope_type, execution_id,
+               data_encrypted, expires_at, auto_renew, renew_config, access_count, accessed_at,
+               created_at
         FROM noetl.keychain
         WHERE cache_key = $1
         "#,
@@ -97,16 +97,17 @@ pub async fn get_keychain_by_cache_key(
     Ok(entry)
 }
 
-/// Increment access count and update accessed_at.
-pub async fn increment_access_count(pool: &DbPool, id: i64) -> AppResult<()> {
+/// Increment access count and update accessed_at (keyed by cache_key — the
+/// table's primary key; there is no surrogate `id`).
+pub async fn increment_access_count(pool: &DbPool, cache_key: &str) -> AppResult<()> {
     sqlx::query(
         r#"
         UPDATE noetl.keychain
         SET access_count = access_count + 1, accessed_at = NOW()
-        WHERE id = $1
+        WHERE cache_key = $1
         "#,
     )
-    .bind(id)
+    .bind(cache_key)
     .execute(pool)
     .await?;
 
@@ -135,9 +136,9 @@ pub async fn list_keychain_by_catalog(
 ) -> AppResult<Vec<KeychainEntry>> {
     let entries = sqlx::query_as::<_, KeychainEntry>(
         r#"
-        SELECT id, cache_key, catalog_id, keychain_name, scope_type, execution_id,
-               data, expires_at, auto_renew, renew_config, access_count, accessed_at,
-               created_at, updated_at
+        SELECT cache_key, catalog_id, keychain_name, scope_type, execution_id,
+               data_encrypted, expires_at, auto_renew, renew_config, access_count, accessed_at,
+               created_at
         FROM noetl.keychain
         WHERE catalog_id = $1
         ORDER BY created_at DESC

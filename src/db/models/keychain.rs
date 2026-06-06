@@ -10,10 +10,8 @@ use sqlx::FromRow;
 /// Keychain entry for cached tokens/credentials.
 #[derive(Debug, Clone, FromRow)]
 pub struct KeychainEntry {
-    /// Unique keychain entry ID
-    pub id: i64,
-
-    /// Cache key (format: {keychain_name}:{catalog_id}:{scope_suffix})
+    /// Cache key (format: {keychain_name}:{catalog_id}:{scope_suffix}).
+    /// Primary key of `noetl.keychain` (the table has no surrogate `id`).
     pub cache_key: String,
 
     /// Catalog ID
@@ -29,8 +27,10 @@ pub struct KeychainEntry {
     #[sqlx(default)]
     pub execution_id: Option<i64>,
 
-    /// Encrypted token/credential data
-    pub data: Vec<u8>,
+    /// Encrypted token/credential data — the self-describing envelope JSON
+    /// string in the `data_encrypted` TEXT column (same storage form as
+    /// `noetl.credential`, Secrets Wallet Phase 1).
+    pub data_encrypted: String,
 
     /// Token expiry time
     #[sqlx(default)]
@@ -54,9 +54,6 @@ pub struct KeychainEntry {
 
     /// Creation timestamp
     pub created_at: DateTime<Utc>,
-
-    /// Last update timestamp
-    pub updated_at: DateTime<Utc>,
 }
 
 /// Request to set a keychain entry.
