@@ -14,12 +14,16 @@
 //! Kubernetes Secrets follow behind the same [`SecretProvider`] trait.
 
 mod gcp;
+mod resolver;
 
 pub use gcp::GcpSecretManager;
+pub use resolver::resolve_keychain_entry;
+
+use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::error::AppResult;
+use crate::error::{AppError, AppResult};
 
 /// A resolved secret plus its provenance.
 ///
@@ -55,4 +59,19 @@ pub trait SecretProvider: Send + Sync {
     /// callers keep it out of any state-surfacing response (masked at the
     /// boundary per the secrets-and-redaction contract).
     async fn fetch(&self, secret: &SecretRef) -> AppResult<SecretValue>;
+}
+
+/// Build a [`SecretProvider`] for a keychain entry's `provider` id.
+///
+/// Mirrors [`crate::crypto::build_key_manager`]. `gcp` → [`GcpSecretManager`]
+/// from ambient config. An unsupported / unset provider returns an error — the
+/// R3b resolver treats that as "this entry isn't provider-sourced" and falls
+/// through to the credential store. AWS / Azure / Vault / K8s slot in here.
+pub fn build_secret_provider(provider: &str) -> AppResult<Arc<dyn SecretProvider>> {
+    match provider {
+        "gcp" => Ok(Arc::new(GcpSecretManager::from_env()?)),
+        other => Err(AppError::Config(format!(
+            "unsupported keychain secret provider '{other}' (supported: gcp)"
+        ))),
+    }
 }
