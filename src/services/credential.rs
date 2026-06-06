@@ -6,14 +6,21 @@
 //! envelope JSON (see `crypto::envelope`). Forward-only — there is no legacy
 //! single-master-key path; a pre-wallet record must be re-registered.
 
+use std::collections::HashMap;
+
+use chrono::Utc;
+
 use crate::crypto::EnvelopeCipher;
 use crate::db::models::{
     CredentialCreateRequest, CredentialEntry, CredentialFilter, CredentialListResponse,
     CredentialResponse,
 };
+use crate::db::queries::catalog as catalog_queries;
 use crate::db::queries::credential as queries;
 use crate::db::DbPool;
 use crate::error::{AppError, AppResult};
+use crate::playbook::types::Playbook;
+use crate::secrets::{build_secret_provider, resolve_keychain_entry};
 
 /// Service for credential operations.
 #[derive(Clone)]
@@ -86,18 +93,126 @@ impl CredentialService {
     }
 
     /// Get a credential by identifier (ID or name).
-    pub async fn get(&self, identifier: &str, include_data: bool) -> AppResult<CredentialResponse> {
-        let entry = self.find_credential(identifier).await?;
+    ///
+    /// On a credential-store miss, when `execution_id` is supplied and
+    /// `include_data` is set, the alias is resolved as a **keychain entry** of
+    /// the execution's playbook (Secrets Wallet Phase 3b): a `provider:`-backed
+    /// entry (e.g. `provider: gcp`) is fetched from its secret manager and
+    /// returned. This is the `auth: "{{ alias }}"` path — the secret never
+    /// becomes workflow step output.
+    pub async fn get(
+        &self,
+        identifier: &str,
+        include_data: bool,
+        execution_id: Option<i64>,
+    ) -> AppResult<CredentialResponse> {
+        match self.find_credential(identifier).await {
+            Ok(entry) => {
+                let data = if include_data {
+                    // `entry.data` is the self-describing envelope JSON from the
+                    // TEXT column — unwrap the DEK + decrypt.
+                    Some(self.cipher.open_storage_json(&entry.data).await?)
+                } else {
+                    None
+                };
+                Ok(self.entry_to_response(entry, data))
+            }
+            Err(AppError::NotFound(_)) if include_data => {
+                if let Some(exec_id) = execution_id {
+                    if let Some(data) = self.try_resolve_keychain(exec_id, identifier).await? {
+                        return Ok(self.keychain_response(identifier, data));
+                    }
+                }
+                Err(AppError::NotFound(format!(
+                    "Credential '{}' not found",
+                    identifier
+                )))
+            }
+            Err(e) => Err(e),
+        }
+    }
 
-        let data = if include_data {
-            // `entry.data` is the self-describing envelope JSON from the
-            // TEXT column — unwrap the DEK + decrypt.
-            Some(self.cipher.open_storage_json(&entry.data).await?)
-        } else {
-            None
+    /// Resolve `alias` as a keychain entry of the execution's playbook.
+    ///
+    /// Returns `Ok(Some(data))` when `alias` is a `provider:`-backed keychain
+    /// entry that resolved; `Ok(None)` when it is not a provider-backed entry
+    /// (the caller surfaces the original not-found); `Err(_)` when the entry
+    /// exists but its provider fetch failed.
+    async fn try_resolve_keychain(
+        &self,
+        execution_id: i64,
+        alias: &str,
+    ) -> AppResult<Option<serde_json::Value>> {
+        // execution_id → (catalog_id, workload) from the start event.
+        let info: Option<(i64, Option<serde_json::Value>)> = sqlx::query_as(
+            r#"
+            SELECT catalog_id, context->'workload' as workload
+            FROM noetl.event
+            WHERE execution_id = $1
+              AND event_type IN ('playbook.initialized', 'playbook_started')
+            LIMIT 1
+            "#,
+        )
+        .bind(execution_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let Some((catalog_id, workload)) = info else {
+            return Ok(None);
         };
 
-        Ok(self.entry_to_response(entry, data))
+        // catalog_id → playbook YAML → parse.
+        let Some(entry) = catalog_queries::get_catalog_by_id(&self.pool, catalog_id).await? else {
+            return Ok(None);
+        };
+        let playbook: Playbook = match serde_yaml::from_str(&entry.content) {
+            Ok(pb) => pb,
+            Err(e) => {
+                tracing::warn!(execution_id, error = %e, "keychain resolve: playbook parse failed");
+                return Ok(None);
+            }
+        };
+
+        // Only provider-backed keychain entries resolve here.
+        let Some(kc) = playbook.find_keychain(alias) else {
+            return Ok(None);
+        };
+        let Some(provider_id) = kc.provider.as_deref() else {
+            return Ok(None);
+        };
+
+        let workload_map: HashMap<String, serde_json::Value> = workload
+            .as_ref()
+            .and_then(|w| w.as_object())
+            .map(|m| m.clone().into_iter().collect())
+            .unwrap_or_default();
+
+        let provider = build_secret_provider(provider_id)?;
+        tracing::info!(
+            execution_id,
+            alias,
+            provider = provider_id,
+            "keychain.resolve"
+        );
+        let data = resolve_keychain_entry(kc, &workload_map, &*provider).await?;
+        Ok(Some(data))
+    }
+
+    /// Build a response for a credential resolved from a keychain provider
+    /// (not a stored credential — the value is fetched live + masked downstream).
+    fn keychain_response(&self, alias: &str, data: serde_json::Value) -> CredentialResponse {
+        let now = Utc::now();
+        CredentialResponse {
+            id: "0".to_string(),
+            name: alias.to_string(),
+            credential_type: "keychain".to_string(),
+            meta: None,
+            tags: None,
+            description: Some("resolved from keychain provider".to_string()),
+            data: Some(data),
+            created_at: now,
+            updated_at: now,
+        }
     }
 
     /// List credentials with optional filtering.
