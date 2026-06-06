@@ -14,7 +14,7 @@ use crate::db::models::{
 };
 use crate::db::queries::keychain as queries;
 use crate::db::DbPool;
-use crate::error::{AppError, AppResult};
+use crate::error::AppResult;
 
 /// Service for keychain operations.
 #[derive(Clone)]
@@ -69,13 +69,12 @@ impl KeychainService {
             }
         }
 
-        // Increment access count
-        queries::increment_access_count(&self.pool, entry.id).await?;
+        // Increment access count (keyed by cache_key — the table PK).
+        queries::increment_access_count(&self.pool, &entry.cache_key).await?;
 
-        // Decrypt data: `entry.data` (BYTEA) holds the UTF-8 envelope JSON.
-        let stored = std::str::from_utf8(&entry.data)
-            .map_err(|e| AppError::Encryption(format!("keychain data not UTF-8: {e}")))?;
-        let data = self.cipher.open_storage_json(stored).await?;
+        // Decrypt data: `data_encrypted` (TEXT) holds the self-describing
+        // envelope JSON string (same storage form as `noetl.credential`).
+        let data = self.cipher.open_storage_json(&entry.data_encrypted).await?;
 
         Ok(KeychainGetResponse {
             status: "found".to_string(),
@@ -107,13 +106,9 @@ impl KeychainService {
                 .map(|seconds| Utc::now() + Duration::seconds(seconds))
         });
 
-        // Envelope-seal data into the self-describing JSON, stored as UTF-8
-        // bytes in the BYTEA `data` column.
-        let encrypted_data = self
-            .cipher
-            .seal_json_to_storage(&request.data)
-            .await?
-            .into_bytes();
+        // Envelope-seal data into the self-describing JSON string, stored in
+        // the `data_encrypted` TEXT column (same form as `noetl.credential`).
+        let encrypted_data = self.cipher.seal_json_to_storage(&request.data).await?;
 
         // Upsert entry
         queries::upsert_keychain_entry(

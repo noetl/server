@@ -13,7 +13,7 @@ use chrono::Utc;
 use crate::crypto::EnvelopeCipher;
 use crate::db::models::{
     CredentialCreateRequest, CredentialEntry, CredentialFilter, CredentialListResponse,
-    CredentialResponse,
+    CredentialResponse, KeychainSetRequest,
 };
 use crate::db::queries::catalog as catalog_queries;
 use crate::db::queries::credential as queries;
@@ -21,12 +21,23 @@ use crate::db::DbPool;
 use crate::error::{AppError, AppResult};
 use crate::playbook::types::Playbook;
 use crate::secrets::{build_secret_provider, resolve_keychain_entry};
+use crate::services::keychain::KeychainService;
+
+/// TTL (seconds) for a keychain-resolved secret cached after a provider fetch.
+/// Execution-scoped, so it's also cleaned up when the execution ends; the TTL
+/// just bounds staleness if the underlying secret rotates mid-run.
+const KEYCHAIN_CACHE_TTL_SECS: i64 = 600;
+
+/// Cache scope for resolved keychain secrets: `local` keys the entry by
+/// `{alias}:{catalog_id}:{execution_id}` (see `queries::keychain::build_cache_key`).
+const KEYCHAIN_CACHE_SCOPE: &str = "local";
 
 /// Service for credential operations.
 #[derive(Clone)]
 pub struct CredentialService {
     pool: DbPool,
     cipher: EnvelopeCipher,
+    keychain: KeychainService,
 }
 
 impl CredentialService {
@@ -34,9 +45,14 @@ impl CredentialService {
     ///
     /// `cipher` is the wallet's [`EnvelopeCipher`], built once at startup over
     /// the configured KEK provider (`crypto::build_envelope_cipher`) — local
-    /// master key in dev, GCP Cloud KMS in production.
-    pub fn new(pool: DbPool, cipher: EnvelopeCipher) -> Self {
-        Self { pool, cipher }
+    /// master key in dev, GCP Cloud KMS in production. `keychain` is the
+    /// execution-scoped cache for provider-resolved secrets (Phase 3c).
+    pub fn new(pool: DbPool, cipher: EnvelopeCipher, keychain: KeychainService) -> Self {
+        Self {
+            pool,
+            cipher,
+            keychain,
+        }
     }
 
     /// Create or update a credential.
@@ -161,6 +177,27 @@ impl CredentialService {
             return Ok(None);
         };
 
+        // Cache read (Phase 3c): an earlier step in this execution may have
+        // already resolved + cached this alias — skip the provider fetch.
+        // Best-effort: a cache error degrades to a fresh resolution, it must
+        // never fail the credential lookup.
+        match self
+            .keychain
+            .get(catalog_id, alias, Some(execution_id), KEYCHAIN_CACHE_SCOPE)
+            .await
+        {
+            Ok(c) if c.status == "found" => {
+                if let Some(data) = c.data {
+                    tracing::debug!(execution_id, alias, "keychain.cache_hit");
+                    return Ok(Some(data));
+                }
+            }
+            Ok(_) => {} // not_found / expired → resolve fresh
+            Err(e) => {
+                tracing::warn!(execution_id, alias, error = %e, "keychain.cache_read failed; resolving fresh")
+            }
+        }
+
         // catalog_id → playbook YAML → parse.
         let Some(entry) = catalog_queries::get_catalog_by_id(&self.pool, catalog_id).await? else {
             return Ok(None);
@@ -195,6 +232,22 @@ impl CredentialService {
             "keychain.resolve"
         );
         let data = resolve_keychain_entry(kc, &workload_map, &*provider).await?;
+
+        // Cache write (Phase 3c): envelope-encrypted, execution-scoped, TTL —
+        // best-effort, a cache failure must not fail the resolution.
+        let set_req = KeychainSetRequest {
+            data: data.clone(),
+            scope_type: KEYCHAIN_CACHE_SCOPE.to_string(),
+            execution_id: Some(execution_id),
+            expires_at: None,
+            expires_in: Some(KEYCHAIN_CACHE_TTL_SECS),
+            auto_renew: false,
+            renew_config: None,
+        };
+        if let Err(e) = self.keychain.set(catalog_id, alias, set_req).await {
+            tracing::warn!(execution_id, alias, error = %e, "keychain.cache_write failed");
+        }
+
         Ok(Some(data))
     }
 
