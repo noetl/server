@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.37.0](https://github.com/noetl/server/compare/v2.36.0...v2.37.0) (2026-06-06)
+
+### Features
+
+* **secrets:** dynamic-secret primitives + cache honors issuer TTL (Phase 6d) ([99a6be6](https://github.com/noetl/server/commit/99a6be6c468fb64ab8eef09055c7fb3e43b2d3ea)), closes [#116](https://github.com/noetl/server/issues/116) [noetl/ai-meta#61](https://github.com/noetl/ai-meta/issues/61)
+
 ## [2.36.0](https://github.com/noetl/server/compare/v2.35.0...v2.36.0) (2026-06-06)
 
 ### Features
