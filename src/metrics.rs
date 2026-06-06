@@ -629,6 +629,72 @@ pub fn record_secret_audit_write(operation: &str, outcome: &str, status: &str) {
         .inc();
 }
 
+/// Secrets-Wallet Phase 7c: token auto-renewal outcomes.
+///
+/// `outcome` is a bounded enum:
+/// - `triggered` — refresh decision made (will spawn or collapse).
+/// - `succeeded` — refresh ran and the new value landed in the cache.
+/// - `failed` — refresh ran but the provider errored.  The cached
+///   row is **preserved** (we don't poison the cache on a transient
+///   outage; the next natural cache miss after `expires_at` re-resolves).
+/// - `stampede_collapsed` — concurrent request found a refresh already
+///   in flight; piggy-backed on it.
+///
+/// `failed` at sustained rate is alert-worthy — it means a provider
+/// is unreachable AND a cached token is about to expire.
+pub fn secret_refresh_total() -> &'static IntCounterVec {
+    static M: OnceLock<IntCounterVec> = OnceLock::new();
+    M.get_or_init(|| {
+        let counter = IntCounterVec::new(
+            Opts::new(
+                "noetl_secret_refresh_total",
+                "Token auto-renewal outcomes (Phase 7c).  Aliases are NOT \
+                 labeled (cardinality); per-alias detail lives on the \
+                 secret.refresh tracing span.",
+            ),
+            &["outcome"],
+        )
+        .expect("static counter spec must be valid");
+        registry()
+            .register(Box::new(counter.clone()))
+            .expect("counter registration must succeed");
+        counter
+    })
+}
+
+/// Increment [`secret_refresh_total`] by 1.
+pub fn record_secret_refresh(outcome: &str) {
+    secret_refresh_total().with_label_values(&[outcome]).inc();
+}
+
+/// Secrets-Wallet Phase 7c: histogram of token auto-renewal wall-clock
+/// latency.  Buckets `[0.05, 0.1, 0.25, 0.5, 1, 2, 5]` — span the range
+/// where auth round-trips actually live.  Observed regardless of
+/// outcome so a dashboard surfaces "refresh is slow" + "refresh is
+/// failing" independently.
+pub fn secret_refresh_duration_seconds() -> &'static prometheus::Histogram {
+    static M: OnceLock<prometheus::Histogram> = OnceLock::new();
+    M.get_or_init(|| {
+        let h = prometheus::Histogram::with_opts(
+            HistogramOpts::new(
+                "noetl_secret_refresh_duration_seconds",
+                "Wall-clock seconds spent in one token auto-renewal (Phase 7c).",
+            )
+            .buckets(vec![0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0]),
+        )
+        .expect("static histogram spec must be valid");
+        registry()
+            .register(Box::new(h.clone()))
+            .expect("histogram registration must succeed");
+        h
+    })
+}
+
+/// Observe one refresh duration.
+pub fn record_secret_refresh_duration(seconds: f64) {
+    secret_refresh_duration_seconds().observe(seconds);
+}
+
 /// Render the global registry as Prometheus text-exposition
 /// format.  Used by the `GET /metrics` handler.
 pub fn gather_text() -> Result<String, prometheus::Error> {

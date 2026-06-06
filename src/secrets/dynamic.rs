@@ -29,6 +29,13 @@ use chrono::{DateTime, Utc};
 /// and the next worker fetch.
 const DEFAULT_SAFETY_MARGIN_SECS: u64 = 60;
 
+/// Default refresh window (seconds) when the env override is unset.
+/// Secrets Wallet Phase 7c: a cached short-lived token gets a
+/// background refresh once its remaining lifetime drops below this
+/// threshold.  60 s covers a typical OAuth2 refresh round-trip (~200ms)
+/// plus headroom.
+const DEFAULT_REFRESH_WINDOW_SECS: u64 = 60;
+
 /// Floor for the effective TTL — never cache for less than this even
 /// when `expires_at - now - safety_margin` would compute to something
 /// smaller.  Below this floor we'd be paying the cache cost (round-trip
@@ -48,6 +55,21 @@ pub fn safety_margin_secs() -> u64 {
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(DEFAULT_SAFETY_MARGIN_SECS)
+    })
+}
+
+/// Secrets Wallet Phase 7c: how long before `expires_at` to mark a
+/// cached row "renewable."  Read once at startup from
+/// `KEYCHAIN_CACHE_REFRESH_WINDOW_SECS` (defaults to
+/// [`DEFAULT_REFRESH_WINDOW_SECS`]).
+pub fn refresh_window_secs() -> u64 {
+    use std::sync::OnceLock;
+    static M: OnceLock<u64> = OnceLock::new();
+    *M.get_or_init(|| {
+        std::env::var("KEYCHAIN_CACHE_REFRESH_WINDOW_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_REFRESH_WINDOW_SECS)
     })
 }
 
@@ -107,6 +129,53 @@ pub fn effective_cache_ttl(
         expires_at,
         default_ttl,
         Duration::from_secs(safety_margin_secs()),
+        now,
+    )
+}
+
+/// Secrets Wallet Phase 7c — should the cached row be refreshed *now*
+/// in the background?
+///
+/// Returns `true` iff:
+/// - `expires_at` is set (long-lived secrets without an issuer expiry
+///   stay on the periodic-eviction path and never get a refresh
+///   triggered);
+/// - the token is STILL VALID (`expires_at > now`) — we don't trigger
+///   a refresh for something already dead; that's
+///   [`CacheDecision::SkipCacheAlreadyExpired`]'s job at the next
+///   resolve;
+/// - the remaining lifetime is within the refresh window
+///   (`now + refresh_window >= expires_at`).
+///
+/// The caller (resolver / cache layer) treats `true` as "return the
+/// still-valid cached value AND spawn a background refresh."
+/// Stampede collapse + the actual refresh path live in
+/// `services::credential`; this is the pure decision primitive.
+pub fn should_refresh(
+    expires_at: Option<DateTime<Utc>>,
+    refresh_window: Duration,
+    now: DateTime<Utc>,
+) -> bool {
+    let Some(expires_at) = expires_at else {
+        return false;
+    };
+    if expires_at <= now {
+        // Already past the deadline — eviction path, not refresh path.
+        return false;
+    }
+    let window = chrono::Duration::from_std(refresh_window)
+        .unwrap_or_else(|_| chrono::Duration::seconds(0));
+    expires_at - window <= now
+}
+
+/// Convenience entry point that reads the refresh window from env.
+pub fn should_refresh_default(
+    expires_at: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> bool {
+    should_refresh(
+        expires_at,
+        Duration::from_secs(refresh_window_secs()),
         now,
     )
 }
@@ -226,5 +295,66 @@ mod tests {
             now,
         );
         assert_eq!(d, CacheDecision::SkipCacheAlreadyExpired);
+    }
+
+    // -------- Phase 7c: refresh-before-expiry --------
+
+    #[test]
+    fn should_refresh_returns_false_when_no_expires_at() {
+        // Long-lived secrets without an issuer expiry stay on the
+        // periodic-eviction path; never trigger a refresh.
+        assert!(!should_refresh(None, Duration::from_secs(60), at(1000)));
+    }
+
+    #[test]
+    fn should_refresh_returns_false_when_already_expired() {
+        // expires_at past now — defensive.  Already-expired tokens go
+        // through the cache eviction path (SkipCacheAlreadyExpired),
+        // not the refresh path.
+        let now = at(1000);
+        let expires_at = at(990); // 10 s past
+        assert!(!should_refresh(
+            Some(expires_at),
+            Duration::from_secs(60),
+            now
+        ));
+    }
+
+    #[test]
+    fn should_refresh_returns_false_when_outside_window() {
+        // expires_at far in the future — no refresh needed.
+        let now = at(1000);
+        let expires_at = at(2000); // 1000 s away
+        assert!(!should_refresh(
+            Some(expires_at),
+            Duration::from_secs(60),
+            now
+        ));
+    }
+
+    #[test]
+    fn should_refresh_returns_true_inside_window() {
+        // expires_at = now + 30 s; window = 60 s → inside the window,
+        // still valid → refresh.
+        let now = at(1000);
+        let expires_at = at(1030);
+        assert!(should_refresh(
+            Some(expires_at),
+            Duration::from_secs(60),
+            now
+        ));
+    }
+
+    #[test]
+    fn should_refresh_at_exact_window_boundary() {
+        // Boundary case: expires_at = now + window.  The condition
+        // `expires_at - window <= now` is `now <= now` → true.  Refresh.
+        let now = at(1000);
+        let expires_at = at(1060);
+        assert!(should_refresh(
+            Some(expires_at),
+            Duration::from_secs(60),
+            now
+        ));
     }
 }
