@@ -56,6 +56,7 @@ pub mod nats;
 pub mod playbook;
 pub mod result_ext;
 pub mod sanitize;
+pub mod secrets;
 pub mod services;
 pub mod sharding;
 pub mod snowflake;
