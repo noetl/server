@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.41.0](https://github.com/noetl/server/compare/v2.40.0...v2.41.0) (2026-06-06)
+
+### Features
+
+* **secrets:** token auto-renewal primitives (Phase 7c) ([f51220a](https://github.com/noetl/server/commit/f51220a1ca6b3658e088a76827f601f05941758d)), closes [#124](https://github.com/noetl/server/issues/124) [noetl/ai-meta#61](https://github.com/noetl/ai-meta/issues/61)
+
 ## [2.40.0](https://github.com/noetl/server/compare/v2.39.0...v2.40.0) (2026-06-06)
 
 ### Features
