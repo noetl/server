@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.33.0](https://github.com/noetl/server/compare/v2.32.0...v2.33.0) (2026-06-06)
+
+### Features
+
+* **api:** sealed credential delivery endpoint (Secrets Wallet Phase 5b) ([68fc193](https://github.com/noetl/server/commit/68fc193936c449034bf74a341af8f3e6390efa63)), closes [noetl/ai-meta#61](https://github.com/noetl/ai-meta/issues/61) [#108](https://github.com/noetl/server/issues/108) [noetl/ai-meta#61](https://github.com/noetl/ai-meta/issues/61)
+
 ## [2.32.0](https://github.com/noetl/server/compare/v2.31.0...v2.32.0) (2026-06-06)
 
 ### Features
