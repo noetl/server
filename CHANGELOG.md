@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.32.0](https://github.com/noetl/server/compare/v2.31.0...v2.32.0) (2026-06-06)
+
+### Features
+
+* **crypto:** sealed payload primitives (Secrets Wallet Phase 5a) ([b551471](https://github.com/noetl/server/commit/b551471a1700174b86d8ffbb15a5cac1255d7843)), closes [noetl/ai-meta#61](https://github.com/noetl/ai-meta/issues/61) [#106](https://github.com/noetl/server/issues/106) [noetl/ai-meta#61](https://github.com/noetl/ai-meta/issues/61)
+
 ## [2.31.0](https://github.com/noetl/server/compare/v2.30.0...v2.31.0) (2026-06-06)
 
 ### Features
