@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.34.0](https://github.com/noetl/server/compare/v2.33.0...v2.34.0) (2026-06-06)
+
+### Features
+
+* **secrets:** region tag on keychain entries + per-region routing (Phase 6a) ([154b73b](https://github.com/noetl/server/commit/154b73b925767d84982d2db56df3857c9950909d)), closes [#110](https://github.com/noetl/server/issues/110) [noetl/ai-meta#61](https://github.com/noetl/ai-meta/issues/61)
+
 ## [2.33.0](https://github.com/noetl/server/compare/v2.32.0...v2.33.0) (2026-06-06)
 
 ### Features
