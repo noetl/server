@@ -600,6 +600,15 @@ pub struct KeychainDef {
     #[serde(default)]
     pub allowed_regions: Vec<String>,
 
+    /// Secrets Wallet Phase 6e — opt-out for the cross-region broker
+    /// fallback.  When `true`, a strict-mode residency denial bubbles up
+    /// as `ResidencyViolation` even if a broker is configured for the
+    /// entry's region — used for credentials whose policy says "this
+    /// data physically cannot leave its home region, full stop."
+    /// Default `false` (broker fallback honoured when registered).
+    #[serde(default)]
+    pub no_broker_fallback: bool,
+
     /// Auto-renew flag.
     #[serde(default)]
     pub auto_renew: bool,

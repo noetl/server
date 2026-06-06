@@ -3,13 +3,13 @@
 //! Endpoints for managing encrypted credentials.
 
 use axum::{
+    Json,
     extract::{Path, Query, State},
     http::StatusCode,
-    Json,
 };
 use serde::Deserialize;
 
-use crate::crypto::{sealed_seal, SealedEnvelope};
+use crate::crypto::{SealedEnvelope, sealed_seal};
 use crate::db::models::{CredentialCreateRequest, CredentialListResponse, CredentialResponse};
 use crate::error::{AppError, AppResult};
 use crate::services::{CredentialService, RuntimeService};
@@ -239,11 +239,7 @@ pub async fn get_sealed(
     // Look up the worker's sealing pubkey first; this is the cheapest reject
     // and avoids decrypting + serialising the credential for a worker that
     // can't unseal it.
-    let pubkey_bytes = match deps
-        .runtime
-        .get_worker_public_key(&query.worker_id)
-        .await
-    {
+    let pubkey_bytes = match deps.runtime.get_worker_public_key(&query.worker_id).await {
         Ok(Some(b)) => b,
         Ok(None) => {
             crate::metrics::record_credential_seal("no_pubkey");
@@ -263,12 +259,84 @@ pub async fn get_sealed(
 
     // Fetch the credential payload (with include_data=true — the whole point
     // of sealing is to deliver the resolved secret).
+    //
+    // Phase 6e — when the local fetch fails with a residency violation AND a
+    // cross-region broker is configured for the credential's home region,
+    // forward the request to the broker instead of bubbling the violation
+    // up.  The broker resolves locally, seals to THIS worker's pubkey, and
+    // returns the envelope directly.  Cleartext stays in the credential's
+    // home region.
     let credential = match deps
         .credentials
         .get(&identifier, true, query.execution_id)
         .await
     {
         Ok(c) => c,
+        Err(AppError::ResidencyViolation {
+            credential,
+            entry_region,
+            server_region,
+        }) => {
+            // Look up a broker for the entry's region.  When none is
+            // configured, propagate the violation per Phase-6c fail-closed
+            // semantics.
+            let registry = crate::secrets::broker::registry();
+            let Some(broker_url) = registry.broker_for(&entry_region) else {
+                crate::metrics::record_credential_seal("residency_violation");
+                return Err(AppError::ResidencyViolation {
+                    credential,
+                    entry_region,
+                    server_region,
+                });
+            };
+            tracing::info!(
+                worker_id = %query.worker_id,
+                credential = %credential,
+                entry_region = %entry_region,
+                broker_url = %broker_url,
+                "credential.cross_region.fallback"
+            );
+            // Forward to the broker.  Wrap the seal in our own handler so
+            // we can record cross-region duration.
+            let started = std::time::Instant::now();
+            let client = match crate::secrets::broker::BrokerClient::new() {
+                Ok(c) => c,
+                Err(e) => {
+                    crate::metrics::record_cross_region_broker_call(&entry_region, "unreachable");
+                    return Err(e);
+                }
+            };
+            let body = crate::secrets::broker::CrossRegionResolveRequest {
+                alias: identifier.clone(),
+                worker_public_key_b64: {
+                    use base64::Engine as _;
+                    base64::engine::general_purpose::STANDARD.encode(pubkey_bytes)
+                },
+                worker_id: query.worker_id.clone(),
+                execution_id: query.execution_id,
+                parent_execution_id: query.parent_execution_id,
+                expected_entry_region: entry_region.clone(),
+                requesting_region: server_region.clone(),
+            };
+            let envelope = match client.resolve(broker_url, &body).await {
+                Ok(e) => e,
+                Err(e) => {
+                    crate::metrics::record_cross_region_broker_call_duration(
+                        &entry_region,
+                        started.elapsed().as_secs_f64(),
+                    );
+                    crate::metrics::record_cross_region_broker_call(&entry_region, "unreachable");
+                    return Err(e);
+                }
+            };
+            crate::metrics::record_cross_region_broker_call_duration(
+                &entry_region,
+                started.elapsed().as_secs_f64(),
+            );
+            crate::metrics::record_cross_region_broker_call(&entry_region, "ok");
+            crate::metrics::record_credential_seal("ok_via_broker");
+            return Ok(Json(envelope));
+        }
         Err(e) => {
             crate::metrics::record_credential_seal("credential_error");
             return Err(e);
@@ -322,7 +390,7 @@ mod tests {
     /// `sealed::tests` exercise, here pinned at the handler-payload layer).
     #[test]
     fn tampered_sealed_credential_is_rejected() {
-        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+        use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 
         let recipient_sk = StaticSecret::random_from_rng(rand_core::OsRng);
         let recipient_pk = PublicKey::from(&recipient_sk);

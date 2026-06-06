@@ -4,6 +4,7 @@
 
 pub mod catalog;
 pub mod credentials;
+pub mod cross_region;
 pub mod dashboard;
 pub mod database;
 pub mod events;
