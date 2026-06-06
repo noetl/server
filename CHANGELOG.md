@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.25.0](https://github.com/noetl/server/compare/v2.24.0...v2.25.0) (2026-06-06)
+
+### Features
+
+* **secrets:** keychain secret-source resolver logic + provider factory (Phase 3b R3a) ([318429b](https://github.com/noetl/server/commit/318429b635522da399e097664930b01c2e8a2701)), closes [noetl/ai-meta#61](https://github.com/noetl/ai-meta/issues/61) [noetl/ai-meta#61](https://github.com/noetl/ai-meta/issues/61)
+
 ## [2.24.0](https://github.com/noetl/server/compare/v2.23.0...v2.24.0) (2026-06-06)
 
 ### Features
