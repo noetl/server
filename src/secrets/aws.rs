@@ -268,6 +268,7 @@ impl SecretProvider for AwsSmSecretProvider {
         Ok(SecretValue {
             value,
             version: body.version_id,
+            expires_at: None,
         })
     }
 }

@@ -272,6 +272,7 @@ impl SecretProvider for AzureKeyVaultProvider {
         Ok(SecretValue {
             value: body.value,
             version: resolved_version,
+            expires_at: None,
         })
     }
 }

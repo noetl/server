@@ -39,6 +39,30 @@ pub async fn resolve_keychain_entry(
     workload: &HashMap<String, serde_json::Value>,
     provider: &dyn SecretProvider,
 ) -> AppResult<serde_json::Value> {
+    resolve_keychain_entry_with_meta(kc, workload, provider)
+        .await
+        .map(|(v, _)| v)
+}
+
+/// Phase 6d — same as [`resolve_keychain_entry`] but also returns the
+/// issuer-reported `expires_at` for the resolved credential.
+///
+/// For a `map`-shaped entry that bundles several secrets, the returned
+/// `expires_at` is the **earliest** of any contributing secret's
+/// `expires_at` — caching the bundle past the soonest expiry means the
+/// next worker fetch gets a 401 from whichever member already expired.
+///
+/// The standard Phase-3c keychain-cache write site
+/// (`crate::services::credential`) consumes this `expires_at` and asks
+/// [`crate::secrets::dynamic::effective_cache_ttl`] for the cache TTL —
+/// honouring `min(default_ttl, expires_at - now - safety_margin)`,
+/// skipping the write entirely when the issuer's expiry is already in
+/// the past (defensive: never cache something already dead).
+pub async fn resolve_keychain_entry_with_meta(
+    kc: &KeychainDef,
+    workload: &HashMap<String, serde_json::Value>,
+    provider: &dyn SecretProvider,
+) -> AppResult<(serde_json::Value, Option<chrono::DateTime<chrono::Utc>>)> {
     let renderer = TemplateRenderer::new();
     let region = effective_region(kc);
     let provider_id = provider.provider();
@@ -55,6 +79,9 @@ pub async fn resolve_keychain_entry(
     let result = match &kc.map {
         Some(map) => {
             let mut out = serde_json::Map::with_capacity(map.len());
+            // Phase 6d — the bundle's expires_at is the earliest of any
+            // contributing secret's expires_at (None contributes nothing).
+            let mut earliest_expires_at: Option<chrono::DateTime<chrono::Utc>> = None;
             for (key, path_template) in map {
                 let path = match renderer.render(path_template, workload) {
                     Ok(p) => p,
@@ -77,9 +104,13 @@ pub async fn resolve_keychain_entry(
                         return Err(e);
                     }
                 };
+                if let Some(exp) = secret.expires_at {
+                    earliest_expires_at =
+                        Some(earliest_expires_at.map(|prev| prev.min(exp)).unwrap_or(exp));
+                }
                 out.insert(key.clone(), serde_json::Value::String(secret.value));
             }
-            Ok(serde_json::Value::Object(out))
+            Ok((serde_json::Value::Object(out), earliest_expires_at))
         }
         None => {
             let secret = match provider
@@ -96,7 +127,7 @@ pub async fn resolve_keychain_entry(
                     return Err(e);
                 }
             };
-            Ok(serde_json::Value::String(secret.value))
+            Ok((serde_json::Value::String(secret.value), secret.expires_at))
         }
     };
     if result.is_ok() {
@@ -169,6 +200,7 @@ mod tests {
                 .map(|v| SecretValue {
                     value: v.clone(),
                     version: None,
+                    expires_at: None,
                 })
                 .ok_or_else(|| {
                     AppError::NotFound(format!("fake secret '{}' not found", secret.name))

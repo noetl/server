@@ -221,7 +221,11 @@ pub fn parse_access_response(body: &str) -> AppResult<SecretValue> {
         .as_deref()
         .and_then(|n| n.split("/versions/").nth(1))
         .map(|s| s.to_string());
-    Ok(SecretValue { value, version })
+    Ok(SecretValue {
+        value,
+        version,
+        expires_at: None,
+    })
 }
 
 #[cfg(test)]

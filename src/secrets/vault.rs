@@ -287,6 +287,7 @@ pub fn extract_kv_value(
     Ok(SecretValue {
         value,
         version: resp.data.metadata.version.map(|v| v.to_string()),
+        expires_at: None,
     })
 }
 

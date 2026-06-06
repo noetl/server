@@ -299,6 +299,7 @@ pub fn extract_secret_value(
     Ok(SecretValue {
         value,
         version: obj.metadata.resource_version,
+        expires_at: None,
     })
 }
 
