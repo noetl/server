@@ -10,6 +10,7 @@ pub mod execution;
 pub mod internal;
 pub mod keychain;
 pub mod runtime;
+pub mod secret_audit;
 pub mod ui_schema;
 
 pub use catalog::CatalogService;
@@ -18,3 +19,4 @@ pub use event::EventService;
 pub use execution::ExecutionService;
 pub use keychain::KeychainService;
 pub use runtime::RuntimeService;
+pub use secret_audit::SecretAuditService;
