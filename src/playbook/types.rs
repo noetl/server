@@ -545,11 +545,32 @@ pub struct KeychainDef {
     #[serde(default)]
     pub scope: Option<String>,
 
+    /// Secret-source backend that resolves this entry: `gcp` (Google Secret
+    /// Manager), `aws`, `azure`, `vault`, `k8s`. When set, the server-side
+    /// keychain resolver fetches the value(s) from this provider on a cache
+    /// miss (Secrets Wallet Phase 3b). `None` means the entry is supplied by
+    /// other means (pre-registered credential, minted token).
+    #[serde(default)]
+    pub provider: Option<String>,
+
+    /// Credential alias used to authenticate to `provider` (e.g. a service
+    /// account). On a provider that authenticates by ambient identity (GCP
+    /// Workload Identity), this is unused.
+    #[serde(default)]
+    pub auth: Option<String>,
+
+    /// Output-key → secret-reference map. Each value is a secret-path template
+    /// (rendered against the workload at resolution time); the resolved entry
+    /// is the object `{ <key>: <secret-value>, ... }` — the "auth object as a
+    /// map" shape. Absent for single-value entries.
+    #[serde(default)]
+    pub map: Option<HashMap<String, String>>,
+
     /// Auto-renew flag.
     #[serde(default)]
     pub auto_renew: bool,
 
-    /// Additional configuration.
+    /// Additional configuration (e.g. `kind`, provider-specific knobs).
     #[serde(flatten)]
     pub extra: HashMap<String, serde_json::Value>,
 }
@@ -637,6 +658,16 @@ impl Playbook {
     /// Get the resource path.
     pub fn path(&self) -> Option<&str> {
         self.metadata.path.as_deref()
+    }
+
+    /// Find a keychain definition by its alias name.
+    ///
+    /// The server-side keychain resolver (Secrets Wallet Phase 3b) uses this
+    /// to look up how an `auth: "{{ alias }}"` reference is sourced — e.g. a
+    /// `provider: gcp` entry whose `map` points at Secret Manager paths — when
+    /// resolving the alias on a keychain cache miss.
+    pub fn find_keychain(&self, alias: &str) -> Option<&KeychainDef> {
+        self.keychain.as_ref()?.iter().find(|kc| kc.name == alias)
     }
 
     /// Get the playbook name.
@@ -1195,8 +1226,14 @@ code: |
   print(f"hello {message}")
 "#;
         let spec: ToolSpec = serde_yaml::from_str(yaml).unwrap();
-        let args = spec.args.clone().expect("input alias should decode into args");
-        assert_eq!(args.get("message").and_then(|v| v.as_str()), Some("Hello World"));
+        let args = spec
+            .args
+            .clone()
+            .expect("input alias should decode into args");
+        assert_eq!(
+            args.get("message").and_then(|v| v.as_str()),
+            Some("Hello World")
+        );
         assert_eq!(args.get("count").and_then(|v| v.as_i64()), Some(42));
 
         let call = ToolCall::from_spec(&spec);
@@ -1204,7 +1241,10 @@ code: |
             .config
             .get("args")
             .expect("ToolCall::from_spec should propagate args");
-        assert_eq!(call_args.get("message").and_then(|v| v.as_str()), Some("Hello World"));
+        assert_eq!(
+            call_args.get("message").and_then(|v| v.as_str()),
+            Some("Hello World")
+        );
     }
 
     #[test]
@@ -1247,5 +1287,75 @@ workflow:
         let playbook: Playbook = serde_yaml::from_str(yaml).unwrap();
         let names = playbook.step_names();
         assert_eq!(names, vec!["start", "process", "end"]);
+    }
+
+    const KEYCHAIN_YAML: &str = r#"
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata:
+  name: kc_test
+keychain:
+  - name: openai_token
+    kind: secrets
+    provider: gcp
+    scope: global
+    auth: "{{ gcp_auth }}"
+    map:
+      api_key: "{{ openai_secret_path }}"
+  - name: plain_token
+    credential: some_cred
+workflow:
+  - step: start
+    tool:
+      kind: python
+      code: ""
+"#;
+
+    #[test]
+    fn keychain_def_parses_typed_provider_auth_map() {
+        let pb: Playbook = serde_yaml::from_str(KEYCHAIN_YAML).unwrap();
+        let kc = pb.find_keychain("openai_token").expect("openai_token");
+        assert_eq!(kc.provider.as_deref(), Some("gcp"));
+        assert_eq!(kc.auth.as_deref(), Some("{{ gcp_auth }}"));
+        assert_eq!(kc.scope.as_deref(), Some("global"));
+        let map = kc.map.as_ref().expect("map");
+        assert_eq!(
+            map.get("api_key").map(String::as_str),
+            Some("{{ openai_secret_path }}")
+        );
+        // `kind: secrets` lands in the flatten catch-all, not a typed field.
+        assert_eq!(
+            kc.extra.get("kind").and_then(|v| v.as_str()),
+            Some("secrets")
+        );
+    }
+
+    #[test]
+    fn find_keychain_handles_missing_and_provider_less_entries() {
+        let pb: Playbook = serde_yaml::from_str(KEYCHAIN_YAML).unwrap();
+        // A provider-less entry parses with provider = None.
+        let plain = pb.find_keychain("plain_token").expect("plain_token");
+        assert_eq!(plain.provider, None);
+        assert_eq!(plain.map, None);
+        assert_eq!(plain.credential.as_deref(), Some("some_cred"));
+        // Unknown alias → None.
+        assert!(pb.find_keychain("nope").is_none());
+    }
+
+    #[test]
+    fn find_keychain_none_when_no_keychain_block() {
+        let yaml = r#"
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata:
+  name: no_kc
+workflow:
+  - step: start
+    tool:
+      kind: python
+      code: ""
+"#;
+        let pb: Playbook = serde_yaml::from_str(yaml).unwrap();
+        assert!(pb.find_keychain("anything").is_none());
     }
 }
