@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.39.0](https://github.com/noetl/server/compare/v2.38.0...v2.39.0) (2026-06-06)
+
+### Features
+
+* **crypto:** wallet KEK rotation primitives (Phase 7a) ([773e188](https://github.com/noetl/server/commit/773e188d415a99d9fa828b443b609c12d7eb87eb)), closes [#120](https://github.com/noetl/server/issues/120) [noetl/ai-meta#61](https://github.com/noetl/ai-meta/issues/61)
+
 ## [2.38.0](https://github.com/noetl/server/compare/v2.37.0...v2.38.0) (2026-06-06)
 
 ### Features
