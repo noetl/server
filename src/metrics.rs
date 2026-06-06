@@ -590,6 +590,45 @@ pub fn record_wallet_rotate(table: &str, status: &str) {
         .inc();
 }
 
+/// Secrets-Wallet Phase 7b: secret-resolution audit-write outcomes.
+///
+/// Labels are bounded enums:
+/// - `operation`: matches `services::secret_audit::Operation::as_str` —
+///   `get_sealed` / `cross_region_broker_serve` / `resolve_keychain` /
+///   `get_credential`.
+/// - `outcome`: the resolver's actual outcome at audit time —
+///   `ok` / `residency_violation` / `broker_unreachable` / etc.
+///   (mirrors `services::secret_audit::Outcome::as_str`).
+/// - `status`: what happened to the audit write itself —
+///   - `written` — sink confirmed the row landed.
+///   - `dropped_async` — fire-and-forget write failed (logged + dropped).
+///   - `failed_strict` — `NOETL_SECRET_AUDIT_REQUIRED=true` and the
+///     sink errored.  **Alert-worthy.**
+pub fn secret_audit_writes_total() -> &'static IntCounterVec {
+    static M: OnceLock<IntCounterVec> = OnceLock::new();
+    M.get_or_init(|| {
+        let counter = IntCounterVec::new(
+            Opts::new(
+                "noetl_secret_audit_writes_total",
+                "Secret-resolution audit-write outcomes (Phase 7b).",
+            ),
+            &["operation", "outcome", "status"],
+        )
+        .expect("static counter spec must be valid");
+        registry()
+            .register(Box::new(counter.clone()))
+            .expect("counter registration must succeed");
+        counter
+    })
+}
+
+/// Increment [`secret_audit_writes_total`] by 1.
+pub fn record_secret_audit_write(operation: &str, outcome: &str, status: &str) {
+    secret_audit_writes_total()
+        .with_label_values(&[operation, outcome, status])
+        .inc();
+}
+
 /// Render the global registry as Prometheus text-exposition
 /// format.  Used by the `GET /metrics` handler.
 pub fn gather_text() -> Result<String, prometheus::Error> {
