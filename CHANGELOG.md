@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.27.1](https://github.com/noetl/server/compare/v2.27.0...v2.27.1) (2026-06-06)
+
+### Bug Fixes
+
+* **parser:** order NextSpec variants so the list form doesn't deserialize as Router ([9c0a947](https://github.com/noetl/server/commit/9c0a94782acac06a6ee32fcad586d8b7924c9924))
+
 ## [2.27.0](https://github.com/noetl/server/compare/v2.26.0...v2.27.0) (2026-06-06)
 
 ### Features
