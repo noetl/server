@@ -18,6 +18,7 @@ mod azure;
 mod gcp;
 mod k8s;
 mod registry;
+pub mod residency;
 mod resolver;
 mod vault;
 

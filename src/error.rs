@@ -4,9 +4,9 @@
 //! for seamless integration with Axum handlers.
 
 use axum::{
+    Json,
     http::StatusCode,
     response::{IntoResponse, Response},
-    Json,
 };
 use serde_json::json;
 use thiserror::Error;
@@ -73,6 +73,21 @@ pub enum AppError {
     /// Parse error (YAML, JSON, etc.)
     #[error("Parse error: {0}")]
     Parse(String),
+
+    /// Secrets Wallet Phase 6c — residency policy violation: a server
+    /// in one region attempted to resolve a keychain entry whose
+    /// `residency: strict` policy region-locks it elsewhere.  Surfaces
+    /// to operators as HTTP 403 with a clear "credential X is
+    /// region-locked to Y; this server is in Z" message that NEVER
+    /// includes the value itself.
+    #[error(
+        "Residency violation: credential '{credential}' is region-locked to '{entry_region}'; this server is in '{server_region}'"
+    )]
+    ResidencyViolation {
+        credential: String,
+        entry_region: String,
+        server_region: String,
+    },
 }
 
 impl IntoResponse for AppError {
@@ -119,6 +134,10 @@ impl IntoResponse for AppError {
             AppError::Parse(msg) => {
                 tracing::error!(error = %msg, "Parse error");
                 (StatusCode::BAD_REQUEST, msg.clone())
+            }
+            AppError::ResidencyViolation { .. } => {
+                tracing::warn!(error = %self, "Residency violation");
+                (StatusCode::FORBIDDEN, self.to_string())
             }
         };
 
