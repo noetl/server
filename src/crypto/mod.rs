@@ -8,11 +8,13 @@ pub mod encryption;
 pub mod envelope;
 pub mod keymanager;
 pub mod kms_gcp;
+pub mod sealed;
 
 pub use encryption::{decrypt, encrypt, Encryptor};
 pub use envelope::{EnvelopeCipher, EnvelopeRecord, ENC_ALG, ENC_VERSION};
 pub use keymanager::{KeyManager, LocalDevKms, WrappedDek};
 pub use kms_gcp::GcpKms;
+pub use sealed::{open as sealed_open, seal as sealed_seal, SealedEnvelope, SEAL_ALG, SEAL_V};
 
 use std::sync::Arc;
 
