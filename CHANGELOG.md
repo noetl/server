@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.35.0](https://github.com/noetl/server/compare/v2.34.0...v2.35.0) (2026-06-06)
+
+### Features
+
+* **secrets:** ProviderRegistry + per-(provider, region) metrics (Phase 6b) ([d86a32b](https://github.com/noetl/server/commit/d86a32b018f22d65e16d6001d4d7ab8a3c63b977)), closes [server#111](https://github.com/noetl/server/issues/111) [#112](https://github.com/noetl/server/issues/112) [noetl/ai-meta#61](https://github.com/noetl/ai-meta/issues/61)
+
 ## [2.34.0](https://github.com/noetl/server/compare/v2.33.0...v2.34.0) (2026-06-06)
 
 ### Features
