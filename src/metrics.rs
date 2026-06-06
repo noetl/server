@@ -239,6 +239,53 @@ pub fn record_credential_seal(status: &str) {
         .inc();
 }
 
+/// Secrets-Wallet Phase 6a: per-resolve counter for keychain entries
+/// against external secret providers.
+///
+/// Labels are bounded enums:
+/// - `provider`: `gcp` / `aws` / `azure` / `vault` / `k8s` (the five
+///   backends behind [`crate::secrets::SecretProvider`]).
+/// - `region`: the secret's home region as it was resolved.  Falls back
+///   to `"-"` when neither the keychain entry nor `NOETL_SERVER_REGION`
+///   supplied one (legacy path; pre-6a behaviour).
+/// - `status`: `ok` on a successful fetch; otherwise a failure-mode
+///   label (`provider_build_error`, `provider_fetch_error`, `template_error`).
+///
+/// `execution_id` is NOT a label (cardinality) — it lives on the matching
+/// span per [`agents/rules/observability.md`].  Region IS a label by design:
+/// the cardinality is bounded (operators don't deploy into hundreds of
+/// regions in practice), and per-region breakdown is exactly what an
+/// operator queries when troubleshooting a residency-related outage.
+pub fn secret_resolve_total() -> &'static IntCounterVec {
+    static M: OnceLock<IntCounterVec> = OnceLock::new();
+    M.get_or_init(|| {
+        let counter = IntCounterVec::new(
+            Opts::new(
+                "noetl_secret_resolve_total",
+                "Keychain-entry resolutions against external secret providers, by \
+                 provider + region + outcome.",
+            ),
+            &["provider", "region", "status"],
+        )
+        .expect("static counter spec must be valid");
+        registry()
+            .register(Box::new(counter.clone()))
+            .expect("counter registration must succeed");
+        counter
+    })
+}
+
+/// Increment [`secret_resolve_total`] by 1 for the given outcome.
+///
+/// `region` may be empty — pass `"-"` (the convention used here) when no
+/// region was supplied, to keep the label cardinality bounded.
+pub fn record_secret_resolve(provider: &str, region: &str, status: &str) {
+    let region_label = if region.is_empty() { "-" } else { region };
+    secret_resolve_total()
+        .with_label_values(&[provider, region_label, status])
+        .inc();
+}
+
 /// Render the global registry as Prometheus text-exposition
 /// format.  Used by the `GET /metrics` handler.
 pub fn gather_text() -> Result<String, prometheus::Error> {

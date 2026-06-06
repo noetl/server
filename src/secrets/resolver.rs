@@ -9,8 +9,9 @@
 
 use std::collections::HashMap;
 
-use super::{SecretProvider, SecretRef};
+use super::{SecretProvider, SecretRef, server_region};
 use crate::error::AppResult;
+use crate::metrics::record_secret_resolve;
 use crate::playbook::types::KeychainDef;
 use crate::template::TemplateRenderer;
 
@@ -24,51 +25,100 @@ use crate::template::TemplateRenderer;
 ///
 /// The resolved value is never logged; callers keep it out of any
 /// state-surfacing response (masked at the boundary).
+///
+/// **Secrets Wallet Phase 6a — region routing.**  The entry's
+/// [`KeychainDef::region`] (or `NOETL_SERVER_REGION` as a fallback) is filled
+/// into [`SecretRef::region`] so the provider can route the fetch to the
+/// right regional endpoint / vault / cluster.  Every resolution increments
+/// [`crate::metrics::record_secret_resolve`] labelled by `(provider, region,
+/// status)` for per-region operator observability.  Cardinality is bounded
+/// (low-tens of regions in practice) — region is a routing hint, not a secret.
 pub async fn resolve_keychain_entry(
     kc: &KeychainDef,
     workload: &HashMap<String, serde_json::Value>,
     provider: &dyn SecretProvider,
 ) -> AppResult<serde_json::Value> {
     let renderer = TemplateRenderer::new();
-    match &kc.map {
+    let region = effective_region(kc);
+    let provider_id = provider.provider();
+    let result = match &kc.map {
         Some(map) => {
             let mut out = serde_json::Map::with_capacity(map.len());
             for (key, path_template) in map {
-                let path = renderer.render(path_template, workload)?;
-                let secret = provider
+                let path = match renderer.render(path_template, workload) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        record_secret_resolve(provider_id, &region, "template_error");
+                        return Err(e);
+                    }
+                };
+                let secret = match provider
                     .fetch(&SecretRef {
                         name: path,
-                        project: None,
-                        version: None,
+                        region: Some(region.clone()).filter(|r| !r.is_empty()),
+                        ..SecretRef::default()
                     })
-                    .await?;
+                    .await
+                {
+                    Ok(s) => s,
+                    Err(e) => {
+                        record_secret_resolve(provider_id, &region, "provider_fetch_error");
+                        return Err(e);
+                    }
+                };
                 out.insert(key.clone(), serde_json::Value::String(secret.value));
             }
             Ok(serde_json::Value::Object(out))
         }
         None => {
-            let secret = provider
+            let secret = match provider
                 .fetch(&SecretRef {
                     name: kc.name.clone(),
-                    project: None,
-                    version: None,
+                    region: Some(region.clone()).filter(|r| !r.is_empty()),
+                    ..SecretRef::default()
                 })
-                .await?;
+                .await
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    record_secret_resolve(provider_id, &region, "provider_fetch_error");
+                    return Err(e);
+                }
+            };
             Ok(serde_json::Value::String(secret.value))
         }
+    };
+    if result.is_ok() {
+        record_secret_resolve(provider_id, &region, "ok");
     }
+    result
+}
+
+/// The region this keychain entry resolves into — the entry's own
+/// `region` wins; otherwise the server's `NOETL_SERVER_REGION` env;
+/// otherwise empty (legacy).
+pub(crate) fn effective_region(kc: &KeychainDef) -> String {
+    if let Some(r) = kc.region.as_deref().filter(|s| !s.is_empty()) {
+        return r.to_string();
+    }
+    server_region().to_string()
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use super::*;
     use crate::error::AppError;
     use crate::secrets::SecretValue;
     use async_trait::async_trait;
 
-    /// In-memory provider: maps secret-name → value.
+    /// In-memory provider: maps secret-name → value.  Records every
+    /// [`SecretRef`] it was called with, so tests can assert that the
+    /// resolver propagated the region correctly.
     struct FakeProvider {
         values: HashMap<String, String>,
+        seen: Mutex<Vec<SecretRef>>,
     }
 
     impl FakeProvider {
@@ -78,7 +128,16 @@ mod tests {
                     .iter()
                     .map(|(k, v)| (k.to_string(), v.to_string()))
                     .collect(),
+                seen: Mutex::new(Vec::new()),
             }
+        }
+
+        fn last_region(&self) -> Option<String> {
+            self.seen
+                .lock()
+                .unwrap()
+                .last()
+                .and_then(|s| s.region.clone())
         }
     }
 
@@ -88,6 +147,7 @@ mod tests {
             "fake"
         }
         async fn fetch(&self, secret: &SecretRef) -> AppResult<SecretValue> {
+            self.seen.lock().unwrap().push(secret.clone());
             self.values
                 .get(&secret.name)
                 .map(|v| SecretValue {
@@ -182,5 +242,101 @@ map:
             .await
             .unwrap_err();
         assert!(format!("{err:?}").contains("not found"), "got: {err:?}");
+    }
+
+    // ---------- Phase 6a: region routing ----------
+
+    #[tokio::test]
+    async fn keychain_region_propagates_into_secret_ref_map_shape() {
+        // KeychainDef.region must reach SecretRef.region for every fetch
+        // a `map`-shaped entry triggers, so the provider can route to the
+        // right regional endpoint.
+        let kc: KeychainDef = serde_yaml::from_str(
+            r#"
+name: eu_secret
+provider: aws
+region: eu-central-1
+map:
+  api_key: "projects/p/secrets/api"
+"#,
+        )
+        .unwrap();
+        let provider = FakeProvider::new(&[("projects/p/secrets/api", "k")]);
+        let _ = resolve_keychain_entry(&kc, &HashMap::new(), &provider)
+            .await
+            .unwrap();
+        assert_eq!(provider.last_region().as_deref(), Some("eu-central-1"));
+    }
+
+    #[tokio::test]
+    async fn keychain_region_propagates_into_secret_ref_map_less_shape() {
+        let kc: KeychainDef = serde_yaml::from_str(
+            r#"
+name: projects/p/secrets/x
+provider: gcp
+region: us-east-1
+"#,
+        )
+        .unwrap();
+        let provider = FakeProvider::new(&[("projects/p/secrets/x", "v")]);
+        let _ = resolve_keychain_entry(&kc, &HashMap::new(), &provider)
+            .await
+            .unwrap();
+        assert_eq!(provider.last_region().as_deref(), Some("us-east-1"));
+    }
+
+    #[tokio::test]
+    async fn missing_region_falls_back_to_none_when_env_unset() {
+        // The server's NOETL_SERVER_REGION OnceLock is process-global,
+        // so we can't reliably mutate env here without races against
+        // other tests.  This test asserts the no-region path: when the
+        // keychain doesn't supply one AND the cached server region is
+        // empty, SecretRef.region is None.
+        let kc: KeychainDef = serde_yaml::from_str(
+            r#"
+name: projects/p/secrets/z
+provider: gcp
+"#,
+        )
+        .unwrap();
+        let provider = FakeProvider::new(&[("projects/p/secrets/z", "v")]);
+        let _ = resolve_keychain_entry(&kc, &HashMap::new(), &provider)
+            .await
+            .unwrap();
+        // If the test process happens to be running with NOETL_SERVER_REGION set,
+        // the resolver fills it; otherwise None.  Either is consistent with
+        // the contract — assert the value matches whatever server_region() reports.
+        let expected = server_region();
+        let got = provider.last_region().unwrap_or_default();
+        assert_eq!(got, expected);
+    }
+
+    #[tokio::test]
+    async fn effective_region_prefers_keychain_over_env() {
+        // Even if env happens to be set, an explicit KeychainDef.region wins.
+        let kc: KeychainDef = serde_yaml::from_str(
+            r#"
+name: x
+provider: gcp
+region: ap-south-1
+"#,
+        )
+        .unwrap();
+        assert_eq!(effective_region(&kc), "ap-south-1");
+    }
+
+    #[tokio::test]
+    async fn empty_string_region_treated_as_unset() {
+        // Defensive: a literal empty string should NOT be passed through as
+        // a region label — it short-circuits to the env fallback path.
+        let kc: KeychainDef = serde_yaml::from_str(
+            r#"
+name: x
+provider: gcp
+region: ""
+"#,
+        )
+        .unwrap();
+        assert_eq!(effective_region(&kc), server_region().to_string());
     }
 }

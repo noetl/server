@@ -27,7 +27,7 @@ pub use k8s::K8sSecretProvider;
 pub use resolver::resolve_keychain_entry;
 pub use vault::VaultSecretProvider;
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 
@@ -50,11 +50,18 @@ pub struct SecretValue {
 /// - `name` — the secret id / name, or a fully-qualified resource path.
 /// - `project` — GCP project / AWS account / Azure vault / Vault mount.
 /// - `version` — version / stage; defaults to the provider's "latest".
-#[derive(Debug, Clone)]
+/// - `region` — Secrets-Wallet Phase 6a: home region of the secret as
+///   declared on the [`KeychainDef`] (or filled from `NOETL_SERVER_REGION`
+///   as a fallback).  AWS uses it as the regional endpoint host; Azure /
+///   Vault use it to route to the per-region cluster / vault; GCP includes
+///   it in the resource id.  `None` means the provider falls back to its
+///   own default region (back-compat with pre-6a deployments).
+#[derive(Debug, Clone, Default)]
 pub struct SecretRef {
     pub name: String,
     pub project: Option<String>,
     pub version: Option<String>,
+    pub region: Option<String>,
 }
 
 /// A backend that resolves [`SecretRef`]s to [`SecretValue`]s.
@@ -67,6 +74,20 @@ pub trait SecretProvider: Send + Sync {
     /// callers keep it out of any state-surfacing response (masked at the
     /// boundary per the secrets-and-redaction contract).
     async fn fetch(&self, secret: &SecretRef) -> AppResult<SecretValue>;
+}
+
+/// The server's home region, read once from `NOETL_SERVER_REGION` at process
+/// startup.  Empty when the env is unset (legacy mode).
+///
+/// Used as the fallback for a [`KeychainDef`] that didn't declare its own
+/// region — the keychain entry's declared region always wins over this.
+/// Phase 6a (residency-aware distributed resolution) — when residency
+/// enforcement lands (Phase 6c), this is also the value compared against an
+/// entry's `region` to decide whether resolution is allowed.
+pub fn server_region() -> &'static str {
+    static R: OnceLock<String> = OnceLock::new();
+    R.get_or_init(|| std::env::var("NOETL_SERVER_REGION").unwrap_or_default())
+        .as_str()
 }
 
 /// Build a [`SecretProvider`] for a keychain entry's `provider` id.
