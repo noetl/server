@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.26.0](https://github.com/noetl/server/compare/v2.25.0...v2.26.0) (2026-06-06)
+
+### Features
+
+* **secrets:** resolve provider-backed keychain aliases on credential miss (Phase 3b R3b) ([4a08e48](https://github.com/noetl/server/commit/4a08e48bb750d594e9c6cb6d55fa46f35aafa29a)), closes [noetl/ai-meta#61](https://github.com/noetl/ai-meta/issues/61) [noetl/ai-meta#61](https://github.com/noetl/ai-meta/issues/61)
+
 ## [2.25.0](https://github.com/noetl/server/compare/v2.24.0...v2.25.0) (2026-06-06)
 
 ### Features
