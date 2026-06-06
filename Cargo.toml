@@ -13,6 +13,12 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "tim
 
 # Web framework
 axum = { version = "0.8", features = ["macros"] }
+# Phase 4a (noetl/ai-meta#61): opt-in TLS/mTLS listener.  `-no-provider`
+# variant so axum-server doesn't pull aws-lc-rs — we build the rustls
+# ServerConfig with the `ring` provider the rest of the stack already uses.
+axum-server = { version = "0.7", default-features = false, features = ["tls-rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-pemfile = "2"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 

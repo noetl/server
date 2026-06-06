@@ -59,6 +59,7 @@ pub mod sanitize;
 pub mod secrets;
 pub mod services;
 pub mod sharding;
+pub mod tls;
 pub mod snowflake;
 pub mod state;
 pub mod template;
