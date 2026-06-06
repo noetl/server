@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.27.2](https://github.com/noetl/server/compare/v2.27.1...v2.27.2) (2026-06-06)
+
+### Bug Fixes
+
+* **orchestrator:** emit terminal playbook.failed on deterministic evaluate error ([27942ce](https://github.com/noetl/server/commit/27942cef5950eb3432201d3fa1ad7c84ed9075ff)), closes [noetl/ai-meta#54](https://github.com/noetl/ai-meta/issues/54) [#94](https://github.com/noetl/server/issues/94) [noetl/ai-meta#54](https://github.com/noetl/ai-meta/issues/54)
+
 ## [2.27.1](https://github.com/noetl/server/compare/v2.27.0...v2.27.1) (2026-06-06)
 
 ### Bug Fixes
