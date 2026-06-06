@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 
+use super::residency;
 use super::{SecretProvider, SecretRef, server_region};
 use crate::error::AppResult;
 use crate::metrics::{record_secret_resolve, record_secret_resolve_duration};
@@ -41,6 +42,14 @@ pub async fn resolve_keychain_entry(
     let renderer = TemplateRenderer::new();
     let region = effective_region(kc);
     let provider_id = provider.provider();
+    // Phase 6c — residency gate, runs BEFORE any provider call.  On a
+    // strict-mode violation `to_result` returns Err; the resolver
+    // short-circuits and never touches the provider.  Advisory + None
+    // paths fall through to the normal fetch path.  The gate records
+    // its own metric inside `evaluate`; we don't need the duration
+    // histogram for the gate (it's an in-process comparison, not a
+    // boundary call).
+    residency::to_result(residency::evaluate(kc, &region))?;
     // Phase 6b — record wall-clock latency for the whole entry resolution.
     let started = std::time::Instant::now();
     let result = match &kc.map {

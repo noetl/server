@@ -588,6 +588,18 @@ pub struct KeychainDef {
     #[serde(default)]
     pub region: Option<String>,
 
+    /// Secrets Wallet Phase 6c — residency policy.  Controls whether a
+    /// server in a different region than this entry's `region` is allowed
+    /// to resolve it.  See [`crate::secrets::residency::Residency`].
+    #[serde(default)]
+    pub residency: crate::secrets::residency::Residency,
+
+    /// Secrets Wallet Phase 6c — extra regions (besides the entry's own
+    /// `region`) from which resolution is allowed when `residency` is
+    /// `strict` or `advisory`.  Empty by default.
+    #[serde(default)]
+    pub allowed_regions: Vec<String>,
+
     /// Auto-renew flag.
     #[serde(default)]
     pub auto_renew: bool,

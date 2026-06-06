@@ -360,6 +360,45 @@ pub fn record_secret_resolve_duration(provider: &str, region: &str, seconds: f64
         .observe(seconds);
 }
 
+/// Secrets-Wallet Phase 6c: residency-policy gate outcomes.
+///
+/// Labels are bounded enums:
+/// - `policy`: `none` / `advisory` / `strict` — the `KeychainDef.residency`
+///   value at evaluation time.
+/// - `decision`: one of `allowed_no_policy` / `allowed_same_region` /
+///   `allowed_in_allowlist` / `violation_allowed` / `violation_blocked`.
+///
+/// `policy="strict"` + `decision="violation_blocked"` is the alert-worthy
+/// combination — it means the gate refused a resolution that would have
+/// crossed a residency boundary.  `policy="advisory"` +
+/// `decision="violation_allowed"` is the migration-window surface for
+/// finding existing cross-region flows before flipping to `strict`.
+pub fn secret_residency_check_total() -> &'static IntCounterVec {
+    static M: OnceLock<IntCounterVec> = OnceLock::new();
+    M.get_or_init(|| {
+        let counter = IntCounterVec::new(
+            Opts::new(
+                "noetl_secret_residency_check_total",
+                "Residency-policy gate outcomes per keychain-entry \
+                 resolution (Secrets Wallet Phase 6c).",
+            ),
+            &["policy", "decision"],
+        )
+        .expect("static counter spec must be valid");
+        registry()
+            .register(Box::new(counter.clone()))
+            .expect("counter registration must succeed");
+        counter
+    })
+}
+
+/// Increment [`secret_residency_check_total`] by 1.
+pub fn record_secret_residency_check(policy: &str, decision: &str) {
+    secret_residency_check_total()
+        .with_label_values(&[policy, decision])
+        .inc();
+}
+
 /// Render the global registry as Prometheus text-exposition
 /// format.  Used by the `GET /metrics` handler.
 pub fn gather_text() -> Result<String, prometheus::Error> {
