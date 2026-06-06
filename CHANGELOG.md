@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.27.0](https://github.com/noetl/server/compare/v2.26.0...v2.27.0) (2026-06-06)
+
+### Features
+
+* **secrets:** execution-scoped cache for resolved keychain secrets (Phase 3c) ([843ed8d](https://github.com/noetl/server/commit/843ed8dd2592f97bdf2e9af9e4fbed6d5e60635f)), closes [noetl/ai-meta#61](https://github.com/noetl/ai-meta/issues/61) [noetl/ai-meta#61](https://github.com/noetl/ai-meta/issues/61)
+
 ## [2.26.0](https://github.com/noetl/server/compare/v2.25.0...v2.26.0) (2026-06-06)
 
 ### Features
