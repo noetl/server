@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.24.0](https://github.com/noetl/server/compare/v2.23.0...v2.24.0) (2026-06-06)
+
+### Features
+
+* **secrets:** model keychain secret-source defs + Playbook::find_keychain (Phase 3b R2) ([bdffcd3](https://github.com/noetl/server/commit/bdffcd388a6ae381dab2e75fe60fa89fde3eea66)), closes [noetl/ai-meta#61](https://github.com/noetl/ai-meta/issues/61) [noetl/ai-meta#61](https://github.com/noetl/ai-meta/issues/61)
+
 ## [2.23.0](https://github.com/noetl/server/compare/v2.22.0...v2.23.0) (2026-06-06)
 
 ### Features
