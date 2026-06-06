@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.40.0](https://github.com/noetl/server/compare/v2.39.0...v2.40.0) (2026-06-06)
+
+### Features
+
+* **services:** secret-resolution audit service (Phase 7b primitives) ([24d572f](https://github.com/noetl/server/commit/24d572f48395a7976af68b21687a509d7cee04fa)), closes [#122](https://github.com/noetl/server/issues/122) [noetl/ai-meta#61](https://github.com/noetl/ai-meta/issues/61)
+
 ## [2.39.0](https://github.com/noetl/server/compare/v2.38.0...v2.39.0) (2026-06-06)
 
 ### Features
