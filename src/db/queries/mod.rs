@@ -6,3 +6,4 @@ pub mod catalog;
 pub mod credential;
 pub mod event;
 pub mod keychain;
+pub mod wallet_rotate;

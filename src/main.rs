@@ -48,6 +48,7 @@ fn build_router(
     keychain_service: KeychainService,
     execution_service: ExecutionService,
     runtime_service: RuntimeService,
+    wallet_cipher: noetl_server::crypto::EnvelopeCipher,
 ) -> Router {
     // CORS configuration - allow all origins for development
     let cors = CorsLayer::new()
@@ -129,6 +130,28 @@ fn build_router(
         )
         .with_state(handlers::cross_region::CrossRegionDeps {
             credentials: credential_service,
+        });
+
+    // Wallet KEK rotation endpoints (Secrets Wallet Phase 7a.2,
+    // noetl/ai-meta#61).  POST /api/internal/wallet/rotate-kek runs a
+    // batched re-wrap pass; GET /api/internal/wallet/key-status reports
+    // per-version row counts so an operator can confirm rotation
+    // completion before retiring an old KEK version.
+    let wallet_rotate_service = noetl_server::services::wallet_rotate::WalletRotateService::new(
+        db_pool.clone(),
+        wallet_cipher.clone(),
+    );
+    let wallet_rotate_routes = Router::new()
+        .route(
+            "/api/internal/wallet/rotate-kek",
+            post(handlers::wallet_rotate::rotate_kek),
+        )
+        .route(
+            "/api/internal/wallet/key-status",
+            get(handlers::wallet_rotate::key_status),
+        )
+        .with_state(handlers::wallet_rotate::WalletRotateDeps {
+            service: wallet_rotate_service,
         });
 
     // Keychain routes
@@ -319,6 +342,7 @@ fn build_router(
         .merge(credential_routes)
         .merge(sealed_credential_routes)
         .merge(cross_region_routes)
+        .merge(wallet_rotate_routes)
         .merge(keychain_routes)
         .merge(execution_routes)
         .merge(executions_routes)
@@ -537,6 +561,7 @@ async fn main() -> anyhow::Result<()> {
     // the credential and keychain services.
     let catalog_service = CatalogService::new(db_pool.clone());
     let wallet_cipher = noetl_server::crypto::build_envelope_cipher(&encryption_key)?;
+    let wallet_cipher_for_router = wallet_cipher.clone();
     // Keychain is the execution-scoped cache for credential resolution
     // (Secrets Wallet Phase 3c), so it is built first + shared into the
     // credential service.
@@ -559,6 +584,7 @@ async fn main() -> anyhow::Result<()> {
         keychain_service,
         execution_service,
         runtime_service,
+        wallet_cipher_for_router,
     );
 
     // Bind to address
