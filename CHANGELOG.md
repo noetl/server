@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.29.0](https://github.com/noetl/server/compare/v2.28.1...v2.29.0) (2026-06-06)
+
+### Features
+
+* **secrets:** add HashiCorp Vault (KV v2) provider behind SecretProvider ([bce9ab1](https://github.com/noetl/server/commit/bce9ab142f44d3429d5fc55752d2b805a26fd410)), closes [#100](https://github.com/noetl/server/issues/100) [noetl/ai-meta#61](https://github.com/noetl/ai-meta/issues/61)
+
 ## [2.28.1](https://github.com/noetl/server/compare/v2.28.0...v2.28.1) (2026-06-06)
 
 ### Performance Improvements
