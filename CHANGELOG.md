@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.28.0](https://github.com/noetl/server/compare/v2.27.2...v2.28.0) (2026-06-06)
+
+### Features
+
+* **secrets:** add Kubernetes Secrets provider behind SecretProvider ([a2e2b35](https://github.com/noetl/server/commit/a2e2b35b48ff8d3e404cf8f09cce6631498943f3)), closes [#96](https://github.com/noetl/server/issues/96) [noetl/ai-meta#61](https://github.com/noetl/ai-meta/issues/61)
+
 ## [2.27.2](https://github.com/noetl/server/compare/v2.27.1...v2.27.2) (2026-06-06)
 
 ### Bug Fixes
