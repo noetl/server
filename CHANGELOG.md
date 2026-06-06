@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.31.0](https://github.com/noetl/server/compare/v2.30.0...v2.31.0) (2026-06-06)
+
+### Features
+
+* **secrets:** AWS Secrets Manager + Azure Key Vault providers ([348534d](https://github.com/noetl/server/commit/348534dac1a8a6bf9e688f5aa526bf2513c09341)), closes [noetl/ai-meta#61](https://github.com/noetl/ai-meta/issues/61) [server#97](https://github.com/noetl/server/issues/97) [server#101](https://github.com/noetl/server/issues/101) [#104](https://github.com/noetl/server/issues/104) [noetl/ai-meta#61](https://github.com/noetl/ai-meta/issues/61)
+
 ## [2.30.0](https://github.com/noetl/server/compare/v2.29.0...v2.30.0) (2026-06-06)
 
 ### Features
