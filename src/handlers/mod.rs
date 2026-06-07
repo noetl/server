@@ -3,6 +3,7 @@
 //! This module contains all route handlers organized by domain.
 
 pub mod catalog;
+pub mod container_callback;
 pub mod credentials;
 pub mod cross_region;
 pub mod dashboard;

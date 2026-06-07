@@ -703,6 +703,72 @@ pub fn gather_text() -> Result<String, prometheus::Error> {
     encoder.encode_to_string(&metric_families)
 }
 
+// ---------------------------------------------------------------------------
+// Container Tool Callback (noetl/ai-meta#43 Round 2 — noetl/server#140)
+// ---------------------------------------------------------------------------
+
+/// Counter for in-flight container-callback emits, labelled by terminal
+/// state.  Sister metric to [`container_callback_stale_total`] (stale path).
+/// Together they answer "how many Job terminations did the watcher
+/// observe, and what fraction matched a live execution".
+pub fn container_callback_total() -> &'static IntCounterVec {
+    static M: OnceLock<IntCounterVec> = OnceLock::new();
+    M.get_or_init(|| {
+        let counter = IntCounterVec::new(
+            Opts::new(
+                "noetl_container_callback_total",
+                "Container-tool callback receives that matched an in-flight \
+                 execution and emitted a call.done event (Container Tool \
+                 Callback umbrella, noetl/ai-meta#43).",
+            ),
+            &["state"],
+        )
+        .expect("static counter spec must be valid");
+        registry()
+            .register(Box::new(counter.clone()))
+            .expect("counter registration must succeed");
+        counter
+    })
+}
+
+/// Increment [`container_callback_total`] by 1.
+pub fn record_container_callback(state: &str) {
+    container_callback_total()
+        .with_label_values(&[state])
+        .inc();
+}
+
+/// Counter for stale container-callback receives — Job terminations the
+/// watcher observed for executions that don't exist on this server.
+/// **Alert-worthy when sustained** — usually means a stale watcher
+/// pointing at the wrong namespace, or a Job created out-of-band.
+pub fn container_callback_stale_total() -> &'static IntCounterVec {
+    static M: OnceLock<IntCounterVec> = OnceLock::new();
+    M.get_or_init(|| {
+        let counter = IntCounterVec::new(
+            Opts::new(
+                "noetl_container_callback_stale_total",
+                "Container-tool callback receives that did NOT match any \
+                 in-flight execution (stale — execution gc'd, watcher \
+                 mis-namespaced, or Job created out-of-band).",
+            ),
+            &["state"],
+        )
+        .expect("static counter spec must be valid");
+        registry()
+            .register(Box::new(counter.clone()))
+            .expect("counter registration must succeed");
+        counter
+    })
+}
+
+/// Increment [`container_callback_stale_total`] by 1.
+pub fn record_container_callback_stale(state: &str) {
+    container_callback_stale_total()
+        .with_label_values(&[state])
+        .inc();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
