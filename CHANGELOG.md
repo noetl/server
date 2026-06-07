@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.57.0](https://github.com/noetl/server/compare/v2.56.0...v2.57.0) (2026-06-07)
+
+### Features
+
+* **replay:** Phase D R5 R7 — cross-server parity harness ([#148](https://github.com/noetl/server/issues/148)) ([f90be57](https://github.com/noetl/server/commit/f90be57761cd74b03ae2e6974325410ffc0bac95)), closes [noetl/ai-meta#49](https://github.com/noetl/ai-meta/issues/49) [noetl/ai-meta#49](https://github.com/noetl/ai-meta/issues/49)
+
 ## [2.56.0](https://github.com/noetl/server/compare/v2.55.0...v2.56.0) (2026-06-07)
 
 ### Features
