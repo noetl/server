@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.51.1](https://github.com/noetl/server/compare/v2.51.0...v2.51.1) (2026-06-07)
+
+### Bug Fixes
+
+* **main:** use ReplayService import-statement shape (release-build fix, [#150](https://github.com/noetl/server/issues/150)) ([0e24b55](https://github.com/noetl/server/commit/0e24b55748e8af8f174f95552cd1d57115e87d76)), closes [server#149](https://github.com/noetl/server/issues/149) [noetl/ai-meta#49](https://github.com/noetl/ai-meta/issues/49) [noetl/server#148](https://github.com/noetl/server/issues/148) [noetl/server#149](https://github.com/noetl/server/issues/149)
+* **replay:** coerce noetl.event.created_at TIMESTAMP → TIMESTAMPTZ in load_events ([#150](https://github.com/noetl/server/issues/150)) ([585fa1e](https://github.com/noetl/server/commit/585fa1eaf32a89d8db9d93dc0251eebd234e6f18)), closes [noetl/ai-meta#49](https://github.com/noetl/ai-meta/issues/49)
+
 ## [2.51.0](https://github.com/noetl/server/compare/v2.50.1...v2.51.0) (2026-06-07)
 
 ### Features
