@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.45.0](https://github.com/noetl/server/compare/v2.44.0...v2.45.0) (2026-06-07)
+
+### Features
+
+* **secrets:** AWS STS AssumeRoleWithWebIdentity provider (Phase 6d.1) ([7a02f05](https://github.com/noetl/server/commit/7a02f0526600e3ab28bd967bca3e59e77bc47821)), closes [#132](https://github.com/noetl/server/issues/132) [noetl/ai-meta#61](https://github.com/noetl/ai-meta/issues/61)
+
 ## [2.44.0](https://github.com/noetl/server/compare/v2.43.0...v2.44.0) (2026-06-07)
 
 ### Features
