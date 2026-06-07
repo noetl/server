@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.50.1](https://github.com/noetl/server/compare/v2.50.0...v2.50.1) (2026-06-07)
+
+### Bug Fixes
+
+* **executions:** status endpoint short-circuits on terminal events ([#146](https://github.com/noetl/server/issues/146)) ([f026611](https://github.com/noetl/server/commit/f02661141dcd2027449268ec2e0f1e1c647c6bfc)), closes [noetl/ai-meta#49](https://github.com/noetl/ai-meta/issues/49)
+
 ## [2.50.0](https://github.com/noetl/server/compare/v2.49.0...v2.50.0) (2026-06-07)
 
 ### Features
