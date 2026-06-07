@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.46.0](https://github.com/noetl/server/compare/v2.45.0...v2.46.0) (2026-06-07)
+
+### Features
+
+* **secrets:** Azure AAD client-credentials provider (Phase 6d.3) ([950938f](https://github.com/noetl/server/commit/950938f39fb33d2bb949d8997f5cc1dca1621293)), closes [noetl/ai-meta#61](https://github.com/noetl/ai-meta/issues/61) [#134](https://github.com/noetl/server/issues/134) [noetl/ai-meta#61](https://github.com/noetl/ai-meta/issues/61)
+
 ## [2.45.0](https://github.com/noetl/server/compare/v2.44.0...v2.45.0) (2026-06-07)
 
 ### Features
