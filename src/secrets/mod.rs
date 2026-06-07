@@ -20,6 +20,7 @@ mod azure_oauth;
 pub mod broker;
 pub mod dynamic;
 mod gcp;
+mod gcp_iam;
 mod k8s;
 mod registry;
 pub mod residency;
@@ -31,6 +32,7 @@ pub use aws_sts::AwsStsProvider;
 pub use azure::AzureKeyVaultProvider;
 pub use azure_oauth::AzureOAuthProvider;
 pub use gcp::GcpSecretManager;
+pub use gcp_iam::GcpIamProvider;
 pub use k8s::K8sSecretProvider;
 pub use registry::get_provider;
 pub use resolver::{resolve_keychain_entry, resolve_keychain_entry_with_meta};
@@ -113,6 +115,7 @@ pub fn server_region() -> &'static str {
 pub fn build_secret_provider(provider: &str) -> AppResult<Arc<dyn SecretProvider>> {
     match provider {
         "gcp" => Ok(Arc::new(GcpSecretManager::from_env()?)),
+        "gcp_iam" | "gcp_iamcredentials" => Ok(Arc::new(GcpIamProvider::from_env()?)),
         "k8s" | "kubernetes" => Ok(Arc::new(K8sSecretProvider::from_env()?)),
         "vault" => Ok(Arc::new(VaultSecretProvider::from_env()?)),
         "aws" | "aws_sm" => Ok(Arc::new(AwsSmSecretProvider::from_env()?)),
@@ -121,7 +124,7 @@ pub fn build_secret_provider(provider: &str) -> AppResult<Arc<dyn SecretProvider
         "azure_oauth" | "azure_aad" => Ok(Arc::new(AzureOAuthProvider::from_env()?)),
         other => Err(AppError::Config(format!(
             "unsupported keychain secret provider '{other}' \
-             (supported: gcp, k8s, vault, aws, aws_sts, azure, azure_oauth)"
+             (supported: gcp, gcp_iam, k8s, vault, aws, aws_sts, azure, azure_oauth)"
         ))),
     }
 }
