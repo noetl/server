@@ -182,14 +182,15 @@ pub struct ReplayState {
     #[serde(default)]
     pub commands: std::collections::BTreeMap<String, ReplayCommandState>,
 
-    /// Business objects map populated by R5 R3.  Keyed by canonical
-    /// `<object_type>/<object_id>` per Python's `_business_object_identity`
-    /// (see [`extract_business_object_identity`]).
+    /// Business objects map populated by R5 R3.  Keyed by
+    /// `<object_type>/<object_id>` per Python's
+    /// `_business_object_identity` (see
+    /// [`extract_business_object_identity`]).
     #[serde(default)]
     pub business_objects: std::collections::BTreeMap<String, ReplayBusinessObjectState>,
 
-    /// Loops map populated by R5 R3.  Keyed by canonical `loop_id`
-    /// (see [`extract_loop_id`]).
+    /// Loops map populated by R5 R3.  Keyed by `loop_id` (see
+    /// [`extract_loop_id`]).
     #[serde(default)]
     pub loops: std::collections::BTreeMap<String, ReplayLoopState>,
 }
@@ -309,7 +310,7 @@ pub struct ReplayCommandState {
 /// `state["loops"][loop_id]` dict shape from
 /// `noetl/server/api/replay/service.py` (`fold_replay_state`,
 /// loops branch).  Keyed in [`ReplayState::loops`] by the
-/// canonical `loop_id` returned by [`extract_loop_id`].
+/// `loop_id` returned by [`extract_loop_id`].
 ///
 /// Counters increment based on event type:
 /// - `command.completed` / `loop.shard.done` → `done++`
@@ -340,7 +341,7 @@ pub struct ReplayLoopState {
 
 /// Business-object projection populated by R5 R3.  Mirrors
 /// Python's `state["business_objects"][<type>/<id>]` dict shape.
-/// Keyed by canonical `<object_type>/<object_id>` per
+/// Keyed by `<object_type>/<object_id>` per
 /// [`extract_business_object_identity`].
 ///
 /// Status defaults to `"UNKNOWN"`.  Each event updates:
@@ -359,7 +360,8 @@ pub struct ReplayLoopState {
 /// payload-resolver round); R3 leaves them empty / `None`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ReplayBusinessObjectState {
-    /// Canonical key: `<object_type>/<object_id>`.
+    /// Object key in `<object_type>/<object_id>` form — the
+    /// map key in [`ReplayState::business_objects`].
     pub object_key: String,
     pub object_type: String,
     pub object_id: String,
@@ -1009,10 +1011,9 @@ fn populate_command(
 // `noetl/server/api/replay/service.py`.
 // ---------------------------------------------------------------
 
-/// Extract the canonical `loop_id` from an event row.  Mirrors
-/// Python's `_loop_id`: reads `meta.loop_id`, then
-/// `meta.loop_event_id`, then `meta.__loop_epoch_id`, in that
-/// order.  Returns `None` when none are present — the event row
+/// Extract the `loop_id` from an event row.  Mirrors Python's
+/// `_loop_id`: reads `meta.loop_id`, then `meta.loop_event_id`,
+/// then `meta.__loop_epoch_id`, in that order.  Returns `None` when none are present — the event row
 /// doesn't participate in the loops projection.
 ///
 /// Note: unlike `extract_stage_id` / `extract_frame_id` /
@@ -1042,8 +1043,9 @@ pub fn extract_loop_id(event: &ReplayEventRow) -> Option<String> {
 ///   is set, parses `aggregate_id` as `business_object/<type>/<id>`
 ///   (or just `<type>/<id>`) to fill in missing fields.  The
 ///   leading `business_object/` prefix is stripped before split.
-/// - `object_key` is the canonical `<object_type>/<object_id>`
-///   tuple returned by Python's tuple key form.
+/// - `object_key` is the `<object_type>/<object_id>` tuple
+///   returned by Python's tuple key form — used directly as the
+///   map key in [`ReplayState::business_objects`].
 pub fn extract_business_object_identity(
     event: &ReplayEventRow,
 ) -> Option<(String, String, String)> {
