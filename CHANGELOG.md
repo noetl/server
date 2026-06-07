@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.56.0](https://github.com/noetl/server/compare/v2.55.0...v2.56.0) (2026-06-07)
+
+### Features
+
+* **replay:** Phase D R5 R6 — payload resolver ([#148](https://github.com/noetl/server/issues/148)) ([7e80cf5](https://github.com/noetl/server/commit/7e80cf5c78f83b061c86b3e43be0d8a056b83a36)), closes [noetl/ai-meta#49](https://github.com/noetl/ai-meta/issues/49) [noetl/ai-meta#49](https://github.com/noetl/ai-meta/issues/49)
+
 ## [2.55.0](https://github.com/noetl/server/compare/v2.54.0...v2.55.0) (2026-06-07)
 
 ### Features
