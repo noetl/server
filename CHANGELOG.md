@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.50.0](https://github.com/noetl/server/compare/v2.49.0...v2.50.0) (2026-06-07)
+
+### Features
+
+* **engine:** apply_event handles step.skipped — closes barrier follow-up ([#144](https://github.com/noetl/server/issues/144)) ([ed7742a](https://github.com/noetl/server/commit/ed7742a61a832a082419bb38fc8163d0e0e8695e)), closes [noetl/ai-meta#49](https://github.com/noetl/ai-meta/issues/49) [server#143](https://github.com/noetl/server/issues/143) [noetl/ai-meta#49](https://github.com/noetl/ai-meta/issues/49)
+
 ## [2.49.0](https://github.com/noetl/server/compare/v2.48.0...v2.49.0) (2026-06-07)
 
 ### Features
