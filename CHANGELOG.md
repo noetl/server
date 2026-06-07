@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.55.0](https://github.com/noetl/server/compare/v2.54.0...v2.55.0) (2026-06-07)
+
+### Features
+
+* **replay:** Phase D R5 R5 — snapshot seed + base_state + upcaster digest ([#148](https://github.com/noetl/server/issues/148)) ([e42ccba](https://github.com/noetl/server/commit/e42ccba5149d1125478a6ac42439e5813ea11983)), closes [noetl/ai-meta#49](https://github.com/noetl/ai-meta/issues/49) [noetl/ai-meta#49](https://github.com/noetl/ai-meta/issues/49)
+
 ## [2.54.0](https://github.com/noetl/server/compare/v2.53.0...v2.54.0) (2026-06-07)
 
 ### Features
