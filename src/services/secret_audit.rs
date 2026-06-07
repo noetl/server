@@ -171,6 +171,31 @@ impl AuditSink for NoopAuditSink {
     }
 }
 
+/// Production sink — writes one row to `noetl.secret_audit` per event.
+/// Phase 7b.2 ships this alongside the table-creation helper
+/// (`db::queries::secret_audit::ensure_table`) that `main.rs` invokes
+/// at startup.
+#[derive(Debug, Clone)]
+pub struct DbAuditSink {
+    pool: crate::db::DbPool,
+}
+
+impl DbAuditSink {
+    pub fn new(pool: crate::db::DbPool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait]
+impl AuditSink for DbAuditSink {
+    async fn write(&self, event: &AuditEvent) -> AppResult<()> {
+        crate::db::queries::secret_audit::insert(&self.pool, event).await
+    }
+    fn sink_id(&self) -> &str {
+        "db"
+    }
+}
+
 /// Service wrapper a handler uses to record events.  Decouples the
 /// "build an event" code path from the "write to DB or drop" path so
 /// the handler integration is one line.
