@@ -182,14 +182,16 @@ pub struct ReplayState {
     #[serde(default)]
     pub commands: std::collections::BTreeMap<String, ReplayCommandState>,
 
-    /// Business objects map.  Empty in Round 1+2; Round 3
-    /// populates.
+    /// Business objects map populated by R5 R3.  Keyed by canonical
+    /// `<object_type>/<object_id>` per Python's `_business_object_identity`
+    /// (see [`extract_business_object_identity`]).
     #[serde(default)]
-    pub business_objects: serde_json::Map<String, serde_json::Value>,
+    pub business_objects: std::collections::BTreeMap<String, ReplayBusinessObjectState>,
 
-    /// Loops map.  Empty in Round 1+2; Round 3 populates.
+    /// Loops map populated by R5 R3.  Keyed by canonical `loop_id`
+    /// (see [`extract_loop_id`]).
     #[serde(default)]
-    pub loops: serde_json::Map<String, serde_json::Value>,
+    pub loops: std::collections::BTreeMap<String, ReplayLoopState>,
 }
 
 /// Execution-level projection.  Round 1 surfaces `status` +
@@ -301,6 +303,86 @@ pub struct ReplayCommandState {
     pub terminal_event_id: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_event_id: Option<i64>,
+}
+
+/// Loop-level projection populated by R5 R3.  Mirrors Python's
+/// `state["loops"][loop_id]` dict shape from
+/// `noetl/server/api/replay/service.py` (`fold_replay_state`,
+/// loops branch).  Keyed in [`ReplayState::loops`] by the
+/// canonical `loop_id` returned by [`extract_loop_id`].
+///
+/// Counters increment based on event type:
+/// - `command.completed` / `loop.shard.done` → `done++`
+/// - `command.failed` / `loop.shard.failed` → `failed++`
+/// - `loop.done` / `loop.fanin.completed` → `completed=true`
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ReplayLoopState {
+    pub loop_id: String,
+    /// `node_name` from the first event that mentioned this loop.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub step_name: Option<String>,
+    /// `meta.collection_size` or `meta.total` from the first event
+    /// that mentioned this loop and carried it.  `None` when the
+    /// loop hint never landed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total: Option<i64>,
+    /// Shards / iterations that have terminated successfully.
+    pub done: i64,
+    /// Shards / iterations that have terminated with a failure.
+    pub failed: i64,
+    /// True once a `loop.done` or `loop.fanin.completed` event
+    /// has been observed.
+    pub completed: bool,
+    /// `event_id` of the most recent event referencing this loop.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_event_id: Option<i64>,
+}
+
+/// Business-object projection populated by R5 R3.  Mirrors
+/// Python's `state["business_objects"][<type>/<id>]` dict shape.
+/// Keyed by canonical `<object_type>/<object_id>` per
+/// [`extract_business_object_identity`].
+///
+/// Status defaults to `"UNKNOWN"`.  Each event updates:
+/// - `last_event_id` / `last_event_type` (always).
+/// - `event_count++`.
+/// - `version` = `meta.business_object.version` ||
+///   `meta.business_object_version` || `event_count`.
+/// - `status` = explicit event `status`, else event-type suffix
+///   (`.created`/`.updated`/`.upserted` → `ACTIVE`,
+///   `.deleted`/`.removed` → `DELETED`).
+/// - `attributes` replaces from `meta.business_object.state` or
+///   patches from `meta.business_object.patch` /
+///   `meta.business_object.attributes`.
+///
+/// `payload_refs` + `last_payload_ref` populate in R6 (the
+/// payload-resolver round); R3 leaves them empty / `None`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ReplayBusinessObjectState {
+    /// Canonical key: `<object_type>/<object_id>`.
+    pub object_key: String,
+    pub object_type: String,
+    pub object_id: String,
+    pub status: String,
+    pub version: i64,
+    pub event_count: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_event_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_event_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deleted_event_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_event_type: Option<String>,
+    /// Per-event attribute snapshot (replaces from
+    /// `meta.business_object.state`; patches from
+    /// `meta.business_object.patch` /
+    /// `meta.business_object.attributes`).
+    #[serde(default)]
+    pub attributes: serde_json::Map<String, serde_json::Value>,
+    // R6 will populate `payload_refs` + `last_payload_ref` from
+    // the event's top-level `payload_ref` column / `result.reference`.
+    // R3 deliberately omits them — see PR body's "Out of scope".
 }
 
 /// Subset of [`crate::db::models::event::Event`] columns the
@@ -550,8 +632,8 @@ pub fn fold_replay_state(
         stages: std::collections::BTreeMap::new(),
         frames: std::collections::BTreeMap::new(),
         commands: std::collections::BTreeMap::new(),
-        business_objects: serde_json::Map::new(),
-        loops: serde_json::Map::new(),
+        business_objects: std::collections::BTreeMap::new(),
+        loops: std::collections::BTreeMap::new(),
     };
 
     // Events arrive sorted ASC by event_id from `load_events`; the
@@ -611,6 +693,9 @@ pub fn fold_replay_state(
         populate_stage(event, &mut state.stages);
         populate_frame(event, &mut state.frames);
         populate_command(event, &mut state.commands);
+        // R5 R3: loop + business_object projections.
+        populate_loop(event, &mut state.loops);
+        populate_business_object(event, &mut state.business_objects);
     }
 
     state
@@ -915,6 +1000,244 @@ fn populate_command(
         }
         _ => {}
     }
+}
+
+// ---------------------------------------------------------------
+// R5 R3 helpers — loop + business_object id extractors +
+// populate functions.  Mirror Python's `_loop_id` /
+// `_business_object_identity` / `_business_object_status` in
+// `noetl/server/api/replay/service.py`.
+// ---------------------------------------------------------------
+
+/// Extract the canonical `loop_id` from an event row.  Mirrors
+/// Python's `_loop_id`: reads `meta.loop_id`, then
+/// `meta.loop_event_id`, then `meta.__loop_epoch_id`, in that
+/// order.  Returns `None` when none are present — the event row
+/// doesn't participate in the loops projection.
+///
+/// Note: unlike `extract_stage_id` / `extract_frame_id` /
+/// `extract_command_id`, loop identity lives ONLY in `meta` —
+/// there's no top-level `loop_id` column and no
+/// `aggregate_type=loop` fallback in the Python implementation.
+pub fn extract_loop_id(event: &ReplayEventRow) -> Option<String> {
+    for key in ["loop_id", "loop_event_id", "__loop_epoch_id"] {
+        if let Some(v) = meta_str(&event.meta, key) {
+            return Some(v);
+        }
+    }
+    None
+}
+
+/// Extract the business-object identity tuple for an event row.
+/// Returns `Some((object_key, object_type, object_id))` when the
+/// event carries enough information to identify a business object,
+/// `None` otherwise.
+///
+/// Mirrors Python's `_business_object_identity`:
+/// - Reads `meta.business_object.{object_type|type}` first, then
+///   `meta.business_object_type`, then `meta.object_type`.
+/// - Reads `meta.business_object.{object_id|id}` first, then
+///   `meta.business_object_id`, then `meta.object_id`.
+/// - If `aggregate_type == "business_object"` and `aggregate_id`
+///   is set, parses `aggregate_id` as `business_object/<type>/<id>`
+///   (or just `<type>/<id>`) to fill in missing fields.  The
+///   leading `business_object/` prefix is stripped before split.
+/// - `object_key` is the canonical `<object_type>/<object_id>`
+///   tuple returned by Python's tuple key form.
+pub fn extract_business_object_identity(
+    event: &ReplayEventRow,
+) -> Option<(String, String, String)> {
+    let business_meta = event
+        .meta
+        .as_ref()
+        .and_then(|m| m.get("business_object"))
+        .and_then(|v| v.as_object());
+
+    let mut object_type: Option<String> = business_meta
+        .and_then(|m| m.get("object_type").or_else(|| m.get("type")))
+        .map(value_to_string)
+        .or_else(|| meta_str(&event.meta, "business_object_type"))
+        .or_else(|| meta_str(&event.meta, "object_type"));
+
+    let mut object_id: Option<String> = business_meta
+        .and_then(|m| m.get("object_id").or_else(|| m.get("id")))
+        .map(value_to_string)
+        .or_else(|| meta_str(&event.meta, "business_object_id"))
+        .or_else(|| meta_str(&event.meta, "object_id"));
+
+    if event.aggregate_type.as_deref() == Some("business_object") {
+        if let Some(agg_id) = &event.aggregate_id {
+            let stripped = agg_id
+                .strip_prefix("business_object/")
+                .unwrap_or(agg_id.as_str());
+            let parts: Vec<&str> = stripped.split('/').filter(|p| !p.is_empty()).collect();
+            if parts.len() >= 2 {
+                if object_type.is_none() {
+                    object_type = Some(parts[0].to_string());
+                }
+                if object_id.is_none() {
+                    object_id = Some(parts[1..].join("/"));
+                }
+            } else {
+                if object_type.is_none() {
+                    object_type = Some("business_object".to_string());
+                }
+                if object_id.is_none() {
+                    object_id = Some(agg_id.clone());
+                }
+            }
+        }
+    }
+
+    match (object_type, object_id) {
+        (Some(t), Some(id)) => {
+            let key = format!("{}/{}", t, id);
+            Some((key, t, id))
+        }
+        _ => None,
+    }
+}
+
+/// Compute the business-object status for an event.  Mirrors
+/// Python's `_business_object_status`:
+/// - If the event row carries an explicit non-empty `status`,
+///   return that verbatim (Python passes it through `str()`).
+/// - Else, suffix-match the event_type: `.deleted` / `.removed`
+///   → `DELETED`; `.created` / `.updated` / `.upserted` →
+///   `ACTIVE`.
+/// - Else, return `None` (caller leaves the existing status
+///   unchanged — `UNKNOWN` on first insert).
+fn business_object_status(event_type: &str, status: &str) -> Option<String> {
+    if !status.is_empty() {
+        return Some(status.to_string());
+    }
+    let lowered = event_type.to_ascii_lowercase();
+    if lowered.ends_with(".deleted") || lowered.ends_with(".removed") {
+        return Some("DELETED".to_string());
+    }
+    if lowered.ends_with(".created")
+        || lowered.ends_with(".updated")
+        || lowered.ends_with(".upserted")
+    {
+        return Some("ACTIVE".to_string());
+    }
+    None
+}
+
+/// Populate / update a loop entry from an event row.  No-op when
+/// the event doesn't reference a loop.  Mirrors Python's loops
+/// branch in `fold_replay_state`.
+fn populate_loop(
+    event: &ReplayEventRow,
+    loops: &mut std::collections::BTreeMap<String, ReplayLoopState>,
+) {
+    let loop_id = match extract_loop_id(event) {
+        Some(id) => id,
+        None => return,
+    };
+
+    let loop_entry = loops.entry(loop_id.clone()).or_insert_with(|| {
+        ReplayLoopState {
+            loop_id: loop_id.clone(),
+            step_name: event.node_name.clone(),
+            total: meta_i64(&event.meta, "collection_size")
+                .or_else(|| meta_i64(&event.meta, "total")),
+            done: 0,
+            failed: 0,
+            completed: false,
+            last_event_id: None,
+        }
+    });
+
+    loop_entry.last_event_id = Some(event.event_id);
+
+    match event.event_type.as_str() {
+        "command.completed" | "loop.shard.done" => {
+            loop_entry.done += 1;
+        }
+        "command.failed" | "loop.shard.failed" => {
+            loop_entry.failed += 1;
+        }
+        "loop.done" | "loop.fanin.completed" => {
+            loop_entry.completed = true;
+        }
+        _ => {}
+    }
+}
+
+/// Populate / update a business-object entry from an event row.
+/// No-op when the event doesn't carry a business-object identity.
+/// Mirrors Python's business_objects branch in `fold_replay_state`.
+fn populate_business_object(
+    event: &ReplayEventRow,
+    business_objects: &mut std::collections::BTreeMap<String, ReplayBusinessObjectState>,
+) {
+    let (object_key, object_type, object_id) = match extract_business_object_identity(event) {
+        Some(t) => t,
+        None => return,
+    };
+
+    let entry = business_objects
+        .entry(object_key.clone())
+        .or_insert_with(|| ReplayBusinessObjectState {
+            object_key: object_key.clone(),
+            object_type: object_type.clone(),
+            object_id: object_id.clone(),
+            status: "UNKNOWN".to_string(),
+            version: 0,
+            event_count: 0,
+            first_event_id: Some(event.event_id),
+            last_event_id: None,
+            deleted_event_id: None,
+            last_event_type: None,
+            attributes: serde_json::Map::new(),
+        });
+
+    entry.last_event_id = Some(event.event_id);
+    entry.last_event_type = Some(event.event_type.clone());
+    entry.event_count += 1;
+
+    // version = meta.business_object.version
+    //        || meta.business_object_version
+    //        || event_count
+    let business_meta = event
+        .meta
+        .as_ref()
+        .and_then(|m| m.get("business_object"))
+        .and_then(|v| v.as_object());
+
+    let version_from_meta = business_meta
+        .and_then(|m| m.get("version"))
+        .and_then(|v| v.as_i64())
+        .or_else(|| meta_i64(&event.meta, "business_object_version"));
+
+    entry.version = version_from_meta.unwrap_or(entry.event_count);
+
+    // Status: explicit event status wins; else suffix-derived;
+    // else unchanged.
+    if let Some(new_status) = business_object_status(&event.event_type, &event.status) {
+        entry.status = new_status.clone();
+        if new_status == "DELETED" {
+            entry.deleted_event_id = Some(event.event_id);
+        }
+    }
+
+    // Attributes: `state` REPLACES; `patch` / `attributes` PATCH.
+    if let Some(state_val) = business_meta.and_then(|m| m.get("state")) {
+        if let Some(state_obj) = state_val.as_object() {
+            entry.attributes = state_obj.clone();
+        }
+    }
+    let patch_val = business_meta
+        .and_then(|m| m.get("patch").or_else(|| m.get("attributes")));
+    if let Some(patch_obj) = patch_val.and_then(|v| v.as_object()) {
+        for (k, v) in patch_obj {
+            entry.attributes.insert(k.clone(), v.clone());
+        }
+    }
+
+    // R6 will populate payload_refs + last_payload_ref from the
+    // event's top-level `payload_ref` column / `result.reference`.
 }
 
 #[cfg(test)]
@@ -1308,5 +1631,287 @@ mod tests {
         assert_eq!(meta_i64(&meta, "n_neg"), Some(-1));
         assert_eq!(meta_i64(&meta, "s"), None); // not an integer
         assert_eq!(meta_i64(&meta, "missing"), None);
+    }
+
+    // ----- R5 R3: loop + business_object projection tests -----
+
+    #[test]
+    fn extract_loop_id_prefers_meta_loop_id_over_aliases() {
+        let event = ev_full(1, "loop.shard.done", |e| {
+            e.meta = Some(serde_json::json!({
+                "loop_id": "primary",
+                "loop_event_id": "alias-one",
+                "__loop_epoch_id": "alias-two",
+            }));
+        });
+        assert_eq!(extract_loop_id(&event).as_deref(), Some("primary"));
+    }
+
+    #[test]
+    fn extract_loop_id_falls_back_through_meta_aliases() {
+        let e_alias1 = ev_full(2, "command.completed", |e| {
+            e.meta = Some(serde_json::json!({"loop_event_id": "fallback"}));
+        });
+        assert_eq!(extract_loop_id(&e_alias1).as_deref(), Some("fallback"));
+
+        let e_alias2 = ev_full(3, "command.completed", |e| {
+            e.meta = Some(serde_json::json!({"__loop_epoch_id": "epoch-7"}));
+        });
+        assert_eq!(extract_loop_id(&e_alias2).as_deref(), Some("epoch-7"));
+
+        let e_none = ev_full(4, "command.completed", |e| {
+            e.meta = Some(serde_json::json!({"unrelated": 1}));
+        });
+        assert_eq!(extract_loop_id(&e_none), None);
+    }
+
+    #[test]
+    fn fold_populates_loop_with_counters_and_completion() {
+        // Three iterations against the same loop_id: one done, one
+        // failed, one shard-done, one final loop.done.
+        let e1 = ev_full(10, "command.completed", |e| {
+            e.node_name = Some("iterate".to_string());
+            e.status = "success".to_string();
+            e.meta = Some(serde_json::json!({
+                "loop_id": "iter-1",
+                "collection_size": 3,
+            }));
+        });
+        let e2 = ev_full(11, "command.failed", |e| {
+            e.node_name = Some("iterate".to_string());
+            e.status = "failed".to_string();
+            e.meta = Some(serde_json::json!({"loop_id": "iter-1"}));
+        });
+        let e3 = ev_full(12, "loop.shard.done", |e| {
+            e.node_name = Some("iterate".to_string());
+            e.meta = Some(serde_json::json!({"loop_id": "iter-1"}));
+        });
+        let e4 = ev_full(13, "loop.done", |e| {
+            e.node_name = Some("iterate".to_string());
+            e.meta = Some(serde_json::json!({"loop_id": "iter-1"}));
+        });
+
+        let state = fold_replay_state(
+            &[e1, e2, e3, e4],
+            "t",
+            "o",
+            42,
+            ReplayProjection::All,
+        );
+
+        assert_eq!(state.loops.len(), 1);
+        let entry = state.loops.get("iter-1").unwrap();
+        assert_eq!(entry.loop_id, "iter-1");
+        assert_eq!(entry.step_name.as_deref(), Some("iterate"));
+        assert_eq!(entry.total, Some(3));
+        assert_eq!(entry.done, 2); // command.completed + loop.shard.done
+        assert_eq!(entry.failed, 1);
+        assert!(entry.completed);
+        assert_eq!(entry.last_event_id, Some(13));
+    }
+
+    #[test]
+    fn fold_loop_total_falls_back_to_meta_total() {
+        let e1 = ev_full(20, "command.completed", |e| {
+            e.node_name = Some("fanout".to_string());
+            e.status = "success".to_string();
+            e.meta = Some(serde_json::json!({
+                "loop_id": "fan-7",
+                "total": 5,
+            }));
+        });
+        let state = fold_replay_state(&[e1], "t", "o", 42, ReplayProjection::All);
+        let entry = state.loops.get("fan-7").unwrap();
+        assert_eq!(entry.total, Some(5));
+    }
+
+    #[test]
+    fn fold_loop_fanin_completed_marks_completed_true() {
+        let e1 = ev_full(30, "loop.fanin.completed", |e| {
+            e.node_name = Some("reduce".to_string());
+            e.meta = Some(serde_json::json!({"loop_id": "fanin-1"}));
+        });
+        let state = fold_replay_state(&[e1], "t", "o", 42, ReplayProjection::All);
+        assert!(state.loops.get("fanin-1").unwrap().completed);
+    }
+
+    #[test]
+    fn extract_business_object_identity_prefers_meta_dot_keys() {
+        let event = ev_full(40, "customer.created", |e| {
+            e.meta = Some(serde_json::json!({
+                "business_object": {
+                    "object_type": "customer",
+                    "object_id": "c-100",
+                }
+            }));
+        });
+        let (k, t, id) = extract_business_object_identity(&event).unwrap();
+        assert_eq!(k, "customer/c-100");
+        assert_eq!(t, "customer");
+        assert_eq!(id, "c-100");
+    }
+
+    #[test]
+    fn extract_business_object_identity_accepts_short_type_id_aliases() {
+        // Python accepts `type` / `id` shorthand on the business_object map.
+        let event = ev_full(41, "order.updated", |e| {
+            e.meta = Some(serde_json::json!({
+                "business_object": {"type": "order", "id": "o-7"}
+            }));
+        });
+        let (k, t, id) = extract_business_object_identity(&event).unwrap();
+        assert_eq!(k, "order/o-7");
+        assert_eq!(t, "order");
+        assert_eq!(id, "o-7");
+    }
+
+    #[test]
+    fn extract_business_object_identity_falls_back_to_aggregate_id() {
+        // aggregate_type=business_object + aggregate_id=business_object/<type>/<id>.
+        let event = ev_full(42, "asset.created", |e| {
+            e.aggregate_type = Some("business_object".to_string());
+            e.aggregate_id = Some("business_object/asset/a-9".to_string());
+        });
+        let (k, t, id) = extract_business_object_identity(&event).unwrap();
+        assert_eq!(k, "asset/a-9");
+        assert_eq!(t, "asset");
+        assert_eq!(id, "a-9");
+
+        // Same logic without the business_object/ prefix.
+        let event2 = ev_full(43, "asset.created", |e| {
+            e.aggregate_type = Some("business_object".to_string());
+            e.aggregate_id = Some("asset/a-10".to_string());
+        });
+        let (k2, t2, id2) = extract_business_object_identity(&event2).unwrap();
+        assert_eq!(k2, "asset/a-10");
+        assert_eq!(t2, "asset");
+        assert_eq!(id2, "a-10");
+    }
+
+    #[test]
+    fn extract_business_object_identity_returns_none_when_no_signal() {
+        let event = ev_full(50, "playbook.completed", |_| {});
+        assert!(extract_business_object_identity(&event).is_none());
+    }
+
+    #[test]
+    fn business_object_status_explicit_status_wins() {
+        assert_eq!(
+            business_object_status("customer.deleted", "ARCHIVED").as_deref(),
+            Some("ARCHIVED"),
+        );
+    }
+
+    #[test]
+    fn business_object_status_suffix_derives_active_or_deleted() {
+        assert_eq!(
+            business_object_status("customer.created", "").as_deref(),
+            Some("ACTIVE"),
+        );
+        assert_eq!(
+            business_object_status("customer.updated", "").as_deref(),
+            Some("ACTIVE"),
+        );
+        assert_eq!(
+            business_object_status("customer.upserted", "").as_deref(),
+            Some("ACTIVE"),
+        );
+        assert_eq!(
+            business_object_status("customer.deleted", "").as_deref(),
+            Some("DELETED"),
+        );
+        assert_eq!(
+            business_object_status("customer.removed", "").as_deref(),
+            Some("DELETED"),
+        );
+        assert_eq!(business_object_status("customer.changed", ""), None);
+    }
+
+    #[test]
+    fn fold_populates_business_object_through_lifecycle() {
+        // Three events: created → updated (patches attributes) → deleted.
+        let e1 = ev_full(60, "customer.created", |e| {
+            e.meta = Some(serde_json::json!({
+                "business_object": {
+                    "object_type": "customer",
+                    "object_id": "c-1",
+                    "state": {"name": "Alice", "tier": "gold"},
+                }
+            }));
+        });
+        let e2 = ev_full(61, "customer.updated", |e| {
+            e.meta = Some(serde_json::json!({
+                "business_object": {
+                    "object_type": "customer",
+                    "object_id": "c-1",
+                    "patch": {"tier": "platinum"},
+                    "version": 7,
+                }
+            }));
+        });
+        let e3 = ev_full(62, "customer.deleted", |e| {
+            e.meta = Some(serde_json::json!({
+                "business_object": {"object_type": "customer", "object_id": "c-1"}
+            }));
+        });
+
+        let state = fold_replay_state(
+            &[e1, e2, e3],
+            "t",
+            "o",
+            42,
+            ReplayProjection::All,
+        );
+
+        assert_eq!(state.business_objects.len(), 1);
+        let bo = state.business_objects.get("customer/c-1").unwrap();
+        assert_eq!(bo.object_key, "customer/c-1");
+        assert_eq!(bo.object_type, "customer");
+        assert_eq!(bo.object_id, "c-1");
+        assert_eq!(bo.status, "DELETED");
+        assert_eq!(bo.event_count, 3);
+        assert_eq!(bo.first_event_id, Some(60));
+        assert_eq!(bo.last_event_id, Some(62));
+        assert_eq!(bo.deleted_event_id, Some(62));
+        assert_eq!(bo.last_event_type.as_deref(), Some("customer.deleted"));
+        // version: e1 falls back to event_count=1, e2 has explicit 7,
+        // e3 falls back to event_count=3 (no override).
+        assert_eq!(bo.version, 3);
+        // attributes: e1 SET state, e2 PATCH tier → name=Alice, tier=platinum.
+        assert_eq!(
+            bo.attributes.get("name").and_then(|v| v.as_str()),
+            Some("Alice"),
+        );
+        assert_eq!(
+            bo.attributes.get("tier").and_then(|v| v.as_str()),
+            Some("platinum"),
+        );
+    }
+
+    #[test]
+    fn fold_business_object_version_from_meta_business_object_version() {
+        // Legacy/flat meta.business_object_version key works.
+        let e1 = ev_full(70, "order.created", |e| {
+            e.meta = Some(serde_json::json!({
+                "business_object": {"object_type": "order", "object_id": "o-1"},
+                "business_object_version": 42,
+            }));
+        });
+        let state = fold_replay_state(&[e1], "t", "o", 99, ReplayProjection::All);
+        assert_eq!(state.business_objects.get("order/o-1").unwrap().version, 42);
+    }
+
+    #[test]
+    fn fold_skips_loop_and_business_object_when_no_signal() {
+        // A vanilla command.completed for a non-loop, non-business
+        // step (e.g. R5 R1's fanout_reduce events) leaves both maps
+        // empty.
+        let event = ev_full(80, "command.completed", |e| {
+            e.node_name = Some("plain_step".to_string());
+            e.status = "success".to_string();
+        });
+        let state = fold_replay_state(&[event], "t", "o", 42, ReplayProjection::All);
+        assert!(state.loops.is_empty());
+        assert!(state.business_objects.is_empty());
     }
 }
