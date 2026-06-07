@@ -22,6 +22,7 @@ use crate::error::{AppError, AppResult};
 use crate::playbook::types::Playbook;
 use crate::secrets::{build_secret_provider, dynamic, resolve_keychain_entry_with_meta};
 use crate::services::keychain::KeychainService;
+use crate::services::keychain_refresh::RefreshInflight;
 
 /// TTL (seconds) for a keychain-resolved secret cached after a provider fetch.
 /// Execution-scoped, so it's also cleaned up when the execution ends; the TTL
@@ -38,6 +39,11 @@ pub struct CredentialService {
     pool: DbPool,
     cipher: EnvelopeCipher,
     keychain: KeychainService,
+    /// Per-`(catalog_id, alias)` stampede collapse for the Phase 7c.3
+    /// background refresh path.  `Clone` shares the inner `Arc` so every
+    /// `CredentialService` instance derived from the same root sees the
+    /// same inflight set.
+    refresh_inflight: RefreshInflight,
 }
 
 impl CredentialService {
@@ -52,6 +58,7 @@ impl CredentialService {
             pool,
             cipher,
             keychain,
+            refresh_inflight: RefreshInflight::new(),
         }
     }
 
@@ -189,6 +196,22 @@ impl CredentialService {
             Ok(c) if c.status == "found" => {
                 if let Some(data) = c.data {
                     tracing::debug!(execution_id, alias, "keychain.cache_hit");
+                    // Phase 7c.3 — proactive refresh-before-expiry.  If the
+                    // cached row is still valid but inside the refresh
+                    // window, spawn a background task to re-resolve via the
+                    // provider and update the cache.  The cached value
+                    // returns to this caller IMMEDIATELY — worker fetches
+                    // stay on the fast path.  Stampedes (multiple workers
+                    // crossing the refresh threshold simultaneously)
+                    // collapse to one provider call: the inflight tracker
+                    // is shared across all `CredentialService` clones.
+                    self.maybe_spawn_refresh(
+                        catalog_id,
+                        alias.to_string(),
+                        execution_id,
+                        workload.clone(),
+                    )
+                    .await;
                     return Ok(Some(data));
                 }
             }
@@ -198,6 +221,29 @@ impl CredentialService {
             }
         }
 
+        // Cache miss — resolve via the provider chain.
+        self.resolve_via_provider(catalog_id, alias, execution_id, workload)
+            .await
+    }
+
+    /// Resolve `alias` via the provider chain and write the result into the
+    /// keychain cache.  Returns `Ok(Some(data))` on a successful provider
+    /// fetch, `Ok(None)` when `alias` is not a `provider:`-backed entry
+    /// (caller treats as not-found), and `Err(_)` when the entry exists but
+    /// the provider call failed.
+    ///
+    /// Shared by:
+    ///
+    /// - The cache-miss inline path in [`Self::try_resolve_keychain`].
+    /// - The Phase-7c.3 background refresh task spawned from
+    ///   [`Self::maybe_spawn_refresh`].
+    async fn resolve_via_provider(
+        &self,
+        catalog_id: i64,
+        alias: &str,
+        execution_id: i64,
+        workload: Option<serde_json::Value>,
+    ) -> AppResult<Option<serde_json::Value>> {
         // catalog_id → playbook YAML → parse.
         let Some(entry) = catalog_queries::get_catalog_by_id(&self.pool, catalog_id).await? else {
             return Ok(None);
@@ -278,6 +324,103 @@ impl CredentialService {
         }
 
         Ok(Some(data))
+    }
+
+    /// Phase 7c.3 — background-refresh trigger.  Called from the cache-hit
+    /// branch after a fresh-but-aging row is returned to the caller.
+    ///
+    /// 1. Ask the cache-side primitive whether the row needs refreshing.
+    ///    A `false` (or any error reading the row) short-circuits silently
+    ///    — the cached value already went out, no further work to do.
+    /// 2. Try to claim the per-`(catalog_id, alias)` inflight slot.
+    ///    - **Claim won.**  Spawn a `tokio::spawn` task that calls
+    ///      [`Self::resolve_via_provider`] using cloned state, records the
+    ///      outcome on `noetl_secret_refresh_total`, then releases the
+    ///      slot — even on the error path.
+    ///    - **Claim lost.**  A concurrent refresh for the same key is in
+    ///      flight; bump `outcome="stampede_collapsed"` and return.  The
+    ///      next worker to find the cache row inside the refresh window
+    ///      after the in-flight refresh completes will re-evaluate.
+    ///
+    /// This method NEVER blocks the caller on the provider call.  The
+    /// `should_refresh` lookup IS awaited (a single indexed cache read),
+    /// but the heavy work — provider fetch + cache write — runs on the
+    /// background task.
+    async fn maybe_spawn_refresh(
+        &self,
+        catalog_id: i64,
+        alias: String,
+        execution_id: i64,
+        workload: Option<serde_json::Value>,
+    ) {
+        let needs_refresh = match self
+            .keychain
+            .should_refresh(
+                catalog_id,
+                &alias,
+                Some(execution_id),
+                KEYCHAIN_CACHE_SCOPE,
+                Utc::now(),
+            )
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                // Don't fail the credential lookup on a refresh-decision
+                // read error — log + skip; the cached value already
+                // returned to the caller.
+                tracing::warn!(
+                    execution_id,
+                    alias = %alias,
+                    error = %e,
+                    "keychain.refresh_decision_failed; skipping background refresh"
+                );
+                return;
+            }
+        };
+        if !needs_refresh {
+            return;
+        }
+
+        let key = (catalog_id, alias.clone());
+        if !self.refresh_inflight.try_claim(key.clone()).await {
+            // Stampede collapse — another refresh for the same key is in
+            // flight; piggy-back via the metric and return.
+            tracing::debug!(
+                execution_id,
+                alias = %alias,
+                catalog_id,
+                "keychain.refresh_stampede_collapsed"
+            );
+            crate::metrics::record_secret_refresh("stampede_collapsed");
+            return;
+        }
+
+        // Slot claimed; spawn the actual provider re-resolution.  Clone
+        // shares `Arc`-backed state — the new task is `'static`.
+        let svc = self.clone();
+        tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            let outcome = match svc
+                .resolve_via_provider(catalog_id, &alias, execution_id, workload)
+                .await
+            {
+                Ok(_) => "succeeded",
+                Err(e) => {
+                    tracing::warn!(
+                        execution_id,
+                        alias = %alias,
+                        catalog_id,
+                        error = %e,
+                        "keychain.refresh_failed"
+                    );
+                    "failed"
+                }
+            };
+            crate::metrics::record_secret_refresh(outcome);
+            crate::metrics::record_secret_refresh_duration(started.elapsed().as_secs_f64());
+            svc.refresh_inflight.release(&key).await;
+        });
     }
 
     /// Build a response for a credential resolved from a keychain provider
