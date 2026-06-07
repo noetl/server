@@ -229,6 +229,46 @@ pub struct ReplayState {
     pub projection_checksums: std::collections::BTreeMap<String, Checksum>,
 }
 
+/// Payload pointer summary extracted from an event's
+/// `result.reference` JSON.  Mirrors Python's `_payload_summary`
+/// in `noetl/server/api/replay/service.py` — same field names,
+/// same fallback chain.  Populated by R5 R6.
+///
+/// Each field falls back across three nested locations:
+/// `reference.<field>` → `reference.rows_ref.meta.<field>` →
+/// `reference.rows_ref.ipc.<field>`.  `sha256` additionally
+/// falls back to `reference.digest`; `ref` falls back to
+/// `reference.uri`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PayloadSummary {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schema_digest: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub row_count: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub media_type: Option<String>,
+    #[serde(rename = "ref", skip_serializing_if = "Option::is_none")]
+    pub reference_uri: Option<String>,
+}
+
+/// A single payload reference observed during the fold —
+/// captured per-event in `execution.payload_refs` +
+/// `business_object.payload_refs` lists.  Mirrors Python's dict
+/// shape: `{event_id, reference, summary}`.  The `summary`
+/// field is a pre-computed [`PayloadSummary`] so consumers
+/// don't have to re-parse the raw reference.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PayloadRefEntry {
+    pub event_id: i64,
+    /// Raw `result.reference` JSON value from the originating
+    /// event row.  Round-tripped without modification.
+    pub reference: serde_json::Value,
+    /// Pre-computed summary; same shape as `_payload_summary`.
+    pub summary: PayloadSummary,
+}
+
 /// Execution-level projection.  Round 1 surfaces `status` +
 /// `last_node_name`.  Future rounds may add `payload_refs`,
 /// `tenant_id`/`organization_id` echoes, etc.
@@ -245,6 +285,12 @@ pub struct ReplayExecutionState {
     /// when no step events have been folded.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_node_name: Option<String>,
+
+    /// R5 R6: every event with a non-null `result.reference` is
+    /// appended here, in event_id order.  Mirrors Python's
+    /// `state["execution"]["payload_refs"]`.
+    #[serde(default)]
+    pub payload_refs: Vec<PayloadRefEntry>,
 }
 
 impl Default for ReplayExecutionState {
@@ -252,6 +298,7 @@ impl Default for ReplayExecutionState {
         Self {
             status: "UNKNOWN".to_string(),
             last_node_name: None,
+            payload_refs: Vec::new(),
         }
     }
 }
@@ -306,6 +353,16 @@ pub struct ReplayFrameState {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_event_id: Option<i64>,
     pub events_emitted: i64,
+    /// R5 R6: raw `result.reference` JSON from the terminal
+    /// `frame.committed` / `frame.failed` event.  None while
+    /// the frame is in-flight.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_ref: Option<serde_json::Value>,
+    /// R5 R6: pre-computed `PayloadSummary` over `output_ref`.
+    /// `Some(default summary)` when the frame terminated but
+    /// the event had no `result.reference`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_ref_summary: Option<PayloadSummary>,
 }
 
 /// Command-level projection populated by R5 R2.  Mirrors
@@ -416,9 +473,17 @@ pub struct ReplayBusinessObjectState {
     /// `meta.business_object.attributes`).
     #[serde(default)]
     pub attributes: serde_json::Map<String, serde_json::Value>,
-    // R6 will populate `payload_refs` + `last_payload_ref` from
-    // the event's top-level `payload_ref` column / `result.reference`.
-    // R3 deliberately omits them — see PR body's "Out of scope".
+    /// R5 R6: every event touching this business object with a
+    /// non-null `result.reference` is appended here in event_id
+    /// order.  Mirrors Python's `business_object["payload_refs"]`.
+    #[serde(default)]
+    pub payload_refs: Vec<PayloadRefEntry>,
+    /// R5 R6: shortcut to the most recent entry of `payload_refs`,
+    /// so consumers don't have to walk the list to find the
+    /// current pointer.  Mirrors Python's
+    /// `business_object["last_payload_ref"]`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_payload_ref: Option<PayloadRefEntry>,
 }
 
 /// Algorithm used to compute a [`Checksum`].  R4 ships with the
@@ -611,6 +676,12 @@ pub struct ReplayEventRow {
     /// `failed_count`, `attempt`, `cursor`).
     #[sqlx(default)]
     pub meta: Option<serde_json::Value>,
+    /// `noetl.event.result` jsonb column — `{status, reference?,
+    /// context?}` per the table's CHECK constraint.  R5 R6's
+    /// payload resolver reads `result.reference` to extract the
+    /// per-event payload pointer.
+    #[sqlx(default)]
+    pub result: Option<serde_json::Value>,
 }
 
 /// Replay service.  Phase F R4-4b shape — owns a [`DbPoolMap`] so
@@ -701,7 +772,11 @@ impl ReplayService {
                     worker_id,
                     aggregate_type,
                     aggregate_id,
-                    meta
+                    meta,
+                    -- R5 R6: result jsonb contains `{status, reference?, context?}`
+                    -- per the table's CHECK constraint; the payload resolver
+                    -- reads `result.reference` to extract the per-event payload.
+                    result
                 FROM noetl.event
                 WHERE execution_id = $1
                   AND event_id <= $2
@@ -737,7 +812,11 @@ impl ReplayService {
                     worker_id,
                     aggregate_type,
                     aggregate_id,
-                    meta
+                    meta,
+                    -- R5 R6: result jsonb contains `{status, reference?, context?}`
+                    -- per the table's CHECK constraint; the payload resolver
+                    -- reads `result.reference` to extract the per-event payload.
+                    result
                 FROM noetl.event
                 WHERE execution_id = $1
                   AND created_at <= $2
@@ -773,7 +852,11 @@ impl ReplayService {
                     worker_id,
                     aggregate_type,
                     aggregate_id,
-                    meta
+                    meta,
+                    -- R5 R6: result jsonb contains `{status, reference?, context?}`
+                    -- per the table's CHECK constraint; the payload resolver
+                    -- reads `result.reference` to extract the per-event payload.
+                    result
                 FROM noetl.event
                 WHERE execution_id = $1
                 ORDER BY event_id ASC
@@ -945,6 +1028,17 @@ pub fn fold_replay_state_with_options(
         // R5 R3: loop + business_object projections.
         populate_loop(event, &mut state.loops);
         populate_business_object(event, &mut state.business_objects);
+
+        // R5 R6: execution-level payload_refs.  Every event
+        // carrying a `result.reference` gets appended in
+        // event_id order.  Mirrors Python's
+        // `state["execution"]["payload_refs"]`.
+        if let Some(reference) = extract_payload_ref(event) {
+            state
+                .execution
+                .payload_refs
+                .push(build_payload_entry(event.event_id, reference));
+        }
     }
 
     // R5 R4: per-projection + top-level SHA-256 checksums.  Runs
@@ -1155,6 +1249,16 @@ fn populate_frame(
             frame.events_emitted =
                 meta_i64(&event.meta, "events_emitted").unwrap_or(frame.events_emitted);
             frame.terminal_event_id = Some(event.event_id);
+            // R5 R6: capture the frame's output_ref + summary from
+            // the terminal event's result.reference.  Python mirrors
+            // this with `frame["output_ref"] = payload_ref` and
+            // `frame["output_ref_summary"] = _payload_summary(payload_ref)`,
+            // assigning even when payload_ref is None.
+            let reference = extract_payload_ref(event);
+            frame.output_ref_summary = Some(payload_summary(
+                reference.as_ref().unwrap_or(&serde_json::Value::Null),
+            ));
+            frame.output_ref = reference;
         }
         "frame.failed" => {
             frame.status = if event.status.is_empty() {
@@ -1165,6 +1269,13 @@ fn populate_frame(
             frame.events_emitted =
                 meta_i64(&event.meta, "events_emitted").unwrap_or(frame.events_emitted);
             frame.terminal_event_id = Some(event.event_id);
+            // R5 R6: same as frame.committed — capture output_ref +
+            // summary so the failure mode can carry a payload pointer.
+            let reference = extract_payload_ref(event);
+            frame.output_ref_summary = Some(payload_summary(
+                reference.as_ref().unwrap_or(&serde_json::Value::Null),
+            ));
+            frame.output_ref = reference;
         }
         _ if !event.status.is_empty() => {
             frame.status = event.status.clone();
@@ -1446,6 +1557,8 @@ fn populate_business_object(
             deleted_event_id: None,
             last_event_type: None,
             attributes: serde_json::Map::new(),
+            payload_refs: Vec::new(),
+            last_payload_ref: None,
         });
 
     entry.last_event_id = Some(event.event_id);
@@ -1491,8 +1604,112 @@ fn populate_business_object(
         }
     }
 
-    // R6 will populate payload_refs + last_payload_ref from the
-    // event's top-level `payload_ref` column / `result.reference`.
+    // R5 R6: payload_refs + last_payload_ref appended when the
+    // event carries a `result.reference`.  Per Python's
+    // business_objects branch: every event with a payload_ref
+    // gets appended; last_payload_ref points at the most recent.
+    if let Some(reference) = extract_payload_ref(event) {
+        let payload_entry = build_payload_entry(event.event_id, reference);
+        entry.payload_refs.push(payload_entry.clone());
+        entry.last_payload_ref = Some(payload_entry);
+    }
+}
+
+// ---------------------------------------------------------------
+// R5 R6 helpers — payload reference extraction + summary +
+// per-projection population.
+// ---------------------------------------------------------------
+
+/// Extract the per-event payload reference from a
+/// [`ReplayEventRow`].  Mirrors Python's `_payload_ref` — reads
+/// `result.reference` (the only Rust-side source; the Python
+/// fallback to a top-level `payload_ref` column doesn't apply
+/// because `noetl.event` has no such column).  Returns `None`
+/// when the event has no result, or the result has no
+/// `reference` key, or `reference` is `null`.
+pub fn extract_payload_ref(event: &ReplayEventRow) -> Option<serde_json::Value> {
+    let result = event.result.as_ref()?.as_object()?;
+    let reference = result.get("reference")?;
+    if reference.is_null() {
+        return None;
+    }
+    Some(reference.clone())
+}
+
+/// Compute the summary fields for a payload reference.  Mirrors
+/// Python's `_payload_summary` — each field falls back across
+/// nested locations: `reference.<field>` → `reference.rows_ref.meta.<field>`
+/// → `reference.rows_ref.ipc.<field>`.  `sha256` additionally
+/// falls back to `reference.digest`; `ref` falls back to
+/// `reference.uri`.  Returns a [`PayloadSummary`] with all
+/// fields `None` if `reference` isn't an object.
+pub fn payload_summary(reference: &serde_json::Value) -> PayloadSummary {
+    let obj = match reference.as_object() {
+        Some(o) => o,
+        None => return PayloadSummary::default(),
+    };
+    let rows_ref = obj.get("rows_ref").and_then(|v| v.as_object());
+    let rows_meta = rows_ref.and_then(|r| r.get("meta")).and_then(|v| v.as_object());
+    let rows_ipc = rows_ref.and_then(|r| r.get("ipc")).and_then(|v| v.as_object());
+
+    // Lookup helper: try the top-level reference key first,
+    // then meta, then ipc.
+    let lookup_str = |key: &str| -> Option<String> {
+        obj.get(key)
+            .and_then(|v| v.as_str().map(String::from))
+            .or_else(|| {
+                rows_meta
+                    .and_then(|m| m.get(key))
+                    .and_then(|v| v.as_str().map(String::from))
+            })
+            .or_else(|| {
+                rows_ipc
+                    .and_then(|i| i.get(key))
+                    .and_then(|v| v.as_str().map(String::from))
+            })
+    };
+    let lookup_i64 = |key: &str| -> Option<i64> {
+        obj.get(key)
+            .and_then(|v| v.as_i64())
+            .or_else(|| rows_meta.and_then(|m| m.get(key)).and_then(|v| v.as_i64()))
+            .or_else(|| rows_ipc.and_then(|i| i.get(key)).and_then(|v| v.as_i64()))
+    };
+
+    let sha256 = lookup_str("sha256").or_else(|| {
+        obj.get("digest").and_then(|v| v.as_str().map(String::from))
+    });
+    let schema_digest = lookup_str("schema_digest");
+    let row_count = lookup_i64("row_count");
+    let media_type = lookup_str("media_type");
+    let reference_uri = obj
+        .get("ref")
+        .and_then(|v| v.as_str().map(String::from))
+        .or_else(|| {
+            rows_ref
+                .and_then(|r| r.get("ref"))
+                .and_then(|v| v.as_str().map(String::from))
+        })
+        .or_else(|| obj.get("uri").and_then(|v| v.as_str().map(String::from)));
+
+    PayloadSummary {
+        sha256,
+        schema_digest,
+        row_count,
+        media_type,
+        reference_uri,
+    }
+}
+
+/// Build a [`PayloadRefEntry`] from an event_id + raw
+/// reference JSON.  Pre-computes the summary so consumers
+/// don't re-parse.
+fn build_payload_entry(event_id: i64, reference: serde_json::Value) -> PayloadRefEntry {
+    let summary = payload_summary(&reference);
+    PayloadRefEntry {
+        event_id,
+        reference,
+        summary,
+    }
 }
 
 // ---------------------------------------------------------------
@@ -1621,6 +1838,7 @@ mod tests {
             aggregate_type: None,
             aggregate_id: None,
             meta: None,
+            result: None,
         }
     }
 
@@ -2667,5 +2885,249 @@ mod tests {
         );
 
         assert_eq!(seeded.upcaster_registry_digest.as_deref(), Some("v1-digest"));
+    }
+
+    // ----- R5 R6: payload resolver tests -----
+
+    #[test]
+    fn extract_payload_ref_returns_none_when_no_result() {
+        let event = ev(1, "playbook.completed", None, "COMPLETED");
+        assert!(extract_payload_ref(&event).is_none());
+    }
+
+    #[test]
+    fn extract_payload_ref_returns_none_when_no_reference_key() {
+        let event = ev_full(2, "playbook.completed", |e| {
+            e.result = Some(serde_json::json!({"status": "ok"}));
+        });
+        assert!(extract_payload_ref(&event).is_none());
+    }
+
+    #[test]
+    fn extract_payload_ref_returns_none_when_reference_is_null() {
+        let event = ev_full(3, "step.exit", |e| {
+            e.result = Some(serde_json::json!({"status": "ok", "reference": null}));
+        });
+        assert!(extract_payload_ref(&event).is_none());
+    }
+
+    #[test]
+    fn extract_payload_ref_returns_reference_object() {
+        let event = ev_full(4, "step.exit", |e| {
+            e.result = Some(serde_json::json!({
+                "status": "ok",
+                "reference": {"sha256": "abc", "row_count": 7}
+            }));
+        });
+        let r = extract_payload_ref(&event).expect("reference present");
+        assert_eq!(r["sha256"], serde_json::json!("abc"));
+        assert_eq!(r["row_count"], serde_json::json!(7));
+    }
+
+    #[test]
+    fn payload_summary_extracts_direct_fields() {
+        let r = serde_json::json!({
+            "sha256": "abc",
+            "schema_digest": "sd1",
+            "row_count": 10,
+            "media_type": "application/json",
+            "ref": "gs://bucket/key",
+        });
+        let s = payload_summary(&r);
+        assert_eq!(s.sha256.as_deref(), Some("abc"));
+        assert_eq!(s.schema_digest.as_deref(), Some("sd1"));
+        assert_eq!(s.row_count, Some(10));
+        assert_eq!(s.media_type.as_deref(), Some("application/json"));
+        assert_eq!(s.reference_uri.as_deref(), Some("gs://bucket/key"));
+    }
+
+    #[test]
+    fn payload_summary_falls_back_to_rows_ref_meta() {
+        // No top-level fields; everything in rows_ref.meta.
+        let r = serde_json::json!({
+            "rows_ref": {
+                "meta": {
+                    "sha256": "from-meta",
+                    "row_count": 99,
+                    "schema_digest": "sd-meta",
+                    "media_type": "x/parquet",
+                },
+                "ref": "s3://b/k",
+            }
+        });
+        let s = payload_summary(&r);
+        assert_eq!(s.sha256.as_deref(), Some("from-meta"));
+        assert_eq!(s.schema_digest.as_deref(), Some("sd-meta"));
+        assert_eq!(s.row_count, Some(99));
+        assert_eq!(s.media_type.as_deref(), Some("x/parquet"));
+        assert_eq!(s.reference_uri.as_deref(), Some("s3://b/k"));
+    }
+
+    #[test]
+    fn payload_summary_falls_back_to_digest_for_sha256() {
+        let r = serde_json::json!({"digest": "alt-digest"});
+        let s = payload_summary(&r);
+        assert_eq!(s.sha256.as_deref(), Some("alt-digest"));
+    }
+
+    #[test]
+    fn payload_summary_falls_back_to_uri_for_ref() {
+        let r = serde_json::json!({"uri": "gs://b/k"});
+        let s = payload_summary(&r);
+        assert_eq!(s.reference_uri.as_deref(), Some("gs://b/k"));
+    }
+
+    #[test]
+    fn payload_summary_returns_all_none_for_non_object() {
+        let s = payload_summary(&serde_json::json!("not-an-object"));
+        assert!(s.sha256.is_none());
+        assert!(s.schema_digest.is_none());
+        assert!(s.row_count.is_none());
+        assert!(s.media_type.is_none());
+        assert!(s.reference_uri.is_none());
+    }
+
+    #[test]
+    fn fold_populates_execution_payload_refs_in_order() {
+        // Two events with result.reference; one without.
+        let e1 = ev_full(10, "step.exit", |e| {
+            e.node_name = Some("a".to_string());
+            e.result = Some(serde_json::json!({
+                "status": "ok",
+                "reference": {"sha256": "h1", "row_count": 1}
+            }));
+        });
+        let e2 = ev(11, "playbook_started", None, "RUNNING");
+        let e3 = ev_full(12, "step.exit", |e| {
+            e.node_name = Some("b".to_string());
+            e.result = Some(serde_json::json!({
+                "status": "ok",
+                "reference": {"sha256": "h2", "row_count": 2}
+            }));
+        });
+
+        let state = fold_replay_state(&[e1, e2, e3], "t", "o", 42, ReplayProjection::All);
+        assert_eq!(state.execution.payload_refs.len(), 2);
+        assert_eq!(state.execution.payload_refs[0].event_id, 10);
+        assert_eq!(
+            state.execution.payload_refs[0].summary.sha256.as_deref(),
+            Some("h1"),
+        );
+        assert_eq!(state.execution.payload_refs[1].event_id, 12);
+        assert_eq!(
+            state.execution.payload_refs[1].summary.row_count,
+            Some(2),
+        );
+    }
+
+    #[test]
+    fn fold_populates_frame_output_ref_on_committed() {
+        let e1 = ev_full(20, "frame.committed", |e| {
+            e.frame_id = Some("frame-1".to_string());
+            e.status = "COMPLETED".to_string();
+            e.meta = Some(serde_json::json!({"row_count": 100}));
+            e.result = Some(serde_json::json!({
+                "status": "ok",
+                "reference": {
+                    "sha256": "frame-hash",
+                    "row_count": 100,
+                    "media_type": "x/parquet",
+                }
+            }));
+        });
+        let state = fold_replay_state(&[e1], "t", "o", 42, ReplayProjection::All);
+        let frame = state.frames.get("frame-1").expect("frame populated");
+        assert_eq!(frame.status, "COMPLETED");
+        assert!(frame.output_ref.is_some());
+        let summary = frame.output_ref_summary.as_ref().expect("summary set");
+        assert_eq!(summary.sha256.as_deref(), Some("frame-hash"));
+        assert_eq!(summary.row_count, Some(100));
+        assert_eq!(summary.media_type.as_deref(), Some("x/parquet"));
+    }
+
+    #[test]
+    fn fold_populates_frame_output_ref_on_failed() {
+        let e1 = ev_full(21, "frame.failed", |e| {
+            e.frame_id = Some("frame-x".to_string());
+            e.status = "FAILED".to_string();
+            e.result = Some(serde_json::json!({
+                "status": "failed",
+                "reference": {"sha256": "err-hash"}
+            }));
+        });
+        let state = fold_replay_state(&[e1], "t", "o", 42, ReplayProjection::All);
+        let frame = state.frames.get("frame-x").expect("frame populated");
+        assert_eq!(frame.status, "FAILED");
+        assert!(frame.output_ref.is_some());
+        assert_eq!(
+            frame
+                .output_ref_summary
+                .as_ref()
+                .unwrap()
+                .sha256
+                .as_deref(),
+            Some("err-hash"),
+        );
+    }
+
+    #[test]
+    fn fold_frame_committed_without_reference_keeps_summary_default() {
+        // Committed event with no result.reference — frame still
+        // gets a summary (with all-None fields) to mirror Python.
+        let e1 = ev_full(22, "frame.committed", |e| {
+            e.frame_id = Some("frame-y".to_string());
+            e.status = "COMPLETED".to_string();
+        });
+        let state = fold_replay_state(&[e1], "t", "o", 42, ReplayProjection::All);
+        let frame = state.frames.get("frame-y").expect("frame populated");
+        assert!(frame.output_ref.is_none());
+        let summary = frame.output_ref_summary.as_ref().expect("summary set even when ref is None");
+        assert!(summary.sha256.is_none());
+        assert!(summary.row_count.is_none());
+    }
+
+    #[test]
+    fn fold_populates_business_object_payload_refs() {
+        let e1 = ev_full(30, "customer.created", |e| {
+            e.meta = Some(serde_json::json!({
+                "business_object": {"object_type": "customer", "object_id": "c-1"}
+            }));
+            e.result = Some(serde_json::json!({
+                "status": "ok",
+                "reference": {"sha256": "v1-hash"}
+            }));
+        });
+        let e2 = ev_full(31, "customer.updated", |e| {
+            e.meta = Some(serde_json::json!({
+                "business_object": {"object_type": "customer", "object_id": "c-1"}
+            }));
+            e.result = Some(serde_json::json!({
+                "status": "ok",
+                "reference": {"sha256": "v2-hash"}
+            }));
+        });
+        let state = fold_replay_state(&[e1, e2], "t", "o", 42, ReplayProjection::All);
+        let bo = state
+            .business_objects
+            .get("customer/c-1")
+            .expect("BO present");
+        assert_eq!(bo.payload_refs.len(), 2);
+        assert_eq!(bo.payload_refs[0].event_id, 30);
+        assert_eq!(
+            bo.payload_refs[0].summary.sha256.as_deref(),
+            Some("v1-hash"),
+        );
+        let last = bo.last_payload_ref.as_ref().expect("last_payload_ref set");
+        assert_eq!(last.event_id, 31);
+        assert_eq!(last.summary.sha256.as_deref(), Some("v2-hash"));
+    }
+
+    #[test]
+    fn fold_empty_log_omits_payload_fields_from_json() {
+        let state = fold_replay_state(&[], "default", "default", 1, ReplayProjection::All);
+        let v = serde_json::to_value(&state).unwrap();
+        // execution.payload_refs is `default` ([]), so it WILL
+        // appear in JSON (no skip_serializing_if on Vec).
+        assert_eq!(v["execution"]["payload_refs"], serde_json::json!([]));
     }
 }
