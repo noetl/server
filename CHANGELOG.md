@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.51.0](https://github.com/noetl/server/compare/v2.50.1...v2.51.0) (2026-06-07)
+
+### Features
+
+* **replay:** Phase D R5 R1 — endpoint scaffold + execution projection ([#148](https://github.com/noetl/server/issues/148)) ([b85e17a](https://github.com/noetl/server/commit/b85e17abba4677fc15953e0b5b829513bc01073b)), closes [noetl/ai-meta#49](https://github.com/noetl/ai-meta/issues/49) [noetl/ai-meta#49](https://github.com/noetl/ai-meta/issues/49)
+
 ## [2.50.1](https://github.com/noetl/server/compare/v2.50.0...v2.50.1) (2026-06-07)
 
 ### Bug Fixes
