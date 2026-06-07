@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.54.0](https://github.com/noetl/server/compare/v2.53.0...v2.54.0) (2026-06-07)
+
+### Features
+
+* **replay:** Phase D R5 R4 — typed Checksum + projection_checksums ([#148](https://github.com/noetl/server/issues/148)) ([a22161c](https://github.com/noetl/server/commit/a22161c413b069b7a760c027c4dbea4be222e19e)), closes [noetl/ai-meta#49](https://github.com/noetl/ai-meta/issues/49) [noetl/ai-meta#49](https://github.com/noetl/ai-meta/issues/49)
+
 ## [2.53.0](https://github.com/noetl/server/compare/v2.52.0...v2.53.0) (2026-06-07)
 
 ### Features
