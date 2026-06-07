@@ -14,6 +14,7 @@ pub mod executions;
 pub mod health;
 pub mod internal;
 pub mod keychain;
+pub mod replay;
 pub mod runtime;
 pub mod secret_audit;
 pub mod sharding;
