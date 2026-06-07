@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.53.0](https://github.com/noetl/server/compare/v2.52.0...v2.53.0) (2026-06-07)
+
+### Features
+
+* **replay:** Phase D R5 R3 — loops + business_objects projections ([#148](https://github.com/noetl/server/issues/148)) ([5211ff0](https://github.com/noetl/server/commit/5211ff06faef970044f33bcfea5112bed80a5939)), closes [noetl/ai-meta#49](https://github.com/noetl/ai-meta/issues/49) [noetl/ai-meta#49](https://github.com/noetl/ai-meta/issues/49)
+
 ## [2.52.0](https://github.com/noetl/server/compare/v2.51.1...v2.52.0) (2026-06-07)
 
 ### Features
