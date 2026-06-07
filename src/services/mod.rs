@@ -9,6 +9,7 @@ pub mod event;
 pub mod execution;
 pub mod internal;
 pub mod keychain;
+pub mod keychain_refresh;
 pub mod runtime;
 pub mod secret_audit;
 pub mod ui_schema;
