@@ -295,7 +295,17 @@ impl ReplayService {
         let rows = if let Some(event_id) = cutoff.as_of_event_id.or(cutoff.as_of_position) {
             sqlx::query_as::<_, ReplayEventRow>(
                 r#"
-                SELECT event_id, event_type, node_name, status, created_at
+                SELECT
+                    event_id,
+                    event_type,
+                    node_name,
+                    status,
+                    -- `noetl.event.created_at` is `TIMESTAMP` (no tz);
+                    -- coerce to `TIMESTAMPTZ` so sqlx decodes into
+                    -- `DateTime<Utc>` directly.  Matches the cast the
+                    -- existing services::execution queries use for the
+                    -- same column.
+                    created_at AT TIME ZONE 'UTC' AS created_at
                 FROM noetl.event
                 WHERE execution_id = $1
                   AND event_id <= $2
@@ -311,7 +321,17 @@ impl ReplayService {
         } else if let Some(t) = cutoff.as_of_time {
             sqlx::query_as::<_, ReplayEventRow>(
                 r#"
-                SELECT event_id, event_type, node_name, status, created_at
+                SELECT
+                    event_id,
+                    event_type,
+                    node_name,
+                    status,
+                    -- `noetl.event.created_at` is `TIMESTAMP` (no tz);
+                    -- coerce to `TIMESTAMPTZ` so sqlx decodes into
+                    -- `DateTime<Utc>` directly.  Matches the cast the
+                    -- existing services::execution queries use for the
+                    -- same column.
+                    created_at AT TIME ZONE 'UTC' AS created_at
                 FROM noetl.event
                 WHERE execution_id = $1
                   AND created_at <= $2
@@ -327,7 +347,17 @@ impl ReplayService {
         } else {
             sqlx::query_as::<_, ReplayEventRow>(
                 r#"
-                SELECT event_id, event_type, node_name, status, created_at
+                SELECT
+                    event_id,
+                    event_type,
+                    node_name,
+                    status,
+                    -- `noetl.event.created_at` is `TIMESTAMP` (no tz);
+                    -- coerce to `TIMESTAMPTZ` so sqlx decodes into
+                    -- `DateTime<Utc>` directly.  Matches the cast the
+                    -- existing services::execution queries use for the
+                    -- same column.
+                    created_at AT TIME ZONE 'UTC' AS created_at
                 FROM noetl.event
                 WHERE execution_id = $1
                 ORDER BY event_id ASC
