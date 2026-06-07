@@ -16,6 +16,7 @@
 mod aws;
 mod aws_sts;
 mod azure;
+mod azure_oauth;
 pub mod broker;
 pub mod dynamic;
 mod gcp;
@@ -28,6 +29,7 @@ mod vault;
 pub use aws::AwsSmSecretProvider;
 pub use aws_sts::AwsStsProvider;
 pub use azure::AzureKeyVaultProvider;
+pub use azure_oauth::AzureOAuthProvider;
 pub use gcp::GcpSecretManager;
 pub use k8s::K8sSecretProvider;
 pub use registry::get_provider;
@@ -116,9 +118,10 @@ pub fn build_secret_provider(provider: &str) -> AppResult<Arc<dyn SecretProvider
         "aws" | "aws_sm" => Ok(Arc::new(AwsSmSecretProvider::from_env()?)),
         "aws_sts" | "aws_iam" => Ok(Arc::new(AwsStsProvider::from_env()?)),
         "azure" | "azure_kv" => Ok(Arc::new(AzureKeyVaultProvider::from_env()?)),
+        "azure_oauth" | "azure_aad" => Ok(Arc::new(AzureOAuthProvider::from_env()?)),
         other => Err(AppError::Config(format!(
             "unsupported keychain secret provider '{other}' \
-             (supported: gcp, k8s, vault, aws, aws_sts, azure)"
+             (supported: gcp, k8s, vault, aws, aws_sts, azure, azure_oauth)"
         ))),
     }
 }
