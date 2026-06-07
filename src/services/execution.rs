@@ -448,12 +448,51 @@ impl ExecutionService {
             )));
         }
 
-        // Get step statistics
+        // Phase D R4 follow-up (noetl/server#146).  Look up terminal
+        // events FIRST.  `playbook.completed` / `playbook.failed` are
+        // the definitive terminal markers — the orchestrator emits
+        // exactly one of them when it decides the playbook is done
+        // (search engine.rs for `Orchestrator marked execution as
+        // terminal`).  Step-stats-based inference (further below)
+        // falls behind reality because `command.completed` events
+        // carry `status='success'` (lowercase) from the worker, but
+        // the existing `completed_steps` filter looked for
+        // `status='COMPLETED'` — so completed_steps stayed at 0 even
+        // after every step succeeded, the `stats.1 == stats.0`
+        // equality never fired, and the endpoint reported `RUNNING`
+        // indefinitely.  The list endpoint at `services::execution`
+        // already uses `bool_or(playbook.completed) → COMPLETED` for
+        // exactly this reason; this is the per-execution twin.
+        let terminal: Option<(String,)> = sqlx::query_as(
+            r#"
+            SELECT event_type
+            FROM noetl.event
+            WHERE execution_id = $1
+              AND event_type IN (
+                'playbook.completed', 'playbook_completed',
+                'playbook.failed',    'playbook_failed'
+              )
+            ORDER BY created_at DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(execution_id)
+        .fetch_optional(self.pool_for(execution_id))
+        .await?;
+
+        // Get step statistics.  The `completed_steps` filter now
+        // accepts the realistic status values workers actually emit
+        // (`'success'` lowercase from `command.completed`) in
+        // addition to the legacy `'COMPLETED'` value — without this
+        // a successfully-finished step would never count.
         let stats: (i64, i64, i64, i64) = sqlx::query_as(
             r#"
             SELECT
                 COUNT(DISTINCT CASE WHEN event_type = 'step.enter' THEN node_name END) as total_steps,
-                COUNT(DISTINCT CASE WHEN event_type IN ('step.exit', 'command.completed') AND status = 'COMPLETED' THEN node_name END) as completed_steps,
+                COUNT(DISTINCT CASE
+                    WHEN event_type IN ('step.exit', 'command.completed')
+                     AND (status IN ('COMPLETED', 'completed', 'success'))
+                    THEN node_name END) as completed_steps,
                 COUNT(DISTINCT CASE WHEN event_type IN ('step.enter', 'command.started') AND status = 'RUNNING' THEN node_name END) as running_steps,
                 COUNT(DISTINCT CASE WHEN status = 'FAILED' THEN node_name END) as failed_steps
             FROM noetl.event
@@ -494,8 +533,22 @@ impl ExecutionService {
         .fetch_one(self.pool_for(execution_id))
         .await?;
 
-        // Determine overall status
-        let status = if is_cancelled {
+        // Determine overall status.  Terminal event > cancellation >
+        // failed-step heuristic > completed-step heuristic > RUNNING.
+        // Terminal-event check goes first so the endpoint reflects
+        // the orchestrator's decision the moment `playbook.completed`
+        // lands, even if the step-stat counters are momentarily
+        // behind (`command.completed` and `playbook.completed` land
+        // in the same handler pass but the cross-row counter is not
+        // load-bearing for terminal status — only for `progress.*`).
+        let status = if let Some((evt,)) = &terminal {
+            match evt.as_str() {
+                "playbook.completed" | "playbook_completed" => "COMPLETED",
+                "playbook.failed" | "playbook_failed" => "FAILED",
+                _ => "RUNNING",
+            }
+            .to_string()
+        } else if is_cancelled {
             "CANCELLED".to_string()
         } else if stats.3 > 0 {
             "FAILED".to_string()
@@ -711,5 +764,107 @@ mod tests {
         let filter = ExecutionFilter::default();
         assert!(filter.catalog_id.is_none());
         assert!(filter.limit.is_none());
+    }
+
+    // ===== Phase D R4 follow-up tests (noetl/server#146) =====
+
+    /// Build a synthetic `ExecutionService` for unit-level tests.
+    /// `determine_status` is pool-free — it operates on an in-memory
+    /// event slice — so we only need a syntactically valid service.
+    /// (The SQL fix in `get_status` itself is validated by the kind-val
+    /// run captured in noetl/ai-meta wiki Sessions-Log on 2026-06-07;
+    /// SQL semantics aren't covered by these unit tests but the
+    /// determine_status helper IS the in-memory mirror of the SQL
+    /// terminal-event short-circuit landed in this PR.)
+    fn make_event(event_type: &str, status: &str) -> ExecutionEvent {
+        ExecutionEvent {
+            event_id: 0,
+            event_type: event_type.to_string(),
+            node_name: None,
+            status: status.to_string(),
+            created_at: Utc::now(),
+            result: None,
+            error: None,
+        }
+    }
+
+    fn make_service() -> ExecutionService {
+        // ExecutionService::new_legacy gives us a pool-less shim valid
+        // for the in-memory determine_status path.
+        let snowflake = std::sync::Arc::new(
+            crate::snowflake::SnowflakeGenerator::new(0).expect("snowflake init"),
+        );
+        ExecutionService::new_legacy(
+            sqlx::PgPool::connect_lazy("postgres://invalid").expect("lazy pool"),
+            snowflake,
+        )
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn determine_status_returns_completed_on_playbook_completed_event() {
+        let service = make_service();
+        let events = vec![
+            make_event("step.enter", "ENTERED"),
+            // Worker emits `command.completed` with lowercase `success`
+            // — this is the realistic shape that broke the SQL counter
+            // in get_status before the #146 fix.
+            make_event("command.completed", "success"),
+            make_event("playbook.completed", "COMPLETED"),
+        ];
+        assert_eq!(service.determine_status(&events), "COMPLETED");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn determine_status_returns_completed_on_underscore_alias() {
+        let service = make_service();
+        let events = vec![
+            make_event("command.completed", "success"),
+            make_event("playbook_completed", "COMPLETED"),
+        ];
+        assert_eq!(service.determine_status(&events), "COMPLETED");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn determine_status_returns_failed_on_playbook_failed_event() {
+        let service = make_service();
+        let events = vec![
+            make_event("step.enter", "ENTERED"),
+            make_event("playbook.failed", "FAILED"),
+        ];
+        assert_eq!(service.determine_status(&events), "FAILED");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn determine_status_returns_cancelled_on_playbook_cancelled() {
+        let service = make_service();
+        let events = vec![
+            make_event("step.enter", "ENTERED"),
+            make_event("playbook.cancelled", "CANCELLED"),
+        ];
+        assert_eq!(service.determine_status(&events), "CANCELLED");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn determine_status_stays_running_without_terminal_event() {
+        let service = make_service();
+        let events = vec![
+            make_event("step.enter", "ENTERED"),
+            // Even after command.completed with `success` (the bug
+            // shape that masked completion in the SQL path), without
+            // a playbook-level terminal event there's no signal to
+            // call the playbook done.
+            make_event("command.completed", "success"),
+        ];
+        assert_eq!(service.determine_status(&events), "RUNNING");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn determine_status_returns_failed_on_individual_event_failure() {
+        let service = make_service();
+        let events = vec![
+            make_event("step.enter", "ENTERED"),
+            make_event("command.failed", "FAILED"),
+        ];
+        assert_eq!(service.determine_status(&events), "FAILED");
     }
 }
