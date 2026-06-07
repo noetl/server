@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.57.1](https://github.com/noetl/server/compare/v2.57.0...v2.57.1) (2026-06-07)
+
+### Bug Fixes
+
+* **orchestrator:** expose `step.data` accessor on user_data shaped step results ([3fe4e76](https://github.com/noetl/server/commit/3fe4e7686aa121d815eae6056c8d1af325bef188)), closes [noetl/ai-meta#65](https://github.com/noetl/ai-meta/issues/65) [#65](https://github.com/noetl/server/issues/65) [noetl/ai-meta#66](https://github.com/noetl/ai-meta/issues/66)
+
 ## [2.57.0](https://github.com/noetl/server/compare/v2.56.0...v2.57.0) (2026-06-07)
 
 ### Features
