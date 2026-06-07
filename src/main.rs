@@ -167,6 +167,18 @@ fn build_router(
             pool: db_pool.clone(),
         });
 
+    // Container Tool Callback endpoint (Round 2 of
+    // noetl/ai-meta#43, noetl/server#140).  POST
+    // /api/internal/container-callback/{execution_id}/{step}
+    // consumes the watcher's POST and emits a call.done event;
+    // returns 202 even on stale callbacks (no matching execution).
+    let container_callback_routes = Router::new()
+        .route(
+            "/api/internal/container-callback/{execution_id}/{step}",
+            post(handlers::container_callback::container_callback),
+        )
+        .with_state(state.clone());
+
     // Keychain routes
     let keychain_routes = Router::new()
         .route(
@@ -357,6 +369,7 @@ fn build_router(
         .merge(cross_region_routes)
         .merge(wallet_rotate_routes)
         .merge(secret_audit_routes)
+        .merge(container_callback_routes)
         .merge(keychain_routes)
         .merge(execution_routes)
         .merge(executions_routes)
