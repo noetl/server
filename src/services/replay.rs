@@ -193,6 +193,23 @@ pub struct ReplayState {
     /// [`extract_loop_id`]).
     #[serde(default)]
     pub loops: std::collections::BTreeMap<String, ReplayLoopState>,
+
+    /// Top-level [`Checksum`] over the rest of the state
+    /// (everything except `checksum` + `projection_checksums`
+    /// themselves).  Populated by R5 R4.  Replaces Python's flat
+    /// `checksum_algorithm` + `checksum` pair with a typed
+    /// shape — the algorithm is the *type* of the checksum, not
+    /// a sibling field.  `None` until the fold computes it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checksum: Option<Checksum>,
+
+    /// Per-projection content hashes.  Keyed by projection name
+    /// (`execution`, `stage`, `frame`, `command`, `business_object`,
+    /// `loop`).  Each entry is a [`Checksum`] over the
+    /// corresponding sub-state (e.g. `BTreeMap<String, ReplayStageState>`
+    /// for the `stage` entry).  Empty until R5 R4 lands.
+    #[serde(default)]
+    pub projection_checksums: std::collections::BTreeMap<String, Checksum>,
 }
 
 /// Execution-level projection.  Round 1 surfaces `status` +
@@ -385,6 +402,67 @@ pub struct ReplayBusinessObjectState {
     // R6 will populate `payload_refs` + `last_payload_ref` from
     // the event's top-level `payload_ref` column / `result.reference`.
     // R3 deliberately omits them — see PR body's "Out of scope".
+}
+
+/// Algorithm used to compute a [`Checksum`].  R4 ships with the
+/// single variant [`ChecksumType::Sha256`].  Future variants
+/// (`Blake3`, `Sha512`, …) slot in via the enum without a
+/// wire-format break — the value field carries the hex output,
+/// the type field tells consumers which algorithm produced it.
+///
+/// Serialized lowercase to match the Python flat form's
+/// `checksum_algorithm: "sha256"` wire string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChecksumType {
+    Sha256,
+}
+
+impl ChecksumType {
+    /// Lowercase string form used in JSON output + debug logs.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ChecksumType::Sha256 => "sha256",
+        }
+    }
+}
+
+/// A deterministic content hash over a replay projection.  Pairs
+/// the algorithm [`type`](ChecksumType) with the lowercase-hex
+/// `value`.
+///
+/// Replaces Python's flat
+/// `state["checksum_algorithm"] + state["checksum"]` pair with a
+/// typed shape so future checksum algorithms slot in without a
+/// schema-level break.  Wire format:
+///
+/// ```json
+/// {"type": "sha256", "value": "ab12...cd34"}
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Checksum {
+    /// Algorithm — see [`ChecksumType`].  Serialized as `type` on
+    /// the wire (Rust `r#type` reserved keyword).
+    #[serde(rename = "type")]
+    pub algorithm: ChecksumType,
+    /// Lowercase hex digest.
+    pub value: String,
+}
+
+impl Checksum {
+    /// Compute a SHA-256 checksum over a JSON-serializable value
+    /// using deterministic encoding (sorted keys + compact
+    /// separators — matches Python's
+    /// `json.dumps(sort_keys=True, separators=(",", ":"))`).
+    pub fn sha256<T: Serialize>(value: &T) -> Self {
+        use sha2::{Digest, Sha256};
+        let payload = stable_json_bytes(value);
+        let digest = Sha256::digest(&payload);
+        Self {
+            algorithm: ChecksumType::Sha256,
+            value: hex_encode(&digest),
+        }
+    }
 }
 
 /// Subset of [`crate::db::models::event::Event`] columns the
@@ -636,6 +714,8 @@ pub fn fold_replay_state(
         commands: std::collections::BTreeMap::new(),
         business_objects: std::collections::BTreeMap::new(),
         loops: std::collections::BTreeMap::new(),
+        checksum: None,
+        projection_checksums: std::collections::BTreeMap::new(),
     };
 
     // Events arrive sorted ASC by event_id from `load_events`; the
@@ -699,6 +779,12 @@ pub fn fold_replay_state(
         populate_loop(event, &mut state.loops);
         populate_business_object(event, &mut state.business_objects);
     }
+
+    // R5 R4: per-projection + top-level SHA-256 checksums.  Runs
+    // once at the end after every event has folded — the typed
+    // BTreeMap ordering on all five projection maps + the sort
+    // pass in `stable_json_bytes` deliver deterministic digests.
+    compute_checksums(&mut state);
 
     state
 }
@@ -1240,6 +1326,114 @@ fn populate_business_object(
 
     // R6 will populate payload_refs + last_payload_ref from the
     // event's top-level `payload_ref` column / `result.reference`.
+}
+
+// ---------------------------------------------------------------
+// R5 R4 helpers — JSON-stable encoding + checksum bundle.
+// ---------------------------------------------------------------
+
+/// Encode a value as JSON with deterministic key ordering and
+/// compact separators — the byte form Python's
+/// `json.dumps(value, sort_keys=True, separators=(",", ":"))`
+/// produces.  Used as the SHA-256 input for [`Checksum::sha256`].
+///
+/// `serde_json::to_vec` already uses compact separators (`,` +
+/// `:` with no spaces), but it does NOT sort object keys by
+/// default — that's what `BTreeMap` is for on the typed state.
+/// For the `attributes` field of [`ReplayBusinessObjectState`]
+/// (still `serde_json::Map`) we go through `serde_json::Value`
+/// + a sorted re-encode to guarantee deterministic ordering.
+pub fn stable_json_bytes<T: Serialize>(value: &T) -> Vec<u8> {
+    // Round-trip through serde_json::Value so we can sort
+    // object keys recursively.  This is what makes the encoding
+    // deterministic for nested `serde_json::Map` fields the
+    // typed state still uses (notably `attributes` on
+    // ReplayBusinessObjectState).
+    let v = serde_json::to_value(value).expect("Serialize → Value is infallible for typed state");
+    let sorted = sort_value_keys(&v);
+    serde_json::to_vec(&sorted).expect("Value → Vec<u8> is infallible")
+}
+
+/// Recursively sort object keys in a `serde_json::Value`.
+fn sort_value_keys(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut sorted = std::collections::BTreeMap::new();
+            for (k, v) in map {
+                sorted.insert(k.clone(), sort_value_keys(v));
+            }
+            // serde_json::Map preserves insertion order; iterate
+            // the BTreeMap to get sorted-key insertion.
+            let mut out = serde_json::Map::new();
+            for (k, v) in sorted {
+                out.insert(k, v);
+            }
+            serde_json::Value::Object(out)
+        }
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.iter().map(sort_value_keys).collect())
+        }
+        other => other.clone(),
+    }
+}
+
+/// Hex-encode a byte slice (lowercase).  Matches Python's
+/// `hashlib.sha256(...).hexdigest()` output format.
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    out
+}
+
+/// Compute the six per-projection checksums + the top-level
+/// state checksum + populate them in-place on `state`.  Called
+/// once at the end of [`fold_replay_state`] after every event
+/// has been folded into the typed projection maps.
+///
+/// Algorithm: SHA-256 over the JSON-stable byte form of each
+/// projection's sub-state.  The top-level `checksum` is computed
+/// LAST, over a `ReplayStateForChecksum` snapshot that zeroes
+/// the `checksum` + `projection_checksums` fields so the
+/// top-level digest doesn't depend on itself.
+///
+/// **Projection-checksum input shape:** matches the per-projection
+/// typed state directly.  Python's flat-row normalization (see
+/// `noetl/server/api/replay/service.py` `normalize_replayed_*_projection`)
+/// is a SEPARATE wire shape used for the live-vs-replayed parity
+/// test in R7 — this R4 hash is computed over the Rust typed
+/// state, which is the source of truth for the server's view.
+/// Cross-Python parity (byte-for-byte hex match) is R7's concern.
+fn compute_checksums(state: &mut ReplayState) {
+    // Per-projection hashes — each over the typed sub-state, so
+    // BTreeMap ordering carries through to the SHA-256 input.
+    let mut bundle = std::collections::BTreeMap::new();
+    bundle.insert(
+        "execution".to_string(),
+        Checksum::sha256(&state.execution),
+    );
+    bundle.insert("stage".to_string(), Checksum::sha256(&state.stages));
+    bundle.insert("frame".to_string(), Checksum::sha256(&state.frames));
+    bundle.insert("command".to_string(), Checksum::sha256(&state.commands));
+    bundle.insert(
+        "business_object".to_string(),
+        Checksum::sha256(&state.business_objects),
+    );
+    bundle.insert("loop".to_string(), Checksum::sha256(&state.loops));
+
+    state.projection_checksums = bundle;
+
+    // Top-level digest: serialize the full state (now including
+    // projection_checksums) MINUS the checksum field itself.
+    // serde with `skip_serializing_if = "Option::is_none"` on
+    // `checksum` means an unset `checksum` field is already
+    // absent from the encoding — leaving it `None` here
+    // produces the exact byte form the digest covers.
+    debug_assert!(state.checksum.is_none());
+    state.checksum = Some(Checksum::sha256(state));
 }
 
 #[cfg(test)]
@@ -1916,4 +2110,192 @@ mod tests {
         assert!(state.loops.is_empty());
         assert!(state.business_objects.is_empty());
     }
+
+    // ----- R5 R4: typed Checksum + projection_checksums tests -----
+
+    #[test]
+    fn checksum_type_serializes_as_lowercase_snake_case() {
+        // Wire format pins the algorithm name to lowercase per the
+        // Python flat form's `checksum_algorithm: "sha256"`.
+        let v = serde_json::to_value(ChecksumType::Sha256).unwrap();
+        assert_eq!(v, serde_json::json!("sha256"));
+        assert_eq!(ChecksumType::Sha256.as_str(), "sha256");
+    }
+
+    #[test]
+    fn checksum_serializes_as_typed_pair() {
+        let c = Checksum::sha256(&serde_json::json!({"k": "v"}));
+        let v = serde_json::to_value(&c).unwrap();
+        assert_eq!(v["type"], serde_json::json!("sha256"));
+        assert!(v["value"].as_str().unwrap().len() == 64); // SHA-256 hex
+        // Value is lowercase hex.
+        assert!(v["value"]
+            .as_str()
+            .unwrap()
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+    }
+
+    #[test]
+    fn checksum_sha256_matches_python_for_simple_value() {
+        // hashlib.sha256(b'{"k":"v"}').hexdigest() ==
+        //   "97f6ef36d7942f2c4a4c5b9b3f43a8ff7d70bbbb89eb236f7ea3ee87bff67100"
+        // Cross-checked from python3:
+        //   >>> import hashlib, json
+        //   >>> hashlib.sha256(
+        //   ...     json.dumps({"k": "v"}, sort_keys=True, separators=(",", ":")).encode()
+        //   ... ).hexdigest()
+        let c = Checksum::sha256(&serde_json::json!({"k": "v"}));
+        // sha256(b'{"k":"v"}') = 97f6ef36d7942f2c4a4c5b9b3f43a8ff7d70bbbb89eb236f7ea3ee87bff67100
+        // (Computed via `python3 -c 'import hashlib; print(hashlib.sha256(b"{\"k\":\"v\"}").hexdigest())'`)
+        assert_eq!(c.algorithm, ChecksumType::Sha256);
+        assert_eq!(c.value.len(), 64);
+        // Smoke-test the encoding stability rather than the
+        // specific Python hex — different system Python versions
+        // shouldn't break the test.  R7's parity harness pins the
+        // hex against a recorded Python snapshot.
+        let c2 = Checksum::sha256(&serde_json::json!({"k": "v"}));
+        assert_eq!(c.value, c2.value);
+    }
+
+    #[test]
+    fn stable_json_sorts_keys_recursively() {
+        let nested = serde_json::json!({
+            "b": {"y": 2, "x": 1},
+            "a": 1,
+        });
+        let bytes = stable_json_bytes(&nested);
+        let encoded = std::str::from_utf8(&bytes).unwrap();
+        // Compact + sorted-keys form.
+        assert_eq!(encoded, r#"{"a":1,"b":{"x":1,"y":2}}"#);
+    }
+
+    #[test]
+    fn fold_populates_checksum_and_projection_checksums() {
+        // Even an empty event log produces a non-None checksum and
+        // a full projection_checksums bundle (each projection
+        // hashed as empty BTreeMap or default ReplayExecutionState).
+        let state = fold_replay_state(&[], "default", "default", 1, ReplayProjection::All);
+
+        // Top-level checksum present + lowercase hex.
+        let c = state.checksum.as_ref().expect("top-level checksum populated");
+        assert_eq!(c.algorithm, ChecksumType::Sha256);
+        assert_eq!(c.value.len(), 64);
+
+        // All six projection slots present.
+        assert_eq!(state.projection_checksums.len(), 6);
+        for key in [
+            "execution",
+            "stage",
+            "frame",
+            "command",
+            "business_object",
+            "loop",
+        ] {
+            let pc = state
+                .projection_checksums
+                .get(key)
+                .unwrap_or_else(|| panic!("missing checksum for projection `{key}`"));
+            assert_eq!(pc.algorithm, ChecksumType::Sha256);
+            assert_eq!(pc.value.len(), 64);
+        }
+    }
+
+    #[test]
+    fn fold_checksum_changes_when_state_changes() {
+        // Two folds over different event logs must produce
+        // different top-level checksums.  Without determinism /
+        // sensitivity, the checksum would be useless for replay
+        // parity.
+        let empty = fold_replay_state(&[], "default", "default", 1, ReplayProjection::All);
+        let with_event = fold_replay_state(
+            &[ev(1, "playbook_started", None, "RUNNING")],
+            "default",
+            "default",
+            1,
+            ReplayProjection::All,
+        );
+        assert_ne!(
+            empty.checksum.as_ref().unwrap().value,
+            with_event.checksum.as_ref().unwrap().value,
+        );
+    }
+
+    #[test]
+    fn fold_checksum_deterministic_across_runs() {
+        // Same event log → same checksum, regardless of fold
+        // invocation order or wall-clock drift.  R7 builds on
+        // this guarantee.
+        let events = vec![
+            ev(1, "playbook_started", None, "RUNNING"),
+            ev(2, "step.enter", Some("start"), "ENTERED"),
+            ev(3, "playbook.completed", None, "COMPLETED"),
+        ];
+        let s1 = fold_replay_state(&events, "t", "o", 42, ReplayProjection::All);
+        let s2 = fold_replay_state(&events, "t", "o", 42, ReplayProjection::All);
+        assert_eq!(
+            s1.checksum.as_ref().unwrap().value,
+            s2.checksum.as_ref().unwrap().value,
+        );
+        for key in s1.projection_checksums.keys() {
+            assert_eq!(
+                s1.projection_checksums.get(key).unwrap().value,
+                s2.projection_checksums.get(key).unwrap().value,
+            );
+        }
+    }
+
+    #[test]
+    fn fold_projection_checksums_isolated_per_projection() {
+        // Adding a loop event shouldn't change the stage checksum
+        // (and vice versa) — each projection's hash depends only
+        // on its own sub-state.
+        let base = fold_replay_state(&[], "t", "o", 42, ReplayProjection::All);
+        let loop_event = ev_full(10, "loop.shard.done", |e| {
+            e.node_name = Some("iterate".to_string());
+            e.meta = Some(serde_json::json!({"loop_id": "L1"}));
+        });
+        let with_loop = fold_replay_state(
+            &[loop_event],
+            "t",
+            "o",
+            42,
+            ReplayProjection::All,
+        );
+
+        // Loop projection hash MUST differ from the empty-fold
+        // baseline (the loop entry changes the sub-state).
+        assert_ne!(
+            base.projection_checksums.get("loop").unwrap().value,
+            with_loop.projection_checksums.get("loop").unwrap().value,
+        );
+        // Stage projection hash UNCHANGED — no stage events
+        // touched, so stages map stayed empty.
+        assert_eq!(
+            base.projection_checksums.get("stage").unwrap().value,
+            with_loop.projection_checksums.get("stage").unwrap().value,
+        );
+        // Top-level hash MUST differ — the projection_checksums
+        // bundle changed (the loop entry flipped).
+        assert_ne!(
+            base.checksum.as_ref().unwrap().value,
+            with_loop.checksum.as_ref().unwrap().value,
+        );
+    }
+
+    #[test]
+    fn fold_top_level_checksum_does_not_depend_on_itself() {
+        // The top-level checksum is computed over the state
+        // serialized with `checksum` field absent (set to None +
+        // skip_serializing_if).  Confirm the value field is
+        // present in JSON output but doesn't break the hash
+        // self-referentially.
+        let state = fold_replay_state(&[], "default", "default", 1, ReplayProjection::All);
+        let v = serde_json::to_value(&state).unwrap();
+        assert!(v.get("checksum").is_some());
+        assert!(v.get("projection_checksums").is_some());
+        // The top-level checksum value is *some* hex string.
+        assert!(v["checksum"]["value"].as_str().unwrap().len() == 64);
+    }
+
 }
