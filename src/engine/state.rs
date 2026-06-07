@@ -665,7 +665,31 @@ impl WorkflowState {
             if let Some(result) = &info.result {
                 steps.insert(name.clone(), result.clone());
                 if let Some(user_data) = extract_user_data(result) {
-                    context.insert(name.clone(), user_data);
+                    // Expose BOTH the flat user_data fields (so
+                    // `{{ step.field }}` works) AND a synthetic
+                    // `.data` accessor that re-references the same
+                    // user_data (so `{{ step.data }}` /
+                    // `{{ step.data.field }}` also work).  Canonical
+                    // v10 fixtures use both shapes interchangeably —
+                    // single-tool python steps producing a flat
+                    // `result = {...}` dict need the `.data` accessor
+                    // because the worker envelope doesn't add it
+                    // (only the task_sequence flatten path does, and
+                    // single-tool steps skip task_sequence wrapping).
+                    //
+                    // Don't clobber an existing `.data` on the
+                    // user_data: the task_sequence flatten may have
+                    // already populated it from a labeled sub-task's
+                    // `data` field.  Tracks noetl/ai-meta#66.
+                    let with_data = match &user_data {
+                        serde_json::Value::Object(map) if !map.contains_key("data") => {
+                            let mut m = map.clone();
+                            m.insert("data".to_string(), user_data.clone());
+                            serde_json::Value::Object(m)
+                        }
+                        _ => user_data,
+                    };
+                    context.insert(name.clone(), with_data);
                 }
             }
         }
@@ -1272,6 +1296,131 @@ mod tests {
         );
         // Workload still at top level (from earlier build_context behavior).
         assert_eq!(ctx.get("temp").and_then(|v| v.as_i64()), Some(30));
+    }
+
+    #[test]
+    fn test_build_context_exposes_step_data_accessor_for_flat_user_dict() {
+        // noetl/ai-meta#66 — canonical fixtures reference `{{ step.data }}`
+        // (or `{{ step.data.field }}`) on the next step's `input`
+        // block to feed an upstream step's user dict into a
+        // downstream step.  Pre-fix: only flat-field accessors
+        // (`{{ step.field }}`) worked; `{{ step.data }}` resolved
+        // to None because single-tool python steps don't go through
+        // the task_sequence flatten path that synthesizes `.data`.
+        let mut state = WorkflowState::new(1, 1);
+        let mut info = StepInfo::new("run_from_file");
+        // Mirror the live kind execution 322087210360770560 envelope:
+        //   result.context.result.context.data = the user's main() return.
+        info.result = Some(serde_json::json!({
+            "status": "COMPLETED",
+            "context": {
+                "result": {
+                    "status": "success",
+                    "context": {
+                        "data": {
+                            "status": "success",
+                            "messages": ["Hello, NoETL! (#1)", "Hello, NoETL! (#2)", "Hello, NoETL! (#3)"],
+                            "total_greetings": 3,
+                            "script_source": "file"
+                        }
+                    }
+                }
+            }
+        }));
+        state.steps.insert("run_from_file".to_string(), info);
+
+        let ctx = state.build_context();
+        let step = ctx.get("run_from_file").expect("top-level step entry exposed");
+
+        // Existing flat-field path (back-compat):
+        assert_eq!(
+            step.get("status").and_then(|v| v.as_str()),
+            Some("success"),
+            "flat `run_from_file.status` must still resolve"
+        );
+        assert_eq!(
+            step.get("total_greetings").and_then(|v| v.as_i64()),
+            Some(3),
+            "flat `run_from_file.total_greetings` must still resolve"
+        );
+
+        // New `.data` accessor — the #66 fix:
+        let data = step
+            .get("data")
+            .expect("`.data` accessor populated for flat user dict");
+        assert_eq!(
+            data.get("status").and_then(|v| v.as_str()),
+            Some("success"),
+            "`run_from_file.data.status` must resolve"
+        );
+        assert_eq!(
+            data.get("total_greetings").and_then(|v| v.as_i64()),
+            Some(3),
+            "`run_from_file.data.total_greetings` must resolve"
+        );
+        assert_eq!(
+            data.get("messages")
+                .and_then(|v| v.as_array())
+                .map(|a| a.len()),
+            Some(3),
+            "`run_from_file.data.messages` must resolve"
+        );
+    }
+
+    #[test]
+    fn test_build_context_data_accessor_does_not_clobber_existing_data_field() {
+        // Edge case: the task_sequence flatten path already merges a
+        // `.data` key in for labeled sub-task results.  The #66 fix
+        // must not overwrite that path's `data` field with the
+        // outer user_data.
+        let mut state = WorkflowState::new(1, 1);
+        let mut info = StepInfo::new("multi_step");
+        // task_sequence-shaped envelope: data = {label1: {data: ...}, label2: ...}
+        info.result = Some(serde_json::json!({
+            "status": "COMPLETED",
+            "context": {
+                "result": {
+                    "status": "success",
+                    "context": {
+                        "data": {
+                            "init_action": {
+                                "data": {"executed": true, "value": 42},
+                                "status": "success"
+                            }
+                        }
+                    }
+                }
+            }
+        }));
+        state.steps.insert("multi_step".to_string(), info);
+
+        let ctx = state.build_context();
+        let step = ctx.get("multi_step").expect("step entry exposed");
+
+        // After task_sequence flatten:
+        //   - `multi_step.init_action.data.executed` works (labeled path)
+        //   - `multi_step.data.executed` works (flattened path; the
+        //     flatten merged init_action's `data` field up).
+        // The #66 fix must NOT overwrite that flattened `data` field
+        // with the outer user_data (`{init_action: ..., data: ..., status: ...}`),
+        // which would wrap `.data.data.executed` and break the
+        // existing template path.
+        let labeled = step
+            .get("init_action")
+            .and_then(|v| v.get("data"))
+            .and_then(|v| v.get("executed"))
+            .and_then(|v| v.as_bool());
+        assert_eq!(labeled, Some(true), "labeled task_sequence path stays intact");
+
+        let flat = step
+            .get("data")
+            .and_then(|v| v.get("executed"))
+            .and_then(|v| v.as_bool());
+        assert_eq!(
+            flat,
+            Some(true),
+            "flattened `multi_step.data.executed` must still resolve (#66 fix preserves task_sequence flatten)"
+        );
     }
 
     #[test]
