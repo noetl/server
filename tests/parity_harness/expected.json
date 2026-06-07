@@ -1,0 +1,139 @@
+{
+  "business_objects": {
+    "customer/c-99": {
+      "attributes": {
+        "name": "Alice S."
+      },
+      "deleted_event_id": null,
+      "event_count": 2,
+      "first_event_id": 109,
+      "last_event_id": 110,
+      "last_event_type": "customer.updated",
+      "last_payload_ref": {
+        "event_id": 109,
+        "reference": {
+          "ref": "gs://bucket/customer-v1",
+          "sha256": "2222222222222222222222222222222222222222222222222222222222222222"
+        },
+        "summary": {
+          "media_type": null,
+          "ref": "gs://bucket/customer-v1",
+          "row_count": null,
+          "schema_digest": null,
+          "sha256": "2222222222222222222222222222222222222222222222222222222222222222"
+        }
+      },
+      "object_id": "c-99",
+      "object_key": "customer/c-99",
+      "object_type": "customer",
+      "payload_refs": [
+        {
+          "event_id": 109,
+          "reference": {
+            "ref": "gs://bucket/customer-v1",
+            "sha256": "2222222222222222222222222222222222222222222222222222222222222222"
+          },
+          "summary": {
+            "media_type": null,
+            "ref": "gs://bucket/customer-v1",
+            "row_count": null,
+            "schema_digest": null,
+            "sha256": "2222222222222222222222222222222222222222222222222222222222222222"
+          }
+        }
+      ],
+      "status": "ACTIVE",
+      "version": 2
+    }
+  },
+  "commands": {
+    "9001": {
+      "command_id": "9001",
+      "frame_id": "f-1",
+      "issued_event_id": 104,
+      "last_event_id": 106,
+      "stage_id": "s-1",
+      "status": "success",
+      "terminal_event_id": 106,
+      "worker_id": "worker-a"
+    }
+  },
+  "event_count": 13,
+  "execution": {
+    "last_node_name": "fanout",
+    "payload_refs": [
+      {
+        "event_id": 105,
+        "reference": {
+          "media_type": "application/json",
+          "ref": "gs://bucket/output-1",
+          "row_count": 42,
+          "sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+        }
+      },
+      {
+        "event_id": 109,
+        "reference": {
+          "ref": "gs://bucket/customer-v1",
+          "sha256": "2222222222222222222222222222222222222222222222222222222222222222"
+        }
+      }
+    ],
+    "status": "COMPLETED"
+  },
+  "frames": {
+    "f-1": {
+      "attempts": 1,
+      "claimed_event_id": 103,
+      "command_id": "9001",
+      "events_emitted": 3,
+      "frame_id": "f-1",
+      "last_event_id": 106,
+      "output_ref": {
+        "media_type": "application/json",
+        "ref": "gs://bucket/output-1",
+        "row_count": 42,
+        "sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+      },
+      "output_ref_summary": {
+        "media_type": "application/json",
+        "ref": "gs://bucket/output-1",
+        "row_count": 42,
+        "schema_digest": null,
+        "sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+      },
+      "row_count": 42,
+      "stage_id": "s-1",
+      "status": "success",
+      "terminal_event_id": 105
+    }
+  },
+  "last_event_id": 112,
+  "last_event_type": "playbook.completed",
+  "loops": {
+    "L-1": {
+      "completed": true,
+      "done": 1,
+      "failed": 0,
+      "last_event_id": 108,
+      "loop_id": "L-1",
+      "step_name": "iterate",
+      "total": 2
+    }
+  },
+  "stages": {
+    "s-1": {
+      "closed_event_id": 111,
+      "events_emitted": 0,
+      "failed_count": 0,
+      "frame_count": 0,
+      "kind": "fanout",
+      "last_event_id": 111,
+      "opened_event_id": 102,
+      "row_count": 0,
+      "stage_id": "s-1",
+      "status": "CLOSED",
+      "step_name": "fanout"
+    }
+  }
+}
