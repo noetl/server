@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.52.0](https://github.com/noetl/server/compare/v2.51.1...v2.52.0) (2026-06-07)
+
+### Features
+
+* **replay:** Phase D R5 R2 — stages + frames + commands projections ([#148](https://github.com/noetl/server/issues/148)) ([43f3a08](https://github.com/noetl/server/commit/43f3a08b559d696417c20bb9a31f6c899b4c3fc5)), closes [noetl/ai-meta#49](https://github.com/noetl/ai-meta/issues/49) [noetl/ai-meta#49](https://github.com/noetl/ai-meta/issues/49)
+
 ## [2.51.1](https://github.com/noetl/server/compare/v2.51.0...v2.51.1) (2026-06-07)
 
 ### Bug Fixes
