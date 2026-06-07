@@ -48,6 +48,7 @@ fn build_router(
     keychain_service: KeychainService,
     execution_service: ExecutionService,
     runtime_service: RuntimeService,
+    replay_service: crate::services::ReplayService,
     wallet_cipher: noetl_server::crypto::EnvelopeCipher,
 ) -> Router {
     // CORS configuration - allow all origins for development
@@ -239,6 +240,14 @@ fn build_router(
         )
         .with_state(execution_service);
 
+    // Replay engine routes (Phase D R5 of noetl/ai-meta#49 →
+    // noetl/server#148).  Round 1 ships `GET /api/replay/state`
+    // with the minimal `execution` projection.  Service uses
+    // `state.pools` for shard-aware reads.
+    let replay_routes = Router::new()
+        .route("/api/replay/state", get(handlers::replay::replay_state))
+        .with_state(replay_service);
+
     // Variable routes (transient table)
     let variable_routes = Router::new()
         .route("/api/vars/{execution_id}", get(handlers::variables::list))
@@ -373,6 +382,7 @@ fn build_router(
         .merge(keychain_routes)
         .merge(execution_routes)
         .merge(executions_routes)
+        .merge(replay_routes)
         .merge(variable_routes)
         .merge(runtime_routes)
         .merge(sharding_routes)
@@ -608,6 +618,11 @@ async fn main() -> anyhow::Result<()> {
     let execution_service = ExecutionService::new(state.pools.clone(), state.snowflake.clone());
     let runtime_service = RuntimeService::new(db_pool.clone(), state.snowflake.clone());
 
+    // Phase D R5 Round 1 (noetl/ai-meta#49 → noetl/server#148).
+    // Replay engine — per-execution event reconstruction; uses
+    // `state.pools` for shard-aware reads of `noetl.event`.
+    let replay_service = crate::services::ReplayService::new(state.pools.clone());
+
     // Build the router
     let app = build_router(
         state,
@@ -617,6 +632,7 @@ async fn main() -> anyhow::Result<()> {
         keychain_service,
         execution_service,
         runtime_service,
+        replay_service,
         wallet_cipher_for_router,
     );
 
