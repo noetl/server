@@ -18,7 +18,8 @@ use noetl_server::{
     db::{DbPool, DbPoolMap, create_pool},
     handlers,
     services::{
-        CatalogService, CredentialService, ExecutionService, KeychainService, RuntimeService,
+        CatalogService, CredentialService, ExecutionService, KeychainService, ReplayService,
+        RuntimeService,
     },
     state::AppState,
 };
@@ -48,7 +49,7 @@ fn build_router(
     keychain_service: KeychainService,
     execution_service: ExecutionService,
     runtime_service: RuntimeService,
-    replay_service: crate::services::ReplayService,
+    replay_service: ReplayService,
     wallet_cipher: noetl_server::crypto::EnvelopeCipher,
 ) -> Router {
     // CORS configuration - allow all origins for development
@@ -621,7 +622,7 @@ async fn main() -> anyhow::Result<()> {
     // Phase D R5 Round 1 (noetl/ai-meta#49 → noetl/server#148).
     // Replay engine — per-execution event reconstruction; uses
     // `state.pools` for shard-aware reads of `noetl.event`.
-    let replay_service = crate::services::ReplayService::new(state.pools.clone());
+    let replay_service = ReplayService::new(state.pools.clone());
 
     // Build the router
     let app = build_router(
