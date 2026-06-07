@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.48.0](https://github.com/noetl/server/compare/v2.47.0...v2.48.0) (2026-06-07)
+
+### Features
+
+* **internal:** container-callback endpoint (Round 2 of [#43](https://github.com/noetl/server/issues/43)) ([3a05cc4](https://github.com/noetl/server/commit/3a05cc4389e282acf73a14429a2e93faafe06179)), closes [noetl/ops#166](https://github.com/noetl/ops/issues/166) [noetl/ops#166](https://github.com/noetl/ops/issues/166) [noetl/tools#36](https://github.com/noetl/tools/issues/36) [#140](https://github.com/noetl/server/issues/140)
+
 ## [2.47.0](https://github.com/noetl/server/compare/v2.46.0...v2.47.0) (2026-06-07)
 
 ### Features
