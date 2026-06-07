@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.49.0](https://github.com/noetl/server/compare/v2.48.0...v2.49.0) (2026-06-07)
+
+### Features
+
+* **engine:** fan-in / reduce barrier — defer multi-upstream dispatch ([#142](https://github.com/noetl/server/issues/142)) ([8e7a5de](https://github.com/noetl/server/commit/8e7a5de73e0a41c2387545527f665b6fd2e02875)), closes [noetl/ai-meta#49](https://github.com/noetl/ai-meta/issues/49) [noetl/ai-meta#49](https://github.com/noetl/ai-meta/issues/49)
+
 ## [2.48.0](https://github.com/noetl/server/compare/v2.47.0...v2.48.0) (2026-06-07)
 
 ### Features
