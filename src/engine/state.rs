@@ -359,6 +359,33 @@ impl WorkflowState {
                     }
                 }
             }
+            "step.skipped" | "step_skipped" => {
+                // Phase D R4 slice 2 (noetl/ai-meta#49 →
+                // noetl/server#144).  The orchestrator emits
+                // `step.skipped` when a step's `when` guard evaluates
+                // false (see `process_in_progress` in orchestrator.rs).
+                // Without this arm `reconstruct` left the step in
+                // `StepState::Pending` and every downstream consumer
+                // (fan-in barrier check, completion-decision quiescent
+                // clause, next-pass dispatch loop) was blind to the
+                // skip.  The barrier check needs `is_step_done` to
+                // see `Skipped` so a fan-in target with a guard-false
+                // upstream + a real upstream eventually dispatches.
+                //
+                // We set `entered_at` to the event's `created_at` —
+                // semantically the step's lifecycle began at the
+                // moment the guard was evaluated; the workflow has
+                // no other anchor for skipped steps.
+                if let Some(name) = &event.node_name {
+                    let step = self
+                        .steps
+                        .entry(name.clone())
+                        .or_insert_with(|| StepInfo::new(name));
+                    step.state = StepState::Skipped;
+                    step.entered_at = Some(event.created_at);
+                    step.completed_at = Some(event.created_at);
+                }
+            }
             "command.issued" => {
                 if let Some(name) = &event.node_name {
                     let step = self
@@ -878,6 +905,53 @@ mod tests {
         assert_eq!(
             state.steps.get("step1").unwrap().state,
             StepState::Completed
+        );
+    }
+
+    /// Phase D R4 slice 2 (noetl/server#144).  `step.skipped`
+    /// events emitted by the orchestrator (`process_in_progress`
+    /// when a step's `when` guard evaluates false) used to be
+    /// silently dropped by `apply_event` — leaving the step in
+    /// `StepState::Pending` and breaking the fan-in barrier's
+    /// terminal-state check for guard-skipped upstreams.  The new
+    /// arm records the step into `state.steps` with
+    /// `StepState::Skipped` and stamps `entered_at` +
+    /// `completed_at` to the event timestamp so the lifecycle is
+    /// recorded even though no actual work ran.
+    #[test]
+    fn step_skipped_event_marks_state_skipped() {
+        let mut state = WorkflowState::new(1, 1);
+
+        // Step doesn't exist yet — apply_event creates it.
+        state.apply_event(&make_event("step.skipped", Some("guarded_step")));
+        let step = state
+            .steps
+            .get("guarded_step")
+            .expect("apply_event should record the skipped step");
+        assert_eq!(step.state, StepState::Skipped);
+        assert!(step.entered_at.is_some());
+        assert!(step.completed_at.is_some());
+
+        // Skipped step is terminal — `is_step_done` returns true
+        // (this is the load-bearing check for the fan-in barrier).
+        assert!(state.is_step_done("guarded_step"));
+        // But it's NOT completed (Completed and Skipped are
+        // distinct terminal states); the dashboard should be able
+        // to tell them apart.
+        assert!(!state.is_step_completed("guarded_step"));
+    }
+
+    /// Underscore alias `step_skipped` works the same as the
+    /// dotted form — both are emitted depending on the producer
+    /// (Python-era code historically used the underscore form;
+    /// the orchestrator and apply_event now accept both).
+    #[test]
+    fn step_skipped_underscore_alias_also_marks_skipped() {
+        let mut state = WorkflowState::new(1, 1);
+        state.apply_event(&make_event("step_skipped", Some("guarded_step")));
+        assert_eq!(
+            state.steps.get("guarded_step").unwrap().state,
+            StepState::Skipped
         );
     }
 

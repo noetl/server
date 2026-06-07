@@ -1995,25 +1995,13 @@ mod tests {
         );
     }
 
-    /// TODO(noetl/server#142 follow-up): `state::apply_event`
-    /// currently has no case for `step.skipped`, so an upstream
-    /// that goes through the step.when guard-false path stays in
-    /// `StepState::Pending` rather than `StepState::Skipped`.  The
-    /// orchestrator then RE-dispatches the upstream when its
-    /// parent's command.completed event lands.  The barrier code
-    /// in this PR already does the right thing on the
-    /// reconstructed state side (the `is_step_done(up)` clause at
-    /// line 540 of state.rs treats Skipped as terminal); the
-    /// missing piece is the apply_event mapping.  File a sibling
-    /// sub-issue to add the `step.skipped` arm in apply_event and
-    /// flip this test from `#[ignore]` to active.  Reality today:
-    /// a skipped upstream defers reduce dispatch forever, which is
-    /// arguably worse than the pre-PR behaviour of dispatching on
-    /// first completion — but only triggers when a fan-in target
-    /// has BOTH a real branch AND a when-guarded branch sharing
-    /// the same upstream parent, which is rare in practice.
+    /// Phase D R4 slice 2 (noetl/server#144) flipped this from
+    /// `#[ignore]` to active by adding the `step.skipped` arm to
+    /// `state::apply_event`.  The barrier check already treated
+    /// Skipped as terminal via `is_step_done` (state.rs:540); the
+    /// missing piece was the apply_event mapping that records the
+    /// skipped step into `state.steps` with `StepState::Skipped`.
     #[test]
-    #[ignore]
     fn test_reduce_step_treats_skipped_upstream_as_done() {
         // Same topology but branch_b is SKIPPED (the step.when
         // guard-false path emits `step.skipped`, which apply_event
