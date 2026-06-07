@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.44.0](https://github.com/noetl/server/compare/v2.43.0...v2.44.0) (2026-06-07)
+
+### Features
+
+* **keychain:** background refresh + stampede collapse (Phase 7c.3) ([da4bd37](https://github.com/noetl/server/commit/da4bd37013781cc5c4aec10b83133a3e1f313e6c)), closes [server#125](https://github.com/noetl/server/issues/125) [server#131](https://github.com/noetl/server/issues/131) [#135](https://github.com/noetl/server/issues/135) [noetl/ai-meta#61](https://github.com/noetl/ai-meta/issues/61)
+
 ## [2.43.0](https://github.com/noetl/server/compare/v2.42.0...v2.43.0) (2026-06-07)
 
 ### Features
