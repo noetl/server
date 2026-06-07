@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.47.0](https://github.com/noetl/server/compare/v2.46.0...v2.47.0) (2026-06-07)
+
+### Features
+
+* **secrets:** GCP iamcredentials.generateAccessToken provider (Phase 6d.2) ([55636ca](https://github.com/noetl/server/commit/55636ca13b22f60fc3d02671e8204022706edd6e)), closes [noetl/ai-meta#61](https://github.com/noetl/ai-meta/issues/61) [#133](https://github.com/noetl/server/issues/133) [noetl/ai-meta#61](https://github.com/noetl/ai-meta/issues/61)
+
 ## [2.46.0](https://github.com/noetl/server/compare/v2.45.0...v2.46.0) (2026-06-07)
 
 ### Features
