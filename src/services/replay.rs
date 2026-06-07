@@ -194,6 +194,23 @@ pub struct ReplayState {
     #[serde(default)]
     pub loops: std::collections::BTreeMap<String, ReplayLoopState>,
 
+    /// Hash of the upcaster registry that was active when the
+    /// snapshot was taken / when the fold ran.  Populated when
+    /// the caller passes `upcaster_registry_digest` via
+    /// [`ReplayFoldOptions`].  Mirrors Python's
+    /// `state["upcaster_registry_digest"]`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upcaster_registry_digest: Option<String>,
+
+    /// Snapshot metadata when this fold was seeded from a prior
+    /// snapshot.  R5 R5 populates this when the caller passes a
+    /// [`ReplaySnapshotSeed`] via [`ReplayFoldOptions`].  Mirrors
+    /// Python's `state["replay_snapshot"]`.  Note: this is only
+    /// the *metadata* — the seed's full `state` is folded into
+    /// `base_state` and isn't echoed back here.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replay_snapshot: Option<ReplaySnapshotInfo>,
+
     /// Top-level [`Checksum`] over the rest of the state
     /// (everything except `checksum` + `projection_checksums`
     /// themselves).  Populated by R5 R4.  Replaces Python's flat
@@ -465,6 +482,89 @@ impl Checksum {
     }
 }
 
+/// Snapshot used as a replay seed.  Mirrors Python's
+/// `ReplaySnapshotSeed` frozen dataclass from
+/// `noetl/server/api/replay/types.py`.  When the caller wants
+/// to skip folding events older than the snapshot's `version`,
+/// it loads the snapshot from storage and passes both:
+/// - the snapshot's `state` field as `base_state` on
+///   [`ReplayFoldOptions`], and
+/// - the snapshot itself as `snapshot_seed`.
+///
+/// The fold deep-copies `base_state`, strips its checksum
+/// fields (they get recomputed at the end), and attaches the
+/// snapshot metadata to `ReplayState.replay_snapshot` for
+/// consumers that need to know the fold was seeded.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplaySnapshotSeed {
+    /// Aggregate the snapshot belongs to (typically the
+    /// `execution_id` as a string, but the Python contract
+    /// keeps it generic).
+    pub aggregate_id: String,
+    /// Aggregate kind — usually `"execution"` for replay
+    /// snapshots; `"business_object"` for per-domain snapshots.
+    pub aggregate_type: String,
+    /// Snapshot's version cursor — the last `event_id` folded
+    /// into `state`.  The fold MUST only consider events with
+    /// `event_id > version` (the caller is responsible for the
+    /// `after_event_id=version` query).
+    pub version: i64,
+    /// Snapshot's `Checksum` at the time it was written.
+    pub checksum: Checksum,
+    /// The folded state the snapshot captures.  Plumbed into
+    /// the fold as `base_state` on
+    /// [`ReplayFoldOptions::base_state`].
+    pub state: ReplayState,
+    /// Provenance metadata (snapshot author, creation time,
+    /// upcaster digest, …).  Round-trips into
+    /// `ReplayState.replay_snapshot.meta` for consumers.
+    #[serde(default)]
+    pub meta: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Snapshot metadata surfaced on the output [`ReplayState`]
+/// when a fold was seeded from a [`ReplaySnapshotSeed`].
+/// Mirrors Python's `state["replay_snapshot"]` dict — same
+/// field names, same nullability.  The full `state` from the
+/// seed isn't echoed here because it already went into
+/// `base_state`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplaySnapshotInfo {
+    pub aggregate_id: String,
+    pub aggregate_type: String,
+    pub version: i64,
+    pub checksum: Checksum,
+    #[serde(default)]
+    pub meta: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Optional inputs to [`fold_replay_state_with_options`].  R1
+/// through R4 always passed defaults; R5 adds `base_state` +
+/// `snapshot_seed` + `upcaster_registry_digest` as the
+/// snapshot-seeded fold path.
+#[derive(Debug, Clone, Default)]
+pub struct ReplayFoldOptions {
+    /// Prior fold output used as the starting point for this
+    /// fold.  Typically the `state` field of a
+    /// [`ReplaySnapshotSeed`] loaded from storage.  The fold
+    /// deep-copies, then strips out the checksum + projection_checksums
+    /// fields (they recompute at the end).  Event counters
+    /// (`event_count`, `last_event_id`, …) continue from where
+    /// the base state left off — the caller is responsible for
+    /// querying only events newer than the snapshot's `version`.
+    pub base_state: Option<ReplayState>,
+    /// Snapshot metadata attached to the output's
+    /// `replay_snapshot` field.  Independent of `base_state` —
+    /// you typically set both, but a caller could attach
+    /// metadata without seeding the fold (rarely useful).
+    pub snapshot_seed: Option<ReplaySnapshotSeed>,
+    /// Hash of the upcaster registry that was active when the
+    /// snapshot was taken / when the fold ran.  Used by future
+    /// validation logic to detect schema-version drift between
+    /// snapshot creation and replay; flows through as-is.
+    pub upcaster_registry_digest: Option<String>,
+}
+
 /// Subset of [`crate::db::models::event::Event`] columns the
 /// replay fold actually needs.  Extended in R5 R2 to include the
 /// stage / frame / command identity columns + the `meta` JSON
@@ -700,23 +800,90 @@ pub fn fold_replay_state(
     execution_id: i64,
     projection: ReplayProjection,
 ) -> ReplayState {
-    let mut state = ReplayState {
-        tenant_id: tenant_id.to_string(),
-        organization_id: organization_id.to_string(),
+    fold_replay_state_with_options(
+        events,
+        tenant_id,
+        organization_id,
         execution_id,
-        projection: projection.as_str().to_string(),
-        event_count: 0,
-        last_event_id: None,
-        last_event_type: None,
-        execution: ReplayExecutionState::default(),
-        stages: std::collections::BTreeMap::new(),
-        frames: std::collections::BTreeMap::new(),
-        commands: std::collections::BTreeMap::new(),
-        business_objects: std::collections::BTreeMap::new(),
-        loops: std::collections::BTreeMap::new(),
-        checksum: None,
-        projection_checksums: std::collections::BTreeMap::new(),
+        projection,
+        ReplayFoldOptions::default(),
+    )
+}
+
+/// Extended fold entry point — accepts a [`ReplayFoldOptions`]
+/// for the snapshot-seeded path.  R5 R5 adds this; the
+/// 5-argument [`fold_replay_state`] above is a thin shim that
+/// passes `ReplayFoldOptions::default()`.
+pub fn fold_replay_state_with_options(
+    events: &[ReplayEventRow],
+    tenant_id: &str,
+    organization_id: &str,
+    execution_id: i64,
+    projection: ReplayProjection,
+    options: ReplayFoldOptions,
+) -> ReplayState {
+    let ReplayFoldOptions {
+        base_state,
+        snapshot_seed,
+        upcaster_registry_digest,
+    } = options;
+
+    // Either start from the supplied base_state (snapshot-seeded
+    // path) or build a fresh state.  When seeded, strip the
+    // checksum + projection_checksums fields — they will
+    // recompute at the end against the new event tail.
+    let mut state = match base_state {
+        Some(mut base) => {
+            base.checksum = None;
+            base.projection_checksums = std::collections::BTreeMap::new();
+            // The caller's tenant/org/execution_id override
+            // whatever the snapshot recorded (the snapshot may
+            // be older than a tenant rename, or the caller may
+            // be replaying into a different organization).
+            base.tenant_id = tenant_id.to_string();
+            base.organization_id = organization_id.to_string();
+            base.execution_id = execution_id;
+            base.projection = projection.as_str().to_string();
+            base
+        }
+        None => ReplayState {
+            tenant_id: tenant_id.to_string(),
+            organization_id: organization_id.to_string(),
+            execution_id,
+            projection: projection.as_str().to_string(),
+            event_count: 0,
+            last_event_id: None,
+            last_event_type: None,
+            execution: ReplayExecutionState::default(),
+            stages: std::collections::BTreeMap::new(),
+            frames: std::collections::BTreeMap::new(),
+            commands: std::collections::BTreeMap::new(),
+            business_objects: std::collections::BTreeMap::new(),
+            loops: std::collections::BTreeMap::new(),
+            upcaster_registry_digest: None,
+            replay_snapshot: None,
+            checksum: None,
+            projection_checksums: std::collections::BTreeMap::new(),
+        },
     };
+
+    // upcaster_registry_digest from the caller wins over
+    // whatever the base_state carried — the fold's digest
+    // represents the registry active at this fold time.
+    state.upcaster_registry_digest = upcaster_registry_digest.or(state.upcaster_registry_digest);
+
+    // Attach snapshot metadata when a seed was provided.  We
+    // only surface the lightweight `ReplaySnapshotInfo` — the
+    // seed's full `state` is already in `base_state`.
+    if let Some(seed) = snapshot_seed {
+        state.replay_snapshot = Some(ReplaySnapshotInfo {
+            aggregate_id: seed.aggregate_id,
+            aggregate_type: seed.aggregate_type,
+            version: seed.version,
+            checksum: seed.checksum,
+            meta: seed.meta,
+        });
+    }
 
     // Events arrive sorted ASC by event_id from `load_events`; the
     // fold is order-deterministic regardless thanks to the
@@ -2298,4 +2465,207 @@ mod tests {
         assert!(v["checksum"]["value"].as_str().unwrap().len() == 64);
     }
 
+    // ----- R5 R5: snapshot seed + base_state tests -----
+
+    #[test]
+    fn fold_default_options_omit_snapshot_and_digest() {
+        // No options → no `replay_snapshot`, no
+        // `upcaster_registry_digest` in JSON (skip_serializing_if).
+        let state = fold_replay_state(&[], "default", "default", 1, ReplayProjection::All);
+        let v = serde_json::to_value(&state).unwrap();
+        assert!(v.get("replay_snapshot").is_none());
+        assert!(v.get("upcaster_registry_digest").is_none());
+        assert!(state.replay_snapshot.is_none());
+        assert!(state.upcaster_registry_digest.is_none());
+    }
+
+    #[test]
+    fn fold_with_options_propagates_upcaster_digest() {
+        let state = fold_replay_state_with_options(
+            &[],
+            "t",
+            "o",
+            42,
+            ReplayProjection::All,
+            ReplayFoldOptions {
+                upcaster_registry_digest: Some("abc123".to_string()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(state.upcaster_registry_digest.as_deref(), Some("abc123"));
+        let v = serde_json::to_value(&state).unwrap();
+        assert_eq!(v["upcaster_registry_digest"].as_str(), Some("abc123"));
+    }
+
+    #[test]
+    fn fold_with_snapshot_seed_surfaces_info_metadata() {
+        // Build a snapshot seed with a checksum + meta.
+        let prev = fold_replay_state(&[], "t", "o", 42, ReplayProjection::All);
+        let seed = ReplaySnapshotSeed {
+            aggregate_id: "exec/42".to_string(),
+            aggregate_type: "execution".to_string(),
+            version: 100,
+            checksum: prev.checksum.clone().unwrap(),
+            state: prev,
+            meta: serde_json::Map::from_iter([(
+                "author".to_string(),
+                serde_json::json!("snapshot-bot"),
+            )]),
+        };
+
+        let state = fold_replay_state_with_options(
+            &[],
+            "t",
+            "o",
+            42,
+            ReplayProjection::All,
+            ReplayFoldOptions {
+                snapshot_seed: Some(seed),
+                ..Default::default()
+            },
+        );
+
+        let info = state
+            .replay_snapshot
+            .as_ref()
+            .expect("replay_snapshot populated when seed provided");
+        assert_eq!(info.aggregate_id, "exec/42");
+        assert_eq!(info.aggregate_type, "execution");
+        assert_eq!(info.version, 100);
+        assert_eq!(info.checksum.algorithm, ChecksumType::Sha256);
+        assert_eq!(
+            info.meta.get("author").and_then(|v| v.as_str()),
+            Some("snapshot-bot"),
+        );
+    }
+
+    #[test]
+    fn fold_with_base_state_continues_counters_from_seed() {
+        // Build an initial state by folding 2 events.
+        let initial_events = vec![
+            ev(1, "playbook_started", None, "RUNNING"),
+            ev(2, "step.enter", Some("start"), "ENTERED"),
+        ];
+        let base = fold_replay_state(&initial_events, "t", "o", 42, ReplayProjection::All);
+        assert_eq!(base.event_count, 2);
+        assert_eq!(base.last_event_id, Some(2));
+
+        // Now fold 2 MORE events with `base_state` set — the
+        // counters continue from where base left off, not from 0.
+        let more_events = vec![
+            ev(3, "step.exit", Some("start"), "EXITED"),
+            ev(4, "playbook.completed", None, "COMPLETED"),
+        ];
+        let seeded = fold_replay_state_with_options(
+            &more_events,
+            "t",
+            "o",
+            42,
+            ReplayProjection::All,
+            ReplayFoldOptions {
+                base_state: Some(base),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(seeded.event_count, 4, "counters continue from base");
+        assert_eq!(seeded.last_event_id, Some(4));
+        assert_eq!(seeded.last_event_type.as_deref(), Some("playbook.completed"));
+        assert_eq!(seeded.execution.status, "COMPLETED");
+    }
+
+    #[test]
+    fn fold_with_base_state_strips_prior_checksum() {
+        // Base state has its own checksum; the seeded fold MUST
+        // recompute, not preserve.
+        let base = fold_replay_state(&[], "t", "o", 42, ReplayProjection::All);
+        let base_checksum = base.checksum.clone().unwrap().value;
+
+        let seeded = fold_replay_state_with_options(
+            &[ev(1, "playbook.completed", None, "COMPLETED")],
+            "t",
+            "o",
+            42,
+            ReplayProjection::All,
+            ReplayFoldOptions {
+                base_state: Some(base),
+                ..Default::default()
+            },
+        );
+
+        // New checksum reflects the new event tail — must differ
+        // from the stale base checksum.
+        assert_ne!(seeded.checksum.as_ref().unwrap().value, base_checksum);
+        // All 6 projection_checksums entries still populate.
+        assert_eq!(seeded.projection_checksums.len(), 6);
+    }
+
+    #[test]
+    fn fold_with_base_state_overrides_tenant_org_execution_id() {
+        // Snapshot was recorded under one tenant; we replay it
+        // for a different tenant — caller's args win.
+        let base = fold_replay_state(&[], "old-tenant", "old-org", 99, ReplayProjection::All);
+
+        let seeded = fold_replay_state_with_options(
+            &[],
+            "new-tenant",
+            "new-org",
+            42,
+            ReplayProjection::All,
+            ReplayFoldOptions {
+                base_state: Some(base),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(seeded.tenant_id, "new-tenant");
+        assert_eq!(seeded.organization_id, "new-org");
+        assert_eq!(seeded.execution_id, 42);
+    }
+
+    #[test]
+    fn fold_with_seed_caller_digest_wins_over_base_state_digest() {
+        // Base state carries an upcaster digest, caller passes a
+        // newer one — the newer one wins (the registry active at
+        // fold time is authoritative).
+        let mut base = fold_replay_state(&[], "t", "o", 42, ReplayProjection::All);
+        base.upcaster_registry_digest = Some("v1-digest".to_string());
+
+        let seeded = fold_replay_state_with_options(
+            &[],
+            "t",
+            "o",
+            42,
+            ReplayProjection::All,
+            ReplayFoldOptions {
+                base_state: Some(base),
+                upcaster_registry_digest: Some("v2-digest".to_string()),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(seeded.upcaster_registry_digest.as_deref(), Some("v2-digest"));
+    }
+
+    #[test]
+    fn fold_with_seed_preserves_base_digest_when_caller_supplies_none() {
+        // No caller-supplied digest → base_state's digest carries
+        // forward (we don't accidentally wipe it).
+        let mut base = fold_replay_state(&[], "t", "o", 42, ReplayProjection::All);
+        base.upcaster_registry_digest = Some("v1-digest".to_string());
+
+        let seeded = fold_replay_state_with_options(
+            &[],
+            "t",
+            "o",
+            42,
+            ReplayProjection::All,
+            ReplayFoldOptions {
+                base_state: Some(base),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(seeded.upcaster_registry_digest.as_deref(), Some("v1-digest"));
+    }
 }
