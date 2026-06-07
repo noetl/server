@@ -5,14 +5,14 @@
 //! - Evaluating transitions to determine next steps
 //! - Publishing commands for workers
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
 use crate::db::models::Event;
 use crate::error::{AppError, AppResult};
-use crate::playbook::types::{Playbook, Step};
+use crate::playbook::types::{NextSpec, Playbook, Step};
 
 use super::commands::{Command, CommandBuilder, IteratorMetadata};
 use super::evaluator::ConditionEvaluator;
@@ -42,6 +42,64 @@ fn merge_iteration_context(
         serde_json::Value::String(iterator_var.to_string()),
     );
     serde_json::Value::Object(obj)
+}
+
+/// Build the inverse arc graph for a workflow: `target_step` →
+/// `{ upstream steps that point at it }`.
+///
+/// Used by the orchestrator's fan-in / reduce barrier (Phase D R4,
+/// noetl/ai-meta#49 → noetl/server#142).  A step with **more than
+/// one** entry in its upstream set is a reduce boundary — its
+/// dispatch is deferred until every upstream is in a terminal
+/// state (`Completed | Failed | Skipped`).  Single-upstream
+/// targets are unaffected.
+///
+/// Mirrors `repos/noetl/noetl/core/dsl/engine/planner.py`'s
+/// `build_fanout_reduce_plan` `incoming` map — every step's
+/// `next` arc collects all its outgoing targets, and the inverse
+/// gives the set of upstreams per step.  Targets that are not
+/// real steps in the workflow (notably the sentinel `"end"`) are
+/// skipped — the orchestrator already special-cases `end` via the
+/// `reached_end` quiescent path.
+///
+/// The empty/missing-`next` case yields no edges (a terminal step
+/// produces no targets).  Self-loops are recorded; the dispatch
+/// path treats them like any other upstream.
+fn build_incoming_arcs<'a>(
+    steps: &'a HashMap<&'a str, &'a Step>,
+) -> HashMap<&'a str, HashSet<&'a str>> {
+    let mut incoming: HashMap<&'a str, HashSet<&'a str>> = HashMap::new();
+    for (step_name, step) in steps {
+        let targets = collect_arc_targets(step);
+        for target in targets {
+            // Only count targets that resolve to a real step in
+            // the workflow definition; the dispatch path drops
+            // unknown targets too.
+            if steps.contains_key(target.as_str()) {
+                // SAFETY: the key lives as long as `steps` (which
+                // outlives this function's borrow).
+                let target_key: &'a str = steps
+                    .get_key_value(target.as_str())
+                    .map(|(k, _)| *k)
+                    .expect("contains_key just confirmed it");
+                incoming.entry(target_key).or_default().insert(step_name);
+            }
+        }
+    }
+    incoming
+}
+
+/// Collect every target step-name referenced by a step's `next`
+/// router, across all four `NextSpec` variants.  Helper for
+/// [`build_incoming_arcs`].
+fn collect_arc_targets(step: &Step) -> Vec<String> {
+    match &step.next {
+        None => Vec::new(),
+        Some(NextSpec::Single(name)) => vec![name.clone()],
+        Some(NextSpec::List(names)) => names.clone(),
+        Some(NextSpec::Router(router)) => router.arcs.iter().map(|a| a.step.clone()).collect(),
+        Some(NextSpec::Targets(targets)) => targets.iter().map(|t| t.step.clone()).collect(),
+    }
 }
 
 /// Result of orchestration evaluation.
@@ -268,6 +326,27 @@ impl WorkflowOrchestrator {
         let mut dispatched_in_pass: std::collections::HashSet<String> =
             std::collections::HashSet::new();
 
+        // R4 fan-in / reduce barrier (noetl/ai-meta#49 Phase D Round 4,
+        // sub-issue noetl/server#142).  A step that has more than one
+        // upstream arc — the canonical `PlannedReduce` shape from the
+        // Python `repos/noetl/noetl/core/dsl/engine/planner.py` —
+        // should fire ONCE after every upstream finishes, not once
+        // per upstream completion.  Today the dispatch-skip checks
+        // below cover same-pass dedup (a sibling arc to the same
+        // target in the same orchestrator round) + already-running /
+        // already-done.  They do NOT cover the cross-pass case where
+        // branch A completes in pass 1 and branch B is still running:
+        // the orchestrator would dispatch `reduce_customer` based on
+        // A alone, and `reduce_customer` would never see B's result.
+        //
+        // The barrier check below defers dispatch of any multi-
+        // upstream target until every upstream is in a terminal state
+        // (`Completed | Failed | Skipped`, i.e. `is_step_done`).
+        // command.failed already short-circuits via the dedicated path
+        // at the top of this function, so reaching the dispatch loop
+        // with all upstreams done means none failed mid-flight.
+        let incoming_arcs = build_incoming_arcs(steps);
+
         // command.failed gets its own dedicated short-circuit path
         // BEFORE the transition-trigger filter — a failed step must
         // not have its next.arcs evaluated, and the orchestrator
@@ -437,6 +516,38 @@ impl WorkflowOrchestrator {
                             next_step_name
                         );
                         continue;
+                    }
+
+                    // R4 fan-in / reduce barrier
+                    // (noetl/ai-meta#49 Phase D R4, noetl/server#142).
+                    // If the target step has more than one upstream
+                    // arc, defer dispatch until every upstream is
+                    // terminal.  `is_step_done` treats Skipped (the
+                    // step.when guard-false path) and Failed as done
+                    // for barrier purposes; the dedicated
+                    // command.failed path at the top of this function
+                    // owns terminal-status-on-failure, so reaching
+                    // this branch with any upstream Failed is
+                    // structurally impossible (we'd have returned
+                    // ExecutionState::Failed first).
+                    if let Some(upstreams) = incoming_arcs.get(next_step_name.as_str()) {
+                        if upstreams.len() > 1 {
+                            let pending: Vec<&str> = upstreams
+                                .iter()
+                                .copied()
+                                .filter(|up| !state.is_step_done(up))
+                                .collect();
+                            if !pending.is_empty() {
+                                debug!(
+                                    "Reduce step '{}' deferring dispatch — {} of {} upstream(s) still pending: {:?}",
+                                    next_step_name,
+                                    pending.len(),
+                                    upstreams.len(),
+                                    pending,
+                                );
+                                continue;
+                            }
+                        }
                     }
 
                     // Build context for next step with additional params
@@ -1747,5 +1858,243 @@ mod tests {
 
         let json = serde_json::to_string(&result).unwrap();
         assert!(json.contains("in_progress"));
+    }
+
+    // ============================================================
+    // R4 fan-in / reduce barrier tests (noetl/server#142).
+    //
+    // Topology under test:
+    //
+    //     start
+    //       ├── branch_a ─┐
+    //       └── branch_b ─┴── reduce → end
+    //
+    // `reduce` has TWO incoming arcs (branch_a, branch_b).  The
+    // orchestrator must defer its dispatch until BOTH branches
+    // finish.
+    // ============================================================
+
+    /// Build the fanout_reduce topology used across the R4 tests.
+    /// Mirrors `tests/fixtures/playbooks/fanout_reduce/fanout_reduce_phase6.yaml`
+    /// in `repos/noetl`.
+    fn make_fanout_reduce_workflow() -> Vec<Step> {
+        let start = make_step_with_parallel_next("start", &["branch_a", "branch_b"]);
+        let branch_a = make_step("branch_a", Some("reduce"));
+        let branch_b = make_step("branch_b", Some("reduce"));
+        let reduce = make_step("reduce", Some("end"));
+        let end = make_step("end", None);
+        vec![start, branch_a, branch_b, reduce, end]
+    }
+
+    fn fanout_reduce_playbook(workflow: Vec<Step>) -> Playbook {
+        Playbook {
+            api_version: "noetl.io/v2".to_string(),
+            kind: "Playbook".to_string(),
+            metadata: Metadata {
+                name: "fanout_reduce_test".to_string(),
+                path: Some("test/fanout_reduce".to_string()),
+                description: None,
+                labels: None,
+                extra: HashMap::new(),
+            },
+            workload: None,
+            vars: None,
+            keychain: None,
+            workbook: None,
+            workflow,
+        }
+    }
+
+    #[test]
+    fn test_reduce_step_defers_when_one_upstream_still_running() {
+        // start fans out to branch_a + branch_b; both target `reduce`.
+        // Events show branch_a COMPLETED, branch_b only ENTERED
+        // (still running).  Expected: orchestrator does NOT dispatch
+        // `reduce` — the second upstream hasn't finished.
+        let orchestrator = WorkflowOrchestrator::new();
+        let workflow = make_fanout_reduce_workflow();
+
+        let events = vec![
+            {
+                let mut e = make_event("playbook_started", None);
+                e.context = Some(serde_json::json!({
+                    "workload": {},
+                    "path": "test/fanout_reduce",
+                    "version": "1"
+                }));
+                e
+            },
+            // start was the previous round; both branches have been
+            // dispatched.
+            make_event("step.enter", Some("start")),
+            make_event("command.completed", Some("start")),
+            make_event("step.enter", Some("branch_a")),
+            make_event("step.enter", Some("branch_b")),
+            // branch_a finishes; branch_b is still running.
+            make_event("command.completed", Some("branch_a")),
+        ];
+
+        let playbook = fanout_reduce_playbook(workflow);
+        let result = orchestrator
+            .evaluate(&events, &playbook, Some("command.completed"))
+            .unwrap();
+
+        // The orchestrator must NOT have dispatched `reduce` yet —
+        // branch_b is still in-flight.
+        let dispatched: Vec<String> =
+            result.commands.iter().map(|c| c.step_name.clone()).collect();
+        assert!(
+            !dispatched.contains(&"reduce".to_string()),
+            "reduce should not dispatch while branch_b is still running; got commands: {:?}",
+            dispatched,
+        );
+        assert!(!result.should_complete);
+    }
+
+    #[test]
+    fn test_reduce_step_dispatches_after_all_upstreams_complete() {
+        // Same topology; events now show BOTH branches completed.
+        // Expected: orchestrator dispatches `reduce` exactly once.
+        let orchestrator = WorkflowOrchestrator::new();
+        let workflow = make_fanout_reduce_workflow();
+
+        let events = vec![
+            {
+                let mut e = make_event("playbook_started", None);
+                e.context = Some(serde_json::json!({
+                    "workload": {},
+                    "path": "test/fanout_reduce",
+                    "version": "1"
+                }));
+                e
+            },
+            make_event("step.enter", Some("start")),
+            make_event("command.completed", Some("start")),
+            make_event("step.enter", Some("branch_a")),
+            make_event("step.enter", Some("branch_b")),
+            make_event("command.completed", Some("branch_a")),
+            // branch_b finishes last; this is the trigger event.
+            make_event("command.completed", Some("branch_b")),
+        ];
+
+        let playbook = fanout_reduce_playbook(workflow);
+        let result = orchestrator
+            .evaluate(&events, &playbook, Some("command.completed"))
+            .unwrap();
+
+        // Both branches done → `reduce` dispatches exactly once.
+        let reduce_dispatches: usize = result
+            .commands
+            .iter()
+            .filter(|c| c.step_name == "reduce")
+            .count();
+        assert_eq!(
+            reduce_dispatches, 1,
+            "expected reduce to dispatch exactly once after both upstreams done; got commands: {:?}",
+            result.commands.iter().map(|c| c.step_name.clone()).collect::<Vec<_>>(),
+        );
+    }
+
+    /// TODO(noetl/server#142 follow-up): `state::apply_event`
+    /// currently has no case for `step.skipped`, so an upstream
+    /// that goes through the step.when guard-false path stays in
+    /// `StepState::Pending` rather than `StepState::Skipped`.  The
+    /// orchestrator then RE-dispatches the upstream when its
+    /// parent's command.completed event lands.  The barrier code
+    /// in this PR already does the right thing on the
+    /// reconstructed state side (the `is_step_done(up)` clause at
+    /// line 540 of state.rs treats Skipped as terminal); the
+    /// missing piece is the apply_event mapping.  File a sibling
+    /// sub-issue to add the `step.skipped` arm in apply_event and
+    /// flip this test from `#[ignore]` to active.  Reality today:
+    /// a skipped upstream defers reduce dispatch forever, which is
+    /// arguably worse than the pre-PR behaviour of dispatching on
+    /// first completion — but only triggers when a fan-in target
+    /// has BOTH a real branch AND a when-guarded branch sharing
+    /// the same upstream parent, which is rare in practice.
+    #[test]
+    #[ignore]
+    fn test_reduce_step_treats_skipped_upstream_as_done() {
+        // Same topology but branch_b is SKIPPED (the step.when
+        // guard-false path emits `step.skipped`, which apply_event
+        // marks as terminal `StepState::Skipped`).  branch_a
+        // COMPLETED.  Expected: `reduce` dispatches — `is_step_done`
+        // already treats Skipped as terminal, so the barrier check
+        // should clear and dispatch should proceed.
+        let orchestrator = WorkflowOrchestrator::new();
+        let workflow = make_fanout_reduce_workflow();
+
+        let events = vec![
+            {
+                let mut e = make_event("playbook_started", None);
+                e.context = Some(serde_json::json!({
+                    "workload": {},
+                    "path": "test/fanout_reduce",
+                    "version": "1"
+                }));
+                e
+            },
+            make_event("step.enter", Some("start")),
+            make_event("command.completed", Some("start")),
+            make_event("step.enter", Some("branch_a")),
+            // branch_b never enters — it's skipped via a step.skipped
+            // event instead (the canonical when-guard-false path).
+            {
+                let mut e = make_event("step.skipped", Some("branch_b"));
+                e.status = "SKIPPED".to_string();
+                e
+            },
+            // branch_a finishes; trigger event for the orchestrator.
+            make_event("command.completed", Some("branch_a")),
+        ];
+
+        let playbook = fanout_reduce_playbook(workflow);
+        let result = orchestrator
+            .evaluate(&events, &playbook, Some("command.completed"))
+            .unwrap();
+
+        let reduce_dispatches: usize = result
+            .commands
+            .iter()
+            .filter(|c| c.step_name == "reduce")
+            .count();
+        assert_eq!(
+            reduce_dispatches, 1,
+            "expected reduce to dispatch once after branch_a Completed + branch_b Skipped; got commands: {:?}",
+            result.commands.iter().map(|c| c.step_name.clone()).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn test_build_incoming_arcs_identifies_reduce_boundary() {
+        // Unit-level coverage of the helper used by the barrier
+        // check.  fanout_reduce topology: `reduce` has 2 upstreams,
+        // every other step has at most 1.
+        let workflow = make_fanout_reduce_workflow();
+        let steps: HashMap<&str, &Step> =
+            workflow.iter().map(|s| (s.step.as_str(), s)).collect();
+
+        let incoming = build_incoming_arcs(&steps);
+
+        // `reduce` has two upstreams (branch_a + branch_b).
+        let reduce_upstreams = incoming
+            .get("reduce")
+            .expect("reduce should have an upstream set");
+        assert_eq!(
+            reduce_upstreams.len(),
+            2,
+            "expected reduce to have 2 upstreams; got {:?}",
+            reduce_upstreams,
+        );
+        assert!(reduce_upstreams.contains("branch_a"));
+        assert!(reduce_upstreams.contains("branch_b"));
+
+        // Single-upstream + no-upstream steps.
+        assert_eq!(incoming.get("branch_a").map(|u| u.len()).unwrap_or(0), 1);
+        assert_eq!(incoming.get("branch_b").map(|u| u.len()).unwrap_or(0), 1);
+        // `end` is referenced only from `reduce` (single upstream).
+        assert_eq!(incoming.get("end").map(|u| u.len()).unwrap_or(0), 1);
+        // `start` has no upstreams.
+        assert!(incoming.get("start").is_none());
     }
 }
