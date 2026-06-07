@@ -12,6 +12,7 @@ pub mod keychain;
 pub mod runtime;
 pub mod secret_audit;
 pub mod ui_schema;
+pub mod wallet_rotate;
 
 pub use catalog::CatalogService;
 pub use credential::CredentialService;

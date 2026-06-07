@@ -18,6 +18,7 @@ pub mod secret_audit;
 pub mod sharding;
 pub mod system;
 pub mod variables;
+pub mod wallet_rotate;
 
 pub use events::{get_command, handle_event};
 pub use execute::execute;

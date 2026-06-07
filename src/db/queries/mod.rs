@@ -7,3 +7,4 @@ pub mod credential;
 pub mod event;
 pub mod keychain;
 pub mod secret_audit;
+pub mod wallet_rotate;
