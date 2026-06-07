@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.43.0](https://github.com/noetl/server/compare/v2.42.0...v2.43.0) (2026-06-07)
+
+### Features
+
+* **audit:** noetl.secret_audit table + DbAuditSink + query endpoint (Phase 7b.2) ([73dfcc5](https://github.com/noetl/server/commit/73dfcc589c54c502b9b4426bae74bfb58b3768de)), closes [#128](https://github.com/noetl/server/issues/128) [noetl/ai-meta#61](https://github.com/noetl/ai-meta/issues/61)
+* **keychain:** should_refresh primitive (Phase 7c.2) ([d39e9f1](https://github.com/noetl/server/commit/d39e9f18169ac238625c1dd75c472170753e64fd)), closes [#130](https://github.com/noetl/server/issues/130) [noetl/ai-meta#61](https://github.com/noetl/ai-meta/issues/61)
+
 ## [2.42.0](https://github.com/noetl/server/compare/v2.41.0...v2.42.0) (2026-06-06)
 
 ### Features
