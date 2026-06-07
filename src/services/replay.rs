@@ -166,24 +166,28 @@ pub struct ReplayState {
     /// `last_node_name`.
     pub execution: ReplayExecutionState,
 
-    /// Stages map.  Empty in Round 1; Round 2 populates.
+    /// Stages map populated by R5 R2.  Keyed by `stage_id`
+    /// (see [`extract_stage_id`]).
     #[serde(default)]
-    pub stages: serde_json::Map<String, serde_json::Value>,
+    pub stages: std::collections::BTreeMap<String, ReplayStageState>,
 
-    /// Frames map.  Empty in Round 1; Round 2 populates.
+    /// Frames map populated by R5 R2.  Keyed by `frame_id`
+    /// (see [`extract_frame_id`]).
     #[serde(default)]
-    pub frames: serde_json::Map<String, serde_json::Value>,
+    pub frames: std::collections::BTreeMap<String, ReplayFrameState>,
 
-    /// Commands map.  Empty in Round 1; Round 2 populates.
+    /// Commands map populated by R5 R2.  Keyed by canonical
+    /// `command_id` (top-level `noetl.event.command_id` column
+    /// preferred over `meta.command_id`).
     #[serde(default)]
-    pub commands: serde_json::Map<String, serde_json::Value>,
+    pub commands: std::collections::BTreeMap<String, ReplayCommandState>,
 
-    /// Business objects map.  Empty in Round 1; Round 3
+    /// Business objects map.  Empty in Round 1+2; Round 3
     /// populates.
     #[serde(default)]
     pub business_objects: serde_json::Map<String, serde_json::Value>,
 
-    /// Loops map.  Empty in Round 1; Round 3 populates.
+    /// Loops map.  Empty in Round 1+2; Round 3 populates.
     #[serde(default)]
     pub loops: serde_json::Map<String, serde_json::Value>,
 }
@@ -215,9 +219,95 @@ impl Default for ReplayExecutionState {
     }
 }
 
+/// Stage-level projection populated by R5 R2.  Mirrors Python's
+/// `state["stages"][stage_id]` dict shape — same field names,
+/// same nullability defaults, same status transitions.  Keyed
+/// in [`ReplayState::stages`] by the canonical `stage_id`
+/// returned by [`extract_stage_id`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ReplayStageState {
+    pub stage_id: String,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub step_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_stage_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub loop_event_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub opened_event_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub closed_event_id: Option<i64>,
+    pub frame_count: i64,
+    pub row_count: i64,
+    pub events_emitted: i64,
+    pub failed_count: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_event_id: Option<i64>,
+}
+
+/// Frame-level projection populated by R5 R2.  Mirrors Python's
+/// `state["frames"][frame_id]` dict.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ReplayFrameState {
+    pub frame_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stage_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_frame_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub claimed_event_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_event_id: Option<i64>,
+    pub status: String,
+    pub row_count: i64,
+    pub attempts: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_event_id: Option<i64>,
+    pub events_emitted: i64,
+}
+
+/// Command-level projection populated by R5 R2.  Mirrors
+/// Python's `state["commands"][command_id]` dict.  R5 R2 does
+/// NOT yet thread the heavier sub-objects (`locality`,
+/// `source_locality`, `placement`, `fanout_reduce`) into the
+/// projection — they round-trip as raw JSON values when present
+/// on `meta`, and Round 3+ may surface them as typed fields.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ReplayCommandState {
+    pub command_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stage_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frame_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_command_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_locator: Option<String>,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub issued_event_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub claimed_event_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_event_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_event_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_event_id: Option<i64>,
+}
+
 /// Subset of [`crate::db::models::event::Event`] columns the
-/// replay fold actually needs.  Round 1 reads `event_id`,
-/// `event_type`, `node_name`, `status`, `created_at`.
+/// replay fold actually needs.  Extended in R5 R2 to include the
+/// stage / frame / command identity columns + the `meta` JSON
+/// blob the Python fold reaches into for parent ids, worker
+/// locator, fanout_reduce hints, etc.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct ReplayEventRow {
     pub event_id: i64,
@@ -225,6 +315,40 @@ pub struct ReplayEventRow {
     pub node_name: Option<String>,
     pub status: String,
     pub created_at: DateTime<Utc>,
+    /// `noetl.event.stage_id` — top-level column (preferred over
+    /// `meta.stage_id` when both are set).  R5 R2 fold key for
+    /// the `stages` map.
+    #[sqlx(default)]
+    pub stage_id: Option<String>,
+    /// `noetl.event.frame_id` — same pattern.  R5 R2 fold key
+    /// for the `frames` map.
+    #[sqlx(default)]
+    pub frame_id: Option<String>,
+    /// `noetl.event.command_id` — top-level bigint column.
+    /// `Option<i64>` so unset / non-numeric values fold through
+    /// naturally.  R5 R2 fold key for the `commands` map.
+    #[sqlx(default)]
+    pub command_id: Option<i64>,
+    /// `noetl.event.worker_id` — character varying.  Used by the
+    /// command projection's `worker_id` field.
+    #[sqlx(default)]
+    pub worker_id: Option<String>,
+    /// `noetl.event.aggregate_type` — when set together with
+    /// `aggregate_id`, the Python fold falls back to deriving
+    /// stage/frame id from those (`stage/<id>` / `frame/<id>`).
+    #[sqlx(default)]
+    pub aggregate_type: Option<String>,
+    /// `noetl.event.aggregate_id` — see `aggregate_type`.
+    #[sqlx(default)]
+    pub aggregate_id: Option<String>,
+    /// `noetl.event.meta` JSON blob.  R5 R2 reaches into it for
+    /// `parent_stage_id`, `parent_frame_id`, `parent_command_id`,
+    /// `worker_locator`, `locality`, `placement`, `fanout_reduce`,
+    /// `kind`, `step_name`, plus the per-event-type counter
+    /// fields (`frame_count`, `row_count`, `events_emitted`,
+    /// `failed_count`, `attempt`, `cursor`).
+    #[sqlx(default)]
+    pub meta: Option<serde_json::Value>,
 }
 
 /// Replay service.  Phase F R4-4b shape — owns a [`DbPoolMap`] so
@@ -305,7 +429,17 @@ impl ReplayService {
                     -- `DateTime<Utc>` directly.  Matches the cast the
                     -- existing services::execution queries use for the
                     -- same column.
-                    created_at AT TIME ZONE 'UTC' AS created_at
+                    created_at AT TIME ZONE 'UTC' AS created_at,
+                    -- R5 R2 fold inputs.  All optional in the DB
+                    -- schema; the fold treats `None` as "this event
+                    -- doesn't participate in that projection".
+                    stage_id,
+                    frame_id,
+                    command_id,
+                    worker_id,
+                    aggregate_type,
+                    aggregate_id,
+                    meta
                 FROM noetl.event
                 WHERE execution_id = $1
                   AND event_id <= $2
@@ -331,7 +465,17 @@ impl ReplayService {
                     -- `DateTime<Utc>` directly.  Matches the cast the
                     -- existing services::execution queries use for the
                     -- same column.
-                    created_at AT TIME ZONE 'UTC' AS created_at
+                    created_at AT TIME ZONE 'UTC' AS created_at,
+                    -- R5 R2 fold inputs.  All optional in the DB
+                    -- schema; the fold treats `None` as "this event
+                    -- doesn't participate in that projection".
+                    stage_id,
+                    frame_id,
+                    command_id,
+                    worker_id,
+                    aggregate_type,
+                    aggregate_id,
+                    meta
                 FROM noetl.event
                 WHERE execution_id = $1
                   AND created_at <= $2
@@ -357,7 +501,17 @@ impl ReplayService {
                     -- `DateTime<Utc>` directly.  Matches the cast the
                     -- existing services::execution queries use for the
                     -- same column.
-                    created_at AT TIME ZONE 'UTC' AS created_at
+                    created_at AT TIME ZONE 'UTC' AS created_at,
+                    -- R5 R2 fold inputs.  All optional in the DB
+                    -- schema; the fold treats `None` as "this event
+                    -- doesn't participate in that projection".
+                    stage_id,
+                    frame_id,
+                    command_id,
+                    worker_id,
+                    aggregate_type,
+                    aggregate_id,
+                    meta
                 FROM noetl.event
                 WHERE execution_id = $1
                 ORDER BY event_id ASC
@@ -393,9 +547,9 @@ pub fn fold_replay_state(
         last_event_id: None,
         last_event_type: None,
         execution: ReplayExecutionState::default(),
-        stages: serde_json::Map::new(),
-        frames: serde_json::Map::new(),
-        commands: serde_json::Map::new(),
+        stages: std::collections::BTreeMap::new(),
+        frames: std::collections::BTreeMap::new(),
+        commands: std::collections::BTreeMap::new(),
         business_objects: serde_json::Map::new(),
         loops: serde_json::Map::new(),
     };
@@ -449,9 +603,318 @@ pub fn fold_replay_state(
                 // last_event_id but don't shape `execution.*`.
             }
         }
+
+        // R5 R2: per-projection population.  Each helper is a
+        // no-op when the event doesn't carry the relevant
+        // identity (e.g. a `playbook.completed` event has no
+        // `stage_id` so `populate_stage` does nothing).
+        populate_stage(event, &mut state.stages);
+        populate_frame(event, &mut state.frames);
+        populate_command(event, &mut state.commands);
     }
 
     state
+}
+
+// ---------------------------------------------------------------
+// R5 R2 helpers — id extractors + per-projection population.
+//
+// Each `extract_*_id` mirrors the Python helper of the same name
+// in `noetl/server/api/replay/service.py`: prefer the top-level
+// DB column; fall back to `aggregate_type` + `aggregate_id`
+// (stripping the `<kind>/` prefix the Python wire encoding uses);
+// finally fall back to `meta.<key>`.  Each `populate_*` is a
+// pure function over the row + the target map; the fold loop
+// calls all three per event.
+// ---------------------------------------------------------------
+
+/// Extract the canonical `stage_id` for an event.  Returns `None`
+/// when the event doesn't participate in the stage projection.
+pub fn extract_stage_id(event: &ReplayEventRow) -> Option<String> {
+    if let Some(s) = &event.stage_id {
+        return Some(s.clone());
+    }
+    if event.aggregate_type.as_deref() == Some("stage") {
+        if let Some(id) = &event.aggregate_id {
+            return Some(id.strip_prefix("stage/").unwrap_or(id).to_string());
+        }
+    }
+    meta_str(&event.meta, "stage_id")
+}
+
+/// Extract the canonical `frame_id` for an event.
+pub fn extract_frame_id(event: &ReplayEventRow) -> Option<String> {
+    if let Some(s) = &event.frame_id {
+        return Some(s.clone());
+    }
+    if event.aggregate_type.as_deref() == Some("frame") {
+        if let Some(id) = &event.aggregate_id {
+            return Some(id.strip_prefix("frame/").unwrap_or(id).to_string());
+        }
+    }
+    meta_str(&event.meta, "frame_id")
+}
+
+/// Extract the canonical `command_id` for an event.  The DB
+/// column is `bigint` (numeric) but the fold key is a string for
+/// consistency with stage / frame / business-object keys.
+pub fn extract_command_id(event: &ReplayEventRow) -> Option<String> {
+    if let Some(c) = event.command_id {
+        return Some(c.to_string());
+    }
+    // Fall back to `meta.command_id` (legacy events that didn't
+    // set the top-level column).  Accepts numeric or string.
+    if let Some(m) = &event.meta {
+        if let Some(v) = m.get("command_id") {
+            return Some(value_to_string(v));
+        }
+    }
+    None
+}
+
+/// Pull a string from a JSON map value at `key`.  Returns `None`
+/// when missing / not a string / not a coercible scalar.
+fn meta_str(meta: &Option<serde_json::Value>, key: &str) -> Option<String> {
+    meta.as_ref().and_then(|m| m.get(key)).map(value_to_string)
+}
+
+/// Pull an integer (as `i64`) from a JSON map value at `key`.
+/// Round-trips through `serde_json::Number::as_i64`; returns
+/// `None` for missing, non-integer, or out-of-range values.
+fn meta_i64(meta: &Option<serde_json::Value>, key: &str) -> Option<i64> {
+    meta.as_ref()
+        .and_then(|m| m.get(key))
+        .and_then(|v| v.as_i64())
+}
+
+/// Coerce a JSON scalar to its string representation.  Strings
+/// preserve the inner value; numbers stringify via `to_string()`;
+/// bools become `"true"`/`"false"`; null returns `"null"`.
+fn value_to_string(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::Bool(b) => b.to_string(),
+        serde_json::Value::Null => "null".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Apply one event to the stages map.  Mirrors Python's
+/// `state["stages"]` population in `fold_replay_state`.
+fn populate_stage(
+    event: &ReplayEventRow,
+    stages: &mut std::collections::BTreeMap<String, ReplayStageState>,
+) {
+    let stage_id = match extract_stage_id(event) {
+        Some(id) => id,
+        None => return,
+    };
+    let stage = stages.entry(stage_id.clone()).or_insert_with(|| ReplayStageState {
+        stage_id: stage_id.clone(),
+        status: "UNKNOWN".to_string(),
+        kind: meta_str(&event.meta, "kind"),
+        step_name: event
+            .node_name
+            .clone()
+            .or_else(|| meta_str(&event.meta, "step_name")),
+        parent_stage_id: meta_str(&event.meta, "parent_stage_id"),
+        ..Default::default()
+    });
+    stage.last_event_id = Some(event.event_id);
+    if let Some(parent) = meta_str(&event.meta, "parent_stage_id") {
+        stage.parent_stage_id = Some(parent);
+    }
+    // Loop event id lives only in meta (no top-level column).
+    if let Some(loop_id) = meta_str(&event.meta, "loop_id")
+        .or_else(|| meta_str(&event.meta, "loop_event_id"))
+        .or_else(|| meta_str(&event.meta, "__loop_epoch_id"))
+    {
+        stage.loop_event_id = Some(loop_id);
+    }
+    match event.event_type.as_str() {
+        "stage.opened" => {
+            stage.status = "OPEN".to_string();
+            stage.opened_event_id = Some(event.event_id);
+        }
+        "stage.closed" => {
+            stage.status = if event.status.is_empty() {
+                "CLOSED".to_string()
+            } else {
+                event.status.clone()
+            };
+            stage.closed_event_id = Some(event.event_id);
+            stage.frame_count = meta_i64(&event.meta, "frame_count").unwrap_or(stage.frame_count);
+            stage.row_count = meta_i64(&event.meta, "row_count").unwrap_or(stage.row_count);
+            stage.events_emitted =
+                meta_i64(&event.meta, "events_emitted").unwrap_or(stage.events_emitted);
+            stage.failed_count =
+                meta_i64(&event.meta, "failed_count").unwrap_or(stage.failed_count);
+        }
+        _ if !event.status.is_empty() => {
+            stage.status = event.status.clone();
+        }
+        _ => {}
+    }
+}
+
+/// Apply one event to the frames map.  Mirrors Python's
+/// `state["frames"]` population.
+fn populate_frame(
+    event: &ReplayEventRow,
+    frames: &mut std::collections::BTreeMap<String, ReplayFrameState>,
+) {
+    let frame_id = match extract_frame_id(event) {
+        Some(id) => id,
+        None => return,
+    };
+    let stage_id_now = extract_stage_id(event);
+    let command_id_now = extract_command_id(event);
+    let frame = frames.entry(frame_id.clone()).or_insert_with(|| ReplayFrameState {
+        frame_id: frame_id.clone(),
+        stage_id: stage_id_now.clone(),
+        parent_frame_id: meta_str(&event.meta, "parent_frame_id"),
+        command_id: None,
+        status: "UNKNOWN".to_string(),
+        ..Default::default()
+    });
+    frame.last_event_id = Some(event.event_id);
+    if stage_id_now.is_some() {
+        frame.stage_id = stage_id_now.clone();
+    }
+    if let Some(parent) = meta_str(&event.meta, "parent_frame_id") {
+        frame.parent_frame_id = Some(parent);
+    }
+    if command_id_now.is_some() {
+        frame.command_id = command_id_now.clone();
+    }
+    match event.event_type.as_str() {
+        "frame.dispatched" => {
+            frame.status = "CLAIMED".to_string();
+            frame.claimed_event_id = Some(event.event_id);
+            let attempt = meta_i64(&event.meta, "attempt").unwrap_or(1);
+            frame.attempts = frame.attempts.max(attempt);
+        }
+        "frame.started" => {
+            frame.status = "RUNNING".to_string();
+        }
+        "frame.abandoned" => {
+            frame.status = if event.status.is_empty() {
+                "ABANDONED".to_string()
+            } else {
+                event.status.clone()
+            };
+        }
+        "frame.committed" => {
+            frame.status = if event.status.is_empty() {
+                "COMPLETED".to_string()
+            } else {
+                event.status.clone()
+            };
+            frame.row_count = meta_i64(&event.meta, "row_count").unwrap_or(frame.row_count);
+            frame.events_emitted =
+                meta_i64(&event.meta, "events_emitted").unwrap_or(frame.events_emitted);
+            frame.terminal_event_id = Some(event.event_id);
+        }
+        "frame.failed" => {
+            frame.status = if event.status.is_empty() {
+                "FAILED".to_string()
+            } else {
+                event.status.clone()
+            };
+            frame.events_emitted =
+                meta_i64(&event.meta, "events_emitted").unwrap_or(frame.events_emitted);
+            frame.terminal_event_id = Some(event.event_id);
+        }
+        _ if !event.status.is_empty() => {
+            frame.status = event.status.clone();
+        }
+        _ => {}
+    }
+}
+
+/// Apply one event to the commands map.  Mirrors Python's
+/// `state["commands"]` population.
+fn populate_command(
+    event: &ReplayEventRow,
+    commands: &mut std::collections::BTreeMap<String, ReplayCommandState>,
+) {
+    let command_id = match extract_command_id(event) {
+        Some(id) => id,
+        None => return,
+    };
+    let stage_id_now = extract_stage_id(event);
+    let frame_id_now = extract_frame_id(event);
+    let command = commands.entry(command_id.clone()).or_insert_with(|| ReplayCommandState {
+        command_id: command_id.clone(),
+        stage_id: stage_id_now.clone(),
+        frame_id: frame_id_now.clone(),
+        status: "UNKNOWN".to_string(),
+        ..Default::default()
+    });
+    command.last_event_id = Some(event.event_id);
+    if stage_id_now.is_some() {
+        command.stage_id = stage_id_now;
+    }
+    if frame_id_now.is_some() {
+        command.frame_id = frame_id_now;
+    }
+    if let Some(parent) = meta_str(&event.meta, "parent_command_id") {
+        command.parent_command_id = Some(parent);
+    }
+    let worker_id_now = event
+        .worker_id
+        .clone()
+        .or_else(|| meta_str(&event.meta, "worker_id"));
+    if worker_id_now.is_some() {
+        command.worker_id = worker_id_now;
+    }
+    if let Some(worker_locator) = meta_str(&event.meta, "worker_locator") {
+        command.worker_locator = Some(worker_locator);
+    }
+    match event.event_type.as_str() {
+        "command.issued" => {
+            command.status = if event.status.is_empty() {
+                "PENDING".to_string()
+            } else {
+                event.status.clone()
+            };
+            command.issued_event_id = Some(event.event_id);
+        }
+        "command.claimed" => {
+            command.status = if event.status.is_empty() {
+                "CLAIMED".to_string()
+            } else {
+                event.status.clone()
+            };
+            command.claimed_event_id = Some(event.event_id);
+        }
+        "command.started" => {
+            command.status = if event.status.is_empty() {
+                "RUNNING".to_string()
+            } else {
+                event.status.clone()
+            };
+            command.started_event_id = Some(event.event_id);
+        }
+        "command.completed" | "command.failed" | "command.cancelled" => {
+            command.status = if event.status.is_empty() {
+                // event_type.removeprefix("command.").upper()
+                event
+                    .event_type
+                    .strip_prefix("command.")
+                    .map(|s| s.to_ascii_uppercase())
+                    .unwrap_or_else(|| event.event_type.clone())
+            } else {
+                event.status.clone()
+            };
+            command.terminal_event_id = Some(event.event_id);
+        }
+        other if other.starts_with("command.") && !event.status.is_empty() => {
+            command.status = event.status.clone();
+        }
+        _ => {}
+    }
 }
 
 #[cfg(test)]
@@ -465,7 +928,26 @@ mod tests {
             node_name: node_name.map(|s| s.to_string()),
             status: status.to_string(),
             created_at: Utc::now(),
+            stage_id: None,
+            frame_id: None,
+            command_id: None,
+            worker_id: None,
+            aggregate_type: None,
+            aggregate_id: None,
+            meta: None,
         }
+    }
+
+    /// R5 R2 builder — extends `ev()` with stage / frame /
+    /// command / worker / meta knobs.
+    fn ev_full(
+        event_id: i64,
+        event_type: &str,
+        builder: impl FnOnce(&mut ReplayEventRow),
+    ) -> ReplayEventRow {
+        let mut row = ev(event_id, event_type, None, "");
+        builder(&mut row);
+        row
     }
 
     #[test]
@@ -590,5 +1072,241 @@ mod tests {
             as_of_time: Some(Utc::now()),
         };
         assert_eq!(three.set_count(), 3);
+    }
+
+    // ================================================================
+    // R5 R2 — stages / frames / commands population.
+    // ================================================================
+
+    #[test]
+    fn extract_stage_id_prefers_column_then_aggregate_then_meta() {
+        // 1. Top-level column wins.
+        let row = ev_full(1, "noop", |r| {
+            r.stage_id = Some("s-from-column".into());
+            r.aggregate_type = Some("stage".into());
+            r.aggregate_id = Some("stage/s-aggregate".into());
+            r.meta = Some(serde_json::json!({"stage_id": "s-from-meta"}));
+        });
+        assert_eq!(extract_stage_id(&row).as_deref(), Some("s-from-column"));
+
+        // 2. aggregate_type=stage / aggregate_id stripped of prefix.
+        let row = ev_full(2, "stage.opened", |r| {
+            r.aggregate_type = Some("stage".into());
+            r.aggregate_id = Some("stage/s-aggregate".into());
+        });
+        assert_eq!(extract_stage_id(&row).as_deref(), Some("s-aggregate"));
+
+        // 3. Meta fallback when no column / aggregate.
+        let row = ev_full(3, "noop", |r| {
+            r.meta = Some(serde_json::json!({"stage_id": "s-from-meta"}));
+        });
+        assert_eq!(extract_stage_id(&row).as_deref(), Some("s-from-meta"));
+
+        // 4. None when nothing carries an id.
+        let row = ev(4, "noop", None, "");
+        assert!(extract_stage_id(&row).is_none());
+    }
+
+    #[test]
+    fn extract_frame_id_mirrors_stage_id_resolution() {
+        let row = ev_full(1, "frame.dispatched", |r| {
+            r.aggregate_type = Some("frame".into());
+            r.aggregate_id = Some("frame/f-1".into());
+        });
+        assert_eq!(extract_frame_id(&row).as_deref(), Some("f-1"));
+    }
+
+    #[test]
+    fn extract_command_id_uses_top_level_bigint_or_meta() {
+        // Top-level i64 column wins + stringifies.
+        let row = ev_full(1, "command.issued", |r| {
+            r.command_id = Some(42);
+        });
+        assert_eq!(extract_command_id(&row).as_deref(), Some("42"));
+
+        // Meta fallback for legacy events.
+        let row = ev_full(2, "command.issued", |r| {
+            r.meta = Some(serde_json::json!({"command_id": "legacy-cmd"}));
+        });
+        assert_eq!(extract_command_id(&row).as_deref(), Some("legacy-cmd"));
+
+        // Meta numeric also coerces to string.
+        let row = ev_full(3, "command.issued", |r| {
+            r.meta = Some(serde_json::json!({"command_id": 99}));
+        });
+        assert_eq!(extract_command_id(&row).as_deref(), Some("99"));
+
+        let row = ev(4, "noop", None, "");
+        assert!(extract_command_id(&row).is_none());
+    }
+
+    #[test]
+    fn fold_populates_stage_projection_through_lifecycle() {
+        let events = vec![
+            // Stage opened.
+            ev_full(1, "stage.opened", |r| {
+                r.stage_id = Some("s1".into());
+                r.node_name = Some("normalize".into());
+                r.meta = Some(serde_json::json!({"kind": "task"}));
+            }),
+            // Stage closed with row + frame counts.
+            ev_full(2, "stage.closed", |r| {
+                r.stage_id = Some("s1".into());
+                r.status = "COMPLETED".into();
+                r.meta = Some(serde_json::json!({
+                    "frame_count": 3,
+                    "row_count": 42,
+                    "events_emitted": 8,
+                    "failed_count": 0,
+                }));
+            }),
+        ];
+        let state = fold_replay_state(&events, "default", "default", 1, ReplayProjection::All);
+        let stage = state.stages.get("s1").expect("stage s1 must exist");
+        assert_eq!(stage.stage_id, "s1");
+        assert_eq!(stage.status, "COMPLETED");
+        assert_eq!(stage.opened_event_id, Some(1));
+        assert_eq!(stage.closed_event_id, Some(2));
+        assert_eq!(stage.frame_count, 3);
+        assert_eq!(stage.row_count, 42);
+        assert_eq!(stage.events_emitted, 8);
+        assert_eq!(stage.last_event_id, Some(2));
+        assert_eq!(stage.kind.as_deref(), Some("task"));
+        assert_eq!(stage.step_name.as_deref(), Some("normalize"));
+    }
+
+    #[test]
+    fn fold_populates_frame_projection_with_terminal_status() {
+        let events = vec![
+            ev_full(10, "frame.dispatched", |r| {
+                r.frame_id = Some("f-1".into());
+                r.stage_id = Some("s-1".into());
+                r.command_id = Some(7);
+                r.meta = Some(serde_json::json!({"attempt": 2}));
+            }),
+            ev_full(11, "frame.started", |r| {
+                r.frame_id = Some("f-1".into());
+                r.stage_id = Some("s-1".into());
+            }),
+            ev_full(12, "frame.committed", |r| {
+                r.frame_id = Some("f-1".into());
+                r.stage_id = Some("s-1".into());
+                r.status = "COMPLETED".into();
+                r.meta = Some(serde_json::json!({
+                    "row_count": 12,
+                    "events_emitted": 4,
+                }));
+            }),
+        ];
+        let state = fold_replay_state(&events, "default", "default", 1, ReplayProjection::All);
+        let frame = state.frames.get("f-1").expect("frame f-1 must exist");
+        assert_eq!(frame.frame_id, "f-1");
+        assert_eq!(frame.stage_id.as_deref(), Some("s-1"));
+        assert_eq!(frame.command_id.as_deref(), Some("7"));
+        assert_eq!(frame.status, "COMPLETED");
+        assert_eq!(frame.claimed_event_id, Some(10));
+        assert_eq!(frame.terminal_event_id, Some(12));
+        assert_eq!(frame.row_count, 12);
+        assert_eq!(frame.events_emitted, 4);
+        // attempt=2 → attempts capped at max(0, 2) = 2.
+        assert_eq!(frame.attempts, 2);
+    }
+
+    #[test]
+    fn fold_populates_command_projection_through_full_lifecycle() {
+        let events = vec![
+            ev_full(100, "command.issued", |r| {
+                r.command_id = Some(42);
+                r.stage_id = Some("s-1".into());
+                r.frame_id = Some("f-1".into());
+            }),
+            ev_full(101, "command.claimed", |r| {
+                r.command_id = Some(42);
+                r.worker_id = Some("worker-pod-7".into());
+            }),
+            ev_full(102, "command.started", |r| {
+                r.command_id = Some(42);
+            }),
+            ev_full(103, "command.completed", |r| {
+                r.command_id = Some(42);
+                r.status = "success".into();
+            }),
+        ];
+        let state = fold_replay_state(&events, "default", "default", 1, ReplayProjection::All);
+        let cmd = state.commands.get("42").expect("command 42 must exist");
+        assert_eq!(cmd.command_id, "42");
+        assert_eq!(cmd.stage_id.as_deref(), Some("s-1"));
+        assert_eq!(cmd.frame_id.as_deref(), Some("f-1"));
+        assert_eq!(cmd.worker_id.as_deref(), Some("worker-pod-7"));
+        assert_eq!(cmd.issued_event_id, Some(100));
+        assert_eq!(cmd.claimed_event_id, Some(101));
+        assert_eq!(cmd.started_event_id, Some(102));
+        assert_eq!(cmd.terminal_event_id, Some(103));
+        // status carries the lowercase worker emit verbatim (matches
+        // Python `status or ...` precedence).
+        assert_eq!(cmd.status, "success");
+    }
+
+    #[test]
+    fn fold_command_terminal_status_defaults_when_event_status_empty() {
+        // When the worker doesn't supply a status string, the
+        // fallback `event_type.strip_prefix("command.").upper()`
+        // kicks in.
+        let events = vec![ev_full(10, "command.failed", |r| {
+            r.command_id = Some(99);
+            r.status = "".into();
+        })];
+        let state = fold_replay_state(&events, "default", "default", 1, ReplayProjection::All);
+        let cmd = state.commands.get("99").unwrap();
+        assert_eq!(cmd.status, "FAILED");
+    }
+
+    #[test]
+    fn fold_skips_population_when_event_has_no_identity() {
+        // A `playbook.completed` event doesn't carry any of stage /
+        // frame / command id — none of the per-projection maps
+        // should grow.  Execution-projection update still fires.
+        let events = vec![
+            ev_full(1, "step.enter", |r| r.node_name = Some("start".into())),
+            ev_full(2, "playbook.completed", |_| {}),
+        ];
+        let state = fold_replay_state(&events, "default", "default", 1, ReplayProjection::All);
+        assert!(state.stages.is_empty());
+        assert!(state.frames.is_empty());
+        assert!(state.commands.is_empty());
+        assert_eq!(state.execution.status, "COMPLETED");
+    }
+
+    #[test]
+    fn fold_three_projections_populated_in_single_pass() {
+        // Single event that carries all three ids — exercises that
+        // `populate_stage`, `populate_frame`, `populate_command`
+        // each fire independently from the same event row.
+        let events = vec![ev_full(5, "frame.dispatched", |r| {
+            r.stage_id = Some("s-multi".into());
+            r.frame_id = Some("f-multi".into());
+            r.command_id = Some(7);
+        })];
+        let state = fold_replay_state(&events, "default", "default", 1, ReplayProjection::All);
+        assert!(state.stages.contains_key("s-multi"));
+        assert!(state.frames.contains_key("f-multi"));
+        assert!(state.commands.contains_key("7"));
+    }
+
+    #[test]
+    fn meta_helpers_round_trip_scalars() {
+        let meta = Some(serde_json::json!({
+            "s": "hello",
+            "n_i64": 7,
+            "n_neg": -1,
+            "b": true,
+        }));
+        assert_eq!(meta_str(&meta, "s").as_deref(), Some("hello"));
+        assert_eq!(meta_str(&meta, "n_i64").as_deref(), Some("7"));
+        assert_eq!(meta_str(&meta, "b").as_deref(), Some("true"));
+        assert_eq!(meta_i64(&meta, "n_i64"), Some(7));
+        assert_eq!(meta_i64(&meta, "n_neg"), Some(-1));
+        assert_eq!(meta_i64(&meta, "s"), None); // not an integer
+        assert_eq!(meta_i64(&meta, "missing"), None);
     }
 }
