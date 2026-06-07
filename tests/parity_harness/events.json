@@ -1,0 +1,210 @@
+[
+  {
+    "event_id": 100,
+    "event_type": "playbook_started",
+    "node_name": null,
+    "status": "RUNNING",
+    "stage_id": null,
+    "frame_id": null,
+    "command_id": null,
+    "worker_id": null,
+    "aggregate_type": null,
+    "aggregate_id": null,
+    "meta": null,
+    "result": null
+  },
+  {
+    "event_id": 101,
+    "event_type": "step.enter",
+    "node_name": "start",
+    "status": "ENTERED",
+    "stage_id": null,
+    "frame_id": null,
+    "command_id": null,
+    "worker_id": null,
+    "aggregate_type": null,
+    "aggregate_id": null,
+    "meta": null,
+    "result": null
+  },
+  {
+    "event_id": 102,
+    "event_type": "stage.opened",
+    "node_name": "fanout",
+    "status": "OPEN",
+    "stage_id": "s-1",
+    "frame_id": null,
+    "command_id": null,
+    "worker_id": null,
+    "aggregate_type": null,
+    "aggregate_id": null,
+    "meta": {"kind": "fanout", "step_name": "fanout"},
+    "result": null
+  },
+  {
+    "event_id": 103,
+    "event_type": "frame.dispatched",
+    "node_name": "fanout",
+    "status": "CLAIMED",
+    "stage_id": "s-1",
+    "frame_id": "f-1",
+    "command_id": 9001,
+    "worker_id": "worker-a",
+    "aggregate_type": null,
+    "aggregate_id": null,
+    "meta": {"attempt": 1},
+    "result": null
+  },
+  {
+    "event_id": 104,
+    "event_type": "command.issued",
+    "node_name": "fanout",
+    "status": "ISSUED",
+    "stage_id": "s-1",
+    "frame_id": "f-1",
+    "command_id": 9001,
+    "worker_id": "worker-a",
+    "aggregate_type": null,
+    "aggregate_id": null,
+    "meta": null,
+    "result": null
+  },
+  {
+    "event_id": 105,
+    "event_type": "frame.committed",
+    "node_name": "fanout",
+    "status": "COMPLETED",
+    "stage_id": "s-1",
+    "frame_id": "f-1",
+    "command_id": 9001,
+    "worker_id": "worker-a",
+    "aggregate_type": null,
+    "aggregate_id": null,
+    "meta": {"row_count": 42, "events_emitted": 3},
+    "result": {
+      "status": "ok",
+      "reference": {
+        "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+        "row_count": 42,
+        "media_type": "application/json",
+        "ref": "gs://bucket/output-1"
+      }
+    }
+  },
+  {
+    "event_id": 106,
+    "event_type": "command.completed",
+    "node_name": "fanout",
+    "status": "success",
+    "stage_id": "s-1",
+    "frame_id": "f-1",
+    "command_id": 9001,
+    "worker_id": "worker-a",
+    "aggregate_type": null,
+    "aggregate_id": null,
+    "meta": null,
+    "result": null
+  },
+  {
+    "event_id": 107,
+    "event_type": "loop.shard.done",
+    "node_name": "iterate",
+    "status": "",
+    "stage_id": null,
+    "frame_id": null,
+    "command_id": null,
+    "worker_id": null,
+    "aggregate_type": null,
+    "aggregate_id": null,
+    "meta": {"loop_id": "L-1", "collection_size": 2},
+    "result": null
+  },
+  {
+    "event_id": 108,
+    "event_type": "loop.done",
+    "node_name": "iterate",
+    "status": "",
+    "stage_id": null,
+    "frame_id": null,
+    "command_id": null,
+    "worker_id": null,
+    "aggregate_type": null,
+    "aggregate_id": null,
+    "meta": {"loop_id": "L-1"},
+    "result": null
+  },
+  {
+    "event_id": 109,
+    "event_type": "customer.created",
+    "node_name": "ingest_customer",
+    "status": "",
+    "stage_id": null,
+    "frame_id": null,
+    "command_id": null,
+    "worker_id": null,
+    "aggregate_type": null,
+    "aggregate_id": null,
+    "meta": {
+      "business_object": {
+        "object_type": "customer",
+        "object_id": "c-99",
+        "state": {"name": "Alice"}
+      }
+    },
+    "result": {
+      "status": "ok",
+      "reference": {
+        "sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+        "ref": "gs://bucket/customer-v1"
+      }
+    }
+  },
+  {
+    "event_id": 110,
+    "event_type": "customer.updated",
+    "node_name": "ingest_customer",
+    "status": "",
+    "stage_id": null,
+    "frame_id": null,
+    "command_id": null,
+    "worker_id": null,
+    "aggregate_type": null,
+    "aggregate_id": null,
+    "meta": {
+      "business_object": {
+        "object_type": "customer",
+        "object_id": "c-99",
+        "patch": {"name": "Alice S."}
+      }
+    },
+    "result": null
+  },
+  {
+    "event_id": 111,
+    "event_type": "stage.closed",
+    "node_name": "fanout",
+    "status": "CLOSED",
+    "stage_id": "s-1",
+    "frame_id": null,
+    "command_id": null,
+    "worker_id": null,
+    "aggregate_type": null,
+    "aggregate_id": null,
+    "meta": null,
+    "result": null
+  },
+  {
+    "event_id": 112,
+    "event_type": "playbook.completed",
+    "node_name": null,
+    "status": "COMPLETED",
+    "stage_id": null,
+    "frame_id": null,
+    "command_id": null,
+    "worker_id": null,
+    "aggregate_type": null,
+    "aggregate_id": null,
+    "meta": null,
+    "result": null
+  }
+]
