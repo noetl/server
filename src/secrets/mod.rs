@@ -14,6 +14,7 @@
 //! Kubernetes Secrets follow behind the same [`SecretProvider`] trait.
 
 mod aws;
+mod aws_sts;
 mod azure;
 mod azure_oauth;
 pub mod broker;
@@ -26,6 +27,7 @@ mod resolver;
 mod vault;
 
 pub use aws::AwsSmSecretProvider;
+pub use aws_sts::AwsStsProvider;
 pub use azure::AzureKeyVaultProvider;
 pub use azure_oauth::AzureOAuthProvider;
 pub use gcp::GcpSecretManager;
@@ -114,11 +116,12 @@ pub fn build_secret_provider(provider: &str) -> AppResult<Arc<dyn SecretProvider
         "k8s" | "kubernetes" => Ok(Arc::new(K8sSecretProvider::from_env()?)),
         "vault" => Ok(Arc::new(VaultSecretProvider::from_env()?)),
         "aws" | "aws_sm" => Ok(Arc::new(AwsSmSecretProvider::from_env()?)),
+        "aws_sts" | "aws_iam" => Ok(Arc::new(AwsStsProvider::from_env()?)),
         "azure" | "azure_kv" => Ok(Arc::new(AzureKeyVaultProvider::from_env()?)),
         "azure_oauth" | "azure_aad" => Ok(Arc::new(AzureOAuthProvider::from_env()?)),
         other => Err(AppError::Config(format!(
             "unsupported keychain secret provider '{other}' \
-             (supported: gcp, k8s, vault, aws, azure, azure_oauth)"
+             (supported: gcp, k8s, vault, aws, aws_sts, azure, azure_oauth)"
         ))),
     }
 }
