@@ -433,21 +433,75 @@ impl WorkflowOrchestrator {
             });
         }
 
-        // Find completed steps that need transition evaluation
+        // #67: pre-compute the per-completed-step eval_results so
+        // we can do TWO ordered passes:
+        //   pass 1 — emit step.skipped for unmatched arc targets,
+        //            so `in_pass_skipped` is fully populated before
+        //            any barrier check;
+        //   pass 2 — dispatch matched arc targets, with the barrier
+        //            able to see every same-pass skip via the
+        //            collected in_pass_skipped set.
+        // Without this two-pass ordering, HashMap iteration order
+        // determined whether `summarize` got dispatched in the same
+        // pass as `start`'s step.skipped for `process_low`.
+        let mut per_step_evals: Vec<(String, &Step, Vec<crate::engine::evaluator::EvaluationResult>)> =
+            Vec::new();
         for step_name in state.steps.keys() {
             if !state.is_step_completed(step_name) {
                 continue;
             }
-
-            // Get step definition
             let step = match steps.get(step_name.as_str()) {
                 Some(s) => *s,
                 None => continue,
             };
-
-            // Evaluate next transitions
             let eval_results = self.evaluator.evaluate_next(step, context)?;
+            per_step_evals.push((step_name.clone(), step, eval_results));
+        }
 
+        // Pass 1: emit step.skipped for every unmatched arc target
+        // across ALL completed steps, before any dispatch barrier
+        // check.  Under `mode: exclusive`, the untaken sibling
+        // arc's target never runs; without step.skipped it would
+        // stay Pending forever and the R4 fan-in barrier on
+        // downstream merge points would deadlock.
+        for (_completed_step_name, _completed_step, eval_results) in &per_step_evals {
+            for result in eval_results {
+                if result.matched {
+                    continue;
+                }
+                let Some(target_name) = &result.next_step else {
+                    continue;
+                };
+                // Skip if already terminal / running / dispatched
+                // (already emitted in this loop).
+                if state.is_step_done(target_name)
+                    || state.running_steps().contains(&target_name.as_str())
+                    || dispatched_in_pass.contains(target_name)
+                {
+                    continue;
+                }
+                if !steps.contains_key(target_name.as_str()) {
+                    continue;
+                }
+                info!(
+                    "Step '{}' skipped (exclusive routing chose a sibling)",
+                    target_name
+                );
+                events_to_emit.push(EventToEmit {
+                    event_type: "step.skipped".to_string(),
+                    node_name: Some(target_name.clone()),
+                    status: "SKIPPED".to_string(),
+                    context: None,
+                    result: None,
+                    error: None,
+                });
+                dispatched_in_pass.insert(target_name.clone());
+            }
+        }
+
+        // Pass 2: dispatch matched arc targets.
+        for (step_name, _step, eval_results) in per_step_evals {
+            let _ = step_name; // kept for parity with old log shape if needed
             for result in eval_results {
                 if !result.matched {
                     continue;
@@ -532,10 +586,31 @@ impl WorkflowOrchestrator {
                     // ExecutionState::Failed first).
                     if let Some(upstreams) = incoming_arcs.get(next_step_name.as_str()) {
                         if upstreams.len() > 1 {
+                            // #67: also treat upstreams that this
+                            // same pass just emitted `step.skipped`
+                            // for as terminal.  Without this, the
+                            // skip event lands in `events_to_emit`
+                            // but `state.is_step_done` won't see it
+                            // until the next orchestrator pass (when
+                            // trigger_orchestrator persists the
+                            // events and re-triggers).  Letting
+                            // `summarize` dispatch in the SAME pass
+                            // is structurally fine — the worker
+                            // pulls commands from NATS after the
+                            // events are persisted, by which point
+                            // the skip event is already durable.
+                            let in_pass_skipped: std::collections::HashSet<&str> =
+                                events_to_emit
+                                    .iter()
+                                    .filter(|e| e.event_type == "step.skipped")
+                                    .filter_map(|e| e.node_name.as_deref())
+                                    .collect();
                             let pending: Vec<&str> = upstreams
                                 .iter()
                                 .copied()
-                                .filter(|up| !state.is_step_done(up))
+                                .filter(|up| {
+                                    !state.is_step_done(up) && !in_pass_skipped.contains(up)
+                                })
                                 .collect();
                             if !pending.is_empty() {
                                 debug!(
@@ -1587,6 +1662,204 @@ mod tests {
                 .collect(),
         }));
         step
+    }
+
+    #[test]
+    fn test_67_exclusive_routing_emits_step_skipped_for_unmatched_siblings() {
+        // noetl/ai-meta#67: under `mode: exclusive` routing, only
+        // one arc fires; the untaken sibling arcs' targets never
+        // run.  Pre-fix the orchestrator silently dropped those
+        // siblings (the R4 fan-in barrier then waited for them
+        // forever on any downstream merge point that joined on
+        // both branches — deadlock).
+        //
+        // This test pins the fix: after start.command.completed,
+        // the orchestrator emits `step.skipped` for the untaken
+        // sibling (`process_low`) in the SAME orchestrator pass.
+        // The downstream merge target (`summarize`) — declared with
+        // two upstreams in the static planner — now dispatches in
+        // the same pass because the barrier check treats
+        // in-pass step.skipped as terminal.
+        //
+        // Reproduces the comprehensive_test.yaml shape: summarize's
+        // `input:` block has a Jinja conditional `{{ A if A else B.x }}`
+        // referencing the untaken sibling — that's the surface
+        // symptom, but the underlying bug was the missing
+        // step.skipped, not the template render.
+        let orchestrator = WorkflowOrchestrator::new();
+
+        // start → process_high (mode: exclusive; only the start
+        // event sets up the routing). process_high → summarize.
+        let start = {
+            let mut s = make_step("start", None);
+            s.next = Some(NextSpec::Router(crate::playbook::types::NextRouter {
+                spec: Some(crate::playbook::types::NextRouterSpec {
+                    mode: Some("exclusive".to_string()),
+                }),
+                arcs: vec![
+                    crate::playbook::types::NextArc {
+                        step: "process_high".to_string(),
+                        when: Some("{{ start.random_value > 10 }}".to_string()),
+                        args: None,
+                    },
+                    crate::playbook::types::NextArc {
+                        step: "process_low".to_string(),
+                        when: Some("{{ start.random_value <= 10 }}".to_string()),
+                        args: None,
+                    },
+                ],
+            }));
+            s
+        };
+        let process_high = make_step("process_high", Some("summarize"));
+        let process_low = make_step("process_low", Some("summarize"));
+        // summarize's tool has `args` with a Jinja conditional that
+        // references the untaken sibling step.  Mirrors the
+        // comprehensive_test fixture.
+        let summarize = {
+            let mut s = make_step("summarize", Some("end"));
+            s.tool = ToolDefinition::Single(ToolSpec {
+                kind: ToolKind::Python,
+                eval: None,
+                auth: None,
+                libs: None,
+                args: Some(serde_json::json!({
+                    "category": "{{ process_high.category if process_high else process_low.category }}",
+                    "final_value": "{{ process_high.processed if process_high else process_low.processed }}"
+                })),
+                code: Some("result = {\"category\": category}".to_string()),
+                url: None,
+                method: None,
+                query: None,
+                command: None,
+                connection: None,
+                params: None,
+                headers: None,
+                output_select: None,
+                extra: HashMap::new(),
+            });
+            s
+        };
+        let end = make_step("end", None);
+
+        // Events: playbook started, start completed (random_value=15
+        // surfaces process_high), process_high completed.
+        let events = vec![
+            {
+                let mut e = make_event("playbook_started", None);
+                e.context = Some(serde_json::json!({
+                    "workload": {"threshold": 10},
+                    "path": "test",
+                    "version": "1"
+                }));
+                e
+            },
+            {
+                let mut e = make_event("call.done", Some("start"));
+                e.result = Some(serde_json::json!({
+                    "status": "COMPLETED",
+                    "context": {
+                        "result": {
+                            "status": "success",
+                            "context": {
+                                "data": {
+                                    "random_value": 15,
+                                    "status": "initialized"
+                                }
+                            }
+                        }
+                    }
+                }));
+                e
+            },
+            make_event("command.completed", Some("start")),
+            {
+                let mut e = make_event("call.done", Some("process_high"));
+                e.result = Some(serde_json::json!({
+                    "status": "COMPLETED",
+                    "context": {
+                        "result": {
+                            "status": "success",
+                            "context": {
+                                "data": {
+                                    "category": "high",
+                                    "original": 15,
+                                    "processed": 30,
+                                    "status": "high_processed"
+                                }
+                            }
+                        }
+                    }
+                }));
+                e
+            },
+            make_event("command.completed", Some("process_high")),
+        ];
+
+        let playbook = Playbook {
+            api_version: "noetl.io/v2".to_string(),
+            kind: "Playbook".to_string(),
+            metadata: Metadata {
+                name: "comprehensive_repro".to_string(),
+                path: Some("test/comprehensive_repro".to_string()),
+                description: None,
+                labels: None,
+                extra: HashMap::new(),
+            },
+            workload: None,
+            vars: None,
+            keychain: None,
+            workbook: None,
+            workflow: vec![start, process_high, process_low, summarize, end],
+        };
+
+        // Triggered by process_high.command.completed.  Expected
+        // after the #67 fix:
+        // - exactly 1 command for `summarize`
+        // - 1 step.skipped event for `process_low` (the untaken
+        //   exclusive sibling)
+        // - 1 step.enter event for `summarize`
+        // - !should_complete (summarize hasn't run yet)
+        let result = orchestrator
+            .evaluate(&events, &playbook, Some("command.completed"))
+            .expect("evaluate should succeed after #67 fix");
+
+        let commands: Vec<&str> =
+            result.commands.iter().map(|c| c.step_name.as_str()).collect();
+        let skipped: Vec<&str> = result
+            .events_to_emit
+            .iter()
+            .filter(|e| e.event_type == "step.skipped")
+            .filter_map(|e| e.node_name.as_deref())
+            .collect();
+        let entered: Vec<&str> = result
+            .events_to_emit
+            .iter()
+            .filter(|e| e.event_type == "step.enter")
+            .filter_map(|e| e.node_name.as_deref())
+            .collect();
+
+        assert_eq!(
+            commands,
+            vec!["summarize"],
+            "expected 1 command for summarize, got {:?}",
+            commands
+        );
+        assert_eq!(
+            skipped,
+            vec!["process_low"],
+            "expected step.skipped for process_low (the untaken exclusive sibling), got {:?}",
+            skipped
+        );
+        assert!(
+            entered.contains(&"summarize"),
+            "expected step.enter for summarize, got entries: {:?}",
+            entered
+        );
+        assert!(
+            !result.should_complete,
+            "summarize is queued but not yet completed — must not should_complete"
+        );
     }
 
     #[test]
