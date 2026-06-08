@@ -12,7 +12,7 @@ use tracing::{debug, info, warn};
 
 use crate::db::models::Event;
 use crate::error::{AppError, AppResult};
-use crate::playbook::types::{NextSpec, Playbook, Step};
+use crate::playbook::types::{LoopMode, NextSpec, Playbook, Step};
 
 use super::commands::{Command, CommandBuilder, IteratorMetadata};
 use super::evaluator::ConditionEvaluator;
@@ -436,6 +436,89 @@ impl WorkflowOrchestrator {
             });
         }
 
+        // #76: Sequential-iterator next-dispatch.
+        //
+        // When a command.completed arrives for a sequential-mode
+        // iterator step that has more iterations to go, dispatch
+        // the next iteration.  The guard avoids double-dispatch
+        // across orchestrator passes: dispatch only when the
+        // number of dispatched iterations equals the number of
+        // completed iterations (no in-flight iteration).
+        //
+        // This block runs before the transition-evaluation loop
+        // because the iterator step is NOT completed yet (only
+        // individual iterations are), so the transition loop
+        // won't pick it up.
+        if matches!(
+            trigger_event_type,
+            Some("command.completed") | Some("action_completed")
+        ) {
+            for (step_name, step_info) in &state.steps {
+                let Some(expected) = step_info.iterations_expected else {
+                    continue;
+                };
+                let completed = step_info.iterations_completed();
+                if completed >= expected {
+                    continue;
+                } // all done
+                if completed == 0 {
+                    continue;
+                } // not started yet
+                if step_info.iterations_dispatched != completed {
+                    continue;
+                } // in-flight iteration
+
+                let Some(step_def) = steps.get(step_name.as_str()) else {
+                    continue;
+                };
+                let Some(loop_cfg) = step_def.r#loop.as_ref() else {
+                    continue;
+                };
+
+                let is_sequential = loop_cfg
+                    .spec
+                    .as_ref()
+                    .map(|s| s.mode == LoopMode::Sequential)
+                    .unwrap_or(true); // default is Sequential
+                if !is_sequential {
+                    continue;
+                }
+
+                let next_idx = completed as usize;
+                let items = self.evaluator.evaluate_loop(&loop_cfg.in_expr, context)?;
+                if next_idx >= items.len() {
+                    continue;
+                } // safety guard
+
+                info!(
+                    "Sequential iterator '{}': dispatching iteration {}/{} after previous completed",
+                    step_name,
+                    next_idx + 1,
+                    expected
+                );
+
+                let item = items.into_iter().nth(next_idx).unwrap();
+                let iter_meta = IteratorMetadata {
+                    parent_execution_id: state.execution_id,
+                    iterator_step: step_name.clone(),
+                    item_var: loop_cfg.iterator.clone(),
+                    item,
+                    index: next_idx,
+                    total: expected as usize,
+                };
+                let command = self.command_builder.build_iteration_command(
+                    0,
+                    state.execution_id,
+                    state.catalog_id,
+                    0,
+                    step_def,
+                    context,
+                    iter_meta,
+                )?;
+                commands.push(command);
+            }
+        }
+
         // #67: pre-compute the per-completed-step eval_results so
         // we can do TWO ordered passes:
         //   pass 1 — emit step.skipped for unmatched arc targets,
@@ -827,16 +910,18 @@ impl WorkflowOrchestrator {
 
                     // R3b iterator fan-out: if the landed step
                     // declares `step.loop`, evaluate the loop
-                    // expression and emit one command per item.  The
-                    // single `step.enter` event carries
-                    // `iterations_expected` in its context so state
-                    // reconstruction can aggregate per-iteration
-                    // `command.completed` events into one
-                    // step-level completion (see
-                    // `state.rs::apply_event`).  Sequential and
-                    // parallel modes both fan out the same way at
-                    // this layer; concurrency is shaped downstream
-                    // by the worker pool.
+                    // expression and emit commands.  The single
+                    // `step.enter` event carries `iterations_expected`
+                    // in its context so state reconstruction can
+                    // aggregate per-iteration `command.completed`
+                    // events into one step-level completion (see
+                    // `state.rs::apply_event`).
+                    //
+                    // #76: Parallel mode dispatches ALL items at
+                    // once.  Sequential mode (the default) dispatches
+                    // only iteration 0; the sequential-next-dispatch
+                    // block above handles subsequent iterations when
+                    // each command.completed arrives.
                     if let Some(loop_cfg) = current_step.r#loop.as_ref() {
                         let items = self
                             .evaluator
@@ -876,9 +961,22 @@ impl WorkflowOrchestrator {
                             continue;
                         }
 
+                        let is_parallel = loop_cfg
+                            .spec
+                            .as_ref()
+                            .map(|s| s.mode == LoopMode::Parallel)
+                            .unwrap_or(false);
+
                         info!(
-                            "Fanning out {} iterations for step '{}' (iterator='{}')",
-                            total, current_step_name, loop_cfg.iterator
+                            "Fanning out {} iterations for step '{}' (iterator='{}', mode={})",
+                            total,
+                            current_step_name,
+                            loop_cfg.iterator,
+                            if is_parallel {
+                                "parallel"
+                            } else {
+                                "sequential"
+                            },
                         );
 
                         // One `step.enter` carries the total so
@@ -898,11 +996,12 @@ impl WorkflowOrchestrator {
                             error: None,
                         });
 
-                        // One command per item via
-                        // build_iteration_command (which injects
-                        // `<iterator>`, `_index`, `_total` into the
-                        // command's render context).
-                        for (idx, item) in items.into_iter().enumerate() {
+                        // #76: parallel = all items; sequential =
+                        // only iteration 0 (the rest are dispatched
+                        // one-at-a-time by the sequential-next-
+                        // dispatch block).
+                        let dispatch_count = if is_parallel { total } else { 1 };
+                        for (idx, item) in items.into_iter().take(dispatch_count).enumerate() {
                             let iter_meta = IteratorMetadata {
                                 parent_execution_id: state.execution_id,
                                 iterator_step: current_step_name.clone(),
@@ -1544,7 +1643,7 @@ mod tests {
 
     #[test]
     fn test_step_loop_fans_out_iterations() {
-        // Playbook: start → looped (loop.in=[1,2,3]) → end.
+        // Playbook: start → looped (loop.in=[1,2,3], mode=parallel) → end.
         // Expectation: orchestrator emits one step.enter(looped)
         // carrying iterations_expected=3 in context, and dispatches
         // three commands (one per item) each with iterator metadata.
@@ -1555,7 +1654,10 @@ mod tests {
         looped.r#loop = Some(crate::playbook::types::Loop {
             in_expr: "{{ [1, 2, 3] }}".to_string(),
             iterator: "n".to_string(),
-            spec: None,
+            spec: Some(crate::playbook::types::LoopSpec {
+                mode: LoopMode::Parallel,
+                max_in_flight: None,
+            }),
         });
         let end = make_step("end", None);
 
@@ -1626,6 +1728,260 @@ mod tests {
         assert_eq!(
             enter_ctx.get("iterator_var").and_then(|v| v.as_str()),
             Some("n")
+        );
+    }
+
+    #[test]
+    fn test_step_loop_sequential_dispatches_only_first() {
+        // #76: Playbook: start → looped (loop.in=[1,2,3],
+        // mode=sequential) → end.  Sequential mode dispatches only
+        // iteration 0 at fan-out time; subsequent iterations are
+        // dispatched one at a time as each command.completed arrives.
+        let orchestrator = WorkflowOrchestrator::new();
+
+        let start = make_step("start", Some("looped"));
+        let mut looped = make_step("looped", Some("end"));
+        looped.r#loop = Some(crate::playbook::types::Loop {
+            in_expr: "{{ [1, 2, 3] }}".to_string(),
+            iterator: "n".to_string(),
+            spec: Some(crate::playbook::types::LoopSpec {
+                mode: LoopMode::Sequential,
+                max_in_flight: None,
+            }),
+        });
+        let end = make_step("end", None);
+
+        let events = vec![
+            {
+                let mut e = make_event("playbook_started", None);
+                e.context = Some(serde_json::json!({
+                    "workload": {},
+                    "path": "test",
+                    "version": "1"
+                }));
+                e
+            },
+            make_event("command.completed", Some("start")),
+        ];
+
+        let playbook = Playbook {
+            api_version: "noetl.io/v2".to_string(),
+            kind: "Playbook".to_string(),
+            metadata: Metadata {
+                name: "seq_loop_test".to_string(),
+                path: Some("test/seq_loop".to_string()),
+                description: None,
+                labels: None,
+                extra: HashMap::new(),
+            },
+            workload: None,
+            vars: None,
+            keychain: None,
+            workbook: None,
+            workflow: vec![start, looped, end],
+        };
+
+        let result = orchestrator
+            .evaluate(&events, &playbook, Some("command.completed"))
+            .unwrap();
+
+        // Sequential: only ONE command for iteration 0.
+        assert_eq!(
+            result.commands.len(),
+            1,
+            "sequential mode should dispatch only iteration 0, got {} commands",
+            result.commands.len()
+        );
+        let iter = result.commands[0]
+            .iterator
+            .as_ref()
+            .expect("iterator metadata present");
+        assert_eq!(iter.index, 0);
+        assert_eq!(iter.total, 3);
+        assert_eq!(iter.iterator_step, "looped");
+        assert_eq!(iter.item_var, "n");
+
+        // step.enter still carries the full iterations_expected=3.
+        let enters: Vec<_> = result
+            .events_to_emit
+            .iter()
+            .filter(|e| e.event_type == "step.enter")
+            .collect();
+        assert_eq!(enters.len(), 1);
+        let enter_ctx = enters[0].context.as_ref().unwrap();
+        assert_eq!(
+            enter_ctx
+                .get("iterations_expected")
+                .and_then(|v| v.as_i64()),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn test_step_loop_sequential_dispatches_next_on_completion() {
+        // #76: After iteration 0 completes, the sequential-next-
+        // dispatch block should dispatch iteration 1.  Simulate the
+        // state where iteration 0 has completed (step.enter with
+        // iterations_expected=3, command.issued iteration 0,
+        // command.completed iteration 0) and verify that the
+        // orchestrator dispatches iteration 1.
+        let orchestrator = WorkflowOrchestrator::new();
+
+        let start = make_step("start", Some("looped"));
+        let mut looped = make_step("looped", Some("end"));
+        looped.r#loop = Some(crate::playbook::types::Loop {
+            in_expr: "{{ [10, 20, 30] }}".to_string(),
+            iterator: "n".to_string(),
+            spec: Some(crate::playbook::types::LoopSpec {
+                mode: LoopMode::Sequential,
+                max_in_flight: None,
+            }),
+        });
+        let end = make_step("end", None);
+
+        // Build event sequence: start completes → looped enters
+        // (iterations_expected=3) → iteration 0 issued + completed.
+        let events = vec![
+            {
+                let mut e = make_event("playbook_started", None);
+                e.context = Some(serde_json::json!({
+                    "workload": {},
+                    "path": "test",
+                    "version": "1"
+                }));
+                e
+            },
+            make_event("command.completed", Some("start")),
+            {
+                // step.enter with iterations_expected=3 (result
+                // envelope shape as persisted by trigger_orchestrator).
+                let mut e = make_event("step.enter", Some("looped"));
+                e.result = Some(serde_json::json!({
+                    "status": "ENTERED",
+                    "context": {
+                        "iterations_expected": 3,
+                        "iterator_var": "n",
+                    },
+                }));
+                e
+            },
+            {
+                // command.issued for iteration 0
+                let mut e = make_event("command.issued", Some("looped"));
+                e.meta = Some(serde_json::json!({
+                    "command_id": "1:looped:100:i0",
+                    "iteration_index": 0,
+                    "iteration_total": 3,
+                }));
+                e
+            },
+            {
+                // command.completed for iteration 0
+                let mut e = make_event("command.completed", Some("looped"));
+                e.meta = Some(serde_json::json!({
+                    "command_id": "1:looped:100:i0",
+                }));
+                e.result = Some(serde_json::json!({
+                    "status": "success",
+                    "context": {"command_id": "1:looped:100:i0"},
+                    "data": {"value": 10},
+                }));
+                e
+            },
+        ];
+
+        let playbook = Playbook {
+            api_version: "noetl.io/v2".to_string(),
+            kind: "Playbook".to_string(),
+            metadata: Metadata {
+                name: "seq_next_test".to_string(),
+                path: Some("test/seq_next".to_string()),
+                description: None,
+                labels: None,
+                extra: HashMap::new(),
+            },
+            workload: None,
+            vars: None,
+            keychain: None,
+            workbook: None,
+            workflow: vec![start, looped, end],
+        };
+
+        let result = orchestrator
+            .evaluate(&events, &playbook, Some("command.completed"))
+            .unwrap();
+
+        // Should dispatch exactly one command for iteration 1.
+        assert_eq!(
+            result.commands.len(),
+            1,
+            "expected 1 command for iteration 1, got {}",
+            result.commands.len()
+        );
+        let iter = result.commands[0]
+            .iterator
+            .as_ref()
+            .expect("iterator metadata present");
+        assert_eq!(iter.index, 1, "expected iteration index 1");
+        assert_eq!(iter.total, 3);
+    }
+
+    #[test]
+    fn test_step_loop_default_mode_is_sequential() {
+        // #76: When no spec is provided, default LoopMode is
+        // Sequential.  Verify that spec: None behaves like
+        // sequential (dispatches only 1 command).
+        let orchestrator = WorkflowOrchestrator::new();
+
+        let start = make_step("start", Some("looped"));
+        let mut looped = make_step("looped", Some("end"));
+        looped.r#loop = Some(crate::playbook::types::Loop {
+            in_expr: "{{ [1, 2] }}".to_string(),
+            iterator: "x".to_string(),
+            spec: None, // default = Sequential
+        });
+        let end = make_step("end", None);
+
+        let events = vec![
+            {
+                let mut e = make_event("playbook_started", None);
+                e.context = Some(serde_json::json!({
+                    "workload": {},
+                    "path": "test",
+                    "version": "1"
+                }));
+                e
+            },
+            make_event("command.completed", Some("start")),
+        ];
+
+        let playbook = Playbook {
+            api_version: "noetl.io/v2".to_string(),
+            kind: "Playbook".to_string(),
+            metadata: Metadata {
+                name: "default_mode_test".to_string(),
+                path: Some("test/default_mode".to_string()),
+                description: None,
+                labels: None,
+                extra: HashMap::new(),
+            },
+            workload: None,
+            vars: None,
+            keychain: None,
+            workbook: None,
+            workflow: vec![start, looped, end],
+        };
+
+        let result = orchestrator
+            .evaluate(&events, &playbook, Some("command.completed"))
+            .unwrap();
+
+        // Default mode = sequential → only 1 command.
+        assert_eq!(
+            result.commands.len(),
+            1,
+            "default mode should be sequential (1 command), got {}",
+            result.commands.len()
         );
     }
 

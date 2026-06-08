@@ -10,6 +10,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::db::models::Event;
 
+/// Serde skip predicate for `i32` fields that default to 0.
+pub(crate) fn is_zero(v: &i32) -> bool {
+    *v == 0
+}
+
 /// High-level execution state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -138,6 +143,20 @@ pub struct StepInfo {
     /// its render context.  Empty for non-looped steps.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub iteration_results: Vec<serde_json::Value>,
+
+    // -------- Sequential-mode dispatch (#76) --------
+    //
+    // Tracks how many iteration commands have been issued (via
+    // `command.issued` events) for this step.  Used by the
+    // sequential-dispatch logic in orchestrator.rs: dispatch the
+    // next iteration only when `iterations_dispatched ==
+    // iterations_completed()` (no in-flight iteration).  For
+    // parallel mode this field still increments but is never
+    // consulted.  Non-iterator steps leave it at 0.
+    /// Number of `command.issued` events observed for this iterator
+    /// step.  Always 0 for non-iterator steps.
+    #[serde(default, skip_serializing_if = "crate::engine::state::is_zero")]
+    pub iterations_dispatched: i32,
 }
 
 impl StepInfo {
@@ -154,6 +173,7 @@ impl StepInfo {
             iterations_expected: None,
             iteration_command_ids: std::collections::HashSet::new(),
             iteration_results: Vec::new(),
+            iterations_dispatched: 0,
         }
     }
 
@@ -393,6 +413,11 @@ impl WorkflowState {
                         .entry(name.clone())
                         .or_insert_with(|| StepInfo::new(name));
                     step.state = StepState::CommandIssued;
+                    // #76: track dispatched iteration count for
+                    // sequential-mode guard in orchestrator.rs.
+                    if step.is_iterator() {
+                        step.iterations_dispatched += 1;
+                    }
                 }
             }
             "command.claimed" => {
