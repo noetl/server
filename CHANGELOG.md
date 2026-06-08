@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.59.0](https://github.com/noetl/server/compare/v2.58.0...v2.59.0) (2026-06-08)
+
+### Features
+
+* **engine:** fan out start step when it has a loop block ([33a2751](https://github.com/noetl/server/commit/33a275167f7f843e8b821f130f92a84f337e8e6d)), closes [noetl/ai-meta#73](https://github.com/noetl/ai-meta/issues/73) [noetl/server#161](https://github.com/noetl/server/issues/161) [noetl/ai-meta#73](https://github.com/noetl/ai-meta/issues/73)
+
 ## [2.58.0](https://github.com/noetl/server/compare/v2.57.2...v2.58.0) (2026-06-08)
 
 ### Features
