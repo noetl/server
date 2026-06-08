@@ -736,6 +736,39 @@ mod tests {
     }
 
     #[test]
+    fn test_jinja_conditional_short_circuits_on_undefined_else_branch() {
+        // noetl/ai-meta#67 — pin the renderer's handling of
+        // `{{ A if A else B.x }}` when only A is in the context
+        // and B is undefined.  Expected per Chainable undefined +
+        // Jinja2 semantics: short-circuit picks `A.x`, never
+        // accesses `B.x` → renders to A's value (or attribute).
+        // This is the surface symptom of #67 but NOT the root
+        // cause — the actual bug was upstream in the orchestrator's
+        // R4 fan-in barrier, not the template engine; the renderer
+        // itself is well-behaved.  Test kept to defend against
+        // regression in Chainable semantics.
+        let mut ctx = HashMap::new();
+        ctx.insert(
+            "process_high".to_string(),
+            serde_json::json!({
+                "category": "high",
+                "processed": 30
+            }),
+        );
+        // NO process_low in ctx.
+
+        let renderer = TemplateRenderer::new();
+        let s = renderer
+            .render(
+                "{{ process_high.category if process_high else process_low.category }}",
+                &ctx,
+            )
+            .expect("render should succeed under Chainable undefined");
+        println!("PROBE RENDER OUTPUT: {:?}", s);
+        assert_eq!(s, "high", "expected 'high' from short-circuit; got {:?}", s);
+    }
+
+    #[test]
     fn test_simple_variable() {
         let renderer = TemplateRenderer::new();
         let ctx = make_context();

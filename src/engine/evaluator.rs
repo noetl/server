@@ -53,6 +53,22 @@ impl EvaluationResult {
         }
     }
 
+    /// Create a non-matched result that carries the target step name.
+    /// Used by `evaluate_next_transitions` to surface arc targets
+    /// that didn't fire (because exclusive mode already chose a
+    /// sibling, or the arc's `when` evaluated false).  The
+    /// orchestrator emits `step.skipped` for these so the R4 fan-in
+    /// barrier correctly treats them as terminal.  See
+    /// noetl/ai-meta#67.
+    pub fn not_matched_with_target(target: &str) -> Self {
+        Self {
+            matched: false,
+            next_step: Some(target.to_string()),
+            with_params: None,
+            error: None,
+        }
+    }
+
     /// Create an error result.
     pub fn error(message: &str) -> Self {
         Self {
@@ -170,7 +186,28 @@ impl ConditionEvaluator {
                     .map(|m| NextMode::from_str(m))
                     .unwrap_or(next_mode);
 
+                // #67 fix: emit `EvaluationResult { matched: false,
+                // next_step: Some(...) }` for arcs that don't fire
+                // (either because exclusive mode already picked an
+                // earlier match, or because the arc's `when`
+                // evaluated false).  process_in_progress uses these
+                // to emit `step.skipped` for those targets so the
+                // R4 fan-in barrier correctly treats them as
+                // terminal.  Without this, a sibling arc target
+                // (e.g. process_low under exclusive routing) stays
+                // Pending forever and a fan-in target downstream
+                // (e.g. summarize) deadlocks.
+                let mut exclusive_matched = false;
                 for arc in &router.arcs {
+                    // In exclusive mode, once we've matched once,
+                    // emit the rest as not-matched-with-target so
+                    // the caller can skip them.  We do NOT evaluate
+                    // their when (irrelevant — they won't fire).
+                    if exclusive_matched {
+                        results.push(EvaluationResult::not_matched_with_target(&arc.step));
+                        continue;
+                    }
+
                     // Evaluate when condition if present
                     let should_transition = match &arc.when {
                         Some(when_expr) => self.evaluate_condition(when_expr, context)?,
@@ -183,16 +220,33 @@ impl ConditionEvaluator {
                         });
                         results.push(EvaluationResult::matched(&arc.step, with_params));
 
-                        // In exclusive mode, first match wins
+                        // In exclusive mode, first match wins — but
+                        // we don't `break`; we continue the loop so
+                        // remaining arcs surface as
+                        // not_matched_with_target (the trip wire for
+                        // step.skipped emission).
                         if router_mode == NextMode::Exclusive {
-                            break;
+                            exclusive_matched = true;
                         }
+                    } else {
+                        // Arc's when evaluated false — also emit as
+                        // not_matched_with_target so callers can
+                        // emit step.skipped.  Applies to BOTH
+                        // exclusive (a false when before the
+                        // matched one) AND inclusive modes.
+                        results.push(EvaluationResult::not_matched_with_target(&arc.step));
                     }
                 }
             }
             Some(NextSpec::Targets(targets)) => {
                 // Legacy canonical format: targets with optional when conditions
+                let mut exclusive_matched = false;
                 for target in targets {
+                    if exclusive_matched {
+                        results.push(EvaluationResult::not_matched_with_target(&target.step));
+                        continue;
+                    }
+
                     // Evaluate when condition if present
                     let should_transition = match &target.when {
                         Some(when_expr) => self.evaluate_condition(when_expr, context)?,
@@ -205,10 +259,14 @@ impl ConditionEvaluator {
                         });
                         results.push(EvaluationResult::matched(&target.step, with_params));
 
-                        // In exclusive mode, first match wins
+                        // In exclusive mode, first match wins — but
+                        // continue iterating to surface the unmatched
+                        // siblings (see Router branch above).
                         if next_mode == NextMode::Exclusive {
-                            break;
+                            exclusive_matched = true;
                         }
+                    } else {
+                        results.push(EvaluationResult::not_matched_with_target(&target.step));
                     }
                 }
             }
