@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.57.2](https://github.com/noetl/server/compare/v2.57.1...v2.57.2) (2026-06-08)
+
+### Bug Fixes
+
+* **orchestrator:** emit step.skipped for untaken exclusive-routing siblings ([5855b8e](https://github.com/noetl/server/commit/5855b8e829bcaf675280967d86ba0d018a96ff35)), closes [noetl/ai-meta#67](https://github.com/noetl/ai-meta/issues/67) [noetl/ai-meta#67](https://github.com/noetl/ai-meta/issues/67)
+
 ## [2.57.1](https://github.com/noetl/server/compare/v2.57.0...v2.57.1) (2026-06-07)
 
 ### Bug Fixes
