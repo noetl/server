@@ -667,6 +667,121 @@ pub fn record_secret_refresh(outcome: &str) {
     secret_refresh_total().with_label_values(&[outcome]).inc();
 }
 
+// ---------------------------------------------------------------------------
+// Result-store metrics (noetl/ai-meta#70)
+// ---------------------------------------------------------------------------
+
+/// Counter: `PUT /api/result/{execution_id}` calls by outcome status.
+///
+/// `status` ∈ { `ok`, `error` }.
+/// `execution_id` is NOT a label (cardinality) — it lives on the
+/// `result_store.put` tracing span per
+/// [`agents/rules/observability.md`] Principle 4.
+pub fn result_store_put_total() -> &'static IntCounterVec {
+    static M: OnceLock<IntCounterVec> = OnceLock::new();
+    M.get_or_init(|| {
+        let counter = IntCounterVec::new(
+            Opts::new(
+                "noetl_result_store_put_total",
+                "PUT /api/result/{execution_id} calls by outcome status.",
+            ),
+            &["status"],
+        )
+        .expect("static counter spec must be valid");
+        registry()
+            .register(Box::new(counter.clone()))
+            .expect("counter registration must succeed");
+        counter
+    })
+}
+
+/// Histogram: wall-clock time spent inside `PUT /api/result/{eid}`.
+pub fn result_store_put_duration_seconds() -> &'static HistogramVec {
+    static M: OnceLock<HistogramVec> = OnceLock::new();
+    M.get_or_init(|| {
+        let h = HistogramVec::new(
+            HistogramOpts::new(
+                "noetl_result_store_put_duration_seconds",
+                "Wall-clock seconds for PUT /api/result/{execution_id}.",
+            )
+            .buckets(EVENT_INGEST_BUCKETS.to_vec()),
+            &["status"],
+        )
+        .expect("static histogram spec must be valid");
+        registry()
+            .register(Box::new(h.clone()))
+            .expect("histogram registration must succeed");
+        h
+    })
+}
+
+/// Record one `PUT /api/result/{eid}` outcome.
+///
+/// `bytes` is the stored payload size (0 on error paths).
+/// `status` is `"ok"` or `"error"`.
+pub fn record_result_store_put(duration_seconds: f64, bytes: usize, status: &str) {
+    result_store_put_total()
+        .with_label_values(&[status])
+        .inc();
+    result_store_put_duration_seconds()
+        .with_label_values(&[status])
+        .observe(duration_seconds);
+    // Log bytes as a span field in the handler; Prometheus metric
+    // stays label-free on bytes (unbounded cardinality for a gauge).
+    let _ = bytes; // consumed for future histogram extension
+}
+
+/// Counter: `GET /api/result/resolve` calls by outcome status.
+///
+/// `status` ∈ { `ok`, `not_found`, `bad_request`, `error` }.
+pub fn result_store_resolve_total() -> &'static IntCounterVec {
+    static M: OnceLock<IntCounterVec> = OnceLock::new();
+    M.get_or_init(|| {
+        let counter = IntCounterVec::new(
+            Opts::new(
+                "noetl_result_store_resolve_total",
+                "GET /api/result/resolve calls by outcome status.",
+            ),
+            &["status"],
+        )
+        .expect("static counter spec must be valid");
+        registry()
+            .register(Box::new(counter.clone()))
+            .expect("counter registration must succeed");
+        counter
+    })
+}
+
+/// Histogram: wall-clock time for `GET /api/result/resolve`.
+pub fn result_store_resolve_duration_seconds() -> &'static HistogramVec {
+    static M: OnceLock<HistogramVec> = OnceLock::new();
+    M.get_or_init(|| {
+        let h = HistogramVec::new(
+            HistogramOpts::new(
+                "noetl_result_store_resolve_duration_seconds",
+                "Wall-clock seconds for GET /api/result/resolve.",
+            )
+            .buckets(EVENT_INGEST_BUCKETS.to_vec()),
+            &["status"],
+        )
+        .expect("static histogram spec must be valid");
+        registry()
+            .register(Box::new(h.clone()))
+            .expect("histogram registration must succeed");
+        h
+    })
+}
+
+/// Record one `GET /api/result/resolve` outcome.
+pub fn record_result_store_resolve(duration_seconds: f64, status: &str) {
+    result_store_resolve_total()
+        .with_label_values(&[status])
+        .inc();
+    result_store_resolve_duration_seconds()
+        .with_label_values(&[status])
+        .observe(duration_seconds);
+}
+
 /// Secrets-Wallet Phase 7c: histogram of token auto-renewal wall-clock
 /// latency.  Buckets `[0.05, 0.1, 0.25, 0.5, 1, 2, 5]` — span the range
 /// where auth round-trips actually live.  Observed regardless of

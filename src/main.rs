@@ -5,7 +5,7 @@
 
 use axum::{
     Router,
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
 };
 use std::net::SocketAddr;
 use tokio::net::TcpListener;
@@ -19,7 +19,7 @@ use noetl_server::{
     handlers,
     services::{
         CatalogService, CredentialService, ExecutionService, KeychainService, ReplayService,
-        RuntimeService,
+        ResultStoreService, RuntimeService,
     },
     state::AppState,
 };
@@ -50,6 +50,7 @@ fn build_router(
     execution_service: ExecutionService,
     runtime_service: RuntimeService,
     replay_service: ReplayService,
+    result_store_service: ResultStoreService,
     wallet_cipher: noetl_server::crypto::EnvelopeCipher,
 ) -> Router {
     // CORS configuration - allow all origins for development
@@ -249,6 +250,32 @@ fn build_router(
         .route("/api/replay/state", get(handlers::replay::replay_state))
         .with_state(replay_service);
 
+    // Result-store routes (noetl/ai-meta#70).
+    //
+    // `PUT /api/result/{execution_id}` — worker calls this after a step
+    // result exceeds the inline budget; stores JSON + mints a
+    // `noetl://` URI.
+    // `GET /api/result/resolve?ref=<uri>` — tools::result_fetch HTTP
+    // fallback; returns the stored payload body directly.
+    //
+    // NOTE: axum matches routes in registration order within a Router.
+    // `GET /api/result/resolve` must be registered BEFORE any wildcard
+    // path like `GET /api/result/{execution_id}/{step_name}` (future
+    // endpoints) to avoid shadowing.  Keeping resolve in its own Router
+    // guarantees order isolation.
+    let result_store_routes = Router::new()
+        .route(
+            "/api/result/{execution_id}",
+            put(handlers::result_store::put_result),
+        )
+        .route(
+            "/api/result/resolve",
+            get(handlers::result_store::resolve_ref),
+        )
+        .with_state(handlers::result_store::ResultStoreDeps {
+            service: result_store_service,
+        });
+
     // Variable routes (transient table)
     let variable_routes = Router::new()
         .route("/api/vars/{execution_id}", get(handlers::variables::list))
@@ -384,6 +411,7 @@ fn build_router(
         .merge(execution_routes)
         .merge(executions_routes)
         .merge(replay_routes)
+        .merge(result_store_routes)
         .merge(variable_routes)
         .merge(runtime_routes)
         .merge(sharding_routes)
@@ -606,6 +634,11 @@ async fn main() -> anyhow::Result<()> {
     // CREATE TABLE IF NOT EXISTS at startup is the right shape — no
     // out-of-band migration step required for first-boot deployments.
     noetl_server::db::queries::secret_audit::ensure_table(&db_pool).await?;
+
+    // Result-store MVP (noetl/ai-meta#70) — same idempotent startup-DDL
+    // pattern as secret_audit above.  The table is server-owned end-to-end;
+    // no out-of-band migration required.
+    noetl_server::db::queries::result_store::ensure_table(&db_pool).await?;
     // Keychain is the execution-scoped cache for credential resolution
     // (Secrets Wallet Phase 3c), so it is built first + shared into the
     // credential service.
@@ -624,6 +657,14 @@ async fn main() -> anyhow::Result<()> {
     // `state.pools` for shard-aware reads of `noetl.event`.
     let replay_service = ReplayService::new(state.pools.clone());
 
+    // Result-store service (noetl/ai-meta#70).  Uses the cluster-wide
+    // pool (same as catalog / credential) because `noetl.result_store`
+    // is a server-owned table — not per-execution-shard.  The
+    // `execution_id` column is present for data locality but the
+    // table itself is cluster-scoped in the MVP.
+    let result_store_service =
+        ResultStoreService::new(db_pool.clone(), state.snowflake.clone());
+
     // Build the router
     let app = build_router(
         state,
@@ -634,6 +675,7 @@ async fn main() -> anyhow::Result<()> {
         execution_service,
         runtime_service,
         replay_service,
+        result_store_service,
         wallet_cipher_for_router,
     );
 
