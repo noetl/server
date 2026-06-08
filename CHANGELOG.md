@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.61.0](https://github.com/noetl/server/compare/v2.60.0...v2.61.0) (2026-06-08)
+
+### Features
+
+* **engine:** expose ctx + workload namespaces in dispatch render context ([f554141](https://github.com/noetl/server/commit/f5541415d6cb80077a9943d7870bb0ce821aca8e)), closes [noetl/ai-meta#74](https://github.com/noetl/ai-meta/issues/74)
+
 ## [2.60.0](https://github.com/noetl/server/compare/v2.59.0...v2.60.0) (2026-06-08)
 
 ### Features
