@@ -380,9 +380,17 @@ pub struct NextArc {
     #[serde(default)]
     pub when: Option<String>,
 
-    /// Arguments to pass to target step.
-    #[serde(default)]
-    pub args: Option<HashMap<String, serde_json::Value>>,
+    /// Arc-level variable mutations to apply to execution context before
+    /// dispatching the downstream step.  Mirrors Python's `set:` on arcs.
+    /// Scope-prefixed keys (`ctx.x`, `iter.x`, `step.x`) are stripped to
+    /// the bare key; bare keys and unknown-scope dotted keys are written
+    /// as-is.  Values are Jinja2 templates rendered against the producing
+    /// step's completion context before being applied.
+    ///
+    /// YAML key: `set:`.  The legacy `args:` key is rejected by the Python
+    /// reference parser and is NOT supported here.
+    #[serde(default, rename = "set")]
+    pub set_vars: Option<HashMap<String, serde_json::Value>>,
 }
 
 /// Next router spec for v10 format.
@@ -1400,5 +1408,59 @@ workflow:
 "#;
         let pb: Playbook = serde_yaml::from_str(yaml).unwrap();
         assert!(pb.find_keychain("anything").is_none());
+    }
+
+    #[test]
+    fn test_next_arc_deserializes_set_field() {
+        // Round-trip: YAML `set: { ctx.foo: '{{ bar }}' }` into NextArc
+        // and confirm set_vars is populated with the unrendered template.
+        let yaml = r#"
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata:
+  name: arc_set_test
+workflow:
+  - step: start
+    tool:
+      kind: python
+      code: "result = {}"
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: use_vars
+          set:
+            ctx.test_var: '{{ initial_value }}'
+            ctx.computed: 200
+  - step: use_vars
+    tool:
+      kind: python
+      code: "result = {}"
+"#;
+        let pb: Playbook = serde_yaml::from_str(yaml).unwrap();
+        let start = pb.get_step("start").expect("start step");
+        let next = start.next.as_ref().expect("next spec");
+        let arcs = match next {
+            NextSpec::Router(r) => &r.arcs,
+            _ => panic!("expected Router, got {:?}", next),
+        };
+        assert_eq!(arcs.len(), 1, "one arc expected");
+        let arc = &arcs[0];
+        assert_eq!(arc.step, "use_vars");
+        let set_vars = arc.set_vars.as_ref().expect("set_vars must be populated");
+        assert!(
+            set_vars.contains_key("ctx.test_var"),
+            "ctx.test_var key must be present (unrendered)"
+        );
+        assert_eq!(
+            set_vars.get("ctx.test_var"),
+            Some(&serde_json::json!("{{ initial_value }}")),
+            "template string must be preserved unrendered"
+        );
+        assert_eq!(
+            set_vars.get("ctx.computed"),
+            Some(&serde_json::json!(200)),
+            "literal value must be preserved"
+        );
     }
 }

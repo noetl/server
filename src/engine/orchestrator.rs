@@ -16,7 +16,8 @@ use crate::playbook::types::{NextSpec, Playbook, Step};
 
 use super::commands::{Command, CommandBuilder, IteratorMetadata};
 use super::evaluator::ConditionEvaluator;
-use super::state::{ExecutionState, WorkflowState};
+use super::state::{apply_set_mutations, ExecutionState, WorkflowState};
+use crate::template::TemplateRenderer;
 
 /// Merge iterator metadata into the step-enter context so
 /// `state.apply_event` can stamp `iterations_expected` (and a
@@ -146,6 +147,7 @@ pub struct EventToEmit {
 pub struct WorkflowOrchestrator {
     evaluator: ConditionEvaluator,
     command_builder: CommandBuilder,
+    renderer: TemplateRenderer,
 }
 
 impl Default for WorkflowOrchestrator {
@@ -160,6 +162,7 @@ impl WorkflowOrchestrator {
         Self {
             evaluator: ConditionEvaluator::new(),
             command_builder: CommandBuilder::new(),
+            renderer: TemplateRenderer::new(),
         }
     }
 
@@ -444,8 +447,11 @@ impl WorkflowOrchestrator {
         // Without this two-pass ordering, HashMap iteration order
         // determined whether `summarize` got dispatched in the same
         // pass as `start`'s step.skipped for `process_low`.
-        let mut per_step_evals: Vec<(String, &Step, Vec<crate::engine::evaluator::EvaluationResult>)> =
-            Vec::new();
+        let mut per_step_evals: Vec<(
+            String,
+            &Step,
+            Vec<crate::engine::evaluator::EvaluationResult>,
+        )> = Vec::new();
         for step_name in state.steps.keys() {
             if !state.is_step_completed(step_name) {
                 continue;
@@ -599,12 +605,11 @@ impl WorkflowOrchestrator {
                             // pulls commands from NATS after the
                             // events are persisted, by which point
                             // the skip event is already durable.
-                            let in_pass_skipped: std::collections::HashSet<&str> =
-                                events_to_emit
-                                    .iter()
-                                    .filter(|e| e.event_type == "step.skipped")
-                                    .filter_map(|e| e.node_name.as_deref())
-                                    .collect();
+                            let in_pass_skipped: std::collections::HashSet<&str> = events_to_emit
+                                .iter()
+                                .filter(|e| e.event_type == "step.skipped")
+                                .filter_map(|e| e.node_name.as_deref())
+                                .collect();
                             let pending: Vec<&str> = upstreams
                                 .iter()
                                 .copied()
@@ -625,12 +630,43 @@ impl WorkflowOrchestrator {
                         }
                     }
 
-                    // Build context for next step with additional params
+                    // Build context for next step with additional params.
+                    // Two sources:
+                    //
+                    // 1. Legacy `with_params` (Targets path, plain merge — no
+                    //    rendering, no scope-stripping).
+                    // 2. `arc_set_vars` (Router/NextArc path): render each
+                    //    template value against the producing step's completion
+                    //    context, then apply scope-prefix stripping via
+                    //    `apply_set_mutations`.  Mirrors Python's arc-level
+                    //    `set:` semantics in transitions.py:786-791.
                     let mut step_context = context.clone();
                     if let Some(serde_json::Value::Object(params)) = &result.with_params {
                         for (k, v) in params {
                             step_context.insert(k.clone(), v.clone());
                         }
+                    }
+                    if let Some(set_vars) = &result.arc_set_vars {
+                        // Render template values against the current context
+                        // (which includes the producing step's result fields),
+                        // then apply scope-stripping.
+                        let mut rendered: HashMap<String, serde_json::Value> =
+                            HashMap::with_capacity(set_vars.len());
+                        for (key, val) in set_vars {
+                            let rendered_val = match self.renderer.render_value(val, &step_context)
+                            {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    warn!(
+                                        "arc set: template render error for key '{}': {}",
+                                        key, e
+                                    );
+                                    val.clone()
+                                }
+                            };
+                            rendered.insert(key.clone(), rendered_val);
+                        }
+                        apply_set_mutations(&mut step_context, &rendered);
                     }
 
                     // Iterative `step.when` enable-guard chain.  When a
@@ -661,10 +697,7 @@ impl WorkflowOrchestrator {
                             break;
                         }
 
-                        info!(
-                            "Step '{}' skipped (when guard false)",
-                            current_step_name
-                        );
+                        info!("Step '{}' skipped (when guard false)", current_step_name);
                         events_to_emit.push(EventToEmit {
                             event_type: "step.skipped".to_string(),
                             node_name: Some(current_step_name.clone()),
@@ -678,8 +711,7 @@ impl WorkflowOrchestrator {
                         // the first matched arc — once we've decided
                         // to skip, we've already committed to the
                         // single-path chain.
-                        let chained =
-                            self.evaluator.evaluate_next(current_step, &current_ctx)?;
+                        let chained = self.evaluator.evaluate_next(current_step, &current_ctx)?;
                         let next_after_skip = chained
                             .into_iter()
                             .find(|r| r.matched && r.next_step.is_some());
@@ -705,25 +737,42 @@ impl WorkflowOrchestrator {
                         }
 
                         let Some(target_step) = steps.get(target_name.as_str()) else {
-                            warn!(
-                                "Chained next step '{}' not found in workflow",
-                                target_name
-                            );
+                            warn!("Chained next step '{}' not found in workflow", target_name);
                             should_dispatch = false;
                             break;
                         };
 
-                        // Merge any with_params from the chained arc
-                        // into the context for the next iteration.
+                        // Merge any with_params / arc_set_vars from the
+                        // chained arc into the context for the next
+                        // iteration.
                         if let Some(serde_json::Value::Object(params)) = &arc.with_params {
                             for (k, v) in params {
                                 current_ctx.insert(k.clone(), v.clone());
                             }
                         }
+                        if let Some(set_vars) = &arc.arc_set_vars {
+                            let mut rendered: HashMap<String, serde_json::Value> =
+                                HashMap::with_capacity(set_vars.len());
+                            for (key, val) in set_vars {
+                                let rendered_val =
+                                    match self.renderer.render_value(val, &current_ctx) {
+                                        Ok(v) => v,
+                                        Err(e) => {
+                                            warn!(
+                                                "chained arc set: render error for key '{}': {}",
+                                                key, e
+                                            );
+                                            val.clone()
+                                        }
+                                    };
+                                rendered.insert(key.clone(), rendered_val);
+                            }
+                            apply_set_mutations(&mut current_ctx, &rendered);
+                        }
 
                         current_step = *target_step;
                         current_step_name = target_name;
-                        current_with_params = arc.with_params;
+                        current_with_params = arc.with_params.clone();
                     }
 
                     if hit_end {
@@ -1283,12 +1332,11 @@ mod tests {
             .completion_status
             .expect("completion_status must be populated on terminal failure");
         assert_eq!(status.status, "FAILED");
-        assert_eq!(status.failed_steps.as_ref().unwrap(), &vec!["eval_flag".to_string()]);
-        assert!(status
-            .error
-            .as_ref()
-            .unwrap()
-            .contains("eval_flag"));
+        assert_eq!(
+            status.failed_steps.as_ref().unwrap(),
+            &vec!["eval_flag".to_string()]
+        );
+        assert!(status.error.as_ref().unwrap().contains("eval_flag"));
     }
 
     #[test]
@@ -1570,7 +1618,9 @@ mod tests {
         assert_eq!(enters[0].node_name.as_deref(), Some("looped"));
         let enter_ctx = enters[0].context.as_ref().unwrap();
         assert_eq!(
-            enter_ctx.get("iterations_expected").and_then(|v| v.as_i64()),
+            enter_ctx
+                .get("iterations_expected")
+                .and_then(|v| v.as_i64()),
             Some(3)
         );
         assert_eq!(
@@ -1657,7 +1707,7 @@ mod tests {
                 .map(|t| NextArc {
                     step: t.to_string(),
                     when: None,
-                    args: None,
+                    set_vars: None,
                 })
                 .collect(),
         }));
@@ -1700,12 +1750,12 @@ mod tests {
                     crate::playbook::types::NextArc {
                         step: "process_high".to_string(),
                         when: Some("{{ start.random_value > 10 }}".to_string()),
-                        args: None,
+                        set_vars: None,
                     },
                     crate::playbook::types::NextArc {
                         step: "process_low".to_string(),
                         when: Some("{{ start.random_value <= 10 }}".to_string()),
-                        args: None,
+                        set_vars: None,
                     },
                 ],
             }));
@@ -1824,8 +1874,11 @@ mod tests {
             .evaluate(&events, &playbook, Some("command.completed"))
             .expect("evaluate should succeed after #67 fix");
 
-        let commands: Vec<&str> =
-            result.commands.iter().map(|c| c.step_name.as_str()).collect();
+        let commands: Vec<&str> = result
+            .commands
+            .iter()
+            .map(|c| c.step_name.as_str())
+            .collect();
         let skipped: Vec<&str> = result
             .events_to_emit
             .iter()
@@ -1915,8 +1968,11 @@ mod tests {
             "expected 2 parallel commands, got {}",
             result.commands.len()
         );
-        let dispatched: Vec<String> =
-            result.commands.iter().map(|c| c.step_name.clone()).collect();
+        let dispatched: Vec<String> = result
+            .commands
+            .iter()
+            .map(|c| c.step_name.clone())
+            .collect();
         assert!(dispatched.contains(&"branch_a".to_string()));
         assert!(dispatched.contains(&"branch_b".to_string()));
 
@@ -2214,8 +2270,11 @@ mod tests {
 
         // The orchestrator must NOT have dispatched `reduce` yet —
         // branch_b is still in-flight.
-        let dispatched: Vec<String> =
-            result.commands.iter().map(|c| c.step_name.clone()).collect();
+        let dispatched: Vec<String> = result
+            .commands
+            .iter()
+            .map(|c| c.step_name.clone())
+            .collect();
         assert!(
             !dispatched.contains(&"reduce".to_string()),
             "reduce should not dispatch while branch_b is still running; got commands: {:?}",
@@ -2332,8 +2391,7 @@ mod tests {
         // check.  fanout_reduce topology: `reduce` has 2 upstreams,
         // every other step has at most 1.
         let workflow = make_fanout_reduce_workflow();
-        let steps: HashMap<&str, &Step> =
-            workflow.iter().map(|s| (s.step.as_str(), s)).collect();
+        let steps: HashMap<&str, &Step> = workflow.iter().map(|s| (s.step.as_str(), s)).collect();
 
         let incoming = build_incoming_arcs(&steps);
 
@@ -2357,5 +2415,123 @@ mod tests {
         assert_eq!(incoming.get("end").map(|u| u.len()).unwrap_or(0), 1);
         // `start` has no upstreams.
         assert!(incoming.get("start").is_none());
+    }
+
+    #[test]
+    fn test_orchestrator_dispatches_with_arc_set_mutations_applied() {
+        // Integration-level pin: an arc with `set: { ctx.x: 42 }` must
+        // result in the downstream step's command context carrying
+        // `x = 42` (scope-stripped bare key, literal value — no
+        // rendering needed for a constant).
+        //
+        // Topology: start → use_vars (via Router arc with set: { ctx.x: 42 }).
+        // After start.command.completed the orchestrator evaluates the arc,
+        // applies the mutation, and builds the command for use_vars.
+        // We inspect the command's context (tool_config.args) for the key.
+        use crate::playbook::types::{
+            NextArc, NextRouter, NextRouterSpec, ToolDefinition, ToolKind, ToolSpec,
+        };
+
+        let orchestrator = WorkflowOrchestrator::new();
+
+        let start = {
+            let mut s = make_step("start", None);
+            s.next = Some(NextSpec::Router(NextRouter {
+                spec: Some(NextRouterSpec {
+                    mode: Some("exclusive".to_string()),
+                }),
+                arcs: vec![NextArc {
+                    step: "use_vars".to_string(),
+                    when: None,
+                    set_vars: Some(
+                        [("ctx.x".to_string(), serde_json::json!(42))]
+                            .into_iter()
+                            .collect(),
+                    ),
+                }],
+            }));
+            s
+        };
+
+        // use_vars step reads x from its input template.
+        let use_vars = {
+            let mut s = make_step("use_vars", Some("end"));
+            s.tool = ToolDefinition::Single(ToolSpec {
+                kind: ToolKind::Python,
+                eval: None,
+                auth: None,
+                libs: None,
+                args: Some({
+                    let mut m = serde_json::Map::new();
+                    // Template that should resolve to 42 via ctx.x → x.
+                    m.insert("the_value".to_string(), serde_json::json!("{{ x }}"));
+                    serde_json::Value::Object(m)
+                }),
+                code: Some("result = {}".to_string()),
+                url: None,
+                method: None,
+                query: None,
+                command: None,
+                connection: None,
+                params: None,
+                headers: None,
+                output_select: None,
+                extra: HashMap::new(),
+            });
+            s
+        };
+
+        let playbook = Playbook {
+            api_version: "noetl.io/v2".to_string(),
+            kind: "Playbook".to_string(),
+            metadata: crate::playbook::types::Metadata {
+                name: "arc_set_test".to_string(),
+                path: None,
+                description: None,
+                labels: None,
+                extra: HashMap::new(),
+            },
+            workload: None,
+            vars: None,
+            keychain: None,
+            workbook: None,
+            workflow: vec![start, use_vars],
+        };
+
+        let events = vec![
+            {
+                let mut e = make_event("playbook_started", None);
+                e.context = Some(serde_json::json!({
+                    "workload": {}, "path": "test", "version": "1"
+                }));
+                e
+            },
+            make_event("command.completed", Some("start")),
+        ];
+
+        let result = orchestrator
+            .evaluate(&events, &playbook, Some("command.completed"))
+            .expect("orchestrator must not error");
+
+        assert!(
+            !result.commands.is_empty(),
+            "expected a command for use_vars"
+        );
+        // The command for use_vars should carry x=42 in its context
+        // (the rendered `{{ x }}` → 42).
+        let cmd = &result.commands[0];
+        let ctx = cmd
+            .context
+            .as_ref()
+            .expect("command context must be populated");
+        // `ctx.x` mutation strips to bare key `x`; the command builder
+        // renders the step's `input.the_value: {{ x }}` against that.
+        // Verify the raw context passed to build_command contains `x`.
+        assert_eq!(
+            ctx.get("x"),
+            Some(&serde_json::json!(42)),
+            "arc set: ctx.x = 42 must appear as bare key x in command context; ctx = {:?}",
+            ctx
+        );
     }
 }
