@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.58.0](https://github.com/noetl/server/compare/v2.57.2...v2.58.0) (2026-06-08)
+
+### Features
+
+* **api:** port PUT /api/result/<eid> + GET /api/result/resolve from Python ([0c0d13b](https://github.com/noetl/server/commit/0c0d13b490533fec8665b7d23f8508b64a1aabe7)), closes [noetl/ai-meta#70](https://github.com/noetl/ai-meta/issues/70)
+
 ## [2.57.2](https://github.com/noetl/server/compare/v2.57.1...v2.57.2) (2026-06-08)
 
 ### Bug Fixes
