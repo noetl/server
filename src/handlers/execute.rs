@@ -336,14 +336,8 @@ pub(crate) async fn persist_engine_command(
     });
     if let Some(iter) = command.iterator.as_ref() {
         if let serde_json::Value::Object(ref mut map) = cmd_meta {
-            map.insert(
-                "iteration_index".to_string(),
-                serde_json::json!(iter.index),
-            );
-            map.insert(
-                "iteration_total".to_string(),
-                serde_json::json!(iter.total),
-            );
+            map.insert("iteration_index".to_string(), serde_json::json!(iter.index));
+            map.insert("iteration_total".to_string(), serde_json::json!(iter.total));
             map.insert(
                 "iterator_step".to_string(),
                 serde_json::json!(iter.iterator_step.clone()),
@@ -417,6 +411,12 @@ pub(crate) async fn persist_engine_command(
 }
 
 /// Generate initial commands for the start step.
+///
+/// If the start step declares a `loop:` block, this function fans out
+/// one command per item in the resolved collection (mirroring the
+/// Phase D R3b fan-out that [`orchestrator.rs`] performs for
+/// mid-execution iterator steps).  When the start step has no loop,
+/// the pre-existing single-command path is preserved verbatim.
 #[allow(clippy::too_many_arguments)]
 async fn generate_initial_commands(
     state: &AppState,
@@ -454,6 +454,79 @@ async fn generate_initial_commands(
         "workload".to_string(),
         serde_json::to_value(&context).unwrap_or_default(),
     );
+
+    // Iterator fan-out at initial dispatch: mirror the R3b shape from
+    // orchestrator.rs.  If the start step has a `loop:` block, resolve
+    // the `in:` expression and emit one command per item.
+    if let Some(loop_cfg) = start_step.r#loop.as_ref() {
+        // Render the loop expression to a raw JSON value and require a
+        // JSON array.  Unlike orchestrator.rs (which coerces numbers to
+        // ranges and strings to splits), the initial-dispatch boundary
+        // enforces strict array typing so callers pass an explicit list.
+        let renderer = crate::template::jinja::TemplateRenderer::new();
+        let raw_value = renderer.render_to_value(&loop_cfg.in_expr, &context)?;
+
+        let items: Vec<serde_json::Value> = match raw_value {
+            serde_json::Value::Array(arr) => arr,
+            other => {
+                let type_name = match &other {
+                    serde_json::Value::Null => "null",
+                    serde_json::Value::Bool(_) => "bool",
+                    serde_json::Value::Number(_) => "number",
+                    serde_json::Value::String(_) => "string",
+                    serde_json::Value::Object(_) => "object",
+                    serde_json::Value::Array(_) => unreachable!(),
+                };
+                return Err(AppError::Validation(format!(
+                    "start step loop.in must resolve to a JSON array, got: {}",
+                    type_name
+                )));
+            }
+        };
+
+        let total = items.len();
+        info!(
+            execution_id,
+            total,
+            iterator = %loop_cfg.iterator,
+            "Fanning out {} iterations for start step (iterator='{}')",
+            total,
+            loop_cfg.iterator,
+        );
+
+        for (idx, item) in items.into_iter().enumerate() {
+            let iter_meta = crate::engine::commands::IteratorMetadata {
+                parent_execution_id: execution_id,
+                iterator_step: start_step.step.clone(),
+                item_var: loop_cfg.iterator.clone(),
+                item,
+                index: idx,
+                total,
+            };
+            let command = command_builder.build_iteration_command(
+                0,
+                execution_id,
+                catalog_id,
+                parent_event_id,
+                start_step,
+                &context,
+                iter_meta,
+            )?;
+            persist_engine_command(
+                state,
+                execution_id,
+                catalog_id,
+                parent_event_id,
+                start_step,
+                &command,
+                &context,
+                playbook,
+            )
+            .await?;
+        }
+
+        return Ok(total as i32);
+    }
 
     let command = command_builder.build_command(
         0, // Will be replaced with actual event_id
@@ -614,6 +687,199 @@ async fn publish_command_notification(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::commands::{CommandBuilder, IteratorMetadata};
+    use crate::playbook::types::{Loop, Step, ToolDefinition, ToolKind, ToolSpec};
+    use crate::template::jinja::TemplateRenderer;
+
+    // -----------------------------------------------------------------------
+    // Helper: build a minimal Step for tests (no loop by default).
+    // -----------------------------------------------------------------------
+    fn make_python_step(name: &str, loop_cfg: Option<Loop>) -> Step {
+        Step {
+            step: name.to_string(),
+            desc: None,
+            spec: None,
+            when: None,
+            args: None,
+            vars: None,
+            r#loop: loop_cfg,
+            tool: ToolDefinition::Single(ToolSpec {
+                kind: ToolKind::Python,
+                auth: None,
+                libs: None,
+                args: None,
+                code: Some("num = input_data.get('num'); return {'number': num}".to_string()),
+                url: None,
+                method: None,
+                query: None,
+                command: None,
+                connection: None,
+                params: None,
+                headers: None,
+                eval: None,
+                output_select: None,
+                extra: HashMap::new(),
+            }),
+            next: None,
+        }
+    }
+
+    /// Simulate the pure (non-async, non-DB) logic of
+    /// `generate_initial_commands` for the iterator fan-out path.
+    /// Returns `(commands, AppError)` depending on what the loop
+    /// expression resolves to.
+    fn run_initial_fanout(
+        step: &Step,
+        context: &HashMap<String, serde_json::Value>,
+    ) -> Result<Vec<crate::engine::commands::Command>, AppError> {
+        let command_builder = CommandBuilder::new();
+        let execution_id = 1_i64;
+        let catalog_id = 2_i64;
+        let parent_event_id = 0_i64;
+
+        if let Some(loop_cfg) = step.r#loop.as_ref() {
+            let renderer = TemplateRenderer::new();
+            let raw_value = renderer
+                .render_to_value(&loop_cfg.in_expr, context)
+                .map_err(|e| AppError::Internal(e.to_string()))?;
+
+            let items: Vec<serde_json::Value> = match raw_value {
+                serde_json::Value::Array(arr) => arr,
+                other => {
+                    let type_name = match &other {
+                        serde_json::Value::Null => "null",
+                        serde_json::Value::Bool(_) => "bool",
+                        serde_json::Value::Number(_) => "number",
+                        serde_json::Value::String(_) => "string",
+                        serde_json::Value::Object(_) => "object",
+                        serde_json::Value::Array(_) => unreachable!(),
+                    };
+                    return Err(AppError::Validation(format!(
+                        "start step loop.in must resolve to a JSON array, got: {}",
+                        type_name
+                    )));
+                }
+            };
+
+            let total = items.len();
+            let mut commands = Vec::with_capacity(total);
+            for (idx, item) in items.into_iter().enumerate() {
+                let iter_meta = IteratorMetadata {
+                    parent_execution_id: execution_id,
+                    iterator_step: step.step.clone(),
+                    item_var: loop_cfg.iterator.clone(),
+                    item,
+                    index: idx,
+                    total,
+                };
+                let cmd = command_builder
+                    .build_iteration_command(
+                        0,
+                        execution_id,
+                        catalog_id,
+                        parent_event_id,
+                        step,
+                        context,
+                        iter_meta,
+                    )
+                    .map_err(|e| AppError::Internal(e.to_string()))?;
+                commands.push(cmd);
+            }
+            return Ok(commands);
+        }
+
+        // No loop — single command.
+        let cmd = command_builder
+            .build_command(
+                0,
+                execution_id,
+                catalog_id,
+                parent_event_id,
+                step,
+                context,
+                None,
+            )
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+        Ok(vec![cmd])
+    }
+
+    /// Fan-out test: start step with loop produces one command per item.
+    #[test]
+    fn test_generate_initial_commands_fans_out_when_start_has_loop() {
+        let loop_cfg = Loop {
+            in_expr: "{{ items }}".to_string(),
+            iterator: "item".to_string(),
+            spec: None,
+        };
+        let step = make_python_step("start", Some(loop_cfg));
+
+        let mut context = HashMap::new();
+        context.insert("items".to_string(), serde_json::json!([1, 2, 3]));
+
+        let commands = run_initial_fanout(&step, &context).expect("should fan out");
+        assert_eq!(commands.len(), 3, "expected 3 commands for 3-element list");
+
+        for (expected_idx, cmd) in commands.iter().enumerate() {
+            let iter = cmd.iterator.as_ref().expect("iterator metadata present");
+            assert_eq!(
+                iter.item_var, "item",
+                "item_var must be the declared iterator name"
+            );
+            assert_eq!(
+                iter.index, expected_idx,
+                "index must match enumeration order"
+            );
+            assert_eq!(iter.total, 3, "total must be the collection length");
+        }
+    }
+
+    /// Back-compat: start step without loop produces exactly one command, no iterator metadata.
+    #[test]
+    fn test_generate_initial_commands_single_command_when_no_loop() {
+        let step = make_python_step("start", None);
+        let context = HashMap::new();
+
+        let commands = run_initial_fanout(&step, &context).expect("should produce one command");
+        assert_eq!(
+            commands.len(),
+            1,
+            "expected exactly 1 command for non-loop start step"
+        );
+        assert!(
+            commands[0].iterator.is_none(),
+            "non-loop command must not carry iterator metadata"
+        );
+    }
+
+    /// Non-array loop.in returns AppError::Validation with the documented message.
+    #[test]
+    fn test_generate_initial_commands_rejects_non_array_loop_in() {
+        let loop_cfg = Loop {
+            in_expr: "{{ count }}".to_string(),
+            iterator: "item".to_string(),
+            spec: None,
+        };
+        let step = make_python_step("start", Some(loop_cfg));
+
+        let mut context = HashMap::new();
+        context.insert("count".to_string(), serde_json::json!(42));
+
+        let err =
+            run_initial_fanout(&step, &context).expect_err("scalar loop.in should return Err");
+        match err {
+            AppError::Validation(msg) => {
+                assert!(
+                    msg.contains("start step loop.in must resolve to a JSON array"),
+                    "unexpected validation message: {msg}"
+                );
+                assert!(
+                    msg.contains("number"),
+                    "message should name the actual type: {msg}"
+                );
+            }
+            other => panic!("expected Validation error, got: {other:?}"),
+        }
+    }
 
     #[test]
     fn test_execute_request_validation() {
