@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.60.0](https://github.com/noetl/server/compare/v2.59.0...v2.60.0) (2026-06-08)
+
+### Features
+
+* **engine:** propagate arc-level set: mutations into downstream step context ([e413bef](https://github.com/noetl/server/commit/e413bef5a4a0750e9163fd26ca02c340e7ff0323)), closes [noetl/ai-meta#73](https://github.com/noetl/ai-meta/issues/73)
+
 ## [2.59.0](https://github.com/noetl/server/compare/v2.58.0...v2.59.0) (2026-06-08)
 
 ### Features
