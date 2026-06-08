@@ -97,9 +97,29 @@ impl CommandBuilder {
         context: &HashMap<String, serde_json::Value>,
         metadata: Option<&serde_json::Value>,
     ) -> AppResult<Command> {
-        // Build tool command based on definition type
-        let tool_command = self.build_tool_from_definition(&step.tool, context)?;
+        // Build a render context that includes `ctx` and `workload` namespace
+        // aliases pointing at the flat dispatch context, mirroring Python's
+        // `context["ctx"] = state.variables` + `context["workload"] = state.variables`
+        // (commands.py:915-916).  Use entry().or_insert_with() so we don't
+        // clobber existing bindings — in particular, execute.rs:453 already
+        // inserts `workload` as the structured YAML workload block, which must
+        // take precedence over the flat-dict alias for
+        // `{{ workload.session_token }}` style templates.
+        let mut render_ctx = context.clone();
+        let ctx_value = serde_json::to_value(context).unwrap_or(serde_json::Value::Null);
+        render_ctx
+            .entry("ctx".to_string())
+            .or_insert_with(|| ctx_value.clone());
+        render_ctx
+            .entry("workload".to_string())
+            .or_insert_with(|| ctx_value);
 
+        // Build tool command using the shimmed render context so that
+        // {{ ctx.foo }} and {{ workload.foo }} templates resolve correctly.
+        let tool_command = self.build_tool_from_definition(&step.tool, &render_ctx)?;
+
+        // Persist the original flat context on the Command (no namespace bloat
+        // in event payloads — the shim is only for the render path).
         Ok(Command {
             command_id,
             execution_id,
@@ -131,8 +151,21 @@ impl CommandBuilder {
         iter_context.insert("_index".to_string(), serde_json::json!(iterator.index));
         iter_context.insert("_total".to_string(), serde_json::json!(iterator.total));
 
-        // Build tool command from definition with iterator context
-        let mut tool_command = self.build_tool_from_definition(&step.tool, &iter_context)?;
+        // Add `ctx` + `workload` namespace shims AFTER the iterator-var
+        // insertions so the iterator value is also visible through
+        // {{ ctx.<item_var> }}.  Same idempotency guard as build_command —
+        // don't clobber any pre-existing binding.
+        let mut render_ctx = iter_context.clone();
+        let ctx_value = serde_json::to_value(&iter_context).unwrap_or(serde_json::Value::Null);
+        render_ctx
+            .entry("ctx".to_string())
+            .or_insert_with(|| ctx_value.clone());
+        render_ctx
+            .entry("workload".to_string())
+            .or_insert_with(|| ctx_value);
+
+        // Build tool command from definition with iterator context (plus shims)
+        let mut tool_command = self.build_tool_from_definition(&step.tool, &render_ctx)?;
 
         // Phase D R3b-2: also inject the iteration variables into
         // the tool's `args` map.  The worker's Python tool exposes
@@ -536,5 +569,172 @@ mod tests {
         assert_eq!(command.step_name, "pipeline_step");
         assert_eq!(command.tool.kind, "task_sequence");
         assert!(command.tool.config.is_some());
+    }
+
+    // ---- ctx / workload namespace shim tests (noetl/ai-meta#74) ----
+
+    fn make_http_step_with_url(url: &str) -> Step {
+        Step {
+            step: "test_step".to_string(),
+            desc: None,
+            spec: None,
+            when: None,
+            args: None,
+            vars: None,
+            r#loop: None,
+            tool: ToolDefinition::Single(ToolSpec {
+                kind: ToolKind::Http,
+                auth: None,
+                libs: None,
+                args: None,
+                code: None,
+                url: Some(url.to_string()),
+                method: Some("GET".to_string()),
+                query: None,
+                command: None,
+                connection: None,
+                params: None,
+                headers: None,
+                eval: None,
+                output_select: None,
+                extra: HashMap::new(),
+            }),
+            next: None,
+        }
+    }
+
+    /// `{{ ctx.foo }}` resolves to the flat dispatch context value for `foo`.
+    #[test]
+    fn test_build_command_exposes_ctx_namespace() {
+        let builder = CommandBuilder::new();
+        let step = make_http_step_with_url("https://example.com/{{ ctx.foo }}");
+
+        let mut context = HashMap::new();
+        context.insert("foo".to_string(), serde_json::json!(42));
+
+        let command = builder
+            .build_command(1, 2, 3, 4, &step, &context, None)
+            .unwrap();
+
+        let config = command.tool.config.unwrap();
+        assert_eq!(
+            config.get("url").and_then(|v| v.as_str()),
+            Some("https://example.com/42"),
+            "{{ ctx.foo }} should resolve to 42 via the ctx namespace shim"
+        );
+        // The persisted context must NOT contain the shim keys (no event bloat).
+        let persisted = command.context.unwrap();
+        assert!(
+            !persisted.contains_key("ctx"),
+            "persisted context must not carry ctx shim"
+        );
+    }
+
+    /// `{{ workload.foo }}` resolves to the flat dispatch context value for `foo`
+    /// when no structured workload block was pre-populated.
+    #[test]
+    fn test_build_command_exposes_workload_namespace() {
+        let builder = CommandBuilder::new();
+        let step = make_http_step_with_url("https://example.com/{{ workload.foo }}");
+
+        let mut context = HashMap::new();
+        context.insert("foo".to_string(), serde_json::json!(42));
+
+        let command = builder
+            .build_command(1, 2, 3, 4, &step, &context, None)
+            .unwrap();
+
+        let config = command.tool.config.unwrap();
+        assert_eq!(
+            config.get("url").and_then(|v| v.as_str()),
+            Some("https://example.com/42"),
+            "{{ workload.foo }} should resolve to 42 via the workload namespace shim"
+        );
+    }
+
+    /// When the incoming context already has `workload` (the structured YAML
+    /// workload block, inserted by execute.rs:453), the shim must NOT clobber it.
+    #[test]
+    fn test_build_command_preserves_existing_workload() {
+        let builder = CommandBuilder::new();
+        let step = make_http_step_with_url("https://example.com/{{ workload.session_token }}");
+
+        let mut context = HashMap::new();
+        // Simulate what execute.rs:453 does: insert the structured workload object.
+        context.insert(
+            "workload".to_string(),
+            serde_json::json!({ "session_token": "abc123" }),
+        );
+        context.insert("foo".to_string(), serde_json::json!(99));
+
+        let command = builder
+            .build_command(1, 2, 3, 4, &step, &context, None)
+            .unwrap();
+
+        let config = command.tool.config.unwrap();
+        assert_eq!(
+            config.get("url").and_then(|v| v.as_str()),
+            Some("https://example.com/abc123"),
+            "existing workload.session_token must survive — shim must not clobber"
+        );
+    }
+
+    /// Flat top-level keys are still accessible alongside `{{ ctx.foo }}`.
+    #[test]
+    fn test_build_command_preserves_flat_top_level_keys() {
+        let builder = CommandBuilder::new();
+        // Template uses both a flat key and a ctx-namespaced key.
+        let step = make_http_step_with_url("https://{{ host }}/{{ ctx.path }}");
+
+        let mut context = HashMap::new();
+        context.insert("host".to_string(), serde_json::json!("example.com"));
+        context.insert("path".to_string(), serde_json::json!("api/v1"));
+
+        let command = builder
+            .build_command(1, 2, 3, 4, &step, &context, None)
+            .unwrap();
+
+        let config = command.tool.config.unwrap();
+        assert_eq!(
+            config.get("url").and_then(|v| v.as_str()),
+            Some("https://example.com/api/v1"),
+            "flat top-level key {{ host }} and ctx-namespaced {{ ctx.path }} must both resolve"
+        );
+    }
+
+    /// In a loop iteration, the iterator variable is visible through
+    /// `{{ ctx.<item_var> }}` because the shim is applied AFTER the
+    /// iterator insertions.
+    #[test]
+    fn test_build_iteration_command_ctx_includes_iterator_var() {
+        let builder = CommandBuilder::new();
+        let step = make_http_step_with_url("https://example.com/{{ ctx.num }}");
+
+        let context = HashMap::new();
+        let iterator = IteratorMetadata {
+            parent_execution_id: 100,
+            iterator_step: "loop_step".to_string(),
+            index: 0,
+            total: 3,
+            item: serde_json::json!(42),
+            item_var: "num".to_string(),
+        };
+
+        let command = builder
+            .build_iteration_command(1, 2, 3, 4, &step, &context, iterator)
+            .unwrap();
+
+        let config = command.tool.config.unwrap();
+        assert_eq!(
+            config.get("url").and_then(|v| v.as_str()),
+            Some("https://example.com/42"),
+            "{{ ctx.num }} must resolve to 42 via the ctx shim in an iteration command"
+        );
+        // The persisted iter_context must NOT contain the shim keys.
+        let persisted = command.context.unwrap();
+        assert!(
+            !persisted.contains_key("ctx"),
+            "persisted iter_context must not carry ctx shim"
+        );
     }
 }
