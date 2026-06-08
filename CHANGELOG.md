@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.61.1](https://github.com/noetl/server/compare/v2.61.0...v2.61.1) (2026-06-08)
+
+### Bug Fixes
+
+* **status:** honest in-flight check prevents premature COMPLETED verdict ([4c14750](https://github.com/noetl/server/commit/4c1475038896f9b47420f8f255563376c92b129c)), closes [noetl/ai-meta#72](https://github.com/noetl/ai-meta/issues/72)
+
 ## [2.61.0](https://github.com/noetl/server/compare/v2.60.0...v2.61.0) (2026-06-08)
 
 ### Features
