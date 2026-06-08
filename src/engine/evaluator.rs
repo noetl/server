@@ -24,21 +24,44 @@ pub struct EvaluationResult {
     /// The next step to transition to (if matched).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_step: Option<String>,
-    /// Parameters to pass to the next step.
+    /// Parameters to pass to the next step (legacy Targets path, plain merge).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub with_params: Option<serde_json::Value>,
+    /// Arc-level `set:` variable mutations (Router / NextArc path).
+    /// Values are unrendered Jinja2 templates; the orchestrator renders them
+    /// against the producing step's completion context and then applies
+    /// scope-stripping via `apply_set_mutations` before dispatching the
+    /// downstream command.  Distinct from `with_params` so the orchestrator
+    /// can apply rendering + scope-stripping only to these.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arc_set_vars: Option<HashMap<String, serde_json::Value>>,
     /// Error message if evaluation failed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
 
 impl EvaluationResult {
-    /// Create a matched result.
+    /// Create a matched result (legacy Targets path, plain with_params).
     pub fn matched(next_step: &str, with_params: Option<serde_json::Value>) -> Self {
         Self {
             matched: true,
             next_step: Some(next_step.to_string()),
             with_params,
+            arc_set_vars: None,
+            error: None,
+        }
+    }
+
+    /// Create a matched result carrying arc-level `set:` mutations (Router path).
+    pub fn matched_with_set(
+        next_step: &str,
+        set_vars: Option<HashMap<String, serde_json::Value>>,
+    ) -> Self {
+        Self {
+            matched: true,
+            next_step: Some(next_step.to_string()),
+            with_params: None,
+            arc_set_vars: set_vars,
             error: None,
         }
     }
@@ -49,6 +72,7 @@ impl EvaluationResult {
             matched: false,
             next_step: None,
             with_params: None,
+            arc_set_vars: None,
             error: None,
         }
     }
@@ -65,6 +89,7 @@ impl EvaluationResult {
             matched: false,
             next_step: Some(target.to_string()),
             with_params: None,
+            arc_set_vars: None,
             error: None,
         }
     }
@@ -75,6 +100,7 @@ impl EvaluationResult {
             matched: false,
             next_step: None,
             with_params: None,
+            arc_set_vars: None,
             error: Some(message.to_string()),
         }
     }
@@ -215,10 +241,10 @@ impl ConditionEvaluator {
                     };
 
                     if should_transition {
-                        let with_params = arc.args.as_ref().map(|args| {
-                            serde_json::to_value(args).unwrap_or(serde_json::Value::Null)
-                        });
-                        results.push(EvaluationResult::matched(&arc.step, with_params));
+                        results.push(EvaluationResult::matched_with_set(
+                            &arc.step,
+                            arc.set_vars.clone(),
+                        ));
 
                         // In exclusive mode, first match wins — but
                         // we don't `break`; we continue the loop so
@@ -257,6 +283,10 @@ impl ConditionEvaluator {
                         let with_params = target.args.as_ref().map(|args| {
                             serde_json::to_value(args).unwrap_or(serde_json::Value::Null)
                         });
+                        // NOTE: legacy CanonicalNextTarget.args is retained as a plain
+                        // pass-through (no scope-stripping) for back-compat with any
+                        // existing fixtures that use the Targets format.  New playbooks
+                        // use NextArc.set_vars (YAML key: `set:`).
                         results.push(EvaluationResult::matched(&target.step, with_params));
 
                         // In exclusive mode, first match wins — but

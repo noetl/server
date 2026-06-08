@@ -454,9 +454,8 @@ impl WorkflowState {
                             // results in arrival order (may not match
                             // dispatch index in parallel mode — see
                             // R3b follow-up).
-                            step.result = Some(serde_json::Value::Array(
-                                step.iteration_results.clone(),
-                            ));
+                            step.result =
+                                Some(serde_json::Value::Array(step.iteration_results.clone()));
                         }
                         // Mid-iteration: leave step.state at whatever
                         // command.started / command.claimed last set
@@ -526,10 +525,8 @@ impl WorkflowState {
                     // noetl/ai-meta#58 for the orchestrator-side
                     // failure-termination fix that depends on this.
                     if let Some(result) = &event.result {
-                        let err_value = result
-                            .get("error")
-                            .and_then(|v| v.as_str())
-                            .or_else(|| {
+                        let err_value =
+                            result.get("error").and_then(|v| v.as_str()).or_else(|| {
                                 result
                                     .get("context")
                                     .and_then(|c| c.get("error"))
@@ -713,6 +710,34 @@ impl WorkflowState {
         }
 
         serde_json::Value::Object(context)
+    }
+}
+
+/// Apply DSL Core `set:` mutations to a variable map (template rendering context).
+///
+/// Mirrors Python's `_apply_set_mutations` in
+/// `noetl/core/dsl/engine/executor/common.py:472-484` verbatim:
+///
+/// - Scoped keys (`ctx.x`, `iter.x`, `step.x`) have the scope prefix stripped
+///   and the bare key is written.
+/// - Bare keys (no dot) are written as-is.
+/// - Dotted keys whose scope is not `ctx`/`iter`/`step` are written as-is
+///   (the dot does NOT split them; the full key is the map key).
+///
+/// `mutations` contains the **already-rendered** template values (caller must
+/// render before calling).  The function is purely a scope-stripping write.
+pub fn apply_set_mutations(
+    variables: &mut HashMap<String, serde_json::Value>,
+    mutations: &HashMap<String, serde_json::Value>,
+) {
+    for (key, value) in mutations {
+        if let Some((scope, bare)) = key.split_once('.') {
+            if matches!(scope, "ctx" | "iter" | "step") {
+                variables.insert(bare.to_string(), value.clone());
+                continue;
+            }
+        }
+        variables.insert(key.clone(), value.clone());
     }
 }
 
@@ -1232,14 +1257,8 @@ mod tests {
             },
         });
         let data = extract_user_data(&envelope).expect("unwrap should succeed");
-        assert_eq!(
-            data.get("is_hot").and_then(|v| v.as_bool()),
-            Some(true)
-        );
-        assert_eq!(
-            data.get("message").and_then(|v| v.as_str()),
-            Some("hot")
-        );
+        assert_eq!(data.get("is_hot").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(data.get("message").and_then(|v| v.as_str()), Some("hot"));
     }
 
     #[test]
@@ -1330,7 +1349,9 @@ mod tests {
         state.steps.insert("run_from_file".to_string(), info);
 
         let ctx = state.build_context();
-        let step = ctx.get("run_from_file").expect("top-level step entry exposed");
+        let step = ctx
+            .get("run_from_file")
+            .expect("top-level step entry exposed");
 
         // Existing flat-field path (back-compat):
         assert_eq!(
@@ -1410,7 +1431,11 @@ mod tests {
             .and_then(|v| v.get("data"))
             .and_then(|v| v.get("executed"))
             .and_then(|v| v.as_bool());
-        assert_eq!(labeled, Some(true), "labeled task_sequence path stays intact");
+        assert_eq!(
+            labeled,
+            Some(true),
+            "labeled task_sequence path stays intact"
+        );
 
         let flat = step
             .get("data")
@@ -1485,5 +1510,102 @@ mod tests {
             Some(true),
             "start.init_action.data.executed must still resolve"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // apply_set_mutations tests (arc-level `set:` DSL contract)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_apply_set_mutations_strips_ctx_prefix() {
+        let mut vars: HashMap<String, serde_json::Value> = HashMap::new();
+        let mutations = [("ctx.foo".to_string(), serde_json::json!(1))]
+            .into_iter()
+            .collect();
+        apply_set_mutations(&mut vars, &mutations);
+        assert_eq!(vars.get("foo"), Some(&serde_json::json!(1)));
+        assert!(
+            !vars.contains_key("ctx.foo"),
+            "scoped key must not be present"
+        );
+    }
+
+    #[test]
+    fn test_apply_set_mutations_strips_iter_prefix() {
+        let mut vars: HashMap<String, serde_json::Value> = HashMap::new();
+        let mutations = [("iter.bar".to_string(), serde_json::json!(2))]
+            .into_iter()
+            .collect();
+        apply_set_mutations(&mut vars, &mutations);
+        assert_eq!(vars.get("bar"), Some(&serde_json::json!(2)));
+        assert!(!vars.contains_key("iter.bar"));
+    }
+
+    #[test]
+    fn test_apply_set_mutations_strips_step_prefix() {
+        let mut vars: HashMap<String, serde_json::Value> = HashMap::new();
+        let mutations = [("step.baz".to_string(), serde_json::json!(3))]
+            .into_iter()
+            .collect();
+        apply_set_mutations(&mut vars, &mutations);
+        assert_eq!(vars.get("baz"), Some(&serde_json::json!(3)));
+        assert!(!vars.contains_key("step.baz"));
+    }
+
+    #[test]
+    fn test_apply_set_mutations_keeps_bare_keys() {
+        let mut vars: HashMap<String, serde_json::Value> = HashMap::new();
+        let mutations = [("qux".to_string(), serde_json::json!(4))]
+            .into_iter()
+            .collect();
+        apply_set_mutations(&mut vars, &mutations);
+        assert_eq!(vars.get("qux"), Some(&serde_json::json!(4)));
+    }
+
+    #[test]
+    fn test_apply_set_mutations_keeps_unknown_scope_dot_keys() {
+        // A dotted key whose scope is not ctx/iter/step is written
+        // as the full key (dot is part of the map key, not stripped).
+        let mut vars: HashMap<String, serde_json::Value> = HashMap::new();
+        let mutations = [("app.config".to_string(), serde_json::json!({"level": 5}))]
+            .into_iter()
+            .collect();
+        apply_set_mutations(&mut vars, &mutations);
+        assert_eq!(
+            vars.get("app.config"),
+            Some(&serde_json::json!({"level": 5}))
+        );
+        assert!(
+            !vars.contains_key("config"),
+            "bare key must NOT be present for unknown scope"
+        );
+    }
+
+    #[test]
+    fn test_apply_set_mutations_all_cases_together() {
+        // Pin all four cases in one call (mirrors the prompt spec).
+        let mut vars: HashMap<String, serde_json::Value> = HashMap::new();
+        let mutations: HashMap<String, serde_json::Value> = [
+            ("ctx.foo".to_string(), serde_json::json!(1)),
+            ("iter.bar".to_string(), serde_json::json!(2)),
+            ("step.baz".to_string(), serde_json::json!(3)),
+            ("qux".to_string(), serde_json::json!(4)),
+            ("app.config".to_string(), serde_json::json!({"level": 5})),
+        ]
+        .into_iter()
+        .collect();
+        apply_set_mutations(&mut vars, &mutations);
+        assert_eq!(vars.get("foo"), Some(&serde_json::json!(1)));
+        assert_eq!(vars.get("bar"), Some(&serde_json::json!(2)));
+        assert_eq!(vars.get("baz"), Some(&serde_json::json!(3)));
+        assert_eq!(vars.get("qux"), Some(&serde_json::json!(4)));
+        assert_eq!(
+            vars.get("app.config"),
+            Some(&serde_json::json!({"level": 5}))
+        );
+        // Scoped prefixed forms must not appear as top-level keys.
+        assert!(!vars.contains_key("ctx.foo"));
+        assert!(!vars.contains_key("iter.bar"));
+        assert!(!vars.contains_key("step.baz"));
     }
 }
