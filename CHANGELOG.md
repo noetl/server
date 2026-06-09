@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.62.0](https://github.com/noetl/server/compare/v2.61.1...v2.62.0) (2026-06-09)
+
+### Features
+
+* sequential-mode iterator dispatch ([#76](https://github.com/noetl/server/issues/76)) ([9bfd4e3](https://github.com/noetl/server/commit/9bfd4e32d3ea3561ba1aa23dc0ed46fcc2ac14ac))
+
 ## [2.61.1](https://github.com/noetl/server/compare/v2.61.0...v2.61.1) (2026-06-08)
 
 ### Bug Fixes
