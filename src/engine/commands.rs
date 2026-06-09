@@ -386,6 +386,7 @@ mod tests {
             when: None,
             args: None,
             vars: None,
+            set_vars: None,
             r#loop: None,
             tool: ToolDefinition::Single(Box::new(ToolSpec {
                 kind: ToolKind::Http,
@@ -435,6 +436,7 @@ mod tests {
             when: None,
             args: None,
             vars: None,
+            set_vars: None,
             r#loop: None,
             tool: ToolDefinition::Single(Box::new(ToolSpec {
                 kind: ToolKind::Python,
@@ -552,6 +554,7 @@ mod tests {
             when: None,
             args: None,
             vars: None,
+            set_vars: None,
             r#loop: None,
             tool: ToolDefinition::Pipeline(vec![
                 crate::playbook::types::PipelineItem::Nested(fetch_task),
@@ -581,6 +584,7 @@ mod tests {
             when: None,
             args: None,
             vars: None,
+            set_vars: None,
             r#loop: None,
             tool: ToolDefinition::Single(Box::new(ToolSpec {
                 kind: ToolKind::Http,

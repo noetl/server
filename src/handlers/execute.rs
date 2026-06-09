@@ -748,6 +748,7 @@ mod tests {
             when: None,
             args: None,
             vars: None,
+            set_vars: None,
             r#loop: loop_cfg,
             tool: ToolDefinition::Single(Box::new(ToolSpec {
                 kind: ToolKind::Python,

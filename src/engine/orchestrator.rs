@@ -238,7 +238,7 @@ impl WorkflowOrchestrator {
         }
 
         // Build context for evaluation (convert Value to HashMap)
-        let context = value_to_hashmap(&state.build_context());
+        let mut context = value_to_hashmap(&state.build_context());
 
         // Build step lookup
         let steps: HashMap<&str, &Step> = playbook
@@ -246,6 +246,41 @@ impl WorkflowOrchestrator {
             .iter()
             .map(|s| (s.step.as_str(), s))
             .collect();
+
+        // Apply step-level `set:` mutations for every completed step.
+        // Mirrors Python's step-level `set:` in transitions.py — these
+        // are template expressions rendered against the completion
+        // context, then applied via scope-prefix stripping (ctx.x → x).
+        // Must run before any evaluate_next / evaluate_loop so the
+        // downstream context includes the mutations.
+        for step_name in state.steps.keys() {
+            if !state.is_step_completed(step_name) {
+                continue;
+            }
+            let step_def = match steps.get(step_name.as_str()) {
+                Some(s) => *s,
+                None => continue,
+            };
+            if let Some(set_vars) = &step_def.set_vars {
+                let shimmed = with_ctx_shims(&context);
+                let mut rendered: HashMap<String, serde_json::Value> =
+                    HashMap::with_capacity(set_vars.len());
+                for (key, val) in set_vars {
+                    let rendered_val = match self.renderer.render_value(val, &shimmed) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            warn!(
+                                "step-level set: template render error for key '{}': {}",
+                                key, e
+                            );
+                            val.clone()
+                        }
+                    };
+                    rendered.insert(key.clone(), rendered_val);
+                }
+                apply_set_mutations(&mut context, &rendered);
+            }
+        }
 
         // Determine what to do based on state
         match state.state {
@@ -1217,6 +1252,7 @@ mod tests {
             when: None,
             args: None,
             vars: None,
+            set_vars: None,
             r#loop: None,
             tool: ToolDefinition::Single(Box::new(ToolSpec {
                 kind: ToolKind::Python,
