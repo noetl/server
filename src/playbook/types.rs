@@ -224,7 +224,7 @@ pub enum EvalEntry {
 /// Format: { label: { kind: ..., args: ..., eval: ... } }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PipelineTask {
-    /// Task label (for referencing with _prev).
+    /// Task label (used as context key in forward-only data flow).
     pub label: String,
 
     /// Tool specification.
@@ -1121,10 +1121,12 @@ workflow:
           kind: http
           url: "https://api.example.com/data"
           method: GET
+          set:
+            fetched_data: "{{ output }}"
       - transform:
           kind: python
-          args:
-            data: "{{ _prev }}"
+          input:
+            data: "{{ fetched_data }}"
           code: |
             result = {"processed": True}
     next:
