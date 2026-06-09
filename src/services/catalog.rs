@@ -52,7 +52,7 @@ impl CatalogService {
             .get("kind")
             .and_then(|v| v.as_str())
             .unwrap_or(&request.resource_type)
-            .to_string();
+            .to_lowercase();
 
         // Get next version
         let version = queries::get_next_version(&self.pool, &path).await?;
