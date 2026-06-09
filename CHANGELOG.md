@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.63.0](https://github.com/noetl/server/compare/v2.62.1...v2.63.0) (2026-06-09)
+
+### Features
+
+* add step-level set: mutation support to orchestrator ([48cb008](https://github.com/noetl/server/commit/48cb00872c6a5f426587dd046b49f21a8888a193))
+
+### Bug Fixes
+
+* add ctx/workload namespace shims to orchestrator evaluation paths ([b05f978](https://github.com/noetl/server/commit/b05f9785437f1d9ab65b015da42f2408d556e3c6))
+
 ## [2.62.1](https://github.com/noetl/server/compare/v2.62.0...v2.62.1) (2026-06-09)
 
 ### Bug Fixes
