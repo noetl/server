@@ -118,8 +118,11 @@ impl CommandBuilder {
         // {{ ctx.foo }} and {{ workload.foo }} templates resolve correctly.
         let tool_command = self.build_tool_from_definition(&step.tool, &render_ctx)?;
 
-        // Persist the original flat context on the Command (no namespace bloat
-        // in event payloads — the shim is only for the render path).
+        // Persist the shimmed render context (with `ctx` and `workload`
+        // namespace aliases) on the Command so the worker can resolve
+        // `{{ ctx.X }}` and `{{ workload.X }}` templates in pipeline
+        // `input:` blocks that render_pipeline_config preserved unrendered
+        // for worker-side resolution.
         Ok(Command {
             command_id,
             execution_id,
@@ -127,7 +130,7 @@ impl CommandBuilder {
             parent_event_id,
             step_name: step.step.clone(),
             tool: tool_command,
-            context: Some(context.clone()),
+            context: Some(render_ctx),
             metadata: metadata.cloned(),
             iterator: None,
         })
@@ -192,6 +195,9 @@ impl CommandBuilder {
             }
         }
 
+        // Persist the shimmed render context so the worker can resolve
+        // `{{ ctx.X }}` / `{{ workload.X }}` templates in pipeline
+        // `input:` blocks (same rationale as build_command).
         Ok(Command {
             command_id,
             execution_id,
@@ -199,7 +205,7 @@ impl CommandBuilder {
             parent_event_id,
             step_name: step.step.clone(),
             tool: tool_command,
-            context: Some(iter_context),
+            context: Some(render_ctx),
             metadata: None,
             iterator: Some(iterator),
         })
@@ -704,11 +710,13 @@ mod tests {
             Some("https://example.com/42"),
             "{{ ctx.foo }} should resolve to 42 via the ctx namespace shim"
         );
-        // The persisted context must NOT contain the shim keys (no event bloat).
+        // The persisted context MUST contain the shim keys so the worker
+        // can resolve `{{ ctx.X }}` templates in pipeline `input:` blocks
+        // that render_pipeline_config preserved unrendered.
         let persisted = command.context.unwrap();
         assert!(
-            !persisted.contains_key("ctx"),
-            "persisted context must not carry ctx shim"
+            persisted.contains_key("ctx"),
+            "persisted context must carry ctx shim for worker-side pipeline input rendering"
         );
     }
 
@@ -812,11 +820,12 @@ mod tests {
             Some("https://example.com/42"),
             "{{ ctx.num }} must resolve to 42 via the ctx shim in an iteration command"
         );
-        // The persisted iter_context must NOT contain the shim keys.
+        // The persisted iter_context MUST contain the shim keys so the
+        // worker can resolve `{{ ctx.X }}` templates in pipeline `input:`.
         let persisted = command.context.unwrap();
         assert!(
-            !persisted.contains_key("ctx"),
-            "persisted iter_context must not carry ctx shim"
+            persisted.contains_key("ctx"),
+            "persisted iter_context must carry ctx shim for worker-side pipeline input rendering"
         );
     }
 }
