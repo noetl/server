@@ -383,13 +383,23 @@ fn render_pipeline_config(
             };
 
             // Stash runtime-only keys before rendering.
+            // These contain template expressions that reference
+            // `output` (tool result data), which doesn't exist
+            // at server-side render time — it's only available
+            // worker-side after tool execution.
             let set_block = spec_obj.get("set").cloned();
             let args_block = spec_obj.get("args").cloned();
+            let spec_block = spec_obj.get("spec").cloned();
 
-            // Build a spec without runtime-only keys.
+            // Build a spec without runtime-only keys.  `spec`
+            // carries `policy.rules[].then.set` whose templates
+            // (e.g. `{{ output.data.counter }}`) must be
+            // evaluated worker-side, not server-side.
             let filtered: serde_json::Map<String, serde_json::Value> = spec_obj
                 .iter()
-                .filter(|(k, _)| k.as_str() != "set" && k.as_str() != "args")
+                .filter(|(k, _)| {
+                    k.as_str() != "set" && k.as_str() != "args" && k.as_str() != "spec"
+                })
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect();
 
@@ -415,6 +425,13 @@ fn render_pipeline_config(
             // rename it back so forward-only resolution works.
             if let Some(args) = args_block {
                 rendered_spec.insert("input".to_string(), args);
+            }
+
+            // Restore `spec` verbatim — policy rules inside it
+            // contain `{{ output.data.* }}` templates resolved
+            // by the worker's task_sequence after execution.
+            if let Some(spec) = spec_block {
+                rendered_spec.insert("spec".to_string(), spec);
             }
 
             rendered_item
