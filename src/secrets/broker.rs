@@ -91,6 +91,12 @@ impl BrokerRegistry {
     pub fn len(&self) -> usize {
         self.inner.len()
     }
+
+    /// Whether the broker map is empty.  Required by clippy alongside `len()`.
+    #[cfg(test)]
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
 }
 
 /// Body of the cross-region resolution request.

@@ -331,7 +331,7 @@ impl DbPoolMap {
         F: FnMut(u32, DbPool) -> Fut,
         Fut: std::future::Future<Output = Result<Option<T>, E>>,
     {
-        let results = self.for_each_shard(|idx, pool| f(idx, pool)).await?;
+        let results = self.for_each_shard(&mut f).await?;
         Ok(results
             .into_iter()
             .find_map(|(idx, opt)| opt.map(|t| (idx, t))))

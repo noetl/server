@@ -109,9 +109,8 @@ pub async fn resolve(
         .credentials
         .get(&body.alias, true, body.execution_id)
         .await
-        .map_err(|e| {
+        .inspect_err(|_e| {
             crate::metrics::record_cross_region_broker_call(my_region, "resolve_error");
-            e
         })?;
 
     // (4) — seal.  Identical to the Phase-5b primitive: serialise the
@@ -123,9 +122,8 @@ pub async fn resolve(
         crate::metrics::record_cross_region_broker_call(my_region, "serialize_error");
         AppError::Internal(format!("cross-region: serialise credential: {e}"))
     })?;
-    let envelope = sealed_seal(&recipient, &plaintext).map_err(|e| {
+    let envelope = sealed_seal(&recipient, &plaintext).inspect_err(|_e| {
         crate::metrics::record_cross_region_broker_call(my_region, "seal_error");
-        e
     })?;
     crate::metrics::record_cross_region_broker_call(my_region, "ok");
     Ok(Json(envelope))

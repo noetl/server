@@ -328,8 +328,10 @@ mod tests {
 
     #[test]
     fn test_connection_url() {
-        let mut config = DatabaseConfig::default();
-        config.password = "secret".to_string();
+        let config = DatabaseConfig {
+            password: "secret".to_string(),
+            ..DatabaseConfig::default()
+        };
         assert_eq!(
             config.connection_url(),
             "postgres://noetl:secret@localhost:5432/noetl"

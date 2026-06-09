@@ -562,10 +562,10 @@ mod tests {
 
     #[test]
     fn number_field() {
-        let yaml = "workload:\n  ratio: 3.14\n";
+        let yaml = "workload:\n  ratio: 2.72\n";
         let f = first_field(yaml);
         assert_eq!(f.kind, "number");
-        assert_eq!(f.default, serde_json::json!(3.14));
+        assert_eq!(f.default, serde_json::json!(2.72));
     }
 
     #[test]

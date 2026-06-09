@@ -88,7 +88,7 @@ impl ReplayCutoff {
 /// `All` is requested, the other map fields are returned empty.
 /// Round 2 fleshes out `Stage`/`Frame`/`Command`; Round 3 adds
 /// `Loop` + `BusinessObject`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReplayProjection {
     Execution,
@@ -97,13 +97,8 @@ pub enum ReplayProjection {
     Command,
     BusinessObject,
     Loop,
+    #[default]
     All,
-}
-
-impl Default for ReplayProjection {
-    fn default() -> Self {
-        Self::All
-    }
 }
 
 impl ReplayProjection {
@@ -124,7 +119,7 @@ impl ReplayProjection {
     /// Parse a wire value.  Accepts the canonical Python names +
     /// the underscore alias `business_object`.  Returns `None`
     /// on unknown — the endpoint surfaces this as a 400.
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse_wire(s: &str) -> Option<Self> {
         match s {
             "execution" => Some(Self::Execution),
             "stage" => Some(Self::Stage),
@@ -1939,22 +1934,22 @@ mod tests {
     #[test]
     fn projection_from_str_accepts_canonical_names() {
         assert_eq!(
-            ReplayProjection::from_str("execution"),
+            ReplayProjection::parse_wire("execution"),
             Some(ReplayProjection::Execution)
         );
         assert_eq!(
-            ReplayProjection::from_str("business_object"),
+            ReplayProjection::parse_wire("business_object"),
             Some(ReplayProjection::BusinessObject)
         );
         assert_eq!(
-            ReplayProjection::from_str("loop"),
+            ReplayProjection::parse_wire("loop"),
             Some(ReplayProjection::Loop)
         );
         assert_eq!(
-            ReplayProjection::from_str("all"),
+            ReplayProjection::parse_wire("all"),
             Some(ReplayProjection::All)
         );
-        assert!(ReplayProjection::from_str("garbage").is_none());
+        assert!(ReplayProjection::parse_wire("garbage").is_none());
     }
 
     #[test]

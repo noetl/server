@@ -137,7 +137,7 @@ pub async fn pool_status(State(state): State<AppState>) -> Json<PoolStatusRespon
     // /metrics (per-shard gauge labels) or a follow-up
     // /api/pool/status/shards endpoint.
     let cluster = state.pools.cluster();
-    let pool_size = u32::try_from(cluster.size()).unwrap_or(u32::MAX);
+    let pool_size = cluster.size();
     let pool_available = u32::try_from(cluster.num_idle()).unwrap_or(u32::MAX);
     let pool_max = pool_size.max(pool_available);
     let pool_min = 0;

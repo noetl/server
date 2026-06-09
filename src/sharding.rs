@@ -142,7 +142,7 @@ impl ShardConfig {
 
     /// Wrap this config in an [`Arc`] for sharing across handlers
     /// + services.  Sibling to `AppState`'s `Arc<SnowflakeGenerator>`
-    /// pattern.
+    ///   pattern.
     pub fn into_arc(self) -> Arc<Self> {
         Arc::new(self)
     }

@@ -103,11 +103,9 @@ pub async fn execute(
     // returned an empty `{}` and Jinja templates referencing
     // workload fields rendered to None.  See noetl/ai-meta#56.
     let mut merged_workload = serde_json::Map::new();
-    if let Some(playbook_workload) = &playbook.workload {
-        if let serde_json::Value::Object(map) = playbook_workload {
-            for (k, v) in map {
-                merged_workload.insert(k.clone(), v.clone());
-            }
+    if let Some(serde_json::Value::Object(map)) = &playbook.workload {
+        for (k, v) in map {
+            merged_workload.insert(k.clone(), v.clone());
         }
     }
     for (k, v) in &request.payload {
@@ -436,11 +434,9 @@ async fn generate_initial_commands(
     let mut context = HashMap::new();
 
     // First, add playbook workload defaults
-    if let Some(workload) = &playbook.workload {
-        if let serde_json::Value::Object(map) = workload {
-            for (k, v) in map {
-                context.insert(k.clone(), v.clone());
-            }
+    if let Some(serde_json::Value::Object(map)) = &playbook.workload {
+        for (k, v) in map {
+            context.insert(k.clone(), v.clone());
         }
     }
 
@@ -753,7 +749,7 @@ mod tests {
             args: None,
             vars: None,
             r#loop: loop_cfg,
-            tool: ToolDefinition::Single(ToolSpec {
+            tool: ToolDefinition::Single(Box::new(ToolSpec {
                 kind: ToolKind::Python,
                 auth: None,
                 libs: None,
@@ -769,7 +765,7 @@ mod tests {
                 eval: None,
                 output_select: None,
                 extra: HashMap::new(),
-            }),
+            })),
             next: None,
         }
     }

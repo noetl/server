@@ -117,8 +117,8 @@ pub enum NextMode {
 }
 
 impl NextMode {
-    /// Parse from string.
-    pub fn from_str(s: &str) -> Self {
+    /// Parse from string value.
+    pub fn parse(s: &str) -> Self {
         match s.to_lowercase().as_str() {
             "inclusive" => NextMode::Inclusive,
             _ => NextMode::Exclusive,
@@ -188,7 +188,7 @@ impl ConditionEvaluator {
             .spec
             .as_ref()
             .and_then(|s| s.next_mode.as_ref())
-            .map(|m| NextMode::from_str(m))
+            .map(|m| NextMode::parse(m))
             .unwrap_or_default();
 
         match &step.next {
@@ -209,7 +209,7 @@ impl ConditionEvaluator {
                     .spec
                     .as_ref()
                     .and_then(|s| s.mode.as_ref())
-                    .map(|m| NextMode::from_str(m))
+                    .map(|m| NextMode::parse(m))
                     .unwrap_or(next_mode);
 
                 // #67 fix: emit `EvaluationResult { matched: false,
@@ -436,10 +436,10 @@ mod tests {
 
     #[test]
     fn test_next_mode_parsing() {
-        assert_eq!(NextMode::from_str("exclusive"), NextMode::Exclusive);
-        assert_eq!(NextMode::from_str("inclusive"), NextMode::Inclusive);
-        assert_eq!(NextMode::from_str("EXCLUSIVE"), NextMode::Exclusive);
-        assert_eq!(NextMode::from_str("INCLUSIVE"), NextMode::Inclusive);
-        assert_eq!(NextMode::from_str("unknown"), NextMode::Exclusive); // default
+        assert_eq!(NextMode::parse("exclusive"), NextMode::Exclusive);
+        assert_eq!(NextMode::parse("inclusive"), NextMode::Inclusive);
+        assert_eq!(NextMode::parse("EXCLUSIVE"), NextMode::Exclusive);
+        assert_eq!(NextMode::parse("INCLUSIVE"), NextMode::Inclusive);
+        assert_eq!(NextMode::parse("unknown"), NextMode::Exclusive); // default
     }
 }

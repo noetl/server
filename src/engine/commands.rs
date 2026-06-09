@@ -387,7 +387,7 @@ mod tests {
             args: None,
             vars: None,
             r#loop: None,
-            tool: ToolDefinition::Single(ToolSpec {
+            tool: ToolDefinition::Single(Box::new(ToolSpec {
                 kind: ToolKind::Http,
                 auth: None,
                 libs: None,
@@ -403,7 +403,7 @@ mod tests {
                 eval: None,
                 output_select: None,
                 extra: HashMap::new(),
-            }),
+            })),
             next: None,
         };
 
@@ -436,7 +436,7 @@ mod tests {
             args: None,
             vars: None,
             r#loop: None,
-            tool: ToolDefinition::Single(ToolSpec {
+            tool: ToolDefinition::Single(Box::new(ToolSpec {
                 kind: ToolKind::Python,
                 auth: None,
                 libs: None,
@@ -452,7 +452,7 @@ mod tests {
                 eval: None,
                 output_select: None,
                 extra: HashMap::new(),
-            }),
+            })),
             next: None,
         };
 
@@ -582,7 +582,7 @@ mod tests {
             args: None,
             vars: None,
             r#loop: None,
-            tool: ToolDefinition::Single(ToolSpec {
+            tool: ToolDefinition::Single(Box::new(ToolSpec {
                 kind: ToolKind::Http,
                 auth: None,
                 libs: None,
@@ -598,7 +598,7 @@ mod tests {
                 eval: None,
                 output_select: None,
                 extra: HashMap::new(),
-            }),
+            })),
             next: None,
         }
     }

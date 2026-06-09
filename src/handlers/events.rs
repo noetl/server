@@ -1170,12 +1170,12 @@ async fn check_already_claimed(
 ///
 /// Mapping:
 /// - `result_kind = "ref"`  + `result_uri` set
-///       → `{status, reference: {store_tier, logical_uri}}`
+///   → `{status, reference: {store_tier, logical_uri}}`
 /// - `result_kind = "refs"` + `event_ids` set
-///       → `{status, reference: {event_ids, total_parts}}`
+///   → `{status, reference: {event_ids, total_parts}}`
 /// - default (`"data"` or unknown):
-///   - `payload` is a non-null object → `{status, context: <payload>}`
-///   - `payload` is null/non-object   → `{status}`
+///     - `payload` is a non-null object → `{status, context: <payload>}`
+///     - `payload` is null/non-object   → `{status}`
 fn build_result_object(request: &EventRequest, status: &str) -> serde_json::Value {
     let mut result = serde_json::Map::new();
     result.insert(

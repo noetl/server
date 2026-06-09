@@ -1188,7 +1188,7 @@ mod tests {
             args: None,
             vars: None,
             r#loop: None,
-            tool: ToolDefinition::Single(ToolSpec {
+            tool: ToolDefinition::Single(Box::new(ToolSpec {
                 kind: ToolKind::Python,
                 eval: None,
                 auth: None,
@@ -1204,7 +1204,7 @@ mod tests {
                 headers: None,
                 output_select: None,
                 extra: HashMap::new(),
-            }),
+            })),
             next: next.map(|n| NextSpec::Single(n.to_string())),
         }
     }
@@ -1300,7 +1300,7 @@ mod tests {
 
         let bad_step = {
             let mut s = make_step("bad_step", Some("end"));
-            s.tool = ToolDefinition::Single(ToolSpec {
+            s.tool = ToolDefinition::Single(Box::new(ToolSpec {
                 kind: ToolKind::Python,
                 eval: None,
                 auth: None,
@@ -1316,7 +1316,7 @@ mod tests {
                 headers: None,
                 output_select: None,
                 extra: HashMap::new(),
-            });
+            }));
             s
         };
 
@@ -2124,7 +2124,7 @@ mod tests {
         // comprehensive_test fixture.
         let summarize = {
             let mut s = make_step("summarize", Some("end"));
-            s.tool = ToolDefinition::Single(ToolSpec {
+            s.tool = ToolDefinition::Single(Box::new(ToolSpec {
                 kind: ToolKind::Python,
                 eval: None,
                 auth: None,
@@ -2143,7 +2143,7 @@ mod tests {
                 headers: None,
                 output_select: None,
                 extra: HashMap::new(),
-            });
+            }));
             s
         };
         let end = make_step("end", None);
@@ -2770,7 +2770,7 @@ mod tests {
         // `end` is referenced only from `reduce` (single upstream).
         assert_eq!(incoming.get("end").map(|u| u.len()).unwrap_or(0), 1);
         // `start` has no upstreams.
-        assert!(incoming.get("start").is_none());
+        assert!(!incoming.contains_key("start"));
     }
 
     #[test]
@@ -2812,7 +2812,7 @@ mod tests {
         // use_vars step reads x from its input template.
         let use_vars = {
             let mut s = make_step("use_vars", Some("end"));
-            s.tool = ToolDefinition::Single(ToolSpec {
+            s.tool = ToolDefinition::Single(Box::new(ToolSpec {
                 kind: ToolKind::Python,
                 eval: None,
                 auth: None,
@@ -2833,7 +2833,7 @@ mod tests {
                 headers: None,
                 output_select: None,
                 extra: HashMap::new(),
-            });
+            }));
             s
         };
 
