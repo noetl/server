@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.0.0](https://github.com/noetl/server/compare/v2.63.0...v3.0.0) (2026-06-09)
+
+### ⚠ BREAKING CHANGES
+
+* replace generic render_value_deferring with targeted pipeline rendering
+
+### Features
+
+* replace generic render_value_deferring with targeted pipeline rendering ([02dc266](https://github.com/noetl/server/commit/02dc26627bf547f283cd18d21694c79ec9406156)), closes [noetl/ai-meta#77](https://github.com/noetl/ai-meta/issues/77)
+
 ## [2.63.0](https://github.com/noetl/server/compare/v2.62.1...v2.63.0) (2026-06-09)
 
 ### Features
