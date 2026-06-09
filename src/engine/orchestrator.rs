@@ -45,6 +45,29 @@ fn merge_iteration_context(
     serde_json::Value::Object(obj)
 }
 
+/// Add `ctx` and `workload` namespace shims to a flat variable
+/// context.  Mirrors the same pattern in `CommandBuilder::build_command`
+/// (commands.rs:108-115) so that `{{ ctx.foo }}` and `{{ workload.foo }}`
+/// resolve in orchestrator-level evaluation (loop expressions, step.when
+/// guards, transition conditions), not just in tool command rendering.
+///
+/// Uses `entry().or_insert_with()` to avoid clobbering existing bindings
+/// — if the context already carries a `ctx` or `workload` key (e.g. from
+/// a prior shim call or from the workload block), the existing value wins.
+fn with_ctx_shims(
+    context: &HashMap<String, serde_json::Value>,
+) -> HashMap<String, serde_json::Value> {
+    let mut render_ctx = context.clone();
+    let ctx_value = serde_json::to_value(context).unwrap_or(serde_json::Value::Null);
+    render_ctx
+        .entry("ctx".to_string())
+        .or_insert_with(|| ctx_value.clone());
+    render_ctx
+        .entry("workload".to_string())
+        .or_insert_with(|| ctx_value);
+    render_ctx
+}
+
 /// Build the inverse arc graph for a workflow: `target_step` →
 /// `{ upstream steps that point at it }`.
 ///
@@ -485,7 +508,8 @@ impl WorkflowOrchestrator {
                 }
 
                 let next_idx = completed as usize;
-                let items = self.evaluator.evaluate_loop(&loop_cfg.in_expr, context)?;
+                let shimmed = with_ctx_shims(context);
+                let items = self.evaluator.evaluate_loop(&loop_cfg.in_expr, &shimmed)?;
                 if next_idx >= items.len() {
                     continue;
                 } // safety guard
@@ -543,7 +567,8 @@ impl WorkflowOrchestrator {
                 Some(s) => *s,
                 None => continue,
             };
-            let eval_results = self.evaluator.evaluate_next(step, context)?;
+            let shimmed = with_ctx_shims(context);
+            let eval_results = self.evaluator.evaluate_next(step, &shimmed)?;
             per_step_evals.push((step_name.clone(), step, eval_results));
         }
 
@@ -732,11 +757,13 @@ impl WorkflowOrchestrator {
                     if let Some(set_vars) = &result.arc_set_vars {
                         // Render template values against the current context
                         // (which includes the producing step's result fields),
-                        // then apply scope-stripping.
+                        // then apply scope-stripping.  Add ctx/workload shims
+                        // so {{ ctx.X }} templates resolve during set rendering.
+                        let shimmed_set = with_ctx_shims(&step_context);
                         let mut rendered: HashMap<String, serde_json::Value> =
                             HashMap::with_capacity(set_vars.len());
                         for (key, val) in set_vars {
-                            let rendered_val = match self.renderer.render_value(val, &step_context)
+                            let rendered_val = match self.renderer.render_value(val, &shimmed_set)
                             {
                                 Ok(v) => v,
                                 Err(e) => {
@@ -773,9 +800,10 @@ impl WorkflowOrchestrator {
                     let mut completion: Option<CompletionStatus> = None;
 
                     loop {
+                        let shimmed_ctx = with_ctx_shims(&current_ctx);
                         let guard_ok = self
                             .evaluator
-                            .evaluate_step_when(current_step, &current_ctx)?;
+                            .evaluate_step_when(current_step, &shimmed_ctx)?;
                         if guard_ok {
                             break;
                         }
@@ -794,7 +822,7 @@ impl WorkflowOrchestrator {
                         // the first matched arc — once we've decided
                         // to skip, we've already committed to the
                         // single-path chain.
-                        let chained = self.evaluator.evaluate_next(current_step, &current_ctx)?;
+                        let chained = self.evaluator.evaluate_next(current_step, &shimmed_ctx)?;
                         let next_after_skip = chained
                             .into_iter()
                             .find(|r| r.matched && r.next_step.is_some());
@@ -834,11 +862,12 @@ impl WorkflowOrchestrator {
                             }
                         }
                         if let Some(set_vars) = &arc.arc_set_vars {
+                            let shimmed_arc = with_ctx_shims(&current_ctx);
                             let mut rendered: HashMap<String, serde_json::Value> =
                                 HashMap::with_capacity(set_vars.len());
                             for (key, val) in set_vars {
                                 let rendered_val =
-                                    match self.renderer.render_value(val, &current_ctx) {
+                                    match self.renderer.render_value(val, &shimmed_arc) {
                                         Ok(v) => v,
                                         Err(e) => {
                                             warn!(
@@ -923,9 +952,10 @@ impl WorkflowOrchestrator {
                     // block above handles subsequent iterations when
                     // each command.completed arrives.
                     if let Some(loop_cfg) = current_step.r#loop.as_ref() {
+                        let shimmed_loop = with_ctx_shims(&current_ctx);
                         let items = self
                             .evaluator
-                            .evaluate_loop(&loop_cfg.in_expr, &current_ctx)?;
+                            .evaluate_loop(&loop_cfg.in_expr, &shimmed_loop)?;
                         let total: usize = items.len();
 
                         if total == 0 {
@@ -2889,5 +2919,121 @@ mod tests {
             "arc set: ctx.x = 42 must appear as bare key x in command context; ctx = {:?}",
             ctx
         );
+    }
+
+    /// Regression test: `{{ ctx.X }}` must resolve inside a `loop.in`
+    /// expression (not just in tool templates).  Before the
+    /// `with_ctx_shims` fix the orchestrator passed raw context (no
+    /// `ctx` namespace) to `evaluate_loop`, so the loop errored with
+    /// "Loop expression did not evaluate to an iterable".
+    #[test]
+    fn test_loop_in_resolves_ctx_namespace() {
+        use crate::playbook::types::{
+            Loop, NextArc, NextRouter, NextRouterSpec, ToolDefinition, ToolKind, ToolSpec,
+        };
+
+        let orchestrator = WorkflowOrchestrator::new();
+
+        // Step 1: `setup` — produces `items: [1,2,3]` in its result.
+        let setup = make_step("setup", None);
+
+        // Arc from setup → loop_step with `set: { ctx.items: "{{ setup.items }}" }`.
+        // Then loop_step has `loop: { in: "{{ ctx.items }}", iterator: item }`.
+        let mut setup_with_arc = setup;
+        setup_with_arc.next = Some(NextSpec::Router(NextRouter {
+            spec: Some(NextRouterSpec {
+                mode: Some("exclusive".to_string()),
+            }),
+            arcs: vec![NextArc {
+                step: "loop_step".to_string(),
+                when: None,
+                set_vars: Some(
+                    [("ctx.items".to_string(), serde_json::json!("{{ setup.items }}"))]
+                        .into_iter()
+                        .collect(),
+                ),
+            }],
+        }));
+
+        let mut loop_step = make_step("loop_step", Some("end"));
+        loop_step.r#loop = Some(Loop {
+            in_expr: "{{ ctx.items }}".to_string(),
+            iterator: "item".to_string(),
+            spec: None,
+        });
+        loop_step.tool = ToolDefinition::Single(Box::new(ToolSpec {
+            kind: ToolKind::Python,
+            eval: None,
+            auth: None,
+            libs: None,
+            args: None,
+            code: Some("result = {}".to_string()),
+            url: None,
+            method: None,
+            query: None,
+            command: None,
+            connection: None,
+            params: None,
+            headers: None,
+            output_select: None,
+            extra: HashMap::new(),
+        }));
+
+        let playbook = Playbook {
+            api_version: "noetl.io/v2".to_string(),
+            kind: "Playbook".to_string(),
+            metadata: crate::playbook::types::Metadata {
+                name: "ctx_loop_test".to_string(),
+                path: None,
+                description: None,
+                labels: None,
+                extra: HashMap::new(),
+            },
+            workload: None,
+            vars: None,
+            keychain: None,
+            workbook: None,
+            workflow: vec![setup_with_arc, loop_step],
+        };
+
+        // Simulate: playbook_started → setup completes with result { items: [1,2,3] }
+        let events = vec![
+            {
+                let mut e = make_event("playbook_started", None);
+                e.context = Some(serde_json::json!({
+                    "workload": {}, "path": "test", "version": "1"
+                }));
+                e
+            },
+            {
+                let mut e = make_event("command.completed", Some("setup"));
+                e.result = Some(serde_json::json!({ "items": [1, 2, 3] }));
+                e
+            },
+        ];
+
+        let result = orchestrator
+            .evaluate(&events, &playbook, Some("command.completed"))
+            .expect("orchestrator must not error — ctx.items must resolve in loop.in");
+
+        // The orchestrator should have produced iteration commands for the
+        // loop_step.  Default mode is sequential, so only iteration 0
+        // dispatches, but step.enter + at least one command must appear.
+        assert!(
+            !result.commands.is_empty(),
+            "expected at least one iteration command for loop_step; got none — \
+             ctx.items did not resolve in the loop expression"
+        );
+
+        // Verify the iterator metadata
+        let cmd = &result.commands[0];
+        let iter = cmd
+            .iterator
+            .as_ref()
+            .expect("command must carry iterator metadata");
+        assert_eq!(iter.item_var, "item");
+        assert_eq!(iter.total, 3);
+        assert_eq!(iter.index, 0);
+        assert_eq!(iter.item, serde_json::json!(1));
     }
 }
