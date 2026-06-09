@@ -41,6 +41,7 @@ fn init_tracing() {
 }
 
 /// Build the application router with all routes.
+#[allow(clippy::too_many_arguments)]
 fn build_router(
     state: AppState,
     db_pool: DbPool,

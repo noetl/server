@@ -236,7 +236,7 @@ pub struct PipelineTask {
 #[serde(untagged)]
 pub enum ToolDefinition {
     /// Single tool (shorthand).
-    Single(ToolSpec),
+    Single(Box<ToolSpec>),
 
     /// Pipeline - list of labeled tasks.
     ///
@@ -288,7 +288,7 @@ pub enum PipelineItem {
     /// the fields are an inline `ToolSpec`.  Stored via `ToolSpec.extra`
     /// (the `#[serde(flatten)] HashMap` catch-all), so no schema change
     /// is needed on ToolSpec itself.
-    Flat(ToolSpec),
+    Flat(Box<ToolSpec>),
 
     /// Nested shape: `{ "label": { kind: "python", code: "...", ... } }`.
     /// Single-key map — the key is the label, the value is the spec.

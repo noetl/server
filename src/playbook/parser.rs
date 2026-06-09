@@ -127,7 +127,7 @@ fn resolve_workbook_references(playbook: &mut crate::playbook::types::Playbook) 
         // doesn't carry the now-resolved reference.
         let mut substituted = resolved_tool;
         substituted.args = merged_args;
-        step.tool = ToolDefinition::Single(substituted);
+        step.tool = ToolDefinition::Single(Box::new(substituted));
     }
 
     Ok(())

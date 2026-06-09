@@ -107,7 +107,7 @@ pub async fn replay_state(
         ));
     }
 
-    let projection = ReplayProjection::from_str(&query.projection).ok_or_else(|| {
+    let projection = ReplayProjection::parse_wire(&query.projection).ok_or_else(|| {
         AppError::BadRequest(format!(
             "unknown projection {:?}; expected one of: execution, stage, frame, command, business_object, loop, all",
             query.projection
