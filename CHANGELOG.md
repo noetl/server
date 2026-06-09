@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.62.1](https://github.com/noetl/server/compare/v2.62.0...v2.62.1) (2026-06-09)
+
+### Bug Fixes
+
+* resolve all pre-existing clippy warnings under -D warnings ([53f93f5](https://github.com/noetl/server/commit/53f93f515d1e25a508500f3ecd41f9fc1b2a0bf1)), closes [#161](https://github.com/noetl/server/issues/161)
+
 ## [2.62.0](https://github.com/noetl/server/compare/v2.61.1...v2.62.0) (2026-06-09)
 
 ### Features
