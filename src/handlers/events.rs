@@ -477,11 +477,7 @@ pub async fn handle_event(
 
     let status_label = if result.is_ok() { "ok" } else { "error" };
     let duration_seconds = started_at.elapsed().as_secs_f64();
-    crate::metrics::record_event_ingest(
-        &event_type_for_metrics,
-        status_label,
-        duration_seconds,
-    );
+    crate::metrics::record_event_ingest(&event_type_for_metrics, status_label, duration_seconds);
 
     result
 }
@@ -557,9 +553,9 @@ async fn handle_event_inner(
     // is available before the INSERT span opens and so per-shard
     // generation can be controlled via `NOETL_SERVER_MACHINE_ID`.
     let event_id: i64 = match request.event_id.as_deref() {
-        Some(raw) => raw.parse().map_err(|_| {
-            AppError::Validation(format!("Invalid event_id: {raw}"))
-        })?,
+        Some(raw) => raw
+            .parse()
+            .map_err(|_| AppError::Validation(format!("Invalid event_id: {raw}")))?,
         None => state.snowflake.generate()?,
     };
 
@@ -624,10 +620,16 @@ async fn handle_event_inner(
     let commands_generated = if !skip_engine_events.contains(&request.event_type.as_str()) {
         // TODO: Implement engine event handling
         // This would call the orchestrator to evaluate next steps
-        debug!("Would process through engine: event_type={}", request.event_type);
+        debug!(
+            "Would process through engine: event_type={}",
+            request.event_type
+        );
         0
     } else {
-        debug!("Skipped engine for administrative event: {}", request.event_type);
+        debug!(
+            "Skipped engine for administrative event: {}",
+            request.event_type
+        );
         0
     };
 
@@ -764,11 +766,7 @@ pub async fn claim_command(
         AppError::NotFound(format!("command.issued event not found: {}", event_id))
     })?;
 
-    let mut tx = state
-        .pools
-        .pool_for(resolved_execution_id)
-        .begin()
-        .await?;
+    let mut tx = state.pools.pool_for(resolved_execution_id).begin().await?;
 
     let cmd_row = sqlx::query(
         r#"
@@ -1180,7 +1178,10 @@ async fn check_already_claimed(
 ///   - `payload` is null/non-object   → `{status}`
 fn build_result_object(request: &EventRequest, status: &str) -> serde_json::Value {
     let mut result = serde_json::Map::new();
-    result.insert("status".to_string(), serde_json::Value::String(status.to_string()));
+    result.insert(
+        "status".to_string(),
+        serde_json::Value::String(status.to_string()),
+    );
 
     match request.result_kind.as_str() {
         "ref" if request.result_uri.is_some() => {
@@ -1336,12 +1337,17 @@ async fn trigger_orchestrator(
             result: r.try_get("result").ok(),
             worker_id: r.try_get("worker_id").ok(),
             attempt: r.try_get("attempt").ok(),
-            created_at: r.try_get("created_at").unwrap_or_else(|_| chrono::Utc::now()),
+            created_at: r
+                .try_get("created_at")
+                .unwrap_or_else(|_| chrono::Utc::now()),
         })
         .collect();
 
     if events.is_empty() {
-        debug!(execution_id, "No events to evaluate — orchestrator exit early");
+        debug!(
+            execution_id,
+            "No events to evaluate — orchestrator exit early"
+        );
         return Ok(0);
     }
 
@@ -1362,17 +1368,16 @@ async fn trigger_orchestrator(
         })?;
 
     // Phase F R4-3: noetl.catalog is a cluster-wide table.
-    let playbook_yaml: String = sqlx::query_scalar(
-        "SELECT content FROM noetl.catalog WHERE catalog_id = $1",
-    )
-    .bind(catalog_id)
-    .fetch_one(state.pools.cluster())
-    .await
-    .map_err(|e| {
-        AppError::Internal(format!(
-            "Failed to load playbook for catalog_id {catalog_id}: {e}"
-        ))
-    })?;
+    let playbook_yaml: String =
+        sqlx::query_scalar("SELECT content FROM noetl.catalog WHERE catalog_id = $1")
+            .bind(catalog_id)
+            .fetch_one(state.pools.cluster())
+            .await
+            .map_err(|e| {
+                AppError::Internal(format!(
+                    "Failed to load playbook for catalog_id {catalog_id}: {e}"
+                ))
+            })?;
     let playbook = crate::playbook::parser::parse_playbook(&playbook_yaml)?;
 
     // 3. Evaluate.
@@ -1804,8 +1809,10 @@ mod tests {
         };
         let result = build_result_object(&request, "STARTED");
         assert_eq!(result["status"], "STARTED");
-        assert!(result.get("context").is_none(),
-            "context must not be set when payload is non-object: {result}");
+        assert!(
+            result.get("context").is_none(),
+            "context must not be set when payload is non-object: {result}"
+        );
     }
 
     #[test]
@@ -1852,8 +1859,10 @@ mod tests {
         let reference = &result["reference"];
         assert_eq!(reference["event_ids"][0], 100);
         assert_eq!(reference["total_parts"], 3);
-        assert!(result.get("event_ids").is_none(),
-            "event_ids should be nested under reference, not top-level");
+        assert!(
+            result.get("event_ids").is_none(),
+            "event_ids should be nested under reference, not top-level"
+        );
     }
 
     #[test]
@@ -2032,11 +2041,10 @@ mod tests {
         req.event_type = "command.completed".to_string();
         req.status = None;
         req.created_at = None;
-        let ev: noetl_events::ExecutorEvent =
-            (&req).try_into().expect("convert with defaults");
+        let ev: noetl_events::ExecutorEvent = (&req).try_into().expect("convert with defaults");
         assert_eq!(ev.status, "COMPLETED"); // name-derived fallback
-        // created_at falls back to now(); just assert it's non-zero
-        // and recent enough to be sane.
+                                            // created_at falls back to now(); just assert it's non-zero
+                                            // and recent enough to be sane.
         let age = chrono::Utc::now() - ev.created_at;
         assert!(age.num_seconds() >= 0 && age.num_seconds() < 60);
     }

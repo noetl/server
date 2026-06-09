@@ -457,7 +457,12 @@ async fn generate_initial_commands(
 
     // Iterator fan-out at initial dispatch: mirror the R3b shape from
     // orchestrator.rs.  If the start step has a `loop:` block, resolve
-    // the `in:` expression and emit one command per item.
+    // the `in:` expression and emit commands.
+    //
+    // #76: respects LoopMode — parallel dispatches all items at once,
+    // sequential (default) dispatches only iteration 0.  Also emits a
+    // `step.enter` event with `iterations_expected` so the state
+    // machine knows how many command.completed events to wait for.
     if let Some(loop_cfg) = start_step.r#loop.as_ref() {
         // Render the loop expression to a raw JSON value and require a
         // JSON array.  Unlike orchestrator.rs (which coerces numbers to
@@ -485,16 +490,61 @@ async fn generate_initial_commands(
         };
 
         let total = items.len();
+        let is_parallel = loop_cfg
+            .spec
+            .as_ref()
+            .map(|s| s.mode == crate::playbook::types::LoopMode::Parallel)
+            .unwrap_or(false);
+
         info!(
             execution_id,
             total,
             iterator = %loop_cfg.iterator,
-            "Fanning out {} iterations for start step (iterator='{}')",
+            mode = if is_parallel { "parallel" } else { "sequential" },
+            "Fanning out {} iterations for start step (iterator='{}', mode={})",
             total,
             loop_cfg.iterator,
+            if is_parallel { "parallel" } else { "sequential" },
         );
 
-        for (idx, item) in items.into_iter().enumerate() {
+        // Emit step.enter with iterations_expected so the state
+        // machine knows how many iterations to wait for before
+        // marking the step Completed.  Without this, the first
+        // command.completed would flip the step to Completed and
+        // the remaining iterations would be orphaned.
+        let enter_event_id = state.snowflake.generate()?;
+        let enter_result = serde_json::json!({
+            "status": "ENTERED",
+            "context": {
+                "iterations_expected": total,
+                "iterator_var": loop_cfg.iterator,
+            },
+        });
+        sqlx::query(
+            r#"
+            INSERT INTO noetl.event (
+                event_id, execution_id, catalog_id, event_type,
+                node_id, node_name, status, result, meta, created_at, parent_event_id
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            "#,
+        )
+        .bind(enter_event_id)
+        .bind(execution_id)
+        .bind(catalog_id)
+        .bind("step.enter")
+        .bind(&start_step.step)
+        .bind(&start_step.step)
+        .bind("ENTERED")
+        .bind(&enter_result)
+        .bind(serde_json::json!({"emitted_by": "execute_handler"}))
+        .bind(chrono::Utc::now())
+        .bind(parent_event_id)
+        .execute(state.pools.pool_for(execution_id))
+        .await?;
+
+        // #76: parallel = all items; sequential = only iteration 0.
+        let dispatch_count = if is_parallel { total } else { 1 };
+        for (idx, item) in items.into_iter().take(dispatch_count).enumerate() {
             let iter_meta = crate::engine::commands::IteratorMetadata {
                 parent_execution_id: execution_id,
                 iterator_step: start_step.step.clone(),
