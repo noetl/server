@@ -517,6 +517,14 @@ pub struct Step {
     #[serde(default)]
     pub vars: Option<HashMap<String, serde_json::Value>>,
 
+    /// Step-level `set:` mutations — template expressions rendered
+    /// against the producing step's completion context, then applied
+    /// via scope-prefix stripping (`ctx.x` → `x`) exactly like
+    /// arc-level `set:`.  Mirrors Python's step-level `set:` in
+    /// `noetl/core/dsl/engine/executor/transitions.py`.
+    #[serde(default, rename = "set")]
+    pub set_vars: Option<HashMap<String, serde_json::Value>>,
+
     /// Loop configuration with spec.mode.
     #[serde(default)]
     pub r#loop: Option<Loop>,
