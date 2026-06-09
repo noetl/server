@@ -215,27 +215,15 @@ impl CommandBuilder {
             ToolDefinition::Single(spec) => self.build_tool_command(spec, context),
             ToolDefinition::Pipeline(tasks) => {
                 // For pipelines, create a task_sequence tool command.
-                // The worker dispatches each sub-task through the
-                // task_sequence tool, which re-renders every sub-task's
-                // config against its own context (the command's
-                // render_context PLUS the runtime `_prev` / `_results`
-                // it injects per task).  So we render `{{ pg_auth }}`,
-                // `{{ item }}`, `{{ execution_id }}`, step results, etc.
-                // now (the worker's keychain-alias resolution needs the
-                // credential alias resolved to a string), but we must
-                // PRESERVE `{{ _prev.* }}` / `{{ _results.* }}` — those
-                // are undefined at command-build time and (with the
-                // Chainable undefined behavior) would otherwise render
-                // to empty strings, producing malformed sub-task configs
-                // (e.g. empty SQL VALUES).  See noetl/server#72 /
-                // noetl/ai-meta#54.
+                // Render server-resolvable templates (credential
+                // aliases, execution_id, step variables, etc.) now,
+                // but preserve `set:` and `input:` blocks verbatim —
+                // they contain runtime-only expressions (`{{ output }}`,
+                // context vars from prior items' `set:`) that the
+                // worker's task_sequence tool evaluates per-item.
                 let pipeline_config = serde_json::to_value(tasks).ok();
                 let config = if let Some(cfg) = pipeline_config {
-                    Some(self.renderer.render_value_deferring(
-                        &cfg,
-                        context,
-                        &["_prev", "_results"],
-                    )?)
+                    Some(render_pipeline_config(&self.renderer, &cfg, context)?)
                 } else {
                     None
                 };
@@ -339,6 +327,96 @@ impl CommandBuilder {
             iterator: None,
         }
     }
+}
+
+/// Render a pipeline (task_sequence) config, preserving `set:` and
+/// `input:`/`args:` blocks that the worker's task_sequence tool
+/// evaluates at runtime.
+///
+/// The pipeline config is an array of single-key objects:
+/// `[{"label": {"kind": ..., "set": {...}, "args": {...}, ...}}, ...]`
+///
+/// For each item the function:
+/// 1. Extracts `set` and `args` from the inner spec (these contain
+///    runtime-only templates like `{{ output }}` and inter-item
+///    context vars).
+/// 2. Renders everything else (credential aliases, execution_id,
+///    step variables — all resolvable at command-build time).
+/// 3. Restores `set` verbatim and `args` as `input` (the key name
+///    the worker's task_sequence reads; serde serialized `input:`
+///    from YAML as `args` because that's ToolSpec's field name).
+fn render_pipeline_config(
+    renderer: &TemplateRenderer,
+    config: &serde_json::Value,
+    context: &HashMap<String, serde_json::Value>,
+) -> AppResult<serde_json::Value> {
+    let arr = match config.as_array() {
+        Some(a) => a,
+        None => return renderer.render_value(config, context),
+    };
+
+    let mut result = Vec::with_capacity(arr.len());
+    for item in arr {
+        let obj = match item.as_object() {
+            Some(o) => o,
+            None => {
+                result.push(renderer.render_value(item, context)?);
+                continue;
+            }
+        };
+
+        let mut rendered_item = serde_json::Map::new();
+        for (label, spec) in obj {
+            let spec_obj = match spec.as_object() {
+                Some(o) => o,
+                None => {
+                    rendered_item
+                        .insert(label.clone(), renderer.render_value(spec, context)?);
+                    continue;
+                }
+            };
+
+            // Stash runtime-only keys before rendering.
+            let set_block = spec_obj.get("set").cloned();
+            let args_block = spec_obj.get("args").cloned();
+
+            // Build a spec without runtime-only keys.
+            let filtered: serde_json::Map<String, serde_json::Value> = spec_obj
+                .iter()
+                .filter(|(k, _)| k.as_str() != "set" && k.as_str() != "args")
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+
+            let rendered =
+                renderer.render_value(&serde_json::Value::Object(filtered), context)?;
+            let mut rendered_spec = match rendered {
+                serde_json::Value::Object(m) => m,
+                other => {
+                    rendered_item.insert(label.clone(), other);
+                    continue;
+                }
+            };
+
+            // Restore `set:` verbatim — evaluated post-execution
+            // by task_sequence with `output` in scope.
+            if let Some(set) = set_block {
+                rendered_spec.insert("set".to_string(), set);
+            }
+
+            // Restore `args` as `input` — the key the worker's
+            // task_sequence reads.  ToolSpec serializes the
+            // `#[serde(alias = "input")]` field as `args`; we
+            // rename it back so forward-only resolution works.
+            if let Some(args) = args_block {
+                rendered_spec.insert("input".to_string(), args);
+            }
+
+            rendered_item
+                .insert(label.clone(), serde_json::Value::Object(rendered_spec));
+        }
+        result.push(serde_json::Value::Object(rendered_item));
+    }
+    Ok(serde_json::Value::Array(result))
 }
 
 #[cfg(test)]
