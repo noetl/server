@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.0.4](https://github.com/noetl/server/compare/v3.0.3...v3.0.4) (2026-06-10)
+
+### Bug Fixes
+
+* **orchestrator:** unblock workflow loops + loop.done-gated transitions ([#175](https://github.com/noetl/server/issues/175)) ([1a92a81](https://github.com/noetl/server/commit/1a92a81b5be63f872310658a14effd81bce0d3bb))
+
 ## [3.0.3](https://github.com/noetl/server/compare/v3.0.2...v3.0.3) (2026-06-10)
 
 ### Bug Fixes
