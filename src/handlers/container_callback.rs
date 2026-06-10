@@ -227,7 +227,7 @@ pub async fn container_callback(
     let event_id = state.snowflake.generate().map_err(|e| {
         AppError::Internal(format!("container-callback: snowflake generate failed: {e}"))
     })?;
-    let context = serde_json::json!({
+    let terminal_context = serde_json::json!({
         "terminal_state": request.state.as_str(),
         "job_name": request.job_name,
         "job_uid": request.job_uid,
@@ -243,6 +243,16 @@ pub async fn container_callback(
         "FAILED"
     };
 
+    // The `result` column carries a constraint-shaped envelope
+    // (`chk_event_result_shape`): a top-level string `status` plus an
+    // optional object `context`.  Mirror handlers::events so the
+    // call.done row validates and the orchestrator reads the terminal
+    // outcome the same way it reads every other call.done.
+    let result_obj = serde_json::json!({
+        "status": status_label,
+        "context": terminal_context,
+    });
+
     // catalog_id is required by the schema; resolve from the
     // execution's existing events (the start event carries it).
     let catalog_id: i64 = sqlx::query_as::<_, (i64,)>(
@@ -256,24 +266,32 @@ pub async fn container_callback(
     .map(|(c,)| c)
     .unwrap_or(0);
 
-    crate::db::queries::event::insert_event(
-        pool,
-        event_id,
-        execution_id,
-        catalog_id,
-        None,
-        None,
-        "call.done",
-        None,
-        Some(&step),
-        Some("container"),
-        status_label,
-        Some(&context),
-        None,
-        None,
-        None,
-        None,
+    // Persist the resume `call.done` using the deployed `noetl.event`
+    // column set (matches handlers::events).  The previous path went
+    // through `db::queries::event::insert_event`, whose SQL targets
+    // `attempt` + `id` columns that do not exist on the deployed
+    // schema — so every callback POST 500'd with
+    // `column "attempt" of relation "event" does not exist`, which
+    // blocked the noetl/ai-meta#43 container-callback chain end to end.
+    sqlx::query(
+        r#"
+        INSERT INTO noetl.event (
+            event_id, execution_id, catalog_id, event_type,
+            node_id, node_name, status, result, meta, created_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        "#,
     )
+    .bind(event_id)
+    .bind(execution_id)
+    .bind(catalog_id)
+    .bind("call.done")
+    .bind(&step)
+    .bind(&step)
+    .bind(status_label)
+    .bind(&result_obj)
+    .bind(serde_json::json!({ "node_type": "container" }))
+    .bind(chrono::Utc::now())
+    .execute(pool)
     .await?;
 
     crate::metrics::record_container_callback(request.state.as_str());
