@@ -16,7 +16,7 @@ use crate::playbook::types::{LoopMode, NextSpec, Playbook, Step};
 
 use super::commands::{Command, CommandBuilder, IteratorMetadata};
 use super::evaluator::ConditionEvaluator;
-use super::state::{apply_set_mutations, ExecutionState, WorkflowState};
+use super::state::{apply_set_mutations, extract_user_data, ExecutionState, WorkflowState};
 use crate::template::TemplateRenderer;
 
 /// Merge iterator metadata into the step-enter context so
@@ -279,6 +279,30 @@ impl WorkflowOrchestrator {
                     rendered.insert(key.clone(), rendered_val);
                 }
                 apply_set_mutations(&mut context, &rendered);
+            }
+        }
+
+        // Apply worker-side `_context_updates` from policy-rule `set:`
+        // evaluation.  The task_sequence tool embeds a `_context_updates`
+        // map in its result data when `spec.policy.rules[].then.set`
+        // mutations fired — these need to propagate to subsequent steps
+        // because the worker only sees one step's pipeline at a time.
+        for (step_name, info) in &state.steps {
+            if !state.is_step_completed(step_name) {
+                continue;
+            }
+            if let Some(result) = &info.result {
+                if let Some(user_data) = extract_user_data(result) {
+                    if let serde_json::Value::Object(map) = &user_data {
+                        if let Some(serde_json::Value::Object(updates)) =
+                            map.get("_context_updates")
+                        {
+                            let mutations: HashMap<String, serde_json::Value> =
+                                updates.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                            apply_set_mutations(&mut context, &mutations);
+                        }
+                    }
+                }
             }
         }
 

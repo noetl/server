@@ -796,7 +796,7 @@ pub fn apply_set_mutations(
 /// that reference `{{ step_name.field }}` in next.arcs / step.when
 /// see an undefined value because the envelope's `status` /
 /// `context` keys swallowed the user fields.
-fn extract_user_data(result: &serde_json::Value) -> Option<serde_json::Value> {
+pub(crate) fn extract_user_data(result: &serde_json::Value) -> Option<serde_json::Value> {
     if result.is_null() {
         return None;
     }

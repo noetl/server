@@ -5,6 +5,7 @@
 
 use axum::{
     Router,
+    extract::DefaultBodyLimit,
     routing::{delete, get, post, put},
 };
 use std::net::SocketAddr;
@@ -273,6 +274,13 @@ fn build_router(
             "/api/result/resolve",
             get(handlers::result_store::resolve_ref),
         )
+        // Workers stage over-budget tool results via PUT; payloads can
+        // reach 10s of MB (e.g. test_storage_tiers generates 15 MB).
+        // Axum's default 2 MB body limit rejects these with HTTP 413,
+        // which breaks the `_ref` propagation path (noetl/ai-meta#69).
+        // 64 MB is generous enough for any realistic tool result while
+        // still bounding memory.
+        .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
         .with_state(handlers::result_store::ResultStoreDeps {
             service: result_store_service,
         });
