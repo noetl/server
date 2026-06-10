@@ -87,8 +87,20 @@ fn with_ctx_shims(
 /// `reached_end` quiescent path.
 ///
 /// The empty/missing-`next` case yields no edges (a terminal step
-/// produces no targets).  Self-loops are recorded; the dispatch
-/// path treats them like any other upstream.
+/// produces no targets).
+///
+/// **Back-edges (loops) are excluded.**  An arc `u -> t` is a
+/// back-edge when `t` can reach `u` again by following forward arcs
+/// (a self-loop, or a longer cycle like the canonical pagination
+/// `fetch_page -> check_pagination -> fetch_page`).  A back-edge
+/// upstream must NOT gate the fan-in barrier: the barrier waits for
+/// every upstream to reach a terminal state, but a loop's back-edge
+/// source is *downstream* of the target and only runs *after* it —
+/// counting it deadlocks the loop forever (`fetch_page` deferring on
+/// `check_pagination` which never starts).  Excluding back-edges
+/// leaves genuine fan-in untouched (a reduce target can't reach its
+/// parallel upstreams) while letting loop heads dispatch on their
+/// real forward entry.  noetl/ai-meta#83.
 fn build_incoming_arcs<'a>(
     steps: &'a HashMap<&'a str, &'a Step>,
 ) -> HashMap<&'a str, HashSet<&'a str>> {
@@ -110,7 +122,51 @@ fn build_incoming_arcs<'a>(
             }
         }
     }
+    // Drop back-edge upstreams so loops don't deadlock the barrier.
+    for (target, upstreams) in incoming.iter_mut() {
+        let reachable = forward_reachable(target, steps);
+        upstreams.retain(|up| !reachable.contains(up));
+    }
+    // A target whose only upstream was a back-edge (pure loop head
+    // reached solely via the cycle) now has an empty set — drop it so
+    // the barrier's `get(name)` returns None and dispatch proceeds.
+    incoming.retain(|_, upstreams| !upstreams.is_empty());
     incoming
+}
+
+/// Forward-reachable set: every step reachable from `start` by
+/// following `next` arcs one or more hops.  Cycle-safe (a visited
+/// set bounds the walk), so a step on a loop appears in its own
+/// reachable set.  Used by [`build_incoming_arcs`] to identify
+/// back-edges.
+fn forward_reachable<'a>(
+    start: &'a str,
+    steps: &'a HashMap<&'a str, &'a Step>,
+) -> HashSet<&'a str> {
+    let mut seen: HashSet<&'a str> = HashSet::new();
+    let mut stack: Vec<&'a str> = Vec::new();
+    if let Some(step) = steps.get(start) {
+        for t in collect_arc_targets(step) {
+            if let Some((k, _)) = steps.get_key_value(t.as_str()) {
+                stack.push(*k);
+            }
+        }
+    }
+    while let Some(node) = stack.pop() {
+        if !seen.insert(node) {
+            continue;
+        }
+        if let Some(step) = steps.get(node) {
+            for t in collect_arc_targets(step) {
+                if let Some((k, _)) = steps.get_key_value(t.as_str()) {
+                    if !seen.contains(*k) {
+                        stack.push(*k);
+                    }
+                }
+            }
+        }
+    }
+    seen
 }
 
 /// Collect every target step-name referenced by a step's `next`
@@ -626,7 +682,27 @@ impl WorkflowOrchestrator {
                 Some(s) => *s,
                 None => continue,
             };
-            let shimmed = with_ctx_shims(context);
+            let mut shimmed = with_ctx_shims(context);
+            // A completed loop step surfaces `event.name == "loop.done"`
+            // to its next-arc conditions — the canonical DSL gate for
+            // "after the loop finishes".  The Python runtime emits a
+            // literal `loop.done` event and fires the transition on it;
+            // the Rust orchestrator detects loop completion via iteration
+            // counting (`StepState::Completed` is only set once
+            // `iterations_completed >= iterations_expected`, see
+            // `state.rs` apply_event), so it injects the same `event.name`
+            // here.  Without this, every `when: {{ event.name ==
+            // "loop.done" }}` arc evaluates against an undefined `event`,
+            // never matches, the downstream step is skipped, and the
+            // execution hangs after the loop (in-step parallel/sequential
+            // `loop:` steps — e.g. the concurrency-probe + load-test
+            // fixtures).  noetl/ai-meta#84.
+            if step.r#loop.is_some() {
+                shimmed.insert(
+                    "event".to_string(),
+                    serde_json::json!({ "name": "loop.done" }),
+                );
+            }
             let eval_results = self.evaluator.evaluate_next(step, &shimmed)?;
             per_step_evals.push((step_name.clone(), step, eval_results));
         }
@@ -2017,6 +2093,116 @@ mod tests {
     }
 
     #[test]
+    fn test_loop_done_event_name_dispatches_gated_downstream() {
+        // noetl/ai-meta#84 regression: a fully-completed loop step must
+        // surface `event.name == "loop.done"` to its next-arc conditions
+        // so a `when: {{ event.name == "loop.done" }}` arc fires.  Before
+        // the fix, `event` was never injected, the arc never matched, the
+        // downstream step was skipped, and the execution hung after the
+        // loop (concurrency-probe + load-test fixtures).
+        use crate::playbook::types::{Loop, LoopSpec, NextArc, NextRouter, NextRouterSpec};
+
+        let orchestrator = WorkflowOrchestrator::new();
+
+        let start = make_step("start", Some("looped"));
+        let mut looped = make_step("looped", None);
+        looped.r#loop = Some(Loop {
+            in_expr: "{{ [10, 20, 30] }}".to_string(),
+            iterator: "n".to_string(),
+            spec: Some(LoopSpec {
+                mode: LoopMode::Sequential,
+                max_in_flight: None,
+            }),
+        });
+        // next: validate WHEN event.name == "loop.done"
+        looped.next = Some(NextSpec::Router(NextRouter {
+            spec: Some(NextRouterSpec {
+                mode: Some("exclusive".to_string()),
+            }),
+            arcs: vec![NextArc {
+                step: "validate".to_string(),
+                when: Some("{{ event.name == \"loop.done\" }}".to_string()),
+                set_vars: None,
+            }],
+        }));
+        let validate = make_step("validate", Some("end"));
+        let end = make_step("end", None);
+
+        // start completes → looped enters (iterations_expected=3) → all
+        // three iterations issued + completed.  After the third completes
+        // `looped` reaches StepState::Completed.
+        let mut events = vec![
+            {
+                let mut e = make_event("playbook_started", None);
+                e.context = Some(serde_json::json!({
+                    "workload": {}, "path": "test", "version": "1"
+                }));
+                e
+            },
+            make_event("command.completed", Some("start")),
+            {
+                let mut e = make_event("step.enter", Some("looped"));
+                e.result = Some(serde_json::json!({
+                    "status": "ENTERED",
+                    "context": { "iterations_expected": 3, "iterator_var": "n" },
+                }));
+                e
+            },
+        ];
+        for i in 0..3 {
+            let cid = format!("1:looped:100:i{}", i);
+            let mut issued = make_event("command.issued", Some("looped"));
+            issued.meta = Some(serde_json::json!({
+                "command_id": cid, "iteration_index": i, "iteration_total": 3,
+            }));
+            events.push(issued);
+            let mut done = make_event("command.completed", Some("looped"));
+            done.meta = Some(serde_json::json!({ "command_id": cid }));
+            done.result = Some(serde_json::json!({
+                "status": "success", "context": {"command_id": cid}, "data": {"value": (i + 1) * 10},
+            }));
+            events.push(done);
+        }
+
+        let playbook = Playbook {
+            api_version: "noetl.io/v2".to_string(),
+            kind: "Playbook".to_string(),
+            metadata: Metadata {
+                name: "loop_done_test".to_string(),
+                path: Some("test/loop_done".to_string()),
+                description: None,
+                labels: None,
+                extra: HashMap::new(),
+            },
+            workload: None,
+            vars: None,
+            keychain: None,
+            workbook: None,
+            workflow: vec![start, looped, validate, end],
+        };
+
+        let result = orchestrator
+            .evaluate(&events, &playbook, Some("command.completed"))
+            .unwrap();
+
+        // The loop.done-gated arc must dispatch `validate`...
+        assert!(
+            result.commands.iter().any(|c| c.step_name == "validate"),
+            "expected `validate` to dispatch on loop.done; got commands: {:?}",
+            result.commands.iter().map(|c| c.step_name.clone()).collect::<Vec<_>>(),
+        );
+        // ...and `validate` must NOT be skipped.
+        assert!(
+            !result
+                .events_to_emit
+                .iter()
+                .any(|e| e.event_type == "step.skipped"
+                    && e.node_name.as_deref() == Some("validate")),
+            "`validate` must not be skipped when the loop completes",
+        );
+    }
+
+    #[test]
     fn test_step_loop_default_mode_is_sequential() {
         // #76: When no spec is provided, default LoopMode is
         // Sequential.  Verify that spec: None behaves like
@@ -2861,6 +3047,68 @@ mod tests {
         assert_eq!(incoming.get("end").map(|u| u.len()).unwrap_or(0), 1);
         // `start` has no upstreams.
         assert!(!incoming.contains_key("start"));
+    }
+
+    #[test]
+    fn test_build_incoming_arcs_excludes_loop_back_edge() {
+        // noetl/ai-meta#83 regression: the canonical pagination loop
+        //   start -> fetch_page -> check_pagination
+        //   check_pagination -> fetch_page (when has_more) | validate (else)
+        //   validate -> end
+        // `fetch_page` is the target of TWO arcs (start + the
+        // check_pagination loop back-edge).  The back-edge must be
+        // excluded so `fetch_page` is NOT treated as a reduce boundary
+        // — otherwise the barrier waits on `check_pagination`, which
+        // only runs *after* `fetch_page`, deadlocking the loop.
+        use crate::playbook::types::{NextArc, NextRouter, NextRouterSpec};
+
+        let start = make_step("start", Some("fetch_page"));
+        let fetch_page = make_step("fetch_page", Some("check_pagination"));
+        let check_pagination = {
+            let mut s = make_step("check_pagination", None);
+            s.next = Some(NextSpec::Router(NextRouter {
+                spec: Some(NextRouterSpec {
+                    mode: Some("exclusive".to_string()),
+                }),
+                arcs: vec![
+                    NextArc {
+                        step: "fetch_page".to_string(),
+                        when: Some("{{ ctx.has_more == true }}".to_string()),
+                        set_vars: None,
+                    },
+                    NextArc {
+                        step: "validate".to_string(),
+                        when: Some("{{ ctx.has_more != true }}".to_string()),
+                        set_vars: None,
+                    },
+                ],
+            }));
+            s
+        };
+        let validate = make_step("validate", Some("end"));
+        let end = make_step("end", None);
+        let workflow = vec![start, fetch_page, check_pagination, validate, end];
+        let steps: HashMap<&str, &Step> = workflow.iter().map(|s| (s.step.as_str(), s)).collect();
+
+        let incoming = build_incoming_arcs(&steps);
+
+        // fetch_page keeps only its forward upstream `start`; the
+        // check_pagination back-edge is dropped -> NOT a reduce
+        // boundary (len 1, so the barrier's len() > 1 check is false).
+        let fetch_upstreams = incoming
+            .get("fetch_page")
+            .expect("fetch_page should retain its forward upstream");
+        assert_eq!(
+            fetch_upstreams.len(),
+            1,
+            "fetch_page back-edge must be excluded; got {:?}",
+            fetch_upstreams,
+        );
+        assert!(fetch_upstreams.contains("start"));
+        assert!(
+            !fetch_upstreams.contains("check_pagination"),
+            "the loop back-edge check_pagination -> fetch_page must not gate the barrier",
+        );
     }
 
     #[test]
