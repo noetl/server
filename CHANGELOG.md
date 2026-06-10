@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.0.1](https://github.com/noetl/server/compare/v3.0.0...v3.0.1) (2026-06-10)
+
+### Bug Fixes
+
+* extract _context_updates from task_sequence result for cross-step propagation ([88a58e1](https://github.com/noetl/server/commit/88a58e1d9032e9ce5d4de3bc149c6de16e71c2c9))
+* lowercase catalog kind on register to match resource FK ([f0301e8](https://github.com/noetl/server/commit/f0301e8654b0d1c4cef699549772f33d04dc896f))
+* persist ctx/workload namespace shims on Command for worker-side pipeline input rendering ([ee8dd67](https://github.com/noetl/server/commit/ee8dd67d74567aff675b29c43f2e4be040b5b86e)), closes [noetl/ai-meta#49](https://github.com/noetl/ai-meta/issues/49)
+* preserve spec block unrendered in render_pipeline_config ([d4a8048](https://github.com/noetl/server/commit/d4a804857f9b73937fd5b4650e47cf13dc6cb949))
+* raise result store body limit to 64MB + preserve command/spec in pipeline render ([f348922](https://github.com/noetl/server/commit/f3489228e9b6210228a10df89096c36362f9fd56)), closes [noetl/ai-meta#69](https://github.com/noetl/ai-meta/issues/69) [noetl/ai-meta#69](https://github.com/noetl/ai-meta/issues/69)
+
 ## [3.0.0](https://github.com/noetl/server/compare/v2.63.0...v3.0.0) (2026-06-09)
 
 ### ⚠ BREAKING CHANGES
