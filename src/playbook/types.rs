@@ -181,9 +181,28 @@ pub struct ToolSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub query: Option<String>,
 
-    /// Command (for database/shell tools).
+    /// Command for the tool runtime.
+    ///
+    /// Two shapes share this key and the type must accept both, so
+    /// it is `serde_json::Value` (same treatment as `args` above):
+    ///
+    /// - **Scalar string** — shell / db tools (`command: "echo hi"`,
+    ///   `command: "SELECT 1"`).  The db tools accept it via a
+    ///   `#[serde(alias = "command")]` on their `query` field.
+    /// - **Array of strings** — the `container` tool kind, K8s-Job
+    ///   style (`command: ["/bin/sh", "-c"]`), which the worker's
+    ///   `ContainerConfig.command: Option<Vec<String>>` consumes.
+    ///
+    /// Before noetl/ai-meta#81 this was `Option<String>`, which made
+    /// the `container` tool impossible to execute: an array failed
+    /// the `ToolSpec` deserialise server-side ("data did not match
+    /// any variant of untagged enum ToolDefinition"), and a scalar
+    /// cleared the server only to be rejected by the worker
+    /// ("expected a sequence").  Carrying the raw `Value` lets the
+    /// array pass through to the worker unchanged while scalars stay
+    /// JSON strings for the shell / db consumers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub command: Option<String>,
+    pub command: Option<serde_json::Value>,
 
     /// Connection string or credential reference.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -810,10 +829,10 @@ impl ToolCall {
             );
         }
         if let Some(ref command) = spec.command {
-            config.insert(
-                "command".to_string(),
-                serde_json::Value::String(command.clone()),
-            );
+            // Pass through unchanged: a scalar stays a JSON string
+            // (shell / db tools), an array stays an array (container
+            // tool's `Vec<String>`).  See noetl/ai-meta#81.
+            config.insert("command".to_string(), command.clone());
         }
         if let Some(ref connection) = spec.connection {
             config.insert(
@@ -1321,6 +1340,58 @@ code: "print(x * 2)"
         let spec: ToolSpec = serde_yaml::from_str(yaml).unwrap();
         let args = spec.args.expect("args field decodes");
         assert_eq!(args.get("x").and_then(|v| v.as_i64()), Some(10));
+    }
+
+    #[test]
+    fn test_container_array_command_decodes_and_passes_through() {
+        // noetl/ai-meta#81 — the `container` tool kind writes
+        // `command` as a K8s-Job-style array.  Before the fix
+        // `ToolSpec.command` was `Option<String>`, so the array
+        // failed the `ToolDefinition` untagged-enum match server-side
+        // ("data did not match any variant").  It must now decode AND
+        // pass through `ToolCall::from_spec` unchanged so the worker's
+        // `ContainerConfig.command: Option<Vec<String>>` consumes it.
+        let yaml = r#"
+kind: container
+image: alpine:3.19
+command: ["/bin/sh", "-c"]
+args: ["echo hi"]
+"#;
+        let spec: ToolSpec = serde_yaml::from_str(yaml).unwrap();
+        let command = spec.command.clone().expect("array command decodes");
+        let arr = command.as_array().expect("command is an array");
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0].as_str(), Some("/bin/sh"));
+        assert_eq!(arr[1].as_str(), Some("-c"));
+
+        // ToolCall::from_spec must carry the array verbatim — not
+        // wrap it in a JSON string.
+        let call = ToolCall::from_spec(&spec);
+        let call_command = call
+            .config
+            .get("command")
+            .expect("command propagated to ToolCall config");
+        assert!(call_command.is_array(), "command must stay an array, got {call_command:?}");
+        assert_eq!(call_command, &serde_json::json!(["/bin/sh", "-c"]));
+    }
+
+    #[test]
+    fn test_scalar_command_stays_a_string() {
+        // Back-compat: shell / db tools write `command` as a scalar.
+        // It must still decode and stay a JSON string through
+        // `ToolCall::from_spec` so the worker's shell/db consumers
+        // (which expect `String`) keep working.  See noetl/ai-meta#81.
+        let yaml = r#"
+kind: shell
+command: "echo hi"
+"#;
+        let spec: ToolSpec = serde_yaml::from_str(yaml).unwrap();
+        let command = spec.command.clone().expect("scalar command decodes");
+        assert_eq!(command.as_str(), Some("echo hi"));
+
+        let call = ToolCall::from_spec(&spec);
+        let call_command = call.config.get("command").expect("command propagated");
+        assert_eq!(call_command, &serde_json::json!("echo hi"));
     }
 
     #[test]
