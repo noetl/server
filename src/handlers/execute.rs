@@ -558,6 +558,14 @@ async fn generate_initial_commands(
                 &context,
                 iter_meta,
             )?;
+            // Use the command's own enriched context (which includes
+            // flat iter vars + ctx/workload shims) rather than the raw
+            // orchestrator `context`.  The orchestrator dispatch path in
+            // events.rs does the same (line 1491).  Without this, the
+            // worker's render_context only carries the `ctx` wrapper and
+            // pipeline `input:`/`command:` templates referencing
+            // `{{ iter.<var> }}` fail with "undefined value".
+            let cmd_render_ctx = command.context.clone().unwrap_or_default();
             persist_engine_command(
                 state,
                 execution_id,
@@ -565,7 +573,7 @@ async fn generate_initial_commands(
                 parent_event_id,
                 start_step,
                 &command,
-                &context,
+                &cmd_render_ctx,
                 playbook,
             )
             .await?;
@@ -587,6 +595,9 @@ async fn generate_initial_commands(
     // Persist + publish via the shared helper so the same wire-format
     // logic feeds both the /api/execute path (this function) and the
     // orchestrator-triggered transitions in events.rs::trigger_orchestrator.
+    // Use the command's enriched context (with ctx/workload shims) so
+    // the worker sees the full render_context for template resolution.
+    let cmd_render_ctx = command.context.clone().unwrap_or_default();
     persist_engine_command(
         state,
         execution_id,
@@ -594,7 +605,7 @@ async fn generate_initial_commands(
         parent_event_id,
         start_step,
         &command,
-        &context,
+        &cmd_render_ctx,
         playbook,
     )
     .await?;

@@ -148,11 +148,23 @@ impl CommandBuilder {
         context: &HashMap<String, serde_json::Value>,
         iterator: IteratorMetadata,
     ) -> AppResult<Command> {
-        // Build context with iterator variables
+        // Build context with iterator variables.
+        // Insert both at the top level (so `{{ num }}` works) AND
+        // under an `iter` namespace map (so `{{ iter.num }}` works).
+        // Playbooks use both conventions; the `iter.` prefix is the
+        // documented DSL shape for v10 loop steps.
         let mut iter_context = context.clone();
         iter_context.insert(iterator.item_var.clone(), iterator.item.clone());
         iter_context.insert("_index".to_string(), serde_json::json!(iterator.index));
         iter_context.insert("_total".to_string(), serde_json::json!(iterator.total));
+
+        // Build the `iter` namespace map so `{{ iter.<var> }}`,
+        // `{{ iter._index }}`, `{{ iter._total }}` all resolve.
+        let mut iter_ns = serde_json::Map::new();
+        iter_ns.insert(iterator.item_var.clone(), iterator.item.clone());
+        iter_ns.insert("_index".to_string(), serde_json::json!(iterator.index));
+        iter_ns.insert("_total".to_string(), serde_json::json!(iterator.total));
+        iter_context.insert("iter".to_string(), serde_json::Value::Object(iter_ns));
 
         // Add `ctx` + `workload` namespace shims AFTER the iterator-var
         // insertions so the iterator value is also visible through
@@ -384,21 +396,31 @@ fn render_pipeline_config(
 
             // Stash runtime-only keys before rendering.
             // These contain template expressions that reference
-            // `output` (tool result data), which doesn't exist
-            // at server-side render time — it's only available
-            // worker-side after tool execution.
+            // `output` (tool result data) or pipeline-internal
+            // variables set by previous steps' `set:` blocks,
+            // which don't exist at server-side render time —
+            // they're only available worker-side after tool
+            // execution.
             let set_block = spec_obj.get("set").cloned();
             let args_block = spec_obj.get("args").cloned();
             let spec_block = spec_obj.get("spec").cloned();
+            let command_block = spec_obj.get("command").cloned();
 
             // Build a spec without runtime-only keys.  `spec`
             // carries `policy.rules[].then.set` whose templates
             // (e.g. `{{ output.data.counter }}`) must be
             // evaluated worker-side, not server-side.
+            // `command` is also deferred because pipeline steps
+            // can reference variables set by previous steps'
+            // `set:` blocks (e.g. `{{ iter.processed_item.item_name }}`
+            // in a postgres command after a python step that sets it).
             let filtered: serde_json::Map<String, serde_json::Value> = spec_obj
                 .iter()
                 .filter(|(k, _)| {
-                    k.as_str() != "set" && k.as_str() != "args" && k.as_str() != "spec"
+                    k.as_str() != "set"
+                        && k.as_str() != "args"
+                        && k.as_str() != "spec"
+                        && k.as_str() != "command"
                 })
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect();
@@ -432,6 +454,15 @@ fn render_pipeline_config(
             // by the worker's task_sequence after execution.
             if let Some(spec) = spec_block {
                 rendered_spec.insert("spec".to_string(), spec);
+            }
+
+            // Restore `command` verbatim — pipeline steps may
+            // reference variables set by previous steps' `set:`
+            // blocks (e.g. `{{ iter.processed_item.item_name }}`).
+            // The worker's task_sequence renders these after each
+            // step completes and the `set:` variables are applied.
+            if let Some(cmd) = command_block {
+                rendered_spec.insert("command".to_string(), cmd);
             }
 
             rendered_item
