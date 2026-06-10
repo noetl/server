@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.0.3](https://github.com/noetl/server/compare/v3.0.2...v3.0.3) (2026-06-10)
+
+### Bug Fixes
+
+* **container-callback:** insert call.done with deployed event schema ([#173](https://github.com/noetl/server/issues/173)) ([1b920a7](https://github.com/noetl/server/commit/1b920a7b9661040e0d1543de9e5a157fe9ca37da)), closes [noetl/ai-meta#43](https://github.com/noetl/ai-meta/issues/43) [noetl/ai-meta#43](https://github.com/noetl/ai-meta/issues/43)
+
 ## [3.0.2](https://github.com/noetl/server/compare/v3.0.1...v3.0.2) (2026-06-10)
 
 ### Bug Fixes
