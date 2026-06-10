@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.0.2](https://github.com/noetl/server/compare/v3.0.1...v3.0.2) (2026-06-10)
+
+### Bug Fixes
+
+* accept array command for container tool (ToolSpec.command -> Value) ([#172](https://github.com/noetl/server/issues/172)) ([7284fed](https://github.com/noetl/server/commit/7284fed96d949e40b69a8f1b10d86d81107e0b31)), closes [noetl/ai-meta#81](https://github.com/noetl/ai-meta/issues/81)
+
 ## [3.0.1](https://github.com/noetl/server/compare/v3.0.0...v3.0.1) (2026-06-10)
 
 ### Bug Fixes
