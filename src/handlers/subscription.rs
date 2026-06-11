@@ -40,7 +40,7 @@ type ListRow = (
     String,
     String,
     i64,
-    Option<chrono::DateTime<chrono::Utc>>,
+    Option<chrono::NaiveDateTime>,
 );
 
 /// `(event_type, status, catalog_id, node_name, created_at)` — the latest
@@ -50,7 +50,7 @@ type LatestRow = (
     String,
     i64,
     Option<String>,
-    Option<chrono::DateTime<chrono::Utc>>,
+    Option<chrono::NaiveDateTime>,
 );
 
 // ---------------------------------------------------------------------------
@@ -312,7 +312,7 @@ pub async fn list(State(state): State<AppState>) -> AppResult<Json<SubscriptionL
                     .unwrap_or("UNKNOWN")
                     .to_string(),
                 last_event_type: event_type,
-                updated_at: created_at.map(|t| t.to_rfc3339()),
+                updated_at: created_at.map(|t| t.and_utc().to_rfc3339()),
             });
         }
     }
@@ -360,7 +360,7 @@ async fn load_latest(state: &AppState, subscription_id: i64) -> AppResult<Option
         catalog_id,
         path,
         last_event_type: event_type,
-        updated_at: created_at.map(|t| t.to_rfc3339()),
+        updated_at: created_at.map(|t| t.and_utc().to_rfc3339()),
     }))
 }
 
