@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.1.0](https://github.com/noetl/server/compare/v3.0.6...v3.1.0) (2026-06-11)
+
+### Features
+
+* **playbook:** accept `subscription` tool kind in ToolKind validation ([#178](https://github.com/noetl/server/issues/178)) ([d3126f8](https://github.com/noetl/server/commit/d3126f8301598f81f3555c5afa93d6f237291ba2)), closes [noetl/ai-meta#90](https://github.com/noetl/ai-meta/issues/90) [noetl/ai-meta#90](https://github.com/noetl/ai-meta/issues/90)
+
 ## [3.0.6](https://github.com/noetl/server/compare/v3.0.5...v3.0.6) (2026-06-11)
 
 ### Bug Fixes
