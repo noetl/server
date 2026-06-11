@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.0.5](https://github.com/noetl/server/compare/v3.0.4...v3.0.5) (2026-06-11)
+
+### Bug Fixes
+
+* **orchestrator:** durable loop ctx propagation + loop-exit hang ([#85](https://github.com/noetl/server/issues/85)) ([#176](https://github.com/noetl/server/issues/176)) ([1ce7f2b](https://github.com/noetl/server/commit/1ce7f2b012765d1bc600cd162e6edad493ddf4e1)), closes [#83](https://github.com/noetl/server/issues/83) [#84](https://github.com/noetl/server/issues/84)
+
 ## [3.0.4](https://github.com/noetl/server/compare/v3.0.3...v3.0.4) (2026-06-10)
 
 ### Bug Fixes
