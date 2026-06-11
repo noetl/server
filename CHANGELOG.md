@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.0.6](https://github.com/noetl/server/compare/v3.0.5...v3.0.6) (2026-06-11)
+
+### Bug Fixes
+
+* **template:** round-trip JSON null in whole-object {{ step }} references ([#177](https://github.com/noetl/server/issues/177)) ([d91d26f](https://github.com/noetl/server/commit/d91d26f6de70985a518b06b5a5627828a28559ab)), closes [noetl/ai-meta#89](https://github.com/noetl/ai-meta/issues/89)
+
 ## [3.0.5](https://github.com/noetl/server/compare/v3.0.4...v3.0.5) (2026-06-11)
 
 ### Bug Fixes
