@@ -106,6 +106,19 @@ pub struct StepInfo {
     pub entered_at: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub completed_at: Option<DateTime<Utc>>,
+    /// `event_id` of the lifecycle event that most recently transitioned
+    /// this step into `Completed`.
+    ///
+    /// noetl/ai-meta#85: used as the **stable** per-completion key for
+    /// durable `set:` persistence.  `completed_at` derives from
+    /// `event.created_at`, which the event loader fills with
+    /// `Utc::now()` when the row's `created_at` is unreadable — so it is
+    /// NOT stable across reconstructions and can't gate once-per-
+    /// completion emission.  `event_id` is the row's snowflake primary
+    /// key: stable across reconstructions and monotonic, so it both
+    /// dedups re-emission and gives a deterministic completion order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_event_id: Option<i64>,
     pub attempt: i32,
 
     // -------- Iterator fan-out (Phase D R3b) --------
@@ -169,6 +182,7 @@ impl StepInfo {
             error: None,
             entered_at: None,
             completed_at: None,
+            completed_event_id: None,
             attempt: 0,
             iterations_expected: None,
             iteration_command_ids: std::collections::HashSet::new(),
@@ -196,6 +210,40 @@ pub struct WorkflowState {
     pub catalog_id: i64,
     pub state: ExecutionState,
     pub steps: HashMap<String, StepInfo>,
+    /// Durable workflow context — the fold over `ctx.updated` events.
+    ///
+    /// noetl/ai-meta#85: workflow-arc loops carry their loop variable
+    /// (offset / cursor / counter) through step-level `set: ctx.*`
+    /// mutations.  Those mutations are ephemeral per orchestrator pass
+    /// — recomputed from the workload default + step results each time
+    /// — so on the next iteration's pass the variable reverts to its
+    /// workload default and the loop thrashes (`0,0,1,0,1,2,…` instead
+    /// of advancing).  The fix persists each completing step's rendered
+    /// `set:` values into the event log as a `ctx.updated` event; this
+    /// map is the latest-wins fold over those events, keyed by the bare
+    /// (scope-stripped) variable name.  `build_context` overlays it on
+    /// top of the workload default so a loop variable survives across
+    /// re-dispatch.  Bare keys match the post-`apply_set_mutations`
+    /// shape (`ctx.offset` → `offset`).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub ctx: HashMap<String, serde_json::Value>,
+    /// Per-producing-step completion `event_id` whose `set:` mutations
+    /// have already been persisted as a `ctx.updated` event.
+    ///
+    /// noetl/ai-meta#85: a step's `set:` fires exactly once per
+    /// completion.  Re-emitting it on every subsequent pass (the old
+    /// "apply all completed steps' set each pass" loop) is the thrash
+    /// source — e.g. `start`'s `set: ctx.offset: {{ workload.offset }}`
+    /// (= 0) competed non-deterministically with `check_pagination`'s
+    /// advancing `set: ctx.offset` in random HashMap order.  The
+    /// orchestrator persists a step's `set:` only when this map's entry
+    /// for the step differs from the step's current `completed_event_id`,
+    /// making emission idempotent per completion.  Keyed by the stable
+    /// completion `event_id` (see [`StepInfo::completed_event_id`]) —
+    /// `completed_at` can't be used because it derives from the
+    /// `Utc::now()` loader fallback and varies across reconstructions.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub ctx_set_marks: HashMap<String, i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workload: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -249,6 +297,8 @@ impl WorkflowState {
             catalog_id,
             state: ExecutionState::Initial,
             steps: HashMap::new(),
+            ctx: HashMap::new(),
+            ctx_set_marks: HashMap::new(),
             workload: None,
             path: None,
             version: None,
@@ -335,6 +385,50 @@ impl WorkflowState {
             "playbook.cancelled" => {
                 self.state = ExecutionState::Cancelled;
                 self.completed_at = Some(event.created_at);
+            }
+            "ctx.updated" => {
+                // noetl/ai-meta#85: durable loop-variable propagation.
+                // The orchestrator persists a completing step's rendered
+                // `set: ctx.*` mutations here so they survive across the
+                // re-dispatch that workflow-arc loops require.  Payload
+                // shape (post `{status, context}` envelope wrapping by
+                // `trigger_orchestrator`):
+                //   result.context = {
+                //     "step": "<producing step>",
+                //     "gen": <completion event_id>,
+                //     "values": { "<bare key>": <json>, ... }
+                //   }
+                // Older / direct callers may populate the event row's
+                // `context` column instead; accept both shapes, matching
+                // the dual-shape read the `step.enter` arm uses for
+                // `iterations_expected`.
+                let payload = event
+                    .result
+                    .as_ref()
+                    .and_then(|r| r.get("context"))
+                    .or(event.context.as_ref());
+                if let Some(payload) = payload {
+                    if let Some(serde_json::Value::Object(values)) =
+                        payload.get("values")
+                    {
+                        // Latest-wins fold: a later iteration's value
+                        // overwrites the earlier one.  `start`'s
+                        // initializer (offset = 0) is shadowed by the
+                        // loop's advancing values because its event is
+                        // earlier in the log.
+                        for (key, val) in values {
+                            self.ctx.insert(key.clone(), val.clone());
+                        }
+                    }
+                    // Record which completion this persisted, so the
+                    // orchestrator emits a step's `set:` only once per
+                    // completion (idempotent emission).
+                    if let Some(step) = payload.get("step").and_then(|v| v.as_str()) {
+                        if let Some(gen) = payload.get("gen").and_then(|v| v.as_i64()) {
+                            self.ctx_set_marks.insert(step.to_string(), gen);
+                        }
+                    }
+                }
             }
             "step.enter" | "step_enter" | "step_started" => {
                 if let Some(name) = &event.node_name {
@@ -475,6 +569,7 @@ impl WorkflowState {
                         if step.iterations_completed() >= expected {
                             step.state = StepState::Completed;
                             step.completed_at = Some(event.created_at);
+                            step.completed_event_id = Some(event.event_id);
                             // Aggregate result = list of per-iteration
                             // results in arrival order (may not match
                             // dispatch index in parallel mode — see
@@ -489,6 +584,7 @@ impl WorkflowState {
                         // Plain (non-iterator) step.
                         step.state = StepState::Completed;
                         step.completed_at = Some(event.created_at);
+                        step.completed_event_id = Some(event.event_id);
                         // Only overwrite step.result with command.completed's
                         // envelope if the user-data hasn't been written yet
                         // (e.g. by an earlier `call.done`).  command.completed
@@ -716,6 +812,19 @@ impl WorkflowState {
             }
         }
         context.insert("steps".to_string(), serde_json::Value::Object(steps));
+
+        // noetl/ai-meta#85: overlay the durable workflow context last,
+        // so persisted `set: ctx.*` loop variables win over both the
+        // workload default and step-result top-level keys.  This is the
+        // same precedence the legacy per-pass `set:` application had
+        // (it ran after `build_context` and overwrote the context), now
+        // sourced from the event log instead of recomputed each pass —
+        // which is what lets a loop variable advance monotonically
+        // across re-dispatch instead of reverting to its workload
+        // default.  Keys are bare (scope already stripped at emit time).
+        for (key, value) in &self.ctx {
+            context.insert(key.clone(), value.clone());
+        }
 
         // Add execution metadata
         context.insert(
@@ -1632,5 +1741,115 @@ mod tests {
         assert!(!vars.contains_key("ctx.foo"));
         assert!(!vars.contains_key("iter.bar"));
         assert!(!vars.contains_key("step.baz"));
+    }
+
+    #[test]
+    fn test_command_issued_after_completion_reactivates_step() {
+        // noetl/ai-meta#85: workflow-arc loop re-entry re-dispatches an
+        // already-`Completed` loop step via a fresh `command.issued`.
+        // State reconstruction must let that later lifecycle event win,
+        // moving the step out of the terminal `Completed` state so the
+        // dispatch guards see it as running again.  The prior result is
+        // retained (carries the loop variable forward) until the new
+        // iteration's `call.done` overwrites it.
+        let mut state = WorkflowState::new(1, 1);
+
+        let mut completed = make_event("command.completed", Some("fetch_page"));
+        completed.result = Some(serde_json::json!({"next_offset": 10}));
+        state.apply_event(&completed);
+        assert!(state.is_step_done("fetch_page"));
+        assert_eq!(
+            state.get_step_result("fetch_page"),
+            Some(&serde_json::json!({"next_offset": 10})),
+        );
+
+        // Re-dispatch: step.enter then command.issued for the next
+        // iteration.
+        state.apply_event(&make_event("step.enter", Some("fetch_page")));
+        state.apply_event(&make_event("command.issued", Some("fetch_page")));
+
+        let after = state.steps.get("fetch_page").unwrap();
+        assert_eq!(after.state, StepState::CommandIssued);
+        assert!(!state.is_step_done("fetch_page"));
+        assert!(!state.is_step_completed("fetch_page"));
+        // Prior result is still visible to context assembly — the loop
+        // variable survives the re-entry.
+        assert_eq!(
+            state.get_step_result("fetch_page"),
+            Some(&serde_json::json!({"next_offset": 10})),
+        );
+    }
+
+    /// Build a `ctx.updated` event in the persisted `{status, context}`
+    /// envelope shape (noetl/ai-meta#85).  `gen` is the producing step's
+    /// completion event_id.
+    fn make_ctx_updated(step: &str, gen: i64, values: serde_json::Value) -> Event {
+        let mut e = make_event("ctx.updated", None);
+        e.result = Some(serde_json::json!({
+            "status": "CONTEXT",
+            "context": {
+                "step": step,
+                "gen": gen,
+                "values": values,
+            },
+        }));
+        e
+    }
+
+    #[test]
+    fn test_ctx_updated_event_folds_latest_wins_and_records_mark() {
+        // noetl/ai-meta#85: the durable ctx is the latest-wins fold over
+        // ctx.updated events; the per-step mark records the completion
+        // event_id that was persisted so the orchestrator emits once per
+        // completion.
+        let mut state = WorkflowState::new(1, 1);
+
+        // start initializes offset = 0; later iterations advance it.
+        state.apply_event(&make_ctx_updated(
+            "start",
+            100,
+            serde_json::json!({ "offset": 0, "limit": 10 }),
+        ));
+        state.apply_event(&make_ctx_updated(
+            "check_pagination",
+            200,
+            serde_json::json!({ "offset": 10 }),
+        ));
+        state.apply_event(&make_ctx_updated(
+            "check_pagination",
+            300,
+            serde_json::json!({ "offset": 20 }),
+        ));
+
+        // offset = 20 (latest wins over start's 0 and the first check),
+        // limit = 10 survives (only start set it, never overwritten).
+        assert_eq!(state.ctx.get("offset"), Some(&serde_json::json!(20)));
+        assert_eq!(state.ctx.get("limit"), Some(&serde_json::json!(10)));
+
+        // Marks track the latest persisted completion event_id per step.
+        assert_eq!(state.ctx_set_marks.get("start"), Some(&100));
+        assert_eq!(state.ctx_set_marks.get("check_pagination"), Some(&300));
+    }
+
+    #[test]
+    fn test_build_context_overlays_durable_ctx_over_workload_default() {
+        // The durable loop variable must win over the workload default
+        // in build_context — that's what stops the loop reverting to its
+        // workload seed on each pass.
+        let mut state = WorkflowState::new(1, 1);
+        state.workload = Some(serde_json::json!({ "offset": 0, "limit": 10 }));
+        state
+            .ctx
+            .insert("offset".to_string(), serde_json::json!(30));
+
+        let ctx = state.build_context();
+        assert_eq!(ctx.get("offset"), Some(&serde_json::json!(30)));
+        // Untouched workload keys remain.
+        assert_eq!(ctx.get("limit"), Some(&serde_json::json!(10)));
+        // The workload namespace still reflects the original seed.
+        assert_eq!(
+            ctx.get("workload").and_then(|w| w.get("offset")),
+            Some(&serde_json::json!(0)),
+        );
     }
 }
