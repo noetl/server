@@ -4,6 +4,31 @@ use crate::db::models::CatalogEntry;
 use crate::db::DbPool;
 use crate::error::AppResult;
 
+/// Ensure the catalog kinds the Rust server owns exist in
+/// `noetl.resource` (the kind lookup that `noetl.catalog.kind` FK-references).
+///
+/// `noetl.catalog.kind` references `noetl.resource(name)`, so a catalog
+/// register of a `kind: Subscription` (noetl/ai-meta#90 Phase 2) fails with a
+/// foreign-key violation unless `subscription` is a seeded resource type.  The
+/// canonical seed lives in `noetl/noetl`'s `schema_ddl.sql`; this idempotent
+/// startup upsert is the safety net so a `kind: Subscription` registers on any
+/// cluster the Rust server boots against, without an out-of-band migration.
+/// Only kinds the server explicitly knows about are seeded — the FK still
+/// rejects an unknown/typo'd kind.
+pub async fn ensure_builtin_kinds(pool: &DbPool) -> AppResult<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO noetl.resource (name, meta) VALUES
+            ('subscription', '{"description":"Source-driven subscription/listener workload (noetl/ai-meta#90)","executable":true,"catalog":true}'::jsonb)
+        ON CONFLICT (name) DO UPDATE
+        SET meta = COALESCE(noetl.resource.meta, '{}'::jsonb) || EXCLUDED.meta
+        "#,
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// Get the next version number for a path.
 ///
 /// `noetl.catalog.version` is Postgres `smallint`; using `i16` here

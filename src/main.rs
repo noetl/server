@@ -671,6 +671,10 @@ async fn main() -> anyhow::Result<()> {
     // pattern as secret_audit above.  The table is server-owned end-to-end;
     // no out-of-band migration required.
     noetl_server::db::queries::result_store::ensure_table(&db_pool).await?;
+    // kind: Subscription (noetl/ai-meta#90 Phase 2) — seed the `subscription`
+    // resource kind so a catalog register doesn't trip the
+    // `noetl.catalog.kind -> noetl.resource(name)` FK.  Idempotent.
+    noetl_server::db::queries::catalog::ensure_builtin_kinds(&db_pool).await?;
     // Keychain is the execution-scoped cache for credential resolution
     // (Secrets Wallet Phase 3c), so it is built first + shared into the
     // credential service.
