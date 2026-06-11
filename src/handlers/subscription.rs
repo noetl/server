@@ -186,6 +186,27 @@ pub async fn register(
         )));
     }
 
+    // Idempotent register: reuse an existing non-deactivated subscription for
+    // the same path so a runtime restart doesn't mint a fresh id each time.
+    if let Some(existing) = latest_for_path(&state, &req.path).await? {
+        if existing.state != SubState::Deactivated {
+            tracing::info!(
+                subscription_id = existing.subscription_id,
+                path = %req.path,
+                state = existing.state.as_status(),
+                "Subscription already registered — reusing"
+            );
+            return Ok(Json(SubscriptionStatus {
+                subscription_id: existing.subscription_id.to_string(),
+                path: req.path,
+                catalog_id: existing.catalog_id.to_string(),
+                state: existing.state.as_status().to_string(),
+                last_event_type: existing.last_event_type,
+                updated_at: existing.updated_at,
+            }));
+        }
+    }
+
     let subscription_id = state.snowflake.generate()?;
     write_lifecycle_event(
         &state,
@@ -329,6 +350,50 @@ struct LatestState {
     path: String,
     last_event_type: String,
     updated_at: Option<String>,
+}
+
+struct LatestForPath {
+    subscription_id: i64,
+    state: SubState,
+    catalog_id: i64,
+    last_event_type: String,
+    updated_at: Option<String>,
+}
+
+/// Find the most recent subscription (by lifecycle event) for a catalog path,
+/// across shards.  Used to make `register` idempotent.
+async fn latest_for_path(state: &AppState, path: &str) -> AppResult<Option<LatestForPath>> {
+    let mut best: Option<(i64, LatestForPath)> = None; // (event_id, state)
+    for (_idx, pool) in state.pools.all_shards() {
+        let row: Option<(i64, i64, String, String, i64, Option<chrono::NaiveDateTime>)> =
+            sqlx::query_as(
+                r#"
+                SELECT event_id, execution_id, event_type, status, catalog_id, created_at
+                FROM noetl.event
+                WHERE node_name = $1 AND event_type LIKE 'subscription.%'
+                ORDER BY event_id DESC
+                LIMIT 1
+                "#,
+            )
+            .bind(path)
+            .fetch_optional(pool)
+            .await?;
+        if let Some((event_id, sid, event_type, status, catalog_id, created_at)) = row {
+            if let Some(st) = SubState::from_status(&status) {
+                let candidate = LatestForPath {
+                    subscription_id: sid,
+                    state: st,
+                    catalog_id,
+                    last_event_type: event_type,
+                    updated_at: created_at.map(|t| t.and_utc().to_rfc3339()),
+                };
+                if best.as_ref().map(|(eid, _)| event_id > *eid).unwrap_or(true) {
+                    best = Some((event_id, candidate));
+                }
+            }
+        }
+    }
+    Ok(best.map(|(_, s)| s))
 }
 
 async fn load_latest(state: &AppState, subscription_id: i64) -> AppResult<Option<LatestState>> {
