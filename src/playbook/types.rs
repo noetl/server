@@ -38,6 +38,11 @@ pub enum ToolKind {
     Noop,
     TaskSequence,
     Rhai,
+    /// Bounded-drain message subscription poll (NATS / Pub/Sub / Kafka).
+    /// noetl/ai-meta#90 Phase 1 — dispatched generically by the worker
+    /// through the noetl-tools registry; the server only needs to accept
+    /// the kind so playbook validation passes.
+    Subscription,
 }
 
 impl std::fmt::Display for ToolKind {
@@ -66,6 +71,7 @@ impl std::fmt::Display for ToolKind {
             ToolKind::Noop => "noop",
             ToolKind::TaskSequence => "task_sequence",
             ToolKind::Rhai => "rhai",
+            ToolKind::Subscription => "subscription",
         };
         write!(f, "{}", s)
     }
@@ -937,6 +943,36 @@ fn default_attempt() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_tool_kind_subscription_parses() {
+        // noetl/ai-meta#90 Phase 1: the `subscription` tool kind must be
+        // accepted by the server's typed ToolKind so a playbook using it
+        // passes validation (the worker dispatches it generically).
+        let kind: ToolKind = serde_json::from_str("\"subscription\"").unwrap();
+        assert_eq!(kind, ToolKind::Subscription);
+        assert_eq!(ToolKind::Subscription.to_string(), "subscription");
+
+        // A full ToolSpec with the subscription drain fields round-trips
+        // (source/operation/stream/consumer/batch/timeout_ms/ack land in
+        // the flattened `extra` and pass through to the worker).
+        let spec_yaml = r#"
+kind: subscription
+source: nats
+operation: poll
+auth: "nats_main"
+stream: ORDERS
+consumer: orders-drain
+batch: 50
+timeout_ms: 3000
+ack: on_success
+"#;
+        let spec: ToolSpec = serde_yaml::from_str(spec_yaml).unwrap();
+        assert_eq!(spec.kind, ToolKind::Subscription);
+        assert_eq!(spec.auth, Some(serde_json::json!("nats_main")));
+        assert_eq!(spec.extra.get("source").unwrap(), "nats");
+        assert_eq!(spec.extra.get("consumer").unwrap(), "orders-drain");
+    }
 
     #[test]
     fn test_parse_simple_playbook() {
