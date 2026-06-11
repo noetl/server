@@ -1633,4 +1633,41 @@ mod tests {
         assert!(!vars.contains_key("iter.bar"));
         assert!(!vars.contains_key("step.baz"));
     }
+
+    #[test]
+    fn test_command_issued_after_completion_reactivates_step() {
+        // noetl/ai-meta#85: workflow-arc loop re-entry re-dispatches an
+        // already-`Completed` loop step via a fresh `command.issued`.
+        // State reconstruction must let that later lifecycle event win,
+        // moving the step out of the terminal `Completed` state so the
+        // dispatch guards see it as running again.  The prior result is
+        // retained (carries the loop variable forward) until the new
+        // iteration's `call.done` overwrites it.
+        let mut state = WorkflowState::new(1, 1);
+
+        let mut completed = make_event("command.completed", Some("fetch_page"));
+        completed.result = Some(serde_json::json!({"next_offset": 10}));
+        state.apply_event(&completed);
+        assert!(state.is_step_done("fetch_page"));
+        assert_eq!(
+            state.get_step_result("fetch_page"),
+            Some(&serde_json::json!({"next_offset": 10})),
+        );
+
+        // Re-dispatch: step.enter then command.issued for the next
+        // iteration.
+        state.apply_event(&make_event("step.enter", Some("fetch_page")));
+        state.apply_event(&make_event("command.issued", Some("fetch_page")));
+
+        let after = state.steps.get("fetch_page").unwrap();
+        assert_eq!(after.state, StepState::CommandIssued);
+        assert!(!state.is_step_done("fetch_page"));
+        assert!(!state.is_step_completed("fetch_page"));
+        // Prior result is still visible to context assembly — the loop
+        // variable survives the re-entry.
+        assert_eq!(
+            state.get_step_result("fetch_page"),
+            Some(&serde_json::json!({"next_offset": 10})),
+        );
+    }
 }

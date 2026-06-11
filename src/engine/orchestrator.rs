@@ -707,13 +707,98 @@ impl WorkflowOrchestrator {
             per_step_evals.push((step_name.clone(), step, eval_results));
         }
 
+        // noetl/ai-meta#85: workflow-arc loop re-entry.
+        //
+        // A matched arc `src -> target` is a genuine loop back-edge
+        // when ALL of:
+        //   1. `target` is already terminal (`is_step_done`) — a
+        //      forward arc into a not-yet-run step dispatches normally
+        //      and never reaches here;
+        //   2. `target` can forward-reach `src` (there is a cycle
+        //      through this arc) — distinguishes a loop from a DAG
+        //      fan-in convergence, where the converge target cannot
+        //      reach its upstreams;
+        //   3. `src` completed *after* `target` — `src` is the more
+        //      recent completion, i.e. this is forward progress around
+        //      the loop.  This is what disambiguates the two arcs of a
+        //      2-cycle (`fetch_page -> check_pagination` and the
+        //      back-edge `check_pagination -> fetch_page`): both satisfy
+        //      (1) and (2) in the round where `check_pagination`
+        //      completes, but only the back-edge has src newer than
+        //      target, so only it re-enters.  Stale forward arcs from an
+        //      earlier iteration's completion are suppressed by the
+        //      normal guard.
+        //
+        // The fix re-dispatches the back-edge target WITHOUT resetting
+        // any step state: the re-dispatch's own `step.enter` /
+        // `command.issued` events move the target out of `Completed`
+        // during the next reconstruction (the later lifecycle event
+        // wins), and each iteration's `call.done` overwrites the step
+        // result.  Crucially, results are never cleared — so a loop
+        // variable carried by a step's result (e.g.
+        // `set: ctx.offset: {{ check_pagination.next_offset }}`)
+        // survives across iterations.  An earlier reset-the-loop-body
+        // approach broke exactly this: clearing the result dropped the
+        // loop variable back to its workload default on the next pass,
+        // and the loop thrashed instead of advancing.
+        //
+        // Re-entry alternates naturally around the cycle: each
+        // re-dispatch makes the target non-terminal (running), so the
+        // recency test (3) next fires for the *other* arc when the
+        // target completes again — driving one iteration per round
+        // until the loop's guard goes false and the back-edge arc no
+        // longer matches.
+        let mut loop_back_arcs: HashSet<(String, String)> = HashSet::new();
+        let mut loop_branch_points: HashSet<String> = HashSet::new();
+        for (src_name, _src, eval_results) in &per_step_evals {
+            for result in eval_results {
+                if !result.matched {
+                    continue;
+                }
+                let Some(target) = &result.next_step else {
+                    continue;
+                };
+                if target == "end" || !steps.contains_key(target.as_str()) {
+                    continue;
+                }
+                if !state.is_step_done(target) {
+                    continue;
+                }
+                // (2) cycle: target can reach src again.
+                if !forward_reachable(target, steps).contains(src_name.as_str()) {
+                    continue;
+                }
+                // (3) recency: src completed strictly after target.
+                let src_done = state.steps.get(src_name).and_then(|s| s.completed_at);
+                let tgt_done = state.steps.get(target).and_then(|s| s.completed_at);
+                match (src_done, tgt_done) {
+                    (Some(s), Some(t)) if s > t => {}
+                    _ => continue,
+                }
+                loop_back_arcs.insert((src_name.clone(), target.clone()));
+                loop_branch_points.insert(src_name.clone());
+            }
+        }
+
         // Pass 1: emit step.skipped for every unmatched arc target
         // across ALL completed steps, before any dispatch barrier
         // check.  Under `mode: exclusive`, the untaken sibling
         // arc's target never runs; without step.skipped it would
         // stay Pending forever and the R4 fan-in barrier on
         // downstream merge points would deadlock.
-        for (_completed_step_name, _completed_step, eval_results) in &per_step_evals {
+        for (completed_step_name, _completed_step, eval_results) in &per_step_evals {
+            // noetl/ai-meta#85: a step taking a loop back-edge this pass
+            // is iterating, not terminally routing.  Its unmatched arcs
+            // (the loop's exit branch, e.g. `validate_results` while
+            // `has_more == true`) are "not this iteration", not
+            // permanently dead — emitting `step.skipped` for them would
+            // make the exit branch terminal and the final iteration's
+            // exit dispatch would then be suppressed by the
+            // `is_step_done` guard.  Leave them Pending until the loop
+            // exits.
+            if loop_branch_points.contains(completed_step_name) {
+                continue;
+            }
             for result in eval_results {
                 if result.matched {
                     continue;
@@ -800,8 +885,22 @@ impl WorkflowOrchestrator {
                         }
                     };
 
+                    // noetl/ai-meta#85: a recognized loop back-edge
+                    // re-enters an already-`Completed` target.  Bypass
+                    // the done-guard so the re-dispatch goes through:
+                    // the dispatch below emits a fresh `step.enter` +
+                    // `command.issued` for the target, and on the next
+                    // reconstruction those later lifecycle events move
+                    // the step out of `Completed` (the step is re-run,
+                    // not reset — its prior result stays available to
+                    // context assembly until the new iteration's
+                    // `call.done` overwrites it, so loop variables
+                    // carried by step results survive the iteration).
+                    let is_loop_reentry =
+                        loop_back_arcs.contains(&(step_name.clone(), next_step_name.clone()));
+
                     // Skip if already completed or running
-                    if state.is_step_done(next_step_name) {
+                    if state.is_step_done(next_step_name) && !is_loop_reentry {
                         debug!("Step '{}' already done, skipping", next_step_name);
                         continue;
                     }
@@ -1057,7 +1156,18 @@ impl WorkflowOrchestrator {
                     // multi-trigger paths — the chain target was
                     // `tail`, which got re-issued on every
                     // tail.command.completed.
-                    if state.is_step_done(&current_step_name) {
+                    // noetl/ai-meta#85: when the matched arc is a loop
+                    // re-entry and we landed directly on the back-edge
+                    // target (no `when`-guard skip chain walked, the
+                    // common loop-head case), bypass this done-guard too
+                    // — the fresh step.enter + command.issued emitted
+                    // below re-activate the target on the next
+                    // reconstruction.  If a skip chain WAS walked
+                    // (`current_step_name` moved off the re-entry
+                    // target), the normal guard applies to the chain
+                    // target.
+                    let reentry_head = is_loop_reentry && current_step_name == *next_step_name;
+                    if state.is_step_done(&current_step_name) && !reentry_head {
                         debug!(
                             "Skip-chain target '{}' already done, suppressing re-dispatch",
                             current_step_name
@@ -3343,5 +3453,197 @@ mod tests {
         assert_eq!(iter.total, 3);
         assert_eq!(iter.index, 0);
         assert_eq!(iter.item, serde_json::json!(1));
+    }
+
+    // ----- noetl/ai-meta#85: workflow-arc loop re-entry -----
+
+    /// Build the canonical pagination loop:
+    ///   start -> fetch_page -> check_pagination
+    ///   check_pagination -> fetch_page (when has_more) | validate_results (else)
+    ///   validate_results -> end
+    fn make_pagination_workflow() -> Vec<Step> {
+        use crate::playbook::types::{NextArc, NextRouter, NextRouterSpec};
+        let start = make_step("start", Some("fetch_page"));
+        let fetch_page = make_step("fetch_page", Some("check_pagination"));
+        let check_pagination = {
+            let mut s = make_step("check_pagination", None);
+            s.next = Some(NextSpec::Router(NextRouter {
+                spec: Some(NextRouterSpec {
+                    mode: Some("exclusive".to_string()),
+                }),
+                arcs: vec![
+                    NextArc {
+                        step: "fetch_page".to_string(),
+                        when: Some("{{ ctx.has_more == true }}".to_string()),
+                        set_vars: None,
+                    },
+                    NextArc {
+                        step: "validate_results".to_string(),
+                        when: Some("{{ ctx.has_more != true }}".to_string()),
+                        set_vars: None,
+                    },
+                ],
+            }));
+            s
+        };
+        let validate_results = make_step("validate_results", Some("end"));
+        let end = make_step("end", None);
+        vec![start, fetch_page, check_pagination, validate_results, end]
+    }
+
+    #[test]
+    fn test_forward_reachable_detects_the_cycle() {
+        // The back-edge detector keys on `target` being able to
+        // forward-reach `src`.  In the pagination loop, fetch_page can
+        // reach check_pagination (so check_pagination -> fetch_page is a
+        // cycle), and check_pagination can reach fetch_page — both arcs
+        // of the 2-cycle qualify on reachability, which is why the
+        // recency tiebreak (covered by the evaluate-level tests) is
+        // required.  validate_results cannot reach fetch_page, so a
+        // fan-out tail is never a cycle.
+        let workflow = make_pagination_workflow();
+        let steps: HashMap<&str, &Step> = workflow.iter().map(|s| (s.step.as_str(), s)).collect();
+
+        assert!(forward_reachable("fetch_page", &steps).contains("check_pagination"));
+        assert!(forward_reachable("check_pagination", &steps).contains("fetch_page"));
+        assert!(
+            !forward_reachable("validate_results", &steps).contains("fetch_page"),
+            "the loop's exit branch must not reach back into the loop head",
+        );
+    }
+
+    fn make_pagination_playbook() -> Playbook {
+        Playbook {
+            api_version: "noetl.io/v2".to_string(),
+            kind: "Playbook".to_string(),
+            metadata: Metadata {
+                name: "pagination".to_string(),
+                path: Some("test/pagination".to_string()),
+                description: None,
+                labels: None,
+                extra: HashMap::new(),
+            },
+            workload: None,
+            vars: None,
+            keychain: None,
+            workbook: None,
+            workflow: make_pagination_workflow(),
+        }
+    }
+
+    #[test]
+    fn test_loop_back_arc_reenters_completed_step() {
+        // The core #85 regression: when check_pagination completes
+        // with has_more == true, its matched back-edge to the already-
+        // Completed fetch_page must RE-ENTER fetch_page (re-dispatch the
+        // head) rather than be suppressed by the is_step_done guard.
+        let orchestrator = WorkflowOrchestrator::new();
+
+        let t0 = Utc::now();
+        let mut started = make_event("playbook_started", None);
+        started.context = Some(serde_json::json!({
+            "workload": { "has_more": true },
+            "path": "test/pagination",
+            "version": "1",
+        }));
+        started.created_at = t0;
+
+        let mut fetch_done = make_event("command.completed", Some("fetch_page"));
+        fetch_done.created_at = t0 + chrono::Duration::seconds(1);
+        fetch_done.result = Some(serde_json::json!({"page": 1}));
+
+        let mut check_done = make_event("command.completed", Some("check_pagination"));
+        check_done.created_at = t0 + chrono::Duration::seconds(2);
+        check_done.result = Some(serde_json::json!({"has_more": true}));
+
+        let events = vec![started, fetch_done, check_done];
+        let playbook = make_pagination_playbook();
+
+        let result = orchestrator
+            .evaluate(&events, &playbook, Some("command.completed"))
+            .unwrap();
+
+        // fetch_page is re-dispatched exactly once.
+        assert_eq!(
+            result.commands.len(),
+            1,
+            "expected exactly one re-dispatch command; got {:?}",
+            result.commands.iter().map(|c| &c.step_name).collect::<Vec<_>>(),
+        );
+        assert_eq!(result.commands[0].step_name, "fetch_page");
+
+        // No state is reset — re-entry is a plain re-dispatch.  The loop
+        // head gets a fresh step.enter (which, paired with the command's
+        // command.issued, re-activates it on the next reconstruction).
+        assert!(result
+            .events_to_emit
+            .iter()
+            .any(|e| e.event_type == "step.enter" && e.node_name.as_deref() == Some("fetch_page")));
+
+        // The exit branch must NOT be skipped while the loop iterates —
+        // otherwise the final iteration's exit dispatch is suppressed.
+        assert!(
+            !result
+                .events_to_emit
+                .iter()
+                .any(|e| e.event_type == "step.skipped"
+                    && e.node_name.as_deref() == Some("validate_results")),
+            "validate_results must stay Pending during looping iterations",
+        );
+
+        assert!(!result.should_complete);
+    }
+
+    #[test]
+    fn test_loop_exit_dispatches_exit_branch_not_back_edge() {
+        // When has_more == false, the back-edge is NOT taken: no
+        // re-dispatch of fetch_page; the exit branch validate_results
+        // dispatches normally.
+        let orchestrator = WorkflowOrchestrator::new();
+
+        let t0 = Utc::now();
+        let mut started = make_event("playbook_started", None);
+        started.context = Some(serde_json::json!({
+            "workload": { "has_more": false },
+            "path": "test/pagination",
+            "version": "1",
+        }));
+        started.created_at = t0;
+
+        let mut fetch_done = make_event("command.completed", Some("fetch_page"));
+        fetch_done.created_at = t0 + chrono::Duration::seconds(1);
+        fetch_done.result = Some(serde_json::json!({"page": 1}));
+
+        let mut check_done = make_event("command.completed", Some("check_pagination"));
+        check_done.created_at = t0 + chrono::Duration::seconds(2);
+        check_done.result = Some(serde_json::json!({"has_more": false}));
+
+        let events = vec![started, fetch_done, check_done];
+        let playbook = make_pagination_playbook();
+
+        let result = orchestrator
+            .evaluate(&events, &playbook, Some("command.completed"))
+            .unwrap();
+
+        // Exit branch dispatched, nothing else.
+        assert_eq!(result.commands.len(), 1);
+        assert_eq!(result.commands[0].step_name, "validate_results");
+    }
+
+    #[test]
+    fn test_fan_in_convergence_is_not_treated_as_loop_back() {
+        // Guard against over-matching: a DAG fan-in (diamond) where two
+        // branches converge on `reduce` must NOT be mistaken for a loop
+        // back-edge — `reduce` cannot reach its upstreams, so the cycle
+        // test (2) fails and the second arrival is handled by the
+        // existing barrier/done guard, not re-entered.
+        let workflow = make_fanout_reduce_workflow();
+        let steps: HashMap<&str, &Step> = workflow.iter().map(|s| (s.step.as_str(), s)).collect();
+        let reduce_reach = forward_reachable("reduce", &steps);
+        assert!(
+            !reduce_reach.contains("branch_a") && !reduce_reach.contains("branch_b"),
+            "reduce must not reach its upstreams; got {:?}",
+            reduce_reach,
+        );
     }
 }
