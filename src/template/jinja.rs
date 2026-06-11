@@ -114,6 +114,23 @@ impl TemplateRenderer {
             if let Ok(value) = serde_json::from_str(&rendered) {
                 return Ok(value);
             }
+            // The output looks like a container but isn't valid JSON.
+            // minijinja renders maps/lists with Python-style repr — a
+            // `null` field surfaces as the token `undefined` (a JSON
+            // `null` in the context maps to `Value::UNDEFINED`), and
+            // other scalars can carry non-JSON spelling too.  When the
+            // template is a single `{{ expr }}` whole-object reference,
+            // re-render with `| tojson` so the value round-trips as
+            // valid JSON — `minijinja_to_json` maps undefined/none back
+            // to JSON `null`, so a `null` field stays `null` instead of
+            // corrupting the payload into an unparseable string the
+            // downstream step then receives as a raw `str`.  See
+            // noetl/ai-meta#89 (cursor pagination's terminal
+            // `next_cursor: null`).  Mirrors the `| tojson` retry in the
+            // noetl-tools `TemplateEngine::render_value`.
+            if let Some(value) = self.retry_single_expr_as_json(template, context) {
+                return Ok(value);
+            }
         }
 
         // Try to parse as primitive values
@@ -133,6 +150,33 @@ impl TemplateRenderer {
         }
 
         Ok(serde_json::Value::String(rendered))
+    }
+
+    /// When `template` is a single `{{ expr }}` reference whose plain
+    /// render produced container-shaped-but-invalid JSON, re-render the
+    /// expression with `| tojson` appended and parse the result.
+    ///
+    /// Returns `None` when the template isn't a lone `{{ expr }}`, when
+    /// the expression already pipes through `tojson` (the plain render
+    /// would already be valid JSON in that case), or when the retried
+    /// render still doesn't parse — callers fall back to their existing
+    /// behaviour.  See noetl/ai-meta#89.
+    fn retry_single_expr_as_json(
+        &self,
+        template: &str,
+        context: &HashMap<String, serde_json::Value>,
+    ) -> Option<serde_json::Value> {
+        let t = template.trim();
+        if !(t.starts_with("{{") && t.ends_with("}}") && t.matches("{{").count() == 1) {
+            return None;
+        }
+        let inner = t[2..t.len() - 2].trim();
+        if inner.is_empty() || inner.contains("tojson") {
+            return None;
+        }
+        let json_tmpl = format!("{{{{ {} | tojson }}}}", inner);
+        let rendered = self.render(&json_tmpl, context).ok()?;
+        serde_json::from_str::<serde_json::Value>(&rendered).ok()
     }
 
     /// Render a nested structure (dict or list) recursively.
@@ -722,4 +766,119 @@ mod tests {
         assert_eq!(result["greeting"], "Hello, Alice!");
         assert_eq!(result["info"]["age_str"], "Age: 30");
     }
+
+    // -----------------------------------------------------------------
+    // noetl/ai-meta#89 — a JSON `null` field in a step result, when the
+    // whole envelope is re-injected into a downstream input via the
+    // single-expression `{{ step }}` reference, must round-trip as JSON
+    // `null` (not the JS token `undefined`) so the consuming step
+    // receives a parsed object, not an unparseable `str`.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_issue_89_null_field_in_whole_object_reference() {
+        let renderer = TemplateRenderer::new();
+        let mut ctx = HashMap::new();
+        ctx.insert(
+            "fetch_page".to_string(),
+            serde_json::json!({
+                "body": {
+                    "next_cursor": null,
+                    "limit": 10,
+                    "events": [{"id": 31}, {"id": 32}]
+                },
+                "status_code": 200
+            }),
+        );
+        let out = renderer.render_to_value("{{ fetch_page }}", &ctx).unwrap();
+        assert!(out.is_object(), "expected parsed object, got: {:?}", out);
+        assert!(
+            out["body"]["next_cursor"].is_null(),
+            "next_cursor must be JSON null, got: {:?}",
+            out["body"]["next_cursor"]
+        );
+        assert_eq!(out["body"]["limit"], serde_json::json!(10));
+        assert_eq!(out["body"]["events"][1]["id"], serde_json::json!(32));
+        assert_eq!(out["status_code"], serde_json::json!(200));
+    }
+
+    #[test]
+    fn test_issue_89_top_level_null_field_round_trips() {
+        // The terminal cursor page shape: `next_cursor` lives directly
+        // on the rendered object, mirroring the real API envelope's
+        // `{"events": [...], "next_cursor": null, "limit": 10}`.
+        let renderer = TemplateRenderer::new();
+        let mut ctx = HashMap::new();
+        ctx.insert(
+            "page".to_string(),
+            serde_json::json!({
+                "events": [{"id": 35}],
+                "next_cursor": null,
+                "limit": 10
+            }),
+        );
+        let out = renderer.render_to_value("{{ page }}", &ctx).unwrap();
+        assert!(out.is_object(), "expected parsed object, got: {:?}", out);
+        assert!(out["next_cursor"].is_null());
+        // Round-trip equality against the original (null preserved).
+        assert_eq!(
+            out,
+            serde_json::json!({
+                "events": [{"id": 35}],
+                "next_cursor": null,
+                "limit": 10
+            })
+        );
+    }
+
+    #[test]
+    fn test_issue_89_array_with_null_element_round_trips() {
+        let renderer = TemplateRenderer::new();
+        let mut ctx = HashMap::new();
+        ctx.insert(
+            "rows".to_string(),
+            serde_json::json!([{"v": 1}, {"v": null}]),
+        );
+        let out = renderer.render_to_value("{{ rows }}", &ctx).unwrap();
+        assert!(out.is_array(), "expected parsed array, got: {:?}", out);
+        assert!(out[1]["v"].is_null());
+    }
+
+    #[test]
+    fn test_issue_89_explicit_tojson_still_parses() {
+        // A user who already wrote `| tojson` must not be double-piped;
+        // the plain render is already valid JSON and parses directly.
+        let renderer = TemplateRenderer::new();
+        let mut ctx = HashMap::new();
+        ctx.insert(
+            "page".to_string(),
+            serde_json::json!({"next_cursor": null, "limit": 10}),
+        );
+        let out = renderer
+            .render_to_value("{{ page | tojson }}", &ctx)
+            .unwrap();
+        assert!(out.is_object());
+        assert!(out["next_cursor"].is_null());
+    }
+
+    #[test]
+    fn test_issue_89_scalar_renders_unaffected() {
+        // The retry only fires for container-shaped output; scalars keep
+        // their existing typed parsing (number stays a number, etc.).
+        let renderer = TemplateRenderer::new();
+        let ctx = make_context();
+        assert_eq!(
+            renderer.render_to_value("{{ age }}", &ctx).unwrap(),
+            serde_json::json!(30)
+        );
+        assert_eq!(
+            renderer.render_to_value("{{ name }}", &ctx).unwrap(),
+            serde_json::json!("Alice")
+        );
+        assert_eq!(
+            renderer.render_to_value("{{ active }}", &ctx).unwrap(),
+            serde_json::json!(true)
+        );
+    }
+
 }
