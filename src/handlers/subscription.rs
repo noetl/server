@@ -331,7 +331,7 @@ pub async fn list(State(state): State<AppState>) -> AppResult<Json<SubscriptionL
                 SELECT DISTINCT ON (execution_id)
                        execution_id, event_type, status, catalog_id, created_at
                 FROM noetl.event
-                WHERE event_type LIKE 'subscription.%'
+                WHERE event_type IN ('subscription.registered','subscription.activated','subscription.paused','subscription.resumed','subscription.draining','subscription.deactivated')
                 ORDER BY execution_id, event_id DESC
                 "#,
             )
@@ -385,7 +385,7 @@ async fn latest_for_path(state: &AppState, path: &str) -> AppResult<Option<Lates
                 r#"
                 SELECT event_id, execution_id, event_type, status, catalog_id, created_at
                 FROM noetl.event
-                WHERE node_name = $1 AND event_type LIKE 'subscription.%'
+                WHERE node_name = $1 AND event_type IN ('subscription.registered','subscription.activated','subscription.paused','subscription.resumed','subscription.draining','subscription.deactivated')
                 ORDER BY event_id DESC
                 LIMIT 1
                 "#,
@@ -416,7 +416,7 @@ async fn load_latest(state: &AppState, subscription_id: i64) -> AppResult<Option
             r#"
             SELECT event_type, status, catalog_id, node_name, created_at
             FROM noetl.event
-            WHERE execution_id = $1 AND event_type LIKE 'subscription.%'
+            WHERE execution_id = $1 AND event_type IN ('subscription.registered','subscription.activated','subscription.paused','subscription.resumed','subscription.draining','subscription.deactivated')
             ORDER BY event_id DESC
             LIMIT 1
             "#,
