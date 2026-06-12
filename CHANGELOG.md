@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.3.0](https://github.com/noetl/server/compare/v3.2.0...v3.3.0) (2026-06-12)
+
+### Features
+
+* push-ingress config endpoint + push catalog validation ([#90](https://github.com/noetl/server/issues/90) Phase 3) ([#182](https://github.com/noetl/server/issues/182)) ([7f62537](https://github.com/noetl/server/commit/7f62537e2b8975d373682ec2dcc67f8dc14ece37)), closes [noetl/server#181](https://github.com/noetl/server/issues/181)
+
 ## [3.2.0](https://github.com/noetl/server/compare/v3.1.0...v3.2.0) (2026-06-12)
 
 ### Features
