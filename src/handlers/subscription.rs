@@ -169,50 +169,65 @@ pub async fn register(
     State(state): State<AppState>,
     Json(req): Json<RegisterRequest>,
 ) -> AppResult<Json<SubscriptionStatus>> {
+    Ok(Json(ensure_registered(&state, &req.path).await?))
+}
+
+/// Register-or-reuse a subscription by catalog path, returning its current
+/// status.  Idempotent: an existing non-deactivated subscription for the same
+/// path is reused (a runtime restart — or a fresh push delivery — doesn't mint
+/// a new id each time); otherwise a snowflake id is minted and the
+/// `subscription.registered` lifecycle event is written.
+///
+/// Shared by `POST /api/subscriptions/register` (the continuous runtime, Mode
+/// B) and the gateway push-ingress config endpoint (`GET
+/// /api/internal/ingress/{listener}`, Mode C) so a push subscription gets the
+/// same event-sourced lifecycle + parent-execution lineage as a pull one
+/// (noetl/ai-meta#90 Phase 3).
+pub async fn ensure_registered(state: &AppState, path: &str) -> AppResult<SubscriptionStatus> {
     // Resolve the catalog entry and confirm it is a subscription.
     let row: Option<(i64, String)> = sqlx::query_as(
         "SELECT catalog_id, kind FROM noetl.catalog WHERE path = $1 ORDER BY version DESC LIMIT 1",
     )
-    .bind(&req.path)
+    .bind(path)
     .fetch_optional(state.pools.cluster())
     .await?;
 
-    let (catalog_id, kind) = row
-        .ok_or_else(|| AppError::NotFound(format!("Subscription not found: {}", req.path)))?;
+    let (catalog_id, kind) =
+        row.ok_or_else(|| AppError::NotFound(format!("Subscription not found: {}", path)))?;
     if kind.to_lowercase() != "subscription" {
         return Err(AppError::Validation(format!(
             "Catalog entry '{}' is kind '{}', not 'subscription'",
-            req.path, kind
+            path, kind
         )));
     }
 
     // Idempotent register: reuse an existing non-deactivated subscription for
     // the same path so a runtime restart doesn't mint a fresh id each time.
-    if let Some(existing) = latest_for_path(&state, &req.path).await? {
+    if let Some(existing) = latest_for_path(state, path).await? {
         if existing.state != SubState::Deactivated {
             tracing::info!(
                 subscription_id = existing.subscription_id,
-                path = %req.path,
+                path = %path,
                 state = existing.state.as_status(),
                 "Subscription already registered — reusing"
             );
-            return Ok(Json(SubscriptionStatus {
+            return Ok(SubscriptionStatus {
                 subscription_id: existing.subscription_id.to_string(),
-                path: req.path,
+                path: path.to_string(),
                 catalog_id: existing.catalog_id.to_string(),
                 state: existing.state.as_status().to_string(),
                 last_event_type: existing.last_event_type,
                 updated_at: existing.updated_at,
-            }));
+            });
         }
     }
 
     let subscription_id = state.snowflake.generate()?;
     write_lifecycle_event(
-        &state,
+        state,
         subscription_id,
         catalog_id,
-        &req.path,
+        path,
         "subscription.registered",
         SubState::Registered,
     )
@@ -220,19 +235,19 @@ pub async fn register(
 
     tracing::info!(
         subscription_id,
-        path = %req.path,
+        path = %path,
         catalog_id,
         "Subscription registered"
     );
 
-    Ok(Json(SubscriptionStatus {
+    Ok(SubscriptionStatus {
         subscription_id: subscription_id.to_string(),
-        path: req.path,
+        path: path.to_string(),
         catalog_id: catalog_id.to_string(),
         state: SubState::Registered.as_status().to_string(),
         last_event_type: "subscription.registered".to_string(),
         updated_at: Some(chrono::Utc::now().to_rfc3339()),
-    }))
+    })
 }
 
 /// `POST /api/subscriptions/{id}/{transition}` — apply a lifecycle transition

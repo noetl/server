@@ -134,7 +134,7 @@ fn build_router(
             post(handlers::cross_region::resolve),
         )
         .with_state(handlers::cross_region::CrossRegionDeps {
-            credentials: credential_service,
+            credentials: credential_service.clone(),
         });
 
     // Wallet KEK rotation endpoints (Secrets Wallet Phase 7a.2,
@@ -401,6 +401,23 @@ fn build_router(
         )
         .with_state(db_pool.clone());
 
+    // Gateway push-ingress config endpoint (noetl/ai-meta#90 Phase 3).  The
+    // gateway calls GET /api/internal/ingress/{listener} (service-account
+    // gated) to resolve a push subscription's verify scheme + Wallet-resolved
+    // secret + dispatch + directive allowlist, so it can verify-then-forward a
+    // webhook/Pub-Sub-push delivery without holding a DB connection
+    // (data-access-boundary.md).  Carries its own deps state (control-plane
+    // state + credential service).
+    let ingress_routes = Router::new()
+        .route(
+            "/api/internal/ingress/{listener}",
+            get(handlers::ingress::get_ingress_config),
+        )
+        .with_state(handlers::ingress::IngressDeps {
+            state: state.clone(),
+            credentials: credential_service.clone(),
+        });
+
     // System monitoring routes
     let system_routes = Router::new()
         .route("/api/status", get(handlers::system::get_status))
@@ -449,6 +466,7 @@ fn build_router(
         .merge(sharding_routes)
         .merge(database_routes)
         .merge(internal_routes)
+        .merge(ingress_routes)
         .merge(system_routes)
         .merge(dashboard_routes)
         .layer(TraceLayer::new_for_http())

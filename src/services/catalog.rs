@@ -221,8 +221,12 @@ fn validate_subscription_spec(yaml: &serde_yaml::Value) -> AppResult<()> {
             }
         }
         "push" => {
-            // Push ingress (Mode C) lands in Phase 3; the type accepts the
-            // shape now so a spec can be registered ahead of the gateway.
+            // Push ingress (Mode C, noetl/ai-meta#90 Phase 3): the spec must
+            // declare how the gateway verifies inbound deliveries before any
+            // directive is honored (RFC §6 / §7.5).  Validate the `ingress`
+            // block shape here so a misconfigured push subscription is
+            // rejected at registration, not at the first webhook.
+            validate_push_ingress(spec)?;
         }
         other => {
             return Err(AppError::Validation(format!(
@@ -274,6 +278,92 @@ fn validate_subscription_spec(yaml: &serde_yaml::Value) -> AppResult<()> {
     Ok(())
 }
 
+/// Verify schemes a push `kind: Subscription` ingress may declare (RFC §6).
+/// `none` is intentionally absent — push ingress always verifies.
+const PUSH_VERIFY_TYPES: &[&str] = &["hmac_sha256", "bearer", "pubsub_oidc"];
+
+/// Validate the push-mode `spec.ingress` block (noetl/ai-meta#90 Phase 3).
+///
+/// The gateway is the only component that terminates untrusted inbound
+/// traffic, so a push subscription must declare *how* the gateway verifies a
+/// delivery (RFC §6) and *where* a verification secret is resolved from the
+/// Secrets Wallet (by alias — never a gateway env var).  This check is
+/// structural: it guarantees the gateway's config endpoint
+/// (`GET /api/internal/ingress/{listener}`) can build a complete verifier.
+///
+/// Per-scheme requirements:
+/// - `hmac_sha256` — `header` (the signature header) + `secret` (Wallet alias).
+/// - `bearer`      — `secret` (Wallet alias for the expected token).
+/// - `pubsub_oidc` — `audience` + `service_account` (Google-signed JWT check;
+///   the JWKS is public, so no Wallet secret).
+fn validate_push_ingress(spec: &serde_yaml::Value) -> AppResult<()> {
+    let ingress = spec.get("ingress").ok_or_else(|| {
+        AppError::Validation(
+            "subscription 'mode: push' requires an 'ingress' block (gateway_path + verify)".into(),
+        )
+    })?;
+
+    let gateway_path = ingress
+        .get("gateway_path")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            AppError::Validation("subscription 'ingress.gateway_path' is required for push".into())
+        })?;
+    if !gateway_path.starts_with('/') {
+        return Err(AppError::Validation(format!(
+            "subscription 'ingress.gateway_path' must be an absolute path starting with '/', got '{}'",
+            gateway_path
+        )));
+    }
+
+    let verify = ingress.get("verify").ok_or_else(|| {
+        AppError::Validation("subscription 'ingress' requires a 'verify' block (push always verifies)".into())
+    })?;
+    let vtype = verify
+        .get("type")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| AppError::Validation("subscription 'ingress.verify.type' is required".into()))?;
+    if !PUSH_VERIFY_TYPES.contains(&vtype) {
+        return Err(AppError::Validation(format!(
+            "subscription 'ingress.verify.type' must be one of {:?}, got '{}' \
+             ('none' is not allowed — push ingress always verifies)",
+            PUSH_VERIFY_TYPES, vtype
+        )));
+    }
+
+    let require = |field: &str| -> AppResult<()> {
+        verify
+            .get(field)
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|_| ())
+            .ok_or_else(|| {
+                AppError::Validation(format!(
+                    "subscription 'ingress.verify.{}' is required for verify.type '{}'",
+                    field, vtype
+                ))
+            })
+    };
+
+    match vtype {
+        "hmac_sha256" => {
+            require("header")?;
+            require("secret")?;
+        }
+        "bearer" => {
+            require("secret")?;
+        }
+        "pubsub_oidc" => {
+            require("audience")?;
+            require("service_account")?;
+        }
+        _ => unreachable!("verify.type already validated against PUSH_VERIFY_TYPES"),
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -307,7 +397,7 @@ spec:
     }
 
     #[test]
-    fn valid_push_subscription() {
+    fn valid_push_subscription_hmac() {
         let v = yaml(
             r#"
 kind: Subscription
@@ -315,10 +405,124 @@ metadata: { name: stripe, path: subscriptions/stripe }
 spec:
   source: webhook
   mode: push
+  ingress:
+    gateway_path: /ingress/stripe
+    verify:
+      type: hmac_sha256
+      header: "Stripe-Signature"
+      secret: "stripe_webhook_secret"
   dispatch: { playbook: domain/handle_stripe }
 "#,
         );
         assert!(validate_subscription_spec(&v).is_ok());
+    }
+
+    #[test]
+    fn valid_push_subscription_bearer() {
+        let v = yaml(
+            r#"
+kind: Subscription
+spec:
+  source: webhook
+  mode: push
+  ingress: { gateway_path: /ingress/hook, verify: { type: bearer, secret: "hook_token" } }
+  dispatch: { playbook: domain/handle }
+"#,
+        );
+        assert!(validate_subscription_spec(&v).is_ok());
+    }
+
+    #[test]
+    fn valid_push_subscription_pubsub_oidc() {
+        let v = yaml(
+            r#"
+kind: Subscription
+spec:
+  source: pubsub
+  mode: push
+  ingress:
+    gateway_path: /ingress/billing
+    verify:
+      type: pubsub_oidc
+      audience: "https://gw.noetl.acme/ingress/billing"
+      service_account: "pubsub-push@acme.iam.gserviceaccount.com"
+  dispatch: { playbook: domain/handle_billing }
+"#,
+        );
+        assert!(validate_subscription_spec(&v).is_ok());
+    }
+
+    #[test]
+    fn push_without_ingress_rejected() {
+        let v = yaml(
+            "kind: Subscription\nspec:\n  source: webhook\n  mode: push\n  dispatch: { playbook: p }\n",
+        );
+        let err = validate_subscription_spec(&v).unwrap_err();
+        assert!(format!("{err}").contains("ingress"));
+    }
+
+    #[test]
+    fn push_verify_none_rejected() {
+        let v = yaml(
+            r#"
+kind: Subscription
+spec:
+  source: webhook
+  mode: push
+  ingress: { gateway_path: /ingress/x, verify: { type: none } }
+  dispatch: { playbook: p }
+"#,
+        );
+        let err = validate_subscription_spec(&v).unwrap_err();
+        assert!(format!("{err}").contains("verify.type"));
+    }
+
+    #[test]
+    fn push_hmac_missing_secret_rejected() {
+        let v = yaml(
+            r#"
+kind: Subscription
+spec:
+  source: webhook
+  mode: push
+  ingress: { gateway_path: /ingress/x, verify: { type: hmac_sha256, header: X-Sig } }
+  dispatch: { playbook: p }
+"#,
+        );
+        let err = validate_subscription_spec(&v).unwrap_err();
+        assert!(format!("{err}").contains("verify.secret"));
+    }
+
+    #[test]
+    fn push_oidc_missing_audience_rejected() {
+        let v = yaml(
+            r#"
+kind: Subscription
+spec:
+  source: pubsub
+  mode: push
+  ingress: { gateway_path: /ingress/x, verify: { type: pubsub_oidc, service_account: sa@x.iam } }
+  dispatch: { playbook: p }
+"#,
+        );
+        let err = validate_subscription_spec(&v).unwrap_err();
+        assert!(format!("{err}").contains("verify.audience"));
+    }
+
+    #[test]
+    fn push_relative_gateway_path_rejected() {
+        let v = yaml(
+            r#"
+kind: Subscription
+spec:
+  source: webhook
+  mode: push
+  ingress: { gateway_path: ingress/x, verify: { type: bearer, secret: t } }
+  dispatch: { playbook: p }
+"#,
+        );
+        let err = validate_subscription_spec(&v).unwrap_err();
+        assert!(format!("{err}").contains("absolute path"));
     }
 
     #[test]
