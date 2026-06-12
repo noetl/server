@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.2.0](https://github.com/noetl/server/compare/v3.1.0...v3.2.0) (2026-06-12)
+
+### Features
+
+* kind:Subscription type + lifecycle + pool routing + W3C trace ([#90](https://github.com/noetl/server/issues/90) Phase 2) ([#180](https://github.com/noetl/server/issues/180)) ([0e435b8](https://github.com/noetl/server/commit/0e435b808aab9abea5468aa770b1a7d3ca9ffdae))
+
 ## [3.1.0](https://github.com/noetl/server/compare/v3.0.6...v3.1.0) (2026-06-11)
 
 ### Features
