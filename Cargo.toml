@@ -58,6 +58,14 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # NATS messaging
 async-nats = "0.38"
 
+# Build-fix pin (NOT used directly).  time 0.3.48 (2026-06-12) collides with
+# async-nats 0.38.0's blanket `From<Kind> for Error<Kind>` under rustc 1.91+
+# (E0119, HourBase).  Pin the transitive dep to the last good release so a
+# fresh CI / image build stays off 0.3.48.  Mirrors the same pin in
+# noetl-tools 3.7.1+, noetl-worker, and noetl-gateway.  Revisit when
+# async-nats ships a fix.
+time = "=0.3.47"
+
 # Templating (Jinja2-style)
 minijinja = { version = "2.5", features = ["loader"] }
 
