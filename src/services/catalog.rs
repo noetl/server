@@ -298,9 +298,13 @@ const SPOOL_ORDERINGS: &[&str] = &["global", "per_key", "none"];
 ///
 /// Structural guarantees the worker runtime needs to stand the spool up:
 /// a valid `mode`/`backend`/`ordering`, and the backend's required target
-/// (a `bucket` for `nats_object`/`gcs`/`s3`, a `path` for `local_disk`, a
-/// keychain `credential` alias for `gcs`/`s3` — an external bucket per
-/// `data-access-boundary.md`).
+/// (a `bucket` for `nats_object`/`gcs`/`s3`, a `path` for `local_disk`).
+///
+/// For `gcs`/`s3` the `credential` keychain alias is **optional**: present →
+/// a tenant-owned external bucket resolved by alias (`data-access-boundary.md`);
+/// absent → the platform's own bucket reached via "already-in-place trust" —
+/// ADC / Workload Identity (gcs) or the instance profile (s3) — which is the
+/// out-of-cluster Cloud Run path (RFC #90 Phase 5, `execution-model.md`).
 fn validate_spool_config(spool: &serde_yaml::Value) -> AppResult<()> {
     if !spool.is_mapping() {
         return Err(AppError::Validation("subscription 'spool' must be a mapping".into()));
@@ -352,12 +356,9 @@ fn validate_spool_config(spool: &serde_yaml::Value) -> AppResult<()> {
         }
         _ => {}
     }
-    if matches!(backend, "gcs" | "s3") && !nonempty("credential") {
-        return Err(AppError::Validation(format!(
-            "subscription 'spool.backend' '{}' requires a keychain 'credential' alias",
-            backend
-        )));
-    }
+    // `credential` is optional for gcs/s3 — absent means ADC / Workload
+    // Identity (the Cloud Run platform-bucket path); present means a keychain
+    // alias for a tenant-owned external bucket. Either is valid.
 
     if let Some(ordering) = spool.get("ordering").and_then(|v| v.as_str()) {
         if !SPOOL_ORDERINGS.contains(&ordering) {
@@ -546,12 +547,23 @@ spec:
     }
 
     #[test]
-    fn spool_gcs_requires_credential() {
+    fn spool_gcs_requires_bucket() {
+        // gcs (like nats_object/s3) requires a bucket...
+        let v = yaml(
+            "kind: Subscription\nspec:\n  source: nats\n  mode: pull\n  stream: S\n  consumer: C\n  dispatch: { playbook: p }\n  spool: { mode: buffer_and_ack, backend: gcs }\n",
+        );
+        let err = validate_subscription_spec(&v).unwrap_err();
+        assert!(format!("{err}").contains("bucket"));
+    }
+
+    #[test]
+    fn spool_gcs_without_credential_is_valid_adc() {
+        // ...but `credential` is optional: a gcs spool with just a bucket is
+        // valid (ADC / Workload Identity — the Cloud Run path, #90 Phase 5).
         let v = yaml(
             "kind: Subscription\nspec:\n  source: nats\n  mode: pull\n  stream: S\n  consumer: C\n  dispatch: { playbook: p }\n  spool: { mode: buffer_and_ack, backend: gcs, bucket: b }\n",
         );
-        let err = validate_subscription_spec(&v).unwrap_err();
-        assert!(format!("{err}").contains("credential"));
+        assert!(validate_subscription_spec(&v).is_ok());
     }
 
     #[test]
