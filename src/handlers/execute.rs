@@ -43,6 +43,33 @@ pub struct ExecuteRequest {
     /// external join.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trace: Option<serde_json::Value>,
+    /// Opt-in exactly-once dedup (noetl/ai-meta#90 Phase 7, RFC §10 OQ1).
+    /// When present, the server consults `noetl.subscription_dedup` scoped by
+    /// `parent_execution_id` (the subscription) and collapses a duplicate
+    /// delivery (same `dedup.key` within `dedup.window_secs`) to a single
+    /// execution — no second `playbook_started`, no second command fan-out.
+    /// Absent → no dedup (the default; at IoT volume a DB write per message
+    /// is too costly, so dedup is opt-in per subscription).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dedup: Option<DedupSpec>,
+}
+
+/// Opt-in dedup directive carried on an execute request (noetl/ai-meta#90
+/// Phase 7).  The continuous subscription runtime stamps this only when the
+/// `kind: Subscription` declares `dedup.enabled: true`; `key` is the resolved
+/// `idempotency_key` header directive, falling back to the source `message_id`
+/// (RFC §10 OQ8).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DedupSpec {
+    /// The idempotency key to dedup on (idempotency_key directive → message_id).
+    pub key: String,
+    /// Window in seconds; a duplicate older than this is treated as fresh.
+    #[serde(default = "default_dedup_window_secs")]
+    pub window_secs: u64,
+}
+
+fn default_dedup_window_secs() -> u64 {
+    crate::db::queries::subscription_dedup::DEFAULT_WINDOW_SECS
 }
 
 /// Per-execution command routing resolved once and threaded through every
@@ -106,6 +133,168 @@ pub async fn execute(
     State(state): State<AppState>,
     Json(request): Json<ExecuteRequest>,
 ) -> Result<Json<ExecuteResponse>, AppError> {
+    let outcome = execute_one(&state, request, "single").await?;
+    Ok(Json(outcome.into_response()))
+}
+
+/// Hard cap on items in one `POST /api/execute/batch` call.  A runaway-loop
+/// backstop set far above any real subscription batch (the runtime caps its
+/// own batch at `RUNTIME_BATCH_DEFAULT`-ish); a larger request is rejected
+/// rather than silently truncated.
+const MAX_BATCH_ITEMS: usize = 1000;
+
+/// Batch execute request (noetl/ai-meta#90 Phase 7, RFC §10 OQ12/#13).
+#[derive(Debug, Deserialize)]
+pub struct BatchExecuteRequest {
+    /// One full execute request per message.  Each carries its own
+    /// `path`/`payload`/`execution_pool`/`trace`/`parent_execution_id`/`dedup`,
+    /// so the directive-resolved per-message routing + trace propagation +
+    /// dedup are preserved inside the batch — a batch is N independent
+    /// executions in one HTTP round-trip, not one shared execution.
+    pub executions: Vec<ExecuteRequest>,
+}
+
+/// Per-item result in a batch response.  Partial failure is first-class: one
+/// bad item yields an `error` entry, the rest still create executions.
+#[derive(Debug, Clone, Serialize)]
+pub struct BatchItemResult {
+    /// Position in the request `executions` array — lets the caller correlate
+    /// each result back to the message it submitted.
+    pub index: usize,
+    /// `"started"` | `"duplicate"` | `"error"`.
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution_id: Option<String>,
+    #[serde(default)]
+    pub commands_generated: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Batch execute response — per-item results plus a summary so the caller can
+/// assert N→N without walking every entry.
+#[derive(Debug, Serialize)]
+pub struct BatchExecuteResponse {
+    pub count: usize,
+    pub started: usize,
+    pub duplicates: usize,
+    pub failed: usize,
+    pub results: Vec<BatchItemResult>,
+}
+
+/// Start N executions in one request.
+///
+/// POST /api/execute/batch
+///
+/// Each element is processed independently through [`execute_one`] — the same
+/// wire-format path the single endpoint uses — so per-message event
+/// traceability, the directive/pool routing, the W3C trace propagation, and
+/// the opt-in dedup window all behave exactly as for a one-at-a-time dispatch.
+/// **Partial failure is contained**: a single item that fails to create an
+/// execution becomes an `error` result at its index; the rest still run.  The
+/// data-access boundary is intact — the server still owns every DB write; the
+/// runtime only collapses N HTTP round-trips into one.
+pub async fn execute_batch(
+    State(state): State<AppState>,
+    Json(request): Json<BatchExecuteRequest>,
+) -> Result<Json<BatchExecuteResponse>, AppError> {
+    let n = request.executions.len();
+    if n == 0 {
+        return Err(AppError::Validation(
+            "execute batch requires a non-empty 'executions' array".to_string(),
+        ));
+    }
+    if n > MAX_BATCH_ITEMS {
+        return Err(AppError::Validation(format!(
+            "execute batch size {} exceeds the {} cap",
+            n, MAX_BATCH_ITEMS
+        )));
+    }
+
+    let span = tracing::info_span!("execute.batch", batch_size = n);
+    let _guard = span.enter();
+    crate::metrics::record_execute_batch_size(n);
+
+    let mut results = Vec::with_capacity(n);
+    let mut started = 0usize;
+    let mut duplicates = 0usize;
+    let mut failed = 0usize;
+
+    for (index, req) in request.executions.into_iter().enumerate() {
+        match execute_one(&state, req, "batch").await {
+            Ok(outcome) => {
+                if outcome.status == "duplicate" {
+                    duplicates += 1;
+                } else {
+                    started += 1;
+                }
+                results.push(BatchItemResult {
+                    index,
+                    status: outcome.status.to_string(),
+                    execution_id: Some(outcome.execution_id.to_string()),
+                    commands_generated: outcome.commands_generated,
+                    error: None,
+                });
+            }
+            Err(e) => {
+                failed += 1;
+                crate::metrics::record_execute_outcome("batch", "error");
+                tracing::warn!(index, error = %e, "batch item failed (continuing)");
+                results.push(BatchItemResult {
+                    index,
+                    status: "error".to_string(),
+                    execution_id: None,
+                    commands_generated: 0,
+                    error: Some(e.to_string()),
+                });
+            }
+        }
+    }
+
+    info!(
+        batch_size = n,
+        started, duplicates, failed, "execute batch complete"
+    );
+
+    Ok(Json(BatchExecuteResponse {
+        count: n,
+        started,
+        duplicates,
+        failed,
+        results,
+    }))
+}
+
+/// The outcome of creating (or deduplicating) one execution.  Shared by the
+/// single (`/api/execute`) and batch (`/api/execute/batch`) entry points.
+#[derive(Debug, Clone)]
+pub(crate) struct ExecuteOutcome {
+    pub execution_id: i64,
+    /// `"started"` for a fresh execution, `"duplicate"` when the dedup window
+    /// collapsed this delivery onto an existing execution.
+    pub status: &'static str,
+    pub commands_generated: i32,
+}
+
+impl ExecuteOutcome {
+    fn into_response(self) -> ExecuteResponse {
+        ExecuteResponse {
+            execution_id: self.execution_id.to_string(),
+            status: self.status.to_string(),
+            commands_generated: self.commands_generated,
+        }
+    }
+}
+
+/// Create (or dedup) one execution.  Factored out of the `/api/execute`
+/// handler so the batch endpoint can reuse the exact same wire-format logic
+/// per item (noetl/ai-meta#90 Phase 7).  `entry` is the metrics label
+/// (`"single"` | `"batch"`).
+pub(crate) async fn execute_one(
+    state: &AppState,
+    request: ExecuteRequest,
+    entry: &'static str,
+) -> Result<ExecuteOutcome, AppError> {
     // Validate request
     request.validate().map_err(AppError::Validation)?;
 
@@ -114,8 +303,56 @@ pub async fn execute(
         request.path, request.catalog_id
     );
 
+    // Generate execution_id via the application-side snowflake
+    // generator (Phase F R1.5 of noetl/ai-meta#49).  ID is
+    // available before any I/O so spans + metrics can use it
+    // immediately, retries stay idempotent, and the opt-in dedup
+    // window (below) can reserve it before any expensive work.
+    let execution_id = state.snowflake.generate()?;
+
+    // Opt-in exactly-once dedup window (noetl/ai-meta#90 Phase 7, RFC §10
+    // OQ1).  Checked *before* catalog resolution + parse so a duplicate is
+    // cheap — it never touches the catalog, never emits an event, never fans
+    // out a command.  Scope is the subscription (parent_execution_id); the
+    // claim is race-safe (INSERT … ON CONFLICT) so two replicas can't both
+    // create an execution for the same key.
+    if let Some(dedup) = request.dedup.as_ref() {
+        let scope = request.parent_execution_id.unwrap_or(0);
+        use crate::db::queries::subscription_dedup::{claim, DedupOutcome};
+        match claim(
+            state.pools.cluster(),
+            scope,
+            &dedup.key,
+            dedup.window_secs,
+            execution_id,
+        )
+        .await?
+        {
+            DedupOutcome::Duplicate {
+                existing_execution_id,
+            } => {
+                emit_deduplicated_event(state, scope, &dedup.key, existing_execution_id, execution_id)
+                    .await;
+                crate::metrics::record_execute_outcome(entry, "duplicate");
+                info!(
+                    subscription_id = scope,
+                    existing_execution_id,
+                    suppressed_execution_id = execution_id,
+                    dedup_key = %dedup.key,
+                    "dedup window collapsed a duplicate delivery to the existing execution"
+                );
+                return Ok(ExecuteOutcome {
+                    execution_id: existing_execution_id,
+                    status: "duplicate",
+                    commands_generated: 0,
+                });
+            }
+            DedupOutcome::Fresh => { /* reserved execution_id; proceed */ }
+        }
+    }
+
     // Resolve catalog entry
-    let (catalog_id, path) = resolve_catalog(&state, &request).await?;
+    let (catalog_id, path) = resolve_catalog(state, &request).await?;
 
     info!(
         "Starting execution for path={}, catalog_id={}",
@@ -123,16 +360,10 @@ pub async fn execute(
     );
 
     // Get playbook from catalog
-    let playbook_yaml = get_playbook_yaml(&state, catalog_id).await?;
+    let playbook_yaml = get_playbook_yaml(state, catalog_id).await?;
 
     // Parse playbook
     let playbook = crate::playbook::parser::parse_playbook(&playbook_yaml)?;
-
-    // Generate execution_id via the application-side snowflake
-    // generator (Phase F R1.5 of noetl/ai-meta#49).  ID is
-    // available before any I/O so spans + metrics can use it
-    // immediately and retries stay idempotent.
-    let execution_id = state.snowflake.generate()?;
 
     // Build the effective workload by merging playbook YAML
     // `workload:` defaults with the request's `payload:` overrides.
@@ -166,7 +397,7 @@ pub async fn execute(
     // the whole playbook nesting (RFC §7.4) bounded by that nesting.
     let trace = match (&request.trace, request.parent_execution_id) {
         (Some(t), _) if !t.is_null() => Some(t.clone()),
-        (_, Some(parent)) => inherit_parent_trace(&state, parent).await,
+        (_, Some(parent)) => inherit_parent_trace(state, parent).await,
         _ => None,
     };
     let routing = CommandRouting {
@@ -179,7 +410,7 @@ pub async fn execute(
 
     // Emit playbook_started event
     let start_event_id = emit_playbook_started_event(
-        &state,
+        state,
         execution_id,
         catalog_id,
         &path,
@@ -191,7 +422,7 @@ pub async fn execute(
 
     // Generate initial commands for the start step
     let commands_generated = generate_initial_commands(
-        &state,
+        state,
         execution_id,
         catalog_id,
         start_event_id,
@@ -206,11 +437,88 @@ pub async fn execute(
         execution_id, commands_generated
     );
 
-    Ok(Json(ExecuteResponse {
-        execution_id: execution_id.to_string(),
-        status: "started".to_string(),
+    crate::metrics::record_execute_outcome(entry, "new");
+    Ok(ExecuteOutcome {
+        execution_id,
+        status: "started",
         commands_generated,
-    }))
+    })
+}
+
+/// Emit a `subscription.message.deduplicated` event on the subscription's
+/// lifecycle log (noetl/ai-meta#90 Phase 7) so a collapsed duplicate is
+/// auditable end to end — which delivery was suppressed, which execution it
+/// folded onto.  Keyed by the subscription id (`scope`); best-effort, since a
+/// failed audit must never turn a correct dedup into an error.  The event type
+/// is intentionally *not* one of the six lifecycle types the subscription
+/// status query matches, so it can share the subscription's `execution_id`
+/// without perturbing its lifecycle state (the Phase-4 fix, server#185).
+async fn emit_deduplicated_event(
+    state: &AppState,
+    scope: i64,
+    dedup_key: &str,
+    existing_execution_id: i64,
+    suppressed_execution_id: i64,
+) {
+    let event_id = match state.snowflake.generate() {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::warn!(subscription_id = scope, error = %e, "dedup audit: snowflake gen failed");
+            return;
+        }
+    };
+    // noetl.event.catalog_id is NOT NULL with an FK to noetl.catalog, so the
+    // dedup audit must carry the subscription's own catalog_id.  Read it back
+    // from the subscription scope's lifecycle events (its execution_id ==
+    // scope).  Best-effort: if it can't be resolved, skip the audit rather
+    // than turning a correct dedup into an error.
+    let catalog_id: Option<i64> = sqlx::query_scalar(
+        "SELECT catalog_id FROM noetl.event WHERE execution_id = $1 ORDER BY event_id ASC LIMIT 1",
+    )
+    .bind(scope)
+    .fetch_optional(state.pools.pool_for(scope))
+    .await
+    .ok()
+    .flatten();
+    let Some(catalog_id) = catalog_id else {
+        tracing::debug!(subscription_id = scope, "dedup audit: no catalog_id for scope; skipping audit event");
+        return;
+    };
+    let context = serde_json::json!({
+        "subscription_id": scope.to_string(),
+        "dedup_key": dedup_key,
+        "original_execution_id": existing_execution_id.to_string(),
+        "suppressed_execution_id": suppressed_execution_id.to_string(),
+        "duplicate_suppressed": true,
+    });
+    let meta = serde_json::json!({
+        "emitted_at": chrono::Utc::now().to_rfc3339(),
+        "emitter": "control_plane",
+    });
+    let res = sqlx::query(
+        r#"
+        INSERT INTO noetl.event (
+            execution_id, catalog_id, event_id, event_type, node_id, node_name, node_type,
+            status, context, meta, created_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+        "#,
+    )
+    .bind(scope)
+    .bind(catalog_id)
+    .bind(event_id)
+    .bind("subscription.message.deduplicated")
+    .bind("subscription")
+    .bind("ingress")
+    .bind("subscription")
+    .bind("DEDUPLICATED")
+    .bind(&context)
+    .bind(&meta)
+    .bind(chrono::Utc::now())
+    .execute(state.pools.pool_for(scope))
+    .await;
+    if let Err(e) = res {
+        tracing::warn!(subscription_id = scope, error = %e, "dedup audit event insert failed (non-fatal)");
+    }
 }
 
 /// Resolve catalog entry from path or catalog_id.
@@ -1075,6 +1383,7 @@ mod tests {
             parent_execution_id: None,
             execution_pool: None,
             trace: None,
+            dedup: None,
         };
         assert!(request.validate().is_err());
 
@@ -1085,6 +1394,7 @@ mod tests {
             parent_execution_id: None,
             execution_pool: None,
             trace: None,
+            dedup: None,
         };
         assert!(request.validate().is_ok());
 
@@ -1095,6 +1405,7 @@ mod tests {
             parent_execution_id: None,
             execution_pool: None,
             trace: None,
+            dedup: None,
         };
         assert!(request.validate().is_ok());
     }
@@ -1110,5 +1421,112 @@ mod tests {
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("12345"));
         assert!(json.contains("started"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 7 — dedup spec + batch request/response shapes
+    // -----------------------------------------------------------------------
+
+    /// `dedup.window_secs` defaults to the module default when omitted, and an
+    /// explicit value is honored.
+    #[test]
+    fn test_dedup_spec_window_default() {
+        let d: DedupSpec = serde_json::from_str(r#"{"key":"abc"}"#).unwrap();
+        assert_eq!(d.key, "abc");
+        assert_eq!(
+            d.window_secs,
+            crate::db::queries::subscription_dedup::DEFAULT_WINDOW_SECS
+        );
+
+        let d: DedupSpec = serde_json::from_str(r#"{"key":"abc","window_secs":42}"#).unwrap();
+        assert_eq!(d.window_secs, 42);
+    }
+
+    /// An execute request carries an optional `dedup` block; absent → None
+    /// (dedup off, the default), present → parsed.
+    #[test]
+    fn test_execute_request_dedup_optional() {
+        let r: ExecuteRequest = serde_json::from_str(r#"{"path":"p"}"#).unwrap();
+        assert!(r.dedup.is_none());
+
+        let r: ExecuteRequest = serde_json::from_str(
+            r#"{"path":"p","parent_execution_id":7,"dedup":{"key":"k1","window_secs":60}}"#,
+        )
+        .unwrap();
+        let d = r.dedup.expect("dedup present");
+        assert_eq!(d.key, "k1");
+        assert_eq!(d.window_secs, 60);
+    }
+
+    /// A batch request is N independent execute requests, each preserving its
+    /// own per-message path / pool / trace / dedup.
+    #[test]
+    fn test_batch_request_preserves_per_item_routing() {
+        let body = r#"{
+            "executions": [
+                {"path":"domain/a","execution_pool":"iot","payload":{"x":1}},
+                {"path":"domain/b","parent_execution_id":99,"dedup":{"key":"k"}},
+                {"catalog_id":5,"trace":{"traceparent":"00-abc-def-01"}}
+            ]
+        }"#;
+        let req: BatchExecuteRequest = serde_json::from_str(body).unwrap();
+        assert_eq!(req.executions.len(), 3);
+        assert_eq!(req.executions[0].path.as_deref(), Some("domain/a"));
+        assert_eq!(req.executions[0].execution_pool.as_deref(), Some("iot"));
+        assert_eq!(req.executions[1].parent_execution_id, Some(99));
+        assert_eq!(req.executions[1].dedup.as_ref().unwrap().key, "k");
+        assert_eq!(req.executions[2].catalog_id, Some(5));
+        assert!(req.executions[2].trace.is_some());
+    }
+
+    /// The batch response serializes a summary + per-item results; an error
+    /// item carries its message, a started item carries its execution_id.
+    #[test]
+    fn test_batch_response_serialization() {
+        let resp = BatchExecuteResponse {
+            count: 2,
+            started: 1,
+            duplicates: 0,
+            failed: 1,
+            results: vec![
+                BatchItemResult {
+                    index: 0,
+                    status: "started".to_string(),
+                    execution_id: Some("777".to_string()),
+                    commands_generated: 1,
+                    error: None,
+                },
+                BatchItemResult {
+                    index: 1,
+                    status: "error".to_string(),
+                    execution_id: None,
+                    commands_generated: 0,
+                    error: Some("Playbook not found: nope".to_string()),
+                },
+            ],
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"count\":2"));
+        assert!(json.contains("\"started\":1"));
+        assert!(json.contains("\"failed\":1"));
+        assert!(json.contains("777"));
+        assert!(json.contains("Playbook not found"));
+        // A started item omits `error`; an error item omits `execution_id`.
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(v["results"][0].get("error").is_none());
+        assert!(v["results"][1].get("execution_id").is_none());
+    }
+
+    #[test]
+    fn test_execute_outcome_into_response() {
+        let outcome = ExecuteOutcome {
+            execution_id: 42,
+            status: "duplicate",
+            commands_generated: 0,
+        };
+        let resp = outcome.into_response();
+        assert_eq!(resp.execution_id, "42");
+        assert_eq!(resp.status, "duplicate");
+        assert_eq!(resp.commands_generated, 0);
     }
 }

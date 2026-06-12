@@ -207,6 +207,7 @@ fn build_router(
     // Execution routes (v2 event-driven)
     let execution_routes = Router::new()
         .route("/api/execute", post(handlers::execute))
+        .route("/api/execute/batch", post(handlers::execute_batch))
         .route("/api/events", post(handlers::handle_event))
         .route(
             "/api/events/batch",
@@ -689,6 +690,11 @@ async fn main() -> anyhow::Result<()> {
     // pattern as secret_audit above.  The table is server-owned end-to-end;
     // no out-of-band migration required.
     noetl_server::db::queries::result_store::ensure_table(&db_pool).await?;
+    // Opt-in subscription dedup window (noetl/ai-meta#90 Phase 7, RFC §10
+    // OQ1) — same idempotent startup-DDL pattern.  The table is server-owned
+    // (only /api/execute writes it) and bounded by age; dedup is opt-in per
+    // subscription so the table stays empty unless a critical stream uses it.
+    noetl_server::db::queries::subscription_dedup::ensure_table(&db_pool).await?;
     // kind: Subscription (noetl/ai-meta#90 Phase 2) — seed the `subscription`
     // resource kind so a catalog register doesn't trip the
     // `noetl.catalog.kind -> noetl.resource(name)` FK.  Idempotent.

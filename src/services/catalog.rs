@@ -248,6 +248,45 @@ fn validate_subscription_spec(yaml: &serde_yaml::Value) -> AppResult<()> {
             AppError::Validation("subscription 'dispatch.playbook' is required".into())
         })?;
 
+    // dispatch.batch_dispatch / batch_max (noetl/ai-meta#90 Phase 7) — optional
+    // scale knobs.  When `batch_dispatch: true` the continuous runtime drains a
+    // backlog via `POST /api/execute/batch` instead of one round-trip per
+    // message; `batch_max` caps how many go in one HTTP call.
+    if let Some(bd) = dispatch.get("batch_dispatch") {
+        if !bd.is_bool() {
+            return Err(AppError::Validation(
+                "subscription 'dispatch.batch_dispatch' must be a boolean".into(),
+            ));
+        }
+    }
+    if let Some(bm) = dispatch.get("batch_max") {
+        let n = bm.as_u64().filter(|n| *n > 0).ok_or_else(|| {
+            AppError::Validation(
+                "subscription 'dispatch.batch_max' must be a positive integer".into(),
+            )
+        })?;
+        if n > 1000 {
+            return Err(AppError::Validation(
+                "subscription 'dispatch.batch_max' must be <= 1000 (the server batch cap)".into(),
+            ));
+        }
+    }
+
+    // dedup (opt-in exactly-once window, noetl/ai-meta#90 Phase 7, RFC §10
+    // OQ1) — optional; structural-only check.  The runtime stamps the dedup
+    // block onto each /api/execute only when `dedup.enabled: true`.
+    if let Some(dedup) = spec.get("dedup") {
+        validate_dedup_config(dedup)?;
+    }
+
+    // limits (per-subscription rate limit / backpressure, noetl/ai-meta#90
+    // Phase 7, RFC §9) — optional; structural-only check.  The runtime
+    // enforces these on its fetch side so an over-limit subscription stops
+    // fetching (source redelivers) rather than dropping.
+    if let Some(limits) = spec.get("limits") {
+        validate_limits_config(limits)?;
+    }
+
     // headers (directive allowlist) — optional; structural-only check here.
     // The strict allowlist/value validation lives in the worker's
     // noetl-tools directive engine (RFC §7); the server only checks shape so
@@ -378,6 +417,65 @@ fn validate_spool_config(spool: &serde_yaml::Value) -> AppResult<()> {
                  'ordering: global'; use 'ordered_then_live' or 'per_key'/'none'"
                     .into(),
             ));
+        }
+    }
+    Ok(())
+}
+
+/// Validate the `spec.dedup` block (noetl/ai-meta#90 Phase 7, RFC §10 OQ1).
+///
+/// Opt-in exactly-once dedup for low-volume critical streams.  Structural
+/// only — the runtime owns the key resolution (idempotency_key → message_id)
+/// and the server owns the bounded dedup table.
+///
+/// - `enabled` — optional boolean (defaults false; absent block == off).
+/// - `window_secs` — optional positive integer; the bounded window.
+fn validate_dedup_config(dedup: &serde_yaml::Value) -> AppResult<()> {
+    if !dedup.is_mapping() {
+        return Err(AppError::Validation(
+            "subscription 'dedup' must be a mapping".into(),
+        ));
+    }
+    if let Some(enabled) = dedup.get("enabled") {
+        if !enabled.is_bool() {
+            return Err(AppError::Validation(
+                "subscription 'dedup.enabled' must be a boolean".into(),
+            ));
+        }
+    }
+    if let Some(window) = dedup.get("window_secs") {
+        window.as_u64().filter(|n| *n > 0).ok_or_else(|| {
+            AppError::Validation(
+                "subscription 'dedup.window_secs' must be a positive integer".into(),
+            )
+        })?;
+    }
+    Ok(())
+}
+
+/// Validate the `spec.limits` block (noetl/ai-meta#90 Phase 7, RFC §9).
+///
+/// Per-subscription rate-limit / backpressure safety valves so one firehose
+/// can't starve the shared control plane or a dedicated pool.  Structural
+/// only — the runtime enforces these on its fetch side (stop fetching at the
+/// cap → source redelivers, no loss).
+///
+/// - `max_in_flight` — optional positive integer; the outstanding cap.
+/// - `max_dispatch_per_sec` — optional positive integer; the dispatch rate.
+fn validate_limits_config(limits: &serde_yaml::Value) -> AppResult<()> {
+    if !limits.is_mapping() {
+        return Err(AppError::Validation(
+            "subscription 'limits' must be a mapping".into(),
+        ));
+    }
+    for key in ["max_in_flight", "max_dispatch_per_sec"] {
+        if let Some(v) = limits.get(key) {
+            v.as_u64().filter(|n| *n > 0).ok_or_else(|| {
+                AppError::Validation(format!(
+                    "subscription 'limits.{}' must be a positive integer",
+                    key
+                ))
+            })?;
         }
     }
     Ok(())
@@ -751,6 +849,76 @@ spec:
         );
         let err = validate_subscription_spec(&v).unwrap_err();
         assert!(format!("{err}").contains("activation"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 7 — dedup / limits / batch-dispatch validation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn valid_dedup_and_limits_and_batch() {
+        let v = yaml(
+            r#"
+kind: Subscription
+spec:
+  source: nats
+  mode: pull
+  stream: ORDERS
+  consumer: orders-drain
+  dispatch: { playbook: domain/order, batch_dispatch: true, batch_max: 200 }
+  dedup: { enabled: true, window_secs: 600 }
+  limits: { max_in_flight: 1000, max_dispatch_per_sec: 200 }
+"#,
+        );
+        assert!(validate_subscription_spec(&v).is_ok());
+    }
+
+    #[test]
+    fn dedup_bad_window_rejected() {
+        let v = yaml(
+            "kind: Subscription\nspec:\n  source: nats\n  mode: pull\n  stream: S\n  consumer: C\n  dispatch: { playbook: p }\n  dedup: { enabled: true, window_secs: 0 }\n",
+        );
+        let err = validate_subscription_spec(&v).unwrap_err();
+        assert!(format!("{err}").contains("dedup.window_secs"));
+    }
+
+    #[test]
+    fn dedup_enabled_must_be_bool() {
+        let v = yaml(
+            "kind: Subscription\nspec:\n  source: nats\n  mode: pull\n  stream: S\n  consumer: C\n  dispatch: { playbook: p }\n  dedup: { enabled: \"yes\" }\n",
+        );
+        let err = validate_subscription_spec(&v).unwrap_err();
+        assert!(format!("{err}").contains("dedup.enabled"));
+    }
+
+    #[test]
+    fn limits_bad_rate_rejected() {
+        let v = yaml(
+            "kind: Subscription\nspec:\n  source: nats\n  mode: pull\n  stream: S\n  consumer: C\n  dispatch: { playbook: p }\n  limits: { max_dispatch_per_sec: 0 }\n",
+        );
+        let err = validate_subscription_spec(&v).unwrap_err();
+        assert!(format!("{err}").contains("limits.max_dispatch_per_sec"));
+    }
+
+    #[test]
+    fn batch_max_must_be_positive_and_bounded() {
+        let zero = yaml(
+            "kind: Subscription\nspec:\n  source: nats\n  mode: pull\n  stream: S\n  consumer: C\n  dispatch: { playbook: p, batch_max: 0 }\n",
+        );
+        assert!(format!("{}", validate_subscription_spec(&zero).unwrap_err()).contains("batch_max"));
+        let huge = yaml(
+            "kind: Subscription\nspec:\n  source: nats\n  mode: pull\n  stream: S\n  consumer: C\n  dispatch: { playbook: p, batch_max: 5000 }\n",
+        );
+        assert!(format!("{}", validate_subscription_spec(&huge).unwrap_err()).contains("batch_max"));
+    }
+
+    #[test]
+    fn batch_dispatch_must_be_bool() {
+        let v = yaml(
+            "kind: Subscription\nspec:\n  source: nats\n  mode: pull\n  stream: S\n  consumer: C\n  dispatch: { playbook: p, batch_dispatch: 1 }\n",
+        );
+        let err = validate_subscription_spec(&v).unwrap_err();
+        assert!(format!("{err}").contains("batch_dispatch"));
     }
 
     #[test]
