@@ -275,6 +275,110 @@ fn validate_subscription_spec(yaml: &serde_yaml::Value) -> AppResult<()> {
         }
     }
 
+    // spool (store-and-forward) — optional; structural check (noetl/ai-meta#90
+    // Phase 4, RFC §8).  The strict cross-field validation lives in the
+    // worker's noetl-tools `SpoolSpec::parse`; the server rejects an
+    // obviously-malformed block at registration so a broken outage buffer is
+    // caught before the first downstream failure, not during one.
+    if let Some(spool) = spec.get("spool") {
+        validate_spool_config(spool)?;
+    }
+
+    Ok(())
+}
+
+/// `spool.mode` values (RFC §8.2).
+const SPOOL_MODES: &[&str] = &["off", "buffer_and_ack", "hybrid"];
+/// `spool.backend` values (RFC §8.3).
+const SPOOL_BACKENDS: &[&str] = &["nats_object", "local_disk", "gcs", "s3"];
+/// `spool.ordering` values (RFC §8.3).
+const SPOOL_ORDERINGS: &[&str] = &["global", "per_key", "none"];
+
+/// Validate the `spec.spool` block (noetl/ai-meta#90 Phase 4).
+///
+/// Structural guarantees the worker runtime needs to stand the spool up:
+/// a valid `mode`/`backend`/`ordering`, and the backend's required target
+/// (a `bucket` for `nats_object`/`gcs`/`s3`, a `path` for `local_disk`, a
+/// keychain `credential` alias for `gcs`/`s3` — an external bucket per
+/// `data-access-boundary.md`).
+fn validate_spool_config(spool: &serde_yaml::Value) -> AppResult<()> {
+    if !spool.is_mapping() {
+        return Err(AppError::Validation("subscription 'spool' must be a mapping".into()));
+    }
+    let mode = spool.get("mode").and_then(|v| v.as_str()).unwrap_or("off");
+    if !SPOOL_MODES.contains(&mode) {
+        return Err(AppError::Validation(format!(
+            "subscription 'spool.mode' must be one of {:?}, got '{}'",
+            SPOOL_MODES, mode
+        )));
+    }
+    // `off` needs no backend config — pure stop-acking.
+    if mode == "off" {
+        return Ok(());
+    }
+
+    let backend = spool
+        .get("backend")
+        .and_then(|v| v.as_str())
+        .unwrap_or("nats_object");
+    if !SPOOL_BACKENDS.contains(&backend) {
+        return Err(AppError::Validation(format!(
+            "subscription 'spool.backend' must be one of {:?}, got '{}'",
+            SPOOL_BACKENDS, backend
+        )));
+    }
+    let nonempty = |key: &str| -> bool {
+        spool
+            .get(key)
+            .and_then(|v| v.as_str())
+            .map(|s| !s.is_empty())
+            .unwrap_or(false)
+    };
+    match backend {
+        "nats_object" | "gcs" | "s3" => {
+            if !nonempty("bucket") {
+                return Err(AppError::Validation(format!(
+                    "subscription 'spool.backend' '{}' requires a non-empty 'bucket'",
+                    backend
+                )));
+            }
+        }
+        "local_disk" => {
+            if !nonempty("path") {
+                return Err(AppError::Validation(
+                    "subscription 'spool.backend' 'local_disk' requires a non-empty 'path'".into(),
+                ));
+            }
+        }
+        _ => {}
+    }
+    if matches!(backend, "gcs" | "s3") && !nonempty("credential") {
+        return Err(AppError::Validation(format!(
+            "subscription 'spool.backend' '{}' requires a keychain 'credential' alias",
+            backend
+        )));
+    }
+
+    if let Some(ordering) = spool.get("ordering").and_then(|v| v.as_str()) {
+        if !SPOOL_ORDERINGS.contains(&ordering) {
+            return Err(AppError::Validation(format!(
+                "subscription 'spool.ordering' must be one of {:?}, got '{}'",
+                SPOOL_ORDERINGS, ordering
+            )));
+        }
+        // interleave drain is order-unsafe with global ordering.
+        let on_recovery = spool
+            .get("drain")
+            .and_then(|d| d.get("on_recovery"))
+            .and_then(|v| v.as_str());
+        if ordering == "global" && on_recovery == Some("interleave") {
+            return Err(AppError::Validation(
+                "subscription 'spool.drain.on_recovery: interleave' is unsafe with \
+                 'ordering: global'; use 'ordered_then_live' or 'per_key'/'none'"
+                    .into(),
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -394,6 +498,77 @@ spec:
 "#,
         );
         assert!(validate_subscription_spec(&v).is_ok());
+    }
+
+    #[test]
+    fn valid_pull_with_spool_buffer_and_ack() {
+        let v = yaml(
+            r#"
+kind: Subscription
+spec:
+  source: nats
+  mode: pull
+  stream: IOT
+  consumer: iot-drain
+  dispatch: { playbook: domain/ingest, execution_pool: iot }
+  spool:
+    mode: buffer_and_ack
+    backend: nats_object
+    bucket: noetl_spool_iot
+    ordering: per_key
+    ordering_key: device_id
+    circuit:
+      trip_after: 3
+      probe_after_ms: 5000
+      downstream:
+        - { name: warehouse, type: http, target: "http://wh/health" }
+    drain: { on_recovery: ordered_then_live }
+"#,
+        );
+        assert!(validate_subscription_spec(&v).is_ok());
+    }
+
+    #[test]
+    fn spool_off_needs_no_backend() {
+        let v = yaml(
+            "kind: Subscription\nspec:\n  source: nats\n  mode: pull\n  stream: S\n  consumer: C\n  dispatch: { playbook: p }\n  spool: { mode: off }\n",
+        );
+        assert!(validate_subscription_spec(&v).is_ok());
+    }
+
+    #[test]
+    fn spool_buffer_and_ack_requires_bucket() {
+        let v = yaml(
+            "kind: Subscription\nspec:\n  source: nats\n  mode: pull\n  stream: S\n  consumer: C\n  dispatch: { playbook: p }\n  spool: { mode: buffer_and_ack, backend: nats_object }\n",
+        );
+        let err = validate_subscription_spec(&v).unwrap_err();
+        assert!(format!("{err}").contains("bucket"));
+    }
+
+    #[test]
+    fn spool_gcs_requires_credential() {
+        let v = yaml(
+            "kind: Subscription\nspec:\n  source: nats\n  mode: pull\n  stream: S\n  consumer: C\n  dispatch: { playbook: p }\n  spool: { mode: buffer_and_ack, backend: gcs, bucket: b }\n",
+        );
+        let err = validate_subscription_spec(&v).unwrap_err();
+        assert!(format!("{err}").contains("credential"));
+    }
+
+    #[test]
+    fn spool_interleave_global_rejected() {
+        let v = yaml(
+            "kind: Subscription\nspec:\n  source: nats\n  mode: pull\n  stream: S\n  consumer: C\n  dispatch: { playbook: p }\n  spool: { mode: buffer_and_ack, backend: local_disk, path: /tmp/s, ordering: global, drain: { on_recovery: interleave } }\n",
+        );
+        let err = validate_subscription_spec(&v).unwrap_err();
+        assert!(format!("{err}").contains("interleave"));
+    }
+
+    #[test]
+    fn spool_bad_mode_rejected() {
+        let v = yaml(
+            "kind: Subscription\nspec:\n  source: nats\n  mode: pull\n  stream: S\n  consumer: C\n  dispatch: { playbook: p }\n  spool: { mode: bogus }\n",
+        );
+        assert!(validate_subscription_spec(&v).is_err());
     }
 
     #[test]
