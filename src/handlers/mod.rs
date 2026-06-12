@@ -26,5 +26,5 @@ pub mod variables;
 pub mod wallet_rotate;
 
 pub use events::{get_command, handle_event};
-pub use execute::execute;
+pub use execute::{execute, execute_batch};
 pub use health::{api_health, health_check};

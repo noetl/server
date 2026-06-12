@@ -810,6 +810,68 @@ pub fn record_secret_refresh_duration(seconds: f64) {
     secret_refresh_duration_seconds().observe(seconds);
 }
 
+// ---------------------------------------------------------------------------
+// Subscription scale hardening (noetl/ai-meta#90 Phase 7)
+// ---------------------------------------------------------------------------
+
+/// Counter: executions created, bucketed by the `/api/execute` entry path
+/// (`single` | `batch`) and the dedup outcome (`new` | `duplicate` | `error`).
+/// Lets an operator see batch-dispatch uptake and how often the opt-in dedup
+/// window is collapsing duplicates without grepping logs.
+pub fn execute_outcomes_total() -> &'static IntCounterVec {
+    static M: OnceLock<IntCounterVec> = OnceLock::new();
+    M.get_or_init(|| {
+        let counter = IntCounterVec::new(
+            Opts::new(
+                "noetl_execute_outcomes_total",
+                "Executions handled by /api/execute(/batch), bucketed by entry path and dedup outcome (noetl/ai-meta#90 Phase 7).",
+            ),
+            &["entry", "outcome"],
+        )
+        .expect("static counter spec must be valid");
+        registry()
+            .register(Box::new(counter.clone()))
+            .expect("counter registration must succeed");
+        counter
+    })
+}
+
+/// Histogram: `POST /api/execute/batch` request sizes (number of executions in
+/// one HTTP round-trip).  Answers "is the runtime actually batching, and how
+/// deep" — the whole point of Phase 7's batch dispatch.
+pub fn execute_batch_size() -> &'static HistogramVec {
+    static M: OnceLock<HistogramVec> = OnceLock::new();
+    M.get_or_init(|| {
+        let hist = HistogramVec::new(
+            HistogramOpts::new(
+                "noetl_execute_batch_size",
+                "Number of executions submitted in one POST /api/execute/batch call (noetl/ai-meta#90 Phase 7).",
+            )
+            .buckets(vec![1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0]),
+            &[],
+        )
+        .expect("static histogram spec must be valid");
+        registry()
+            .register(Box::new(hist.clone()))
+            .expect("histogram registration must succeed");
+        hist
+    })
+}
+
+/// Record one execution outcome.  `entry` is `"single"` or `"batch"`;
+/// `outcome` is `"new"` (execution created), `"duplicate"` (dedup window
+/// collapsed it), or `"error"`.
+pub fn record_execute_outcome(entry: &str, outcome: &str) {
+    execute_outcomes_total()
+        .with_label_values(&[entry, outcome])
+        .inc();
+}
+
+/// Observe one batch-dispatch request size.
+pub fn record_execute_batch_size(n: usize) {
+    execute_batch_size().with_label_values(&[]).observe(n as f64);
+}
+
 /// Render the global registry as Prometheus text-exposition
 /// format.  Used by the `GET /metrics` handler.
 pub fn gather_text() -> Result<String, prometheus::Error> {
