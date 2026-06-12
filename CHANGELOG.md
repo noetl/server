@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.5.0](https://github.com/noetl/server/compare/v3.4.2...v3.5.0) (2026-06-12)
+
+### Features
+
+* batch execute + opt-in dedup window (subscription scale hardening) ([#189](https://github.com/noetl/server/issues/189)) ([1c4b88a](https://github.com/noetl/server/commit/1c4b88a2425551e6b3fe9f8b1d48c2f8a34f9e2a)), closes [noetl/ai-meta#90](https://github.com/noetl/ai-meta/issues/90) [noetl/server#188](https://github.com/noetl/server/issues/188)
+
 ## [3.4.2](https://github.com/noetl/server/compare/v3.4.1...v3.4.2) (2026-06-12)
 
 ### Bug Fixes
