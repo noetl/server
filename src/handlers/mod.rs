@@ -19,6 +19,7 @@ pub mod result_store;
 pub mod runtime;
 pub mod secret_audit;
 pub mod sharding;
+pub mod subscription;
 pub mod system;
 pub mod variables;
 pub mod wallet_rotate;

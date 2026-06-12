@@ -1478,6 +1478,17 @@ async fn trigger_orchestrator(
         .await?;
     }
 
+    // Recover the per-execution routing (dedicated pool segment + W3C trace)
+    // the `/api/execute` caller supplied, persisted on the `playbook_started`
+    // event meta, so every follow-up command lands on the same segment and
+    // carries the same trace context (noetl/ai-meta#90 Phase 2).
+    let routing = events
+        .iter()
+        .find(|e| e.event_type == "playbook_started")
+        .and_then(|e| e.meta.as_ref())
+        .map(crate::handlers::execute::CommandRouting::from_started_meta)
+        .unwrap_or_default();
+
     // 5. Issue new commands via the shared persist + publish helper.
     let mut commands_generated = 0i32;
     for command in &result.commands {
@@ -1500,6 +1511,7 @@ async fn trigger_orchestrator(
             command,
             &render_context,
             &playbook,
+            &routing,
         )
         .await?;
         commands_generated += 1;

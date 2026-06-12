@@ -219,6 +219,28 @@ fn build_router(
         )
         .with_state(state.clone());
 
+    // Subscription lifecycle routes (noetl/ai-meta#90 Phase 2).  A
+    // `kind: Subscription` is registered + activated here; the continuous
+    // runtime drives pause/resume/drain/deactivate, each event-logged.
+    let subscription_routes = Router::new()
+        .route(
+            "/api/subscriptions",
+            get(handlers::subscription::list).post(handlers::subscription::register),
+        )
+        .route(
+            "/api/subscriptions/register",
+            post(handlers::subscription::register),
+        )
+        .route(
+            "/api/subscriptions/{id}",
+            get(handlers::subscription::get),
+        )
+        .route(
+            "/api/subscriptions/{id}/{action}",
+            post(handlers::subscription::lifecycle),
+        )
+        .with_state(state.clone());
+
     // Execution management routes
     let executions_routes = Router::new()
         .route("/api/executions", get(handlers::executions::list))
@@ -419,6 +441,7 @@ fn build_router(
         .merge(keychain_routes)
         .merge(execution_routes)
         .merge(executions_routes)
+        .merge(subscription_routes)
         .merge(replay_routes)
         .merge(result_store_routes)
         .merge(variable_routes)
@@ -648,6 +671,10 @@ async fn main() -> anyhow::Result<()> {
     // pattern as secret_audit above.  The table is server-owned end-to-end;
     // no out-of-band migration required.
     noetl_server::db::queries::result_store::ensure_table(&db_pool).await?;
+    // kind: Subscription (noetl/ai-meta#90 Phase 2) — seed the `subscription`
+    // resource kind so a catalog register doesn't trip the
+    // `noetl.catalog.kind -> noetl.resource(name)` FK.  Idempotent.
+    noetl_server::db::queries::catalog::ensure_builtin_kinds(&db_pool).await?;
     // Keychain is the execution-scoped cache for credential resolution
     // (Secrets Wallet Phase 3c), so it is built first + shared into the
     // credential service.

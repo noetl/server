@@ -26,6 +26,53 @@ pub struct ExecuteRequest {
     /// Parent execution ID (for nested executions).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_execution_id: Option<i64>,
+    /// Dedicated worker pool / command segment for this whole execution
+    /// (noetl/ai-meta#90 Phase 2).  When set, every command of this
+    /// execution publishes to `noetl.commands.<execution_pool>.<eid>`
+    /// instead of the path-derived default (`system` / `shared`).  The
+    /// subscription continuous runtime passes the subscription's
+    /// `dispatch.execution_pool` (or a header-directive `x-noetl-pool`
+    /// override) so the firehose lands on an isolated segment.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution_pool: Option<String>,
+    /// W3C distributed-trace context to stamp onto this execution's events
+    /// (`meta.trace`) and propagate to its commands + child executions
+    /// (noetl/ai-meta#90 Phase 2, RFC §7.4).  Shape:
+    /// `{ "traceparent": "...", "tracestate": "...", "baggage": {...} }`.
+    /// `execution_id` stays the primary NoETL trace key; this is the
+    /// external join.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trace: Option<serde_json::Value>,
+}
+
+/// Per-execution command routing resolved once and threaded through every
+/// `persist_engine_command` call so the initial command (this handler) and
+/// every orchestrator follow-up (`events::trigger_orchestrator`) land on the
+/// same dedicated pool segment and carry the same trace context.
+///
+/// It is persisted on the `playbook_started` event `meta` so the orchestrator
+/// — which rebuilds state from the event log on each pass — can recover it.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct CommandRouting {
+    /// Dedicated pool / command-segment override for the whole execution.
+    pub pool: Option<String>,
+    /// W3C trace context (opaque JSON) propagated onto events + commands.
+    pub trace: Option<serde_json::Value>,
+}
+
+impl CommandRouting {
+    /// Recover the routing the `/api/execute` caller supplied from a
+    /// `playbook_started` event's `meta` JSON (used by the orchestrator).
+    pub(crate) fn from_started_meta(meta: &serde_json::Value) -> CommandRouting {
+        CommandRouting {
+            pool: meta
+                .get("execution_pool")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
+            trace: meta.get("trace").filter(|v| !v.is_null()).cloned(),
+        }
+    }
 }
 
 impl ExecuteRequest {
@@ -113,6 +160,23 @@ pub async fn execute(
     }
     let workload = serde_json::Value::Object(merged_workload);
 
+    // Resolve the per-execution routing once (noetl/ai-meta#90 Phase 2).
+    // A `trace` not supplied explicitly is inherited from the parent
+    // execution when this is a child run, so a W3C trace propagates down
+    // the whole playbook nesting (RFC §7.4) bounded by that nesting.
+    let trace = match (&request.trace, request.parent_execution_id) {
+        (Some(t), _) if !t.is_null() => Some(t.clone()),
+        (_, Some(parent)) => inherit_parent_trace(&state, parent).await,
+        _ => None,
+    };
+    let routing = CommandRouting {
+        pool: request
+            .execution_pool
+            .clone()
+            .filter(|s| !s.is_empty()),
+        trace,
+    };
+
     // Emit playbook_started event
     let start_event_id = emit_playbook_started_event(
         &state,
@@ -121,6 +185,7 @@ pub async fn execute(
         &path,
         &workload,
         request.parent_execution_id,
+        &routing,
     )
     .await?;
 
@@ -132,6 +197,7 @@ pub async fn execute(
         start_event_id,
         &playbook,
         &request.payload,
+        &routing,
     )
     .await?;
 
@@ -214,6 +280,7 @@ async fn emit_playbook_started_event(
     path: &str,
     workload: &serde_json::Value,
     parent_execution_id: Option<i64>,
+    routing: &CommandRouting,
 ) -> AppResult<i64> {
     let event_id = state.snowflake.generate()?;
 
@@ -224,10 +291,22 @@ async fn emit_playbook_started_event(
         "workload": workload,
     });
 
-    let meta = serde_json::json!({
+    // Persist the per-execution routing (pool segment + trace) on the
+    // start event's meta so the orchestrator — which rebuilds state from
+    // the event log on each pass — recovers it for every follow-up command
+    // (noetl/ai-meta#90 Phase 2).
+    let mut meta = serde_json::json!({
         "emitted_at": chrono::Utc::now().to_rfc3339(),
         "emitter": "control_plane",
     });
+    if let serde_json::Value::Object(ref mut m) = meta {
+        if let Some(pool) = routing.pool.as_ref() {
+            m.insert("execution_pool".to_string(), serde_json::json!(pool));
+        }
+        if let Some(trace) = routing.trace.as_ref() {
+            m.insert("trace".to_string(), trace.clone());
+        }
+    }
 
     sqlx::query(
         r#"
@@ -256,6 +335,22 @@ async fn emit_playbook_started_event(
     .await?;
 
     Ok(event_id)
+}
+
+/// Inherit the W3C trace context (RFC §7.4) from a parent execution's
+/// `playbook_started` event so a child run joins the same distributed trace.
+/// Best-effort: a missing parent / missing trace simply yields `None`.
+async fn inherit_parent_trace(state: &AppState, parent_execution_id: i64) -> Option<serde_json::Value> {
+    let meta: Option<serde_json::Value> = sqlx::query_scalar(
+        "SELECT meta FROM noetl.event WHERE execution_id = $1 AND event_type = 'playbook_started' \
+         ORDER BY event_id ASC LIMIT 1",
+    )
+    .bind(parent_execution_id)
+    .fetch_optional(state.pools.pool_for(parent_execution_id))
+    .await
+    .ok()
+    .flatten();
+    meta.and_then(|m| m.get("trace").filter(|v| !v.is_null()).cloned())
 }
 
 /// Persist one engine-generated command + its `command.issued`
@@ -289,6 +384,7 @@ pub(crate) async fn persist_engine_command(
     command: &crate::engine::commands::Command,
     render_context: &HashMap<String, serde_json::Value>,
     playbook: &crate::playbook::types::Playbook,
+    routing: &CommandRouting,
 ) -> AppResult<i64> {
     let event_id = state.snowflake.generate()?;
 
@@ -344,6 +440,14 @@ pub(crate) async fn persist_engine_command(
                 "item_var".to_string(),
                 serde_json::json!(iter.item_var.clone()),
             );
+        }
+    }
+    // Thread the W3C trace context onto the command.issued event meta so the
+    // event log carries the external trace join and the worker can attach it
+    // to its dispatch span (noetl/ai-meta#90 Phase 2, RFC §7.4).
+    if let Some(trace) = routing.trace.as_ref() {
+        if let serde_json::Value::Object(ref mut map) = cmd_meta {
+            map.insert("trace".to_string(), trace.clone());
         }
     }
 
@@ -402,6 +506,7 @@ pub(crate) async fn persist_engine_command(
         &step.step,
         command.tool.kind.as_str(),
         playbook,
+        routing,
     )
     .await?;
 
@@ -423,6 +528,7 @@ async fn generate_initial_commands(
     parent_event_id: i64,
     playbook: &crate::playbook::types::Playbook,
     payload: &HashMap<String, serde_json::Value>,
+    routing: &CommandRouting,
 ) -> AppResult<i32> {
     // Find start step
     let start_step = playbook
@@ -575,6 +681,7 @@ async fn generate_initial_commands(
                 &command,
                 &cmd_render_ctx,
                 playbook,
+                routing,
             )
             .await?;
         }
@@ -607,6 +714,7 @@ async fn generate_initial_commands(
         &command,
         &cmd_render_ctx,
         playbook,
+        routing,
     )
     .await?;
 
@@ -681,6 +789,7 @@ async fn insert_command_row(
 /// notification is skipped with a WARN — caller still records the
 /// `command.issued` event so dashboards work, but no worker will
 /// pick the command up.
+#[allow(clippy::too_many_arguments)]
 async fn publish_command_notification(
     state: &AppState,
     execution_id: i64,
@@ -689,6 +798,7 @@ async fn publish_command_notification(
     step: &str,
     _tool_kind: &str,
     playbook: &crate::playbook::types::Playbook,
+    routing: &CommandRouting,
 ) -> AppResult<()> {
     let Some(nats_client) = state.nats.as_ref() else {
         tracing::warn!(
@@ -699,12 +809,22 @@ async fn publish_command_notification(
         return Ok(());
     };
 
-    // Pool segment from the playbook's catalog path.  The
-    // `Playbook` type's `metadata.path` is `Option<String>`; if
-    // unset we default to `shared` (the same default Python uses).
-    let pool_segment = match playbook.metadata.path.as_deref() {
-        Some(p) if p.starts_with("system/") => "system",
-        _ => "shared",
+    // Pool segment selection (noetl/ai-meta#90 Phase 2).  Precedence:
+    //   1. an explicit per-execution `execution_pool` override (the
+    //      subscription continuous runtime / a header `x-noetl-pool`
+    //      directive) — lands the run on `noetl.commands.<override>.<eid>`,
+    //   2. else the path-derived default: `system/` paths → `system`,
+    //      `subscription/` paths → `subscription`, everything else →
+    //      `shared` (the same default Python uses).
+    // The override isolates a subscription firehose on a dedicated segment
+    // without touching the shared command stream.
+    let pool_segment = match routing.pool.as_deref() {
+        Some(p) if !p.is_empty() => p,
+        _ => match playbook.metadata.path.as_deref() {
+            Some(p) if p.starts_with("system/") => "system",
+            Some(p) if p.starts_with("subscription/") => "subscription",
+            _ => "shared",
+        },
     };
     let subject = format!("noetl.commands.{}.{}", pool_segment, execution_id);
 
@@ -714,13 +834,20 @@ async fn publish_command_notification(
         .clone()
         .unwrap_or_else(|| "http://localhost:8082".to_string());
 
-    let notification = serde_json::json!({
+    let mut notification = serde_json::json!({
         "execution_id": execution_id,
         "event_id": event_id,
         "command_id": command_id,
         "step": step,
         "server_url": server_url,
     });
+    // Carry the W3C trace context on the command notification so the worker
+    // can attach it to its dispatch span (RFC §7.4).
+    if let Some(trace) = routing.trace.as_ref() {
+        if let serde_json::Value::Object(ref mut m) = notification {
+            m.insert("trace".to_string(), trace.clone());
+        }
+    }
     let payload = serde_json::to_vec(&notification)
         .map_err(|e| AppError::Internal(format!("Serialize command notification: {e}")))?;
 
@@ -946,6 +1073,8 @@ mod tests {
             catalog_id: None,
             payload: HashMap::new(),
             parent_execution_id: None,
+            execution_pool: None,
+            trace: None,
         };
         assert!(request.validate().is_err());
 
@@ -954,6 +1083,8 @@ mod tests {
             catalog_id: None,
             payload: HashMap::new(),
             parent_execution_id: None,
+            execution_pool: None,
+            trace: None,
         };
         assert!(request.validate().is_ok());
 
@@ -962,6 +1093,8 @@ mod tests {
             catalog_id: Some(12345),
             payload: HashMap::new(),
             parent_execution_id: None,
+            execution_pool: None,
+            trace: None,
         };
         assert!(request.validate().is_ok());
     }
