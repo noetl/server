@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.4.1](https://github.com/noetl/server/compare/v3.4.0...v3.4.1) (2026-06-12)
+
+### Bug Fixes
+
+* subscription lifecycle status must ignore spool/circuit/message events ([#90](https://github.com/noetl/server/issues/90) Phase 4) ([#185](https://github.com/noetl/server/issues/185)) ([5611a9a](https://github.com/noetl/server/commit/5611a9a48c55bbf6c5db8630571f6cac5e205b8d))
+
 ## [3.4.0](https://github.com/noetl/server/compare/v3.3.0...v3.4.0) (2026-06-12)
 
 ### Features
