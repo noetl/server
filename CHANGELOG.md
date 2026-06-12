@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.5.1](https://github.com/noetl/server/compare/v3.5.0...v3.5.1) (2026-06-12)
+
+### Bug Fixes
+
+* pin time =0.3.47 to dodge async-nats 0.38 E0119 build break ([#190](https://github.com/noetl/server/issues/190)) ([55d2dfc](https://github.com/noetl/server/commit/55d2dfc8f9e7e5f02ff66be22e857e4132ee2a34)), closes [noetl/ai-meta#49](https://github.com/noetl/ai-meta/issues/49)
+
 ## [3.5.0](https://github.com/noetl/server/compare/v3.4.2...v3.5.0) (2026-06-12)
 
 ### Features
