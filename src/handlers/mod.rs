@@ -12,6 +12,7 @@ pub mod events;
 pub mod execute;
 pub mod executions;
 pub mod health;
+pub mod ingress;
 pub mod internal;
 pub mod keychain;
 pub mod replay;
