@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.4.2](https://github.com/noetl/server/compare/v3.4.1...v3.4.2) (2026-06-12)
+
+### Bug Fixes
+
+* **catalog:** gcs/s3 spool credential optional (ADC / Workload Identity) ([c2ba6da](https://github.com/noetl/server/commit/c2ba6dadb74c15dd55dc3130d6e1e5d14641091b)), closes [noetl/server#186](https://github.com/noetl/server/issues/186) [noetl/ai-meta#90](https://github.com/noetl/ai-meta/issues/90)
+
 ## [3.4.1](https://github.com/noetl/server/compare/v3.4.0...v3.4.1) (2026-06-12)
 
 ### Bug Fixes
