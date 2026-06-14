@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.5.2](https://github.com/noetl/server/compare/v3.5.1...v3.5.2) (2026-06-14)
+
+### Bug Fixes
+
+* env-gated sqlx statement-cache capacity for transaction-mode poolers ([#191](https://github.com/noetl/server/issues/191)) ([0577cc6](https://github.com/noetl/server/commit/0577cc66ef8601b9710799d5d430a7fa60c412d7)), closes [noetl/ai-meta#49](https://github.com/noetl/ai-meta/issues/49)
+
 ## [3.5.1](https://github.com/noetl/server/compare/v3.5.0...v3.5.1) (2026-06-12)
 
 ### Bug Fixes
