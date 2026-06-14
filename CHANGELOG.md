@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.6.0](https://github.com/noetl/server/compare/v3.5.3...v3.6.0) (2026-06-14)
+
+### Features
+
+* **internal:** add POST /api/internal/cleanup/purge for scheduled retention ([#193](https://github.com/noetl/server/issues/193)) ([77231de](https://github.com/noetl/server/commit/77231deda1d9cda5b802f19cca6410a9f8d749a9)), closes [noetl/ai-meta#96](https://github.com/noetl/ai-meta/issues/96) [noetl/ai-meta#96](https://github.com/noetl/ai-meta/issues/96)
+
 ## [3.5.3](https://github.com/noetl/server/compare/v3.5.2...v3.5.3) (2026-06-14)
 
 ### Bug Fixes
