@@ -221,8 +221,21 @@ impl TemplateRenderer {
         let rendered = self.render(&template, context)?;
         let trimmed = rendered.trim().to_lowercase();
 
-        // Evaluate as boolean
-        Ok(matches!(trimmed.as_str(), "true" | "1" | "yes"))
+        // Python-compatible truthiness.  A condition like
+        // `{{ (start.error is defined) and request_id }}` renders to the
+        // *value* of the truthy operand (e.g. "req-123"), NOT the literal
+        // "true" — minijinja's `and`/`or` return the operand, like Python's.
+        // The reference Python orchestrator applies `bool(...)` to the
+        // rendered value, so any non-empty, non-false-like string is truthy.
+        // Treating only "true"/"1"/"yes" as true silently skipped every arc
+        // whose `when` resolved to such a value (e.g. the auth0_login routing
+        // — noetl/ai-meta#49), stalling the playbook.  The falsy set mirrors
+        // Python `bool()` on the stringified value plus the false-like
+        // keywords Jinja emits and empty containers.
+        Ok(!matches!(
+            trimmed.as_str(),
+            "" | "false" | "0" | "no" | "none" | "null" | "off" | "{}" | "[]"
+        ))
     }
 }
 

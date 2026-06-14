@@ -1523,6 +1523,129 @@ mod tests {
     }
 
     #[test]
+    fn test_auth_login_start_error_survives_apply_event_into_arc_context() {
+        // Repro of the prod auth0_login stall (noetl/ai-meta#49): the
+        // `start` step errors (empty token → {"error": "Invalid JWT format"}),
+        // emitted on `call.done`; `command.completed` carries only
+        // {status, command_id} (no data).  next.arcs gate on
+        // `{{ start.error is defined }}` — which must resolve true so the
+        // error-callback arc fires instead of all arcs skipping.
+        let mut state = WorkflowState::new(1, 1);
+
+        // call.done — rich envelope carrying the user error data.
+        let mut call_done = make_event("call.done", Some("start"));
+        call_done.event_id = 1;
+        call_done.result = Some(serde_json::json!({
+            "status": "COMPLETED",
+            "context": {
+                "result": {
+                    "status": "success",
+                    "context": {
+                        "data": { "error": "Invalid JWT format" },
+                        "status": "success",
+                        "stderr": "",
+                        "stdout": ""
+                    }
+                }
+            }
+        }));
+        // command.completed — no user data (just status + command_id).
+        let mut cmd_completed = make_event("command.completed", Some("start"));
+        cmd_completed.event_id = 2;
+        cmd_completed.result = Some(serde_json::json!({
+            "status": "success",
+            "context": { "status": "success", "command_id": "x:start:y" }
+        }));
+
+        state.apply_event(&call_done);
+        state.apply_event(&cmd_completed);
+
+        let ctx = state.build_context();
+        let start = ctx.get("start").expect("`start` step entry exposed");
+        assert!(
+            start.get("error").and_then(|v| v.as_str()) == Some("Invalid JWT format"),
+            "start.error must resolve for arc routing; got start = {start:?}"
+        );
+    }
+
+    #[test]
+    fn test_auth0_login_full_orchestrator_arc_routing_repro() {
+        use crate::engine::WorkflowOrchestrator;
+        let yaml = r#"
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata:
+  name: t
+  path: t
+workload:
+  request_id: "req-123"
+workflow:
+  - step: start
+    tool:
+      kind: python
+      code: |
+        result = {"error": "Invalid JWT format"}
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: err_cb
+          when: "{{ (start.error is defined) and request_id }}"
+        - step: end_step
+          when: "{{ start.error is defined and not request_id }}"
+        - step: create
+          when: "{{ start.sub is defined }}"
+  - step: err_cb
+    tool: { kind: python, code: "result = {}" }
+  - step: end_step
+    tool: { kind: python, code: "result = {}" }
+  - step: create
+    tool: { kind: python, code: "result = {}" }
+"#;
+        let playbook = crate::playbook::parser::parse_playbook(yaml).unwrap();
+
+        let mut e_started = make_event("playbook_started", None);
+        e_started.event_id = 1;
+        e_started.context = Some(serde_json::json!({
+            "workload": { "request_id": "req-123" },
+            "path": "t"
+        }));
+        let mut e_issued = make_event("command.issued", Some("start"));
+        e_issued.event_id = 2;
+        let mut e_done = make_event("call.done", Some("start"));
+        e_done.event_id = 3;
+        e_done.result = Some(serde_json::json!({
+            "status": "COMPLETED",
+            "context": { "result": { "status": "success", "context": {
+                "data": { "error": "Invalid JWT format" }, "status": "success" } } }
+        }));
+        let mut e_completed = make_event("command.completed", Some("start"));
+        e_completed.event_id = 4;
+        e_completed.result = Some(serde_json::json!({
+            "status": "success", "context": { "status": "success", "command_id": "x" }
+        }));
+
+        let events = vec![e_started, e_issued, e_done, e_completed];
+        let orch = WorkflowOrchestrator::new();
+        let result = orch
+            .evaluate(&events, &playbook, Some("command.completed"))
+            .expect("evaluate ok");
+
+        let skipped: Vec<String> = result
+            .events_to_emit
+            .iter()
+            .filter(|e| e.event_type == "step.skipped")
+            .filter_map(|e| e.node_name.clone())
+            .collect();
+        let cmds: Vec<String> = result.commands.iter().map(|c| c.step_name.clone()).collect();
+        assert!(
+            !skipped.contains(&"err_cb".to_string()),
+            "err_cb arc must fire (start.error defined + request_id truthy), not skip. \
+             skipped={skipped:?} commands={cmds:?}"
+        );
+    }
+
+    #[test]
     fn test_build_context_data_accessor_does_not_clobber_existing_data_field() {
         // Edge case: the task_sequence flatten path already merges a
         // `.data` key in for labeled sub-task results.  The #66 fix
