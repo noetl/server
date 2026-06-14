@@ -67,7 +67,88 @@ impl Default for CleanupPolicy {
 pub struct CleanupResult {
     pub commands_purged: u64,
     pub runtime_purged: u64,
+    /// Number of `noetl.event` partitions dropped (the event log is
+    /// range-partitioned by execution_id, so retention drops whole old
+    /// partitions instead of row-by-row DELETE).
     pub events_purged: u64,
+    /// Names of the dropped event partitions (for the audit log).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub event_partitions_dropped: Vec<String>,
+}
+
+/// NoETL snowflake epoch in Unix ms (2024-01-01T00:00:00Z) and the timestamp
+/// shift (sequence 12 + machine_id 10 bits).  Mirrors `crate::snowflake`.
+const NOETL_EPOCH_MS: i64 = 1_704_067_200_000;
+const SNOWFLAKE_TS_SHIFT: i64 = 22;
+
+/// Drop `noetl.event` partitions whose entire `execution_id` range is older
+/// than the retention cutoff.
+///
+/// `noetl.event` is `PARTITION BY RANGE (execution_id)` where execution_id is a
+/// time-ordered snowflake (`(unix_ms - epoch) << 22 | machine | seq`). A
+/// partition whose upper bound `<=` the cutoff snowflake id therefore holds
+/// only rows older than `retention_days` — so it can be `DROP`ped wholesale.
+/// This reclaims space instantly with no DELETE scan, dead tuples, or vacuum,
+/// which is the whole point of partitioning the event log for retention.
+/// `event_default` (the catch-all) is never dropped.
+async fn drop_old_event_partitions(
+    pool: &DbPool,
+    retention_days: i64,
+) -> AppResult<Vec<String>> {
+    // cutoff snowflake id for "retention_days ago".
+    let cutoff: i64 = sqlx::query_scalar(
+        r#"
+        SELECT ((((extract(epoch from now()) * 1000)::bigint)
+                 - ($1::bigint * 86400000) - $2::bigint) << $3::int)::bigint
+        "#,
+    )
+    .bind(retention_days)
+    .bind(NOETL_EPOCH_MS)
+    .bind(SNOWFLAKE_TS_SHIFT as i32)
+    .fetch_one(pool)
+    .await?;
+
+    // Partitions of noetl.event and their bound expressions (excluding the
+    // DEFAULT catch-all).
+    let parts: Vec<(String, String)> = sqlx::query_as(
+        r#"
+        SELECT c.relname, pg_get_expr(c.relpartbound, c.oid)
+        FROM pg_inherits i
+        JOIN pg_class c ON c.oid = i.inhrelid
+        JOIN pg_class p ON p.oid = i.inhparent
+        JOIN pg_namespace n ON n.oid = p.relnamespace
+        WHERE n.nspname = 'noetl' AND p.relname = 'event'
+          AND c.relname <> 'event_default'
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let mut dropped = Vec::new();
+    for (name, bound) in parts {
+        // bound: `FOR VALUES FROM (<lo>) TO (<hi>)`.  Skip MAXVALUE uppers
+        // (they extend into the future and can never be fully old).
+        match parse_partition_upper(&bound) {
+            Some(hi) if hi <= cutoff => {
+                // `name` comes from pg_catalog (trusted); quote it defensively.
+                sqlx::query(&format!("DROP TABLE IF EXISTS noetl.\"{}\"", name))
+                    .execute(pool)
+                    .await?;
+                dropped.push(name);
+            }
+            _ => {}
+        }
+    }
+    Ok(dropped)
+}
+
+/// Extract the upper bound of a RANGE partition bound expression
+/// (`... TO (<n>)`).  Returns `None` for `MAXVALUE` or unparseable bounds.
+fn parse_partition_upper(bound: &str) -> Option<i64> {
+    let start = bound.rfind("TO (")? + 4;
+    let rest = &bound[start..];
+    let end = rest.find(')')?;
+    rest[..end].trim().trim_matches('\'').parse::<i64>().ok()
 }
 
 /// Delete clearly-transient `noetl.*` rows per the retention policy.
@@ -109,26 +190,20 @@ pub async fn purge_stale(pool: &DbPool, policy: &CleanupPolicy) -> AppResult<Cle
         0
     };
 
-    // Event log is opt-in only — default policy never purges it.
-    let events_purged = if policy.event_retention_days > 0 {
-        sqlx::query(
-            r#"
-            DELETE FROM noetl.event
-            WHERE created_at < now() - make_interval(days => $1::int)
-            "#,
-        )
-        .bind(policy.event_retention_days as i32)
-        .execute(pool)
-        .await?
-        .rows_affected()
+    // Event log is opt-in only — default policy never touches it.  When
+    // enabled, retention drops whole old partitions (the event table is
+    // range-partitioned by execution_id) rather than DELETE-ing rows.
+    let event_partitions_dropped = if policy.event_retention_days > 0 {
+        drop_old_event_partitions(pool, policy.event_retention_days).await?
     } else {
-        0
+        Vec::new()
     };
 
     Ok(CleanupResult {
         commands_purged,
         runtime_purged,
-        events_purged,
+        events_purged: event_partitions_dropped.len() as u64,
+        event_partitions_dropped,
     })
 }
 
@@ -474,6 +549,31 @@ mod tests {
         assert_eq!(d.command_retention_days, 7);
         assert_eq!(d.runtime_stale_minutes, 60);
         assert_eq!(d.event_retention_days, 0);
+    }
+
+    #[test]
+    fn parse_partition_upper_extracts_range_bound() {
+        use super::parse_partition_upper;
+        // Numeric upper bound -> parsed.
+        assert_eq!(
+            parse_partition_upper("FOR VALUES FROM (264905529753600000) TO (297520437657600000)"),
+            Some(297520437657600000)
+        );
+        // MINVALUE lower, numeric upper (the event_pre_* partition).
+        assert_eq!(
+            parse_partition_upper("FOR VALUES FROM (MINVALUE) TO (264905529753600000)"),
+            Some(264905529753600000)
+        );
+        // MAXVALUE upper -> never fully old -> None (skip).
+        assert_eq!(
+            parse_partition_upper("FOR VALUES FROM (569000000000000000) TO (MAXVALUE)"),
+            None
+        );
+        // Quoted form tolerated.
+        assert_eq!(
+            parse_partition_upper("FOR VALUES FROM ('1') TO ('100')"),
+            Some(100)
+        );
     }
 
     #[test]
