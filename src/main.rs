@@ -400,6 +400,10 @@ fn build_router(
             "/api/internal/events/project",
             post(handlers::internal::events_project),
         )
+        .route(
+            "/api/internal/cleanup/purge",
+            post(handlers::internal::cleanup_purge),
+        )
         .with_state(db_pool.clone());
 
     // Gateway push-ingress config endpoint (noetl/ai-meta#90 Phase 3).  The

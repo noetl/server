@@ -293,6 +293,38 @@ pub async fn events_project(
     }))
 }
 
+/// `POST /api/internal/cleanup/purge`
+///
+/// Scheduled-cleanup entry point for the system worker pool
+/// (noetl/ai-meta#96).  Deletes clearly-transient `noetl.*` rows per the
+/// retention policy in the request body (terminal `noetl.command` rows, dead
+/// `noetl.runtime` worker registrations, and — opt-in only — old `noetl.event`
+/// rows).  An empty body uses safe defaults (commands 7d, runtime 60m, events
+/// skipped).  Per data-access-boundary.md this is the only path the
+/// `system/scheduled_cleanup` playbook uses to touch these tables.
+#[tracing::instrument(skip(pool, _token))]
+pub async fn cleanup_purge(
+    State(pool): State<DbPool>,
+    _token: RequireInternalApiToken,
+    body: Option<Json<svc::CleanupPolicy>>,
+) -> AppResult<Json<svc::CleanupResult>> {
+    let policy = body.map(|Json(p)| p).unwrap_or_default();
+    let result = svc::purge_stale(&pool, &policy).await?;
+    crate::metrics::record_cleanup_purged("command", result.commands_purged);
+    crate::metrics::record_cleanup_purged("runtime", result.runtime_purged);
+    crate::metrics::record_cleanup_purged("event", result.events_purged);
+    info!(
+        commands_purged = result.commands_purged,
+        runtime_purged = result.runtime_purged,
+        events_purged = result.events_purged,
+        command_retention_days = policy.command_retention_days,
+        runtime_stale_minutes = policy.runtime_stale_minutes,
+        event_retention_days = policy.event_retention_days,
+        "cleanup/purge done"
+    );
+    Ok(Json(result))
+}
+
 // ===========================================================================
 // Tests — auth extractor (the only logic that doesn't need a real DB)
 // ===========================================================================

@@ -20,6 +20,119 @@ use crate::db::DbPool;
 use crate::error::AppResult;
 
 // ---------------------------------------------------------------------------
+// Scheduled cleanup (noetl/ai-meta#96)
+// ---------------------------------------------------------------------------
+
+/// Retention policy for one cleanup run.  All windows are inclusive of "older
+/// than"; a `0` / `None` window means **skip that table** so an empty body is
+/// a safe no-op and the event log is never purged unless explicitly asked.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CleanupPolicy {
+    /// Purge terminal (`completed_at IS NOT NULL`) `noetl.command` rows older
+    /// than this many days.  These are transient queue entries — the durable
+    /// audit trail lives in `noetl.event`.  Default 7.
+    #[serde(default = "default_command_days")]
+    pub command_retention_days: i64,
+    /// Purge `noetl.runtime` `worker_pool` rows whose heartbeat is older than
+    /// this many minutes (dead/scaled-down worker registrations).  Default 60.
+    #[serde(default = "default_runtime_minutes")]
+    pub runtime_stale_minutes: i64,
+    /// Purge `noetl.event` rows older than this many days.  **Opt-in**: `0`
+    /// (the default) skips the event log entirely, because it is the
+    /// append-only source of truth and purging it makes those executions
+    /// un-replayable.  Set a large value (e.g. 365) deliberately.
+    #[serde(default)]
+    pub event_retention_days: i64,
+}
+
+fn default_command_days() -> i64 {
+    7
+}
+fn default_runtime_minutes() -> i64 {
+    60
+}
+
+impl Default for CleanupPolicy {
+    fn default() -> Self {
+        Self {
+            command_retention_days: default_command_days(),
+            runtime_stale_minutes: default_runtime_minutes(),
+            event_retention_days: 0,
+        }
+    }
+}
+
+/// Per-table purge counts returned by [`purge_stale`].
+#[derive(Debug, Clone, Serialize)]
+pub struct CleanupResult {
+    pub commands_purged: u64,
+    pub runtime_purged: u64,
+    pub events_purged: u64,
+}
+
+/// Delete clearly-transient `noetl.*` rows per the retention policy.
+///
+/// Conservative by design: only terminal command rows, dead worker
+/// registrations, and (opt-in) old event rows are touched. A window of `<= 0`
+/// skips that table. Counts are returned per table so the caller can record
+/// metrics + a single structured log line instead of per-delete logging.
+pub async fn purge_stale(pool: &DbPool, policy: &CleanupPolicy) -> AppResult<CleanupResult> {
+    let commands_purged = if policy.command_retention_days > 0 {
+        sqlx::query(
+            r#"
+            DELETE FROM noetl.command
+            WHERE completed_at IS NOT NULL
+              AND completed_at < now() - make_interval(days => $1::int)
+            "#,
+        )
+        .bind(policy.command_retention_days as i32)
+        .execute(pool)
+        .await?
+        .rows_affected()
+    } else {
+        0
+    };
+
+    let runtime_purged = if policy.runtime_stale_minutes > 0 {
+        sqlx::query(
+            r#"
+            DELETE FROM noetl.runtime
+            WHERE kind = 'worker_pool'
+              AND heartbeat < now() - make_interval(mins => $1::int)
+            "#,
+        )
+        .bind(policy.runtime_stale_minutes as i32)
+        .execute(pool)
+        .await?
+        .rows_affected()
+    } else {
+        0
+    };
+
+    // Event log is opt-in only — default policy never purges it.
+    let events_purged = if policy.event_retention_days > 0 {
+        sqlx::query(
+            r#"
+            DELETE FROM noetl.event
+            WHERE created_at < now() - make_interval(days => $1::int)
+            "#,
+        )
+        .bind(policy.event_retention_days as i32)
+        .execute(pool)
+        .await?
+        .rows_affected()
+    } else {
+        0
+    };
+
+    Ok(CleanupResult {
+        commands_purged,
+        runtime_purged,
+        events_purged,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Outbox claim
 // ---------------------------------------------------------------------------
 
@@ -345,6 +458,34 @@ pub async fn project_events(pool: &DbPool, events: &[EventEnvelope]) -> AppResul
 
 #[cfg(test)]
 mod tests {
+    use super::CleanupPolicy;
+
+    #[test]
+    fn cleanup_empty_body_uses_safe_defaults_and_skips_events() {
+        // An empty `{}` body must deserialize to the safe defaults: prune
+        // transient command + dead runtime rows, but NEVER touch the event
+        // log (source of truth) unless explicitly asked.
+        let p: CleanupPolicy = serde_json::from_str("{}").unwrap();
+        assert_eq!(p.command_retention_days, 7);
+        assert_eq!(p.runtime_stale_minutes, 60);
+        assert_eq!(p.event_retention_days, 0, "event log must be opt-in");
+        // The `Default` impl agrees with the serde defaults.
+        let d = CleanupPolicy::default();
+        assert_eq!(d.command_retention_days, 7);
+        assert_eq!(d.runtime_stale_minutes, 60);
+        assert_eq!(d.event_retention_days, 0);
+    }
+
+    #[test]
+    fn cleanup_event_retention_is_explicit_opt_in() {
+        let p: CleanupPolicy =
+            serde_json::from_str(r#"{"event_retention_days": 365}"#).unwrap();
+        assert_eq!(p.event_retention_days, 365);
+        // Other fields still fall back to safe defaults.
+        assert_eq!(p.command_retention_days, 7);
+        assert_eq!(p.runtime_stale_minutes, 60);
+    }
+
     /// Verify the exponential-backoff math matches the Python side's
     /// `min(max_delay, 2 ** min(8, max(0, attempts-1)))`.
     fn compute_delay(attempts: i32, max_delay: i32) -> i64 {
