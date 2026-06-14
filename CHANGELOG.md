@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.7.0](https://github.com/noetl/server/compare/v3.6.0...v3.7.0) (2026-06-14)
+
+### Features
+
+* **internal:** event retention drops old partitions instead of DELETE ([#194](https://github.com/noetl/server/issues/194)) ([8999eb9](https://github.com/noetl/server/commit/8999eb9fbe86df3b685a3cbf2b5f551a3658f140)), closes [noetl/ai-meta#96](https://github.com/noetl/ai-meta/issues/96) [noetl/ai-meta#96](https://github.com/noetl/ai-meta/issues/96)
+
 ## [3.6.0](https://github.com/noetl/server/compare/v3.5.3...v3.6.0) (2026-06-14)
 
 ### Features
