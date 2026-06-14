@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.5.3](https://github.com/noetl/server/compare/v3.5.2...v3.5.3) (2026-06-14)
+
+### Bug Fixes
+
+* Python-compatible truthiness in evaluate_condition (auth playbook stall) ([#192](https://github.com/noetl/server/issues/192)) ([b99d8e4](https://github.com/noetl/server/commit/b99d8e47280af067755103a06b828cbb205c0613)), closes [noetl/ai-meta#49](https://github.com/noetl/ai-meta/issues/49) [noetl/ai-meta#49](https://github.com/noetl/ai-meta/issues/49)
+
 ## [3.5.2](https://github.com/noetl/server/compare/v3.5.1...v3.5.2) (2026-06-14)
 
 ### Bug Fixes
