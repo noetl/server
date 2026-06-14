@@ -296,9 +296,11 @@ pub async fn events_project(
 /// `POST /api/internal/cleanup/purge`
 ///
 /// Scheduled-cleanup entry point for the system worker pool
-/// (noetl/ai-meta#96).  Deletes clearly-transient `noetl.*` rows per the
-/// retention policy in the request body (terminal `noetl.command` rows, dead
-/// `noetl.runtime` worker registrations, and — opt-in only — old `noetl.event`
+/// (noetl/ai-meta#96).  Reclaims clearly-transient `noetl.*` storage per the
+/// retention policy in the request body: DELETE terminal `noetl.command` rows +
+/// dead `noetl.runtime` worker registrations, and — opt-in only — DROP whole
+/// old `noetl.event` partitions (the event log is range-partitioned by
+/// execution_id, so retention drops partitions instead of scanning + deleting
 /// rows).  An empty body uses safe defaults (commands 7d, runtime 60m, events
 /// skipped).  Per data-access-boundary.md this is the only path the
 /// `system/scheduled_cleanup` playbook uses to touch these tables.
@@ -312,11 +314,12 @@ pub async fn cleanup_purge(
     let result = svc::purge_stale(&pool, &policy).await?;
     crate::metrics::record_cleanup_purged("command", result.commands_purged);
     crate::metrics::record_cleanup_purged("runtime", result.runtime_purged);
-    crate::metrics::record_cleanup_purged("event", result.events_purged);
+    crate::metrics::record_cleanup_purged("event_partition", result.events_purged);
     info!(
         commands_purged = result.commands_purged,
         runtime_purged = result.runtime_purged,
-        events_purged = result.events_purged,
+        event_partitions_dropped = result.events_purged,
+        dropped = ?result.event_partitions_dropped,
         command_retention_days = policy.command_retention_days,
         runtime_stale_minutes = policy.runtime_stale_minutes,
         event_retention_days = policy.event_retention_days,
