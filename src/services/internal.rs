@@ -131,10 +131,24 @@ async fn drop_old_event_partitions(
         match parse_partition_upper(&bound) {
             Some(hi) if hi <= cutoff => {
                 // `name` comes from pg_catalog (trusted); quote it defensively.
-                sqlx::query(&format!("DROP TABLE IF EXISTS noetl.\"{}\"", name))
+                match sqlx::query(&format!("DROP TABLE IF EXISTS noetl.\"{}\"", name))
                     .execute(pool)
-                    .await?;
-                dropped.push(name);
+                    .await
+                {
+                    Ok(_) => dropped.push(name),
+                    // Don't fail the whole cleanup if one partition can't be
+                    // dropped — most likely the server's DB role doesn't OWN
+                    // the partition (DROP requires ownership; DELETE does not).
+                    // Log loudly so the operator can grant ownership, and keep
+                    // going (commands/runtime retention already succeeded).
+                    Err(e) => tracing::warn!(
+                        partition = %name,
+                        error = %e,
+                        "cleanup: could not DROP event partition — the server's \
+                         DB role must OWN the noetl.event partitions for \
+                         drop-based retention (ALTER TABLE ... OWNER TO <app user>)",
+                    ),
+                }
             }
             _ => {}
         }
