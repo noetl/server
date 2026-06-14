@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.7.1](https://github.com/noetl/server/compare/v3.7.0...v3.7.1) (2026-06-14)
+
+### Bug Fixes
+
+* **internal:** cleanup tolerates un-droppable event partitions ([#195](https://github.com/noetl/server/issues/195)) ([b2c9b45](https://github.com/noetl/server/commit/b2c9b45506281a758c8693ef9f8596fd0f4b07d1)), closes [noetl/ai-meta#96](https://github.com/noetl/ai-meta/issues/96)
+
 ## [3.7.0](https://github.com/noetl/server/compare/v3.6.0...v3.7.0) (2026-06-14)
 
 ### Features
