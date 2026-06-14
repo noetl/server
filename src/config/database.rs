@@ -78,6 +78,29 @@ fn default_acquire_timeout() -> u64 {
     30
 }
 
+/// Per-connection prepared-statement-cache capacity, from the
+/// environment.
+///
+/// `NOETL_PG_STATEMENT_CACHE_CAPACITY` controls sqlx's prepared-
+/// statement cache.  Unset → sqlx's own default (100), preserving
+/// existing behaviour for direct/session-mode Postgres (kind, a
+/// dedicated server).
+///
+/// Set it to `0` when the server connects through a **transaction-
+/// mode** connection pooler (e.g. pgbouncer `pool_mode=transaction`
+/// in front of Cloud SQL — the prod path).  Under transaction
+/// pooling a cached prepared statement lives on a backend
+/// connection the pooler can hand to a different client mid-session,
+/// producing `prepared statement "sqlx_s_N" does not exist`.
+/// Capacity `0` makes sqlx use one-shot unnamed statements, which
+/// are safe under transaction pooling.
+fn statement_cache_capacity_from_env() -> usize {
+    std::env::var("NOETL_PG_STATEMENT_CACHE_CAPACITY")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(100)
+}
+
 /// Connection options for a single Postgres host — used by the
 /// per-shard + cluster-wide pools in [`ShardingConfig`].
 ///
@@ -152,6 +175,7 @@ impl ShardConnection {
             .username(&self.user)
             .password(&self.password)
             .database(&self.database)
+            .statement_cache_capacity(statement_cache_capacity_from_env())
     }
 }
 
@@ -270,6 +294,7 @@ impl DatabaseConfig {
             .username(&self.user)
             .password(&self.password)
             .database(&self.database)
+            .statement_cache_capacity(statement_cache_capacity_from_env())
     }
 
     /// Get the connection URL string.
