@@ -90,6 +90,34 @@ pub fn events_ingested_total() -> &'static IntCounterVec {
     })
 }
 
+/// Counter: rows purged by `POST /api/internal/cleanup/purge`, bucketed by
+/// the `noetl.*` table they were purged from.  Lets retention runs be
+/// observed without per-delete log lines (noetl/ai-meta#96).
+pub fn cleanup_rows_purged_total() -> &'static IntCounterVec {
+    static M: OnceLock<IntCounterVec> = OnceLock::new();
+    M.get_or_init(|| {
+        let counter = IntCounterVec::new(
+            Opts::new(
+                "noetl_cleanup_rows_purged_total",
+                "Total rows deleted by the scheduled-cleanup internal endpoint, by table.",
+            ),
+            &["table"],
+        )
+        .expect("static counter spec must be valid");
+        registry()
+            .register(Box::new(counter.clone()))
+            .expect("counter registration must succeed");
+        counter
+    })
+}
+
+/// Record the rows purged from one table by a cleanup run.
+pub fn record_cleanup_purged(table: &str, rows: u64) {
+    cleanup_rows_purged_total()
+        .with_label_values(&[table])
+        .inc_by(rows);
+}
+
 /// Histogram: wall-clock time spent inside the `POST /api/events` handler.
 pub fn event_ingest_duration_seconds() -> &'static HistogramVec {
     static M: OnceLock<HistogramVec> = OnceLock::new();
