@@ -178,6 +178,31 @@ pub struct StepInfo {
     /// `step.exit` carrying `__cursor_drained` once the claim returns no rows.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub is_cursor: bool,
+
+    // -------- Cursor-loop frame tracking (noetl/ai-meta#100) --------
+    //
+    // Maintained INCREMENTALLY by `apply_event` so the orchestrator never
+    // re-scans the whole event log to rebuild cursor progress (the per-trigger
+    // O(n) scan was the scaling bottleneck).  Reset on each `step.enter`
+    // (loop-back re-entry starts fresh).
+    /// Issued cursor sub-commands: command_id -> (phase "claim"|"body", frame).
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub cursor_issued: std::collections::HashMap<String, (String, i64)>,
+    /// Completed cursor sub-command command_ids (dedup repeated completions).
+    #[serde(default, skip_serializing_if = "std::collections::HashSet::is_empty")]
+    pub cursor_completed: std::collections::HashSet<String>,
+    /// Per-frame progress, keyed by frame index.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub cursor_frames: std::collections::BTreeMap<i64, CursorFrame>,
+}
+
+/// Per-frame progress of a `mode: cursor` loop (noetl/ai-meta#100).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CursorFrame {
+    pub claim_completed: bool,
+    pub claim_rows: Vec<serde_json::Value>,
+    pub body_issued: usize,
+    pub body_completed: usize,
 }
 
 impl StepInfo {
@@ -197,6 +222,9 @@ impl StepInfo {
             iteration_results: Vec::new(),
             iterations_dispatched: 0,
             is_cursor: false,
+            cursor_issued: std::collections::HashMap::new(),
+            cursor_completed: std::collections::HashSet::new(),
+            cursor_frames: std::collections::BTreeMap::new(),
         }
     }
 
@@ -498,6 +526,12 @@ impl WorkflowState {
                         .unwrap_or(false);
                     if cursor_marked {
                         step.is_cursor = true;
+                        // Loop-back re-entry: a fresh step.enter resets frame
+                        // tracking so the re-run's frame 0 doesn't merge with a
+                        // prior drained run's frames.
+                        step.cursor_issued.clear();
+                        step.cursor_completed.clear();
+                        step.cursor_frames.clear();
                     }
                 }
             }
@@ -530,6 +564,20 @@ impl WorkflowState {
             }
             "command.issued" => {
                 if let Some(name) = &event.node_name {
+                    // noetl/ai-meta#100: incrementally track cursor sub-command
+                    // dispatch (phase/frame) from the command.issued meta so the
+                    // orchestrator never rescans the log to rebuild frame state.
+                    let cursor_meta = event
+                        .meta
+                        .as_ref()
+                        .and_then(|m| m.get("cursor"))
+                        .map(|c| {
+                            (
+                                c.get("phase").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                                c.get("frame").and_then(|v| v.as_i64()).unwrap_or(0),
+                            )
+                        });
+                    let cid = extract_command_id(event);
                     let step = self
                         .steps
                         .entry(name.clone())
@@ -539,6 +587,18 @@ impl WorkflowState {
                     // sequential-mode guard in orchestrator.rs.
                     if step.is_iterator() {
                         step.iterations_dispatched += 1;
+                    }
+                    if let (Some((phase, frame)), Some(cid)) = (cursor_meta, cid) {
+                        if step
+                            .cursor_issued
+                            .insert(cid, (phase.clone(), frame))
+                            .is_none()
+                        {
+                            let f = step.cursor_frames.entry(frame).or_default();
+                            if phase == "body" {
+                                f.body_issued += 1;
+                            }
+                        }
                     }
                 }
             }
@@ -584,12 +644,27 @@ impl WorkflowState {
                                 .and_then(|v| v.as_bool())
                         })
                         .unwrap_or(false);
+                    // Correlate a cursor sub-command completion to its frame
+                    // (claim done / one more body row done) — incremental.
+                    let cid = extract_command_id(event);
                     let step = self
                         .steps
                         .entry(name.clone())
                         .or_insert_with(|| StepInfo::new(name));
 
                     if step.is_cursor && !is_drain {
+                        if let Some(cid) = cid {
+                            if let Some((phase, frame)) = step.cursor_issued.get(&cid).cloned() {
+                                if step.cursor_completed.insert(cid) {
+                                    let f = step.cursor_frames.entry(frame).or_default();
+                                    if phase == "claim" {
+                                        f.claim_completed = true;
+                                    } else if phase == "body" {
+                                        f.body_completed += 1;
+                                    }
+                                }
+                            }
+                        }
                         // Cursor sub-command completion — record nothing toward
                         // step completion; the drive block re-claims / drains.
                         return;
@@ -664,6 +739,17 @@ impl WorkflowState {
                 // (above) flips to Completed.  This event's purpose
                 // here is data attachment only.
                 if let Some(name) = &event.node_name {
+                    // The claim's RETURNING rows arrive on call.done (not
+                    // command.completed).  Capture them into the frame.
+                    let cid = extract_command_id(event);
+                    let rows = event
+                        .result
+                        .as_ref()
+                        .and_then(extract_user_data)
+                        .as_ref()
+                        .and_then(|d| d.get("rows"))
+                        .and_then(|r| r.as_array())
+                        .cloned();
                     let step = self
                         .steps
                         .entry(name.clone())
@@ -672,6 +758,13 @@ impl WorkflowState {
                     // must not overwrite the cursor step's result (the drive
                     // block sets it on drain).
                     if step.is_cursor {
+                        if let (Some(cid), Some(rows)) = (cid, rows) {
+                            if let Some((phase, frame)) = step.cursor_issued.get(&cid).cloned() {
+                                if phase == "claim" {
+                                    step.cursor_frames.entry(frame).or_default().claim_rows = rows;
+                                }
+                            }
+                        }
                         return;
                     }
                     // For iterator steps the iteration-aware branch

@@ -1283,6 +1283,117 @@ fn event_status_from_name(event_name: &str) -> &'static str {
 /// triggered this evaluation pass (usually the `command.completed`
 /// row).  It's used as the `parent_event_id` for newly-inserted
 /// events so the event log forms a proper causal chain.
+/// Resolve any `{status, reference: {ref: "noetl://..."}}` results in `events`
+/// back to the inline `{status, context: <data>}` shape the orchestrator reads.
+///
+/// Results-by-reference: the worker stages an over-budget tool result in the
+/// result store and emits only a small reference on the event (keeping the
+/// event log lean).  The orchestrator needs the data to evaluate `output.*`
+/// guards / `set:` and to dispatch cursor bodies, so it rehydrates the
+/// reference here — only for the events it's about to apply, not the whole log.
+/// Inline results (no `reference`) and unresolvable refs are left untouched.
+/// Resolve over-budget result references inline before the orchestrator
+/// applies the events.
+///
+/// The worker stages results larger than its inline budget in the durable
+/// result store and emits a `{data: {_ref}}` placeholder plus a sibling
+/// `reference` block instead of the data (see
+/// `repos/worker/src/executor/command.rs` `build_reference_or_inline`).  The
+/// orchestrator's state machine (`extract_user_data`, the cursor drive,
+/// `build_context`) reads the actual data out of the event — a placeholder
+/// makes a cursor claim look like it returned zero rows, which stalls the
+/// loop.  So before `from_events` / `evaluate_state` see the events, we swap
+/// each placeholder for the resolved data.
+///
+/// The reference sits at one of two paths depending on how the `call.done`
+/// envelope wrapped the tool result. Nested (the standard envelope) puts the
+/// tool result under `context.result`, so the reference is at
+/// `result.context.result.reference` and the placeholder at
+/// `result.context.result.context.data._ref`. Top-level (an un-wrapped tool
+/// result) puts the reference at `result.reference` and the placeholder at
+/// `result.context.data._ref`.
+///
+/// In both cases `reference.ref` is the `noetl://` URI and the sibling
+/// `context` is replaced with the resolved store payload (`{data: {...}}`),
+/// then the `reference` block is dropped so the result reads like an inline
+/// one.
+async fn hydrate_result_references(
+    events: &mut [crate::db::models::Event],
+    result_store: &crate::services::result_store::ResultStoreService,
+) {
+    use crate::services::result_store::parse_noetl_ref;
+
+    enum Shape {
+        /// reference at `result.context.result.reference`
+        Nested,
+        /// reference at `result.reference`
+        TopLevel,
+    }
+
+    let mut hydrated = 0usize;
+    for ev in events.iter_mut() {
+        let Some(result) = ev.result.as_mut() else {
+            continue;
+        };
+        // Locate the reference URI + remember which envelope shape carried it.
+        let (shape, ref_uri) = if let Some(u) = result
+            .pointer("/context/result/reference/ref")
+            .and_then(|v| v.as_str())
+        {
+            (Shape::Nested, u.to_string())
+        } else if let Some(u) = result.pointer("/reference/ref").and_then(|v| v.as_str()) {
+            (Shape::TopLevel, u.to_string())
+        } else {
+            continue;
+        };
+
+        let parsed = match parse_noetl_ref(&ref_uri) {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(execution_id = ev.execution_id, ref_uri, %e, "unparseable result reference; left as-is");
+                continue;
+            }
+        };
+        let resolved = match result_store.resolve(&parsed).await {
+            Ok(Some(data)) => data,
+            Ok(None) => {
+                warn!(execution_id = ev.execution_id, ref_uri, "result reference not found in store; left as-is");
+                continue;
+            }
+            Err(e) => {
+                warn!(execution_id = ev.execution_id, ref_uri, %e, "result reference resolution failed; left as-is");
+                continue;
+            }
+        };
+
+        // Splice the resolved payload over the `{data: {_ref}}` placeholder
+        // and drop the `reference` block so the event reads as inline.
+        match shape {
+            Shape::Nested => {
+                if let Some(inner) = result
+                    .get_mut("context")
+                    .and_then(|c| c.get_mut("result"))
+                    .and_then(|r| r.as_object_mut())
+                {
+                    inner.insert("context".to_string(), resolved);
+                    inner.remove("reference");
+                    hydrated += 1;
+                }
+            }
+            Shape::TopLevel => {
+                if let Some(obj) = result.as_object_mut() {
+                    obj.insert("context".to_string(), resolved);
+                    obj.remove("reference");
+                    hydrated += 1;
+                }
+            }
+        }
+    }
+    if hydrated > 0 {
+        debug!(hydrated, "hydrate_result_references: resolved over-budget result references");
+    }
+}
+
 async fn trigger_orchestrator(
     state: &AppState,
     execution_id: i64,
@@ -1296,76 +1407,143 @@ async fn trigger_orchestrator(
         trigger_event_id, "trigger_orchestrator: loading events"
     );
 
-    // 1. Load all events for this execution.
+    // 1. Incremental state (noetl/ai-meta#100 perf).
     //
-    // `attempt` is stored inside `meta` JSONB (no dedicated column on
-    // noetl.event today — same shape Python projector uses), so we
-    // source it via `meta->>'attempt'` cast to int.
-    let rows = sqlx::query(
-        r#"
+    // Reloading + replaying the whole event log on every completion is O(n)
+    // per trigger (O(n²) over a run) and, under high concurrency, the many
+    // simultaneous full loads spike memory and OOM the server.  Instead we
+    // cache the reconstructed `WorkflowState` per execution behind a
+    // per-execution lock (serialising one execution's triggers) and advance it
+    // by applying only events newer than `last_event_id`.
+    //
+    // `attempt` is stored inside `meta` JSONB (no dedicated column), sourced
+    // via `meta->>'attempt'` cast to int.
+    let parse_rows = |rows: Vec<sqlx::postgres::PgRow>| -> Vec<crate::db::models::Event> {
+        rows.into_iter()
+            .map(|r| crate::db::models::Event {
+                id: r.try_get("event_id").unwrap_or(0),
+                execution_id: r.try_get("execution_id").unwrap_or(0),
+                catalog_id: r.try_get("catalog_id").unwrap_or(0),
+                event_id: r.try_get("event_id").unwrap_or(0),
+                parent_event_id: r.try_get("parent_event_id").ok(),
+                parent_execution_id: r.try_get("parent_execution_id").ok(),
+                event_type: r.try_get("event_type").unwrap_or_default(),
+                node_id: r.try_get("node_id").ok(),
+                node_name: r.try_get("node_name").ok(),
+                node_type: r.try_get("node_type").ok(),
+                status: r.try_get("status").unwrap_or_default(),
+                context: r.try_get("context").ok(),
+                meta: r.try_get("meta").ok(),
+                result: r.try_get("result").ok(),
+                worker_id: r.try_get("worker_id").ok(),
+                attempt: r.try_get("attempt").ok(),
+                created_at: r
+                    .try_get("created_at")
+                    .unwrap_or_else(|_| chrono::Utc::now()),
+            })
+            .collect()
+    };
+    const EVENT_COLS: &str = r#"
         SELECT event_id, execution_id, catalog_id,
                parent_event_id, parent_execution_id,
                event_type, node_id, node_name, node_type, status,
                context, meta, result, worker_id,
                NULLIF(meta->>'attempt', '')::int AS attempt,
                created_at
-        FROM noetl.event
-        WHERE execution_id = $1
-        ORDER BY event_id ASC
-        "#,
-    )
-    .bind(execution_id)
-    .fetch_all(state.pools.pool_for(execution_id))
-    .await?;
+        FROM noetl.event "#;
 
-    let events: Vec<crate::db::models::Event> = rows
-        .into_iter()
-        .map(|r| crate::db::models::Event {
-            id: r.try_get("event_id").unwrap_or(0),
-            execution_id: r.try_get("execution_id").unwrap_or(0),
-            catalog_id: r.try_get("catalog_id").unwrap_or(0),
-            event_id: r.try_get("event_id").unwrap_or(0),
-            parent_event_id: r.try_get("parent_event_id").ok(),
-            parent_execution_id: r.try_get("parent_execution_id").ok(),
-            event_type: r.try_get("event_type").unwrap_or_default(),
-            node_id: r.try_get("node_id").ok(),
-            node_name: r.try_get("node_name").ok(),
-            node_type: r.try_get("node_type").ok(),
-            status: r.try_get("status").unwrap_or_default(),
-            context: r.try_get("context").ok(),
-            meta: r.try_get("meta").ok(),
-            result: r.try_get("result").ok(),
-            worker_id: r.try_get("worker_id").ok(),
-            attempt: r.try_get("attempt").ok(),
-            created_at: r
-                .try_get("created_at")
-                .unwrap_or_else(|_| chrono::Utc::now()),
-        })
-        .collect();
+    let pool = state.pools.pool_for(execution_id);
+    // Results-by-reference: an over-budget tool result is stored in the result
+    // store and the event carries `{status, reference}` (no inline data).  The
+    // orchestrator resolves those references back to inline data before reading
+    // them so referenced results are transparent to state/templates.
+    let result_store = crate::services::result_store::ResultStoreService::new(
+        pool.clone(),
+        state.snowflake.clone(),
+    );
 
-    if events.is_empty() {
-        debug!(
-            execution_id,
-            "No events to evaluate — orchestrator exit early"
-        );
+    // Per-execution lock: serialises this execution's concurrent completion
+    // triggers so only one advances the cached state at a time.
+    let cache_slot = state.orch_cache.entry(execution_id);
+    let mut cache = cache_slot.lock().await;
+
+    // Live event count + the events newer than what we've applied.
+    let total: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM noetl.event WHERE execution_id = $1")
+            .bind(execution_id)
+            .fetch_one(pool)
+            .await?;
+    let since = if cache.state.is_some() {
+        cache.last_event_id
+    } else {
+        0
+    };
+    let mut new_events: Vec<crate::db::models::Event> = parse_rows(
+        sqlx::query(&format!(
+            "{EVENT_COLS} WHERE execution_id = $1 AND event_id > $2 ORDER BY event_id ASC"
+        ))
+        .bind(execution_id)
+        .bind(since)
+        .fetch_all(pool)
+        .await?,
+    );
+    hydrate_result_references(&mut new_events, &result_store).await;
+
+    if new_events.is_empty() {
+        debug!(execution_id, "No new events to evaluate — orchestrator exit early");
         return Ok(0);
     }
 
-    // 2. Look up catalog_id + playbook content.
-    let catalog_id = events
-        .iter()
-        .find_map(|e| {
-            if e.catalog_id > 0 {
-                Some(e.catalog_id)
-            } else {
-                None
-            }
-        })
-        .ok_or_else(|| {
-            AppError::Internal(format!(
-                "No catalog_id found in events for execution {execution_id}"
+    // Trigger type + latest timestamp from the new events (the trigger event is
+    // the one that fired this pass; it is among the new events).
+    let trigger_ev = new_events.iter().find(|e| e.event_id == trigger_event_id);
+    let trigger_event_type = trigger_ev
+        .map(|e| e.event_type.clone())
+        .unwrap_or_else(|| "command.completed".to_string());
+    let latest_ts = new_events.last().map(|e| e.created_at);
+
+    // Incremental is correct only if applying the new events accounts for ALL
+    // events — otherwise a straggler (event_id <= last_event_id inserted late,
+    // possible with worker-generated snowflake ids interleaving) would be
+    // missed.  On mismatch (or a cold cache) rebuild from the full log.
+    let can_incremental =
+        cache.state.is_some() && cache.applied_count + new_events.len() as i64 == total;
+
+    if can_incremental {
+        let ws = cache.state.as_mut().unwrap();
+        for e in &new_events {
+            ws.apply_event(e);
+        }
+        cache.applied_count += new_events.len() as i64;
+        cache.last_event_id = new_events.last().map(|e| e.event_id).unwrap_or(since);
+    } else {
+        let mut all_events = parse_rows(
+            sqlx::query(&format!(
+                "{EVENT_COLS} WHERE execution_id = $1 ORDER BY event_id ASC"
             ))
-        })?;
+            .bind(execution_id)
+            .fetch_all(pool)
+            .await?,
+        );
+        hydrate_result_references(&mut all_events, &result_store).await;
+        let ws = crate::engine::state::WorkflowState::from_events(&all_events)
+            .ok_or_else(|| AppError::Validation("No events found for execution".to_string()))?;
+        cache.applied_count = all_events.len() as i64;
+        cache.last_event_id = all_events.last().map(|e| e.event_id).unwrap_or(0);
+        cache.routing_meta = all_events
+            .iter()
+            .find(|e| e.event_type == "playbook_started")
+            .and_then(|e| e.meta.clone());
+        cache.state = Some(ws);
+    }
+
+    // 2. Look up catalog_id (from the cached state) + playbook content.
+    let catalog_id = cache.state.as_ref().map(|s| s.catalog_id).unwrap_or(0);
+    if catalog_id == 0 {
+        return Err(AppError::Internal(format!(
+            "No catalog_id found for execution {execution_id}"
+        )));
+    }
 
     // Phase F R4-3: noetl.catalog is a cluster-wide table.
     let playbook_yaml: String =
@@ -1380,22 +1558,15 @@ async fn trigger_orchestrator(
             })?;
     let playbook = crate::playbook::parser::parse_playbook(&playbook_yaml)?;
 
-    // 3. Evaluate.
-    //
-    // Resolve the real trigger event's type from the loaded events
-    // list instead of hard-coding `command.completed` — the same
-    // path serves `command.failed` triggers (noetl/ai-meta#58) and
-    // future trigger sources (e.g. `iterator_completed`,
-    // `step.exit`).  Without this lookup, a failure trigger would
-    // be misreported as a completion to the orchestrator, and the
-    // failure-termination branch would never run.
-    let trigger_event_type = events
-        .iter()
-        .find(|e| e.event_id == trigger_event_id)
-        .map(|e| e.event_type.as_str())
-        .unwrap_or("command.completed");
+    // 3. Evaluate against the cached state.
     let orchestrator = WorkflowOrchestrator::new();
-    let result = match orchestrator.evaluate(&events, &playbook, Some(trigger_event_type)) {
+    let ws = cache.state.as_mut().unwrap();
+    let result = match orchestrator.evaluate_state(
+        ws,
+        latest_ts,
+        &playbook,
+        Some(trigger_event_type.as_str()),
+    ) {
         Ok(r) => r,
         Err(e) => {
             // A deterministic orchestrator evaluate failure (invalid
@@ -1482,10 +1653,9 @@ async fn trigger_orchestrator(
     // the `/api/execute` caller supplied, persisted on the `playbook_started`
     // event meta, so every follow-up command lands on the same segment and
     // carries the same trace context (noetl/ai-meta#90 Phase 2).
-    let routing = events
-        .iter()
-        .find(|e| e.event_type == "playbook_started")
-        .and_then(|e| e.meta.as_ref())
+    let routing = cache
+        .routing_meta
+        .as_ref()
         .map(crate::handlers::execute::CommandRouting::from_started_meta)
         .unwrap_or_default();
 
@@ -1551,6 +1721,10 @@ async fn trigger_orchestrator(
             terminal_event = %event_type,
             "Orchestrator marked execution as terminal"
         );
+        // Free the cached state for a terminal execution (noetl/ai-meta#100).
+        // Drop the guard first so the slot's Arc refcount can fall to zero.
+        drop(cache);
+        state.orch_cache.evict(execution_id);
     }
 
     Ok(commands_generated)
