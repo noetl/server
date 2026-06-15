@@ -758,6 +758,17 @@ pub(crate) async fn persist_engine_command(
             map.insert("trace".to_string(), trace.clone());
         }
     }
+    // Carry the command's own metadata (e.g. the cursor-loop phase/frame for
+    // mode: cursor, noetl/ai-meta#100) onto the command.issued event meta so a
+    // later orchestrator pass can recognise the claim vs body command by
+    // correlating the completion back to this issued event via command_id.
+    if let Some(serde_json::Value::Object(extra)) = command.metadata.as_ref() {
+        if let serde_json::Value::Object(ref mut map) = cmd_meta {
+            for (k, v) in extra {
+                map.insert(k.clone(), v.clone());
+            }
+        }
+    }
 
     sqlx::query(
         r#"
@@ -879,7 +890,7 @@ async fn generate_initial_commands(
         // ranges and strings to splits), the initial-dispatch boundary
         // enforces strict array typing so callers pass an explicit list.
         let renderer = crate::template::jinja::TemplateRenderer::new();
-        let raw_value = renderer.render_to_value(&loop_cfg.in_expr, &context)?;
+        let raw_value = renderer.render_to_value(loop_cfg.in_expr.as_deref().unwrap_or(""), &context)?;
 
         let items: Vec<serde_json::Value> = match raw_value {
             serde_json::Value::Array(arr) => arr,
@@ -1233,7 +1244,7 @@ mod tests {
         if let Some(loop_cfg) = step.r#loop.as_ref() {
             let renderer = TemplateRenderer::new();
             let raw_value = renderer
-                .render_to_value(&loop_cfg.in_expr, context)
+                .render_to_value(loop_cfg.in_expr.as_deref().unwrap_or(""), context)
                 .map_err(|e| AppError::Internal(e.to_string()))?;
 
             let items: Vec<serde_json::Value> = match raw_value {
@@ -1300,7 +1311,8 @@ mod tests {
     #[test]
     fn test_generate_initial_commands_fans_out_when_start_has_loop() {
         let loop_cfg = Loop {
-            in_expr: "{{ items }}".to_string(),
+            in_expr: Some("{{ items }}".to_string()),
+            cursor: None,
             iterator: "item".to_string(),
             spec: None,
         };
@@ -1348,7 +1360,8 @@ mod tests {
     #[test]
     fn test_generate_initial_commands_rejects_non_array_loop_in() {
         let loop_cfg = Loop {
-            in_expr: "{{ count }}".to_string(),
+            in_expr: Some("{{ count }}".to_string()),
+            cursor: None,
             iterator: "item".to_string(),
             spec: None,
         };

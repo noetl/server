@@ -375,12 +375,14 @@ fn validate_loop_config(
     loop_config: &crate::playbook::types::Loop,
     step_name: &str,
 ) -> AppResult<()> {
-    // Validate in expression
-    if !is_valid_jinja_expression(&loop_config.in_expr) {
-        return Err(AppError::Validation(format!(
-            "Step '{}': loop.in has invalid expression: {}",
-            step_name, loop_config.in_expr
-        )));
+    // Validate in expression (only when present — cursor loops have no `in:`)
+    if let Some(in_expr) = loop_config.in_expr.as_deref() {
+        if !is_valid_jinja_expression(in_expr) {
+            return Err(AppError::Validation(format!(
+                "Step '{}': loop.in has invalid expression: {}",
+                step_name, in_expr
+            )));
+        }
     }
 
     // Validate iterator name
@@ -391,8 +393,25 @@ fn validate_loop_config(
         )));
     }
 
-    // Note: loop.spec.mode validation is done by serde during deserialization
-    // (LoopMode enum only allows "sequential" or "parallel")
+    // mode is validated by serde (LoopMode enum: sequential / parallel / cursor).
+    // Shape requirements differ by mode:
+    //   - cursor: requires `loop.cursor.claim`; `in:` is not used.
+    //   - sequential / parallel: require `in:`; `cursor:` is not used.
+    let is_cursor = loop_config.mode() == crate::playbook::types::LoopMode::Cursor;
+    if is_cursor {
+        if loop_config.cursor.is_none() {
+            return Err(AppError::Validation(format!(
+                "Step '{}': loop.spec.mode=cursor requires a loop.cursor block with a claim query",
+                step_name
+            )));
+        }
+    } else if loop_config.in_expr.as_deref().unwrap_or("").trim().is_empty() {
+        return Err(AppError::Validation(format!(
+            "Step '{}': loop requires `in:` (the collection expression) for mode={:?}",
+            step_name,
+            loop_config.mode()
+        )));
+    }
 
     Ok(())
 }

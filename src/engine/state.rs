@@ -170,6 +170,14 @@ pub struct StepInfo {
     /// step.  Always 0 for non-iterator steps.
     #[serde(default, skip_serializing_if = "crate::engine::state::is_zero")]
     pub iterations_dispatched: i32,
+
+    /// True when this step is a `mode: cursor` loop (noetl/ai-meta#100).  Set
+    /// from the `step.enter` context marker `__cursor_loop`.  Cursor steps are
+    /// NOT completed by individual claim/body `command.completed` events — the
+    /// orchestrator's cursor-drive block completes the step via a drain
+    /// `step.exit` carrying `__cursor_drained` once the claim returns no rows.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_cursor: bool,
 }
 
 impl StepInfo {
@@ -188,6 +196,7 @@ impl StepInfo {
             iteration_command_ids: std::collections::HashSet::new(),
             iteration_results: Vec::new(),
             iterations_dispatched: 0,
+            is_cursor: false,
         }
     }
 
@@ -264,7 +273,7 @@ pub struct WorkflowState {
 /// (constraint-compliant envelope), or — in older shapes — on
 /// `result.data`.  Returns the first match.  Used by R3b iterator
 /// state aggregation to deduplicate `command.completed` events.
-fn extract_command_id(event: &Event) -> Option<String> {
+pub(crate) fn extract_command_id(event: &Event) -> Option<String> {
     if let Some(meta) = &event.meta {
         if let Some(s) = meta.get("command_id").and_then(|v| v.as_str()) {
             return Some(s.to_string());
@@ -471,6 +480,25 @@ impl WorkflowState {
                     if let Some(total) = total {
                         step.iterations_expected = Some(total as i32);
                     }
+                    // noetl/ai-meta#100: mark cursor-loop steps from the
+                    // `__cursor_loop` context marker (same dual-shape read).
+                    let cursor_marked = event
+                        .result
+                        .as_ref()
+                        .and_then(|r| r.get("context"))
+                        .and_then(|c| c.get("__cursor_loop"))
+                        .and_then(|v| v.as_bool())
+                        .or_else(|| {
+                            event
+                                .context
+                                .as_ref()
+                                .and_then(|c| c.get("__cursor_loop"))
+                                .and_then(|v| v.as_bool())
+                        })
+                        .unwrap_or(false);
+                    if cursor_marked {
+                        step.is_cursor = true;
+                    }
                 }
             }
             "step.skipped" | "step_skipped" => {
@@ -537,10 +565,35 @@ impl WorkflowState {
             }
             "command.completed" | "action_completed" | "step.exit" | "step_completed" => {
                 if let Some(name) = &event.node_name {
+                    // noetl/ai-meta#100: a `mode: cursor` loop's claim/body
+                    // sub-commands must NOT complete the step.  The step is
+                    // completed only by the orchestrator's drain `step.exit`
+                    // (carrying `__cursor_drained` in its context).  So for a
+                    // cursor step, skip completion unless the event is the drain.
+                    let is_drain = event
+                        .result
+                        .as_ref()
+                        .and_then(|r| r.get("context"))
+                        .and_then(|c| c.get("__cursor_drained"))
+                        .and_then(|v| v.as_bool())
+                        .or_else(|| {
+                            event
+                                .context
+                                .as_ref()
+                                .and_then(|c| c.get("__cursor_drained"))
+                                .and_then(|v| v.as_bool())
+                        })
+                        .unwrap_or(false);
                     let step = self
                         .steps
                         .entry(name.clone())
                         .or_insert_with(|| StepInfo::new(name));
+
+                    if step.is_cursor && !is_drain {
+                        // Cursor sub-command completion — record nothing toward
+                        // step completion; the drive block re-claims / drains.
+                        return;
+                    }
 
                     // R3b iterator-aware completion: if this step is
                     // a loop step (iterations_expected set), count
@@ -615,6 +668,12 @@ impl WorkflowState {
                         .steps
                         .entry(name.clone())
                         .or_insert_with(|| StepInfo::new(name));
+                    // noetl/ai-meta#100: cursor sub-command call.done results
+                    // must not overwrite the cursor step's result (the drive
+                    // block sets it on drain).
+                    if step.is_cursor {
+                        return;
+                    }
                     // For iterator steps the iteration-aware branch
                     // in command.completed builds the per-iteration
                     // result array; leave it alone here.  Plain steps
