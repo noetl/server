@@ -94,7 +94,15 @@ fn reconstruct_cursor_frames(
             continue;
         }
         match ev.event_type.as_str() {
-            "step.enter" | "step_enter" | "step_started" => entered = true,
+            "step.enter" | "step_enter" | "step_started" => {
+                // Reset on (re-)entry so a loop-back re-run of the cursor step
+                // starts fresh — its frames restart at 0 and must not merge with
+                // a prior drained run's frames (noetl/ai-meta#100 re-entry).
+                entered = true;
+                issued.clear();
+                completed.clear();
+                frames.clear();
+            }
             "command.issued" => {
                 let Some(cur) = ev.meta.as_ref().and_then(|m| m.get("cursor")) else {
                     continue;
@@ -2038,6 +2046,13 @@ mod tests {
         events.push(dup);
         let (_, frames3) = reconstruct_cursor_frames(&events, "cur");
         assert_eq!(frames3.get(&0).unwrap().body_completed, 1, "dedup repeat");
+
+        // Re-entry (loop-back): a fresh step.enter resets frame tracking so the
+        // re-run's frame 0 doesn't merge with the prior run's frame 0.
+        events.push(make_event("step.enter", Some("cur")));
+        let (re_entered, re_frames) = reconstruct_cursor_frames(&events, "cur");
+        assert!(re_entered);
+        assert!(re_frames.is_empty(), "re-entry clears prior frames");
     }
 
     #[test]
