@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.8.0](https://github.com/noetl/server/compare/v3.7.1...v3.8.0) (2026-06-15)
+
+### Features
+
+* **orchestrator:** cursor/claim loop mode (loop.cursor + mode: cursor) ([#196](https://github.com/noetl/server/issues/196)) ([3568c61](https://github.com/noetl/server/commit/3568c615e0b4fb1c05b4d494abc07e5c34c371b1)), closes [noetl/ai-meta#100](https://github.com/noetl/ai-meta/issues/100) [noetl/ai-meta#100](https://github.com/noetl/ai-meta/issues/100) [noetl/ai-meta#100](https://github.com/noetl/ai-meta/issues/100) [noetl/ai-meta#100](https://github.com/noetl/ai-meta/issues/100) [noetl/ai-meta#100](https://github.com/noetl/ai-meta/issues/100)
+
 ## [3.7.1](https://github.com/noetl/server/compare/v3.7.0...v3.7.1) (2026-06-14)
 
 ### Bug Fixes
