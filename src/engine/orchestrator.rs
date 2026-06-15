@@ -48,6 +48,24 @@ fn merge_iteration_context(
     serde_json::Value::Object(obj)
 }
 
+/// Build the `output` namespace for a completed step's `when:` / `set:`
+/// rendering (noetl/ai-meta#100 PFT parity).  Exposes the step's unwrapped
+/// tool data both as `output.X` and `output.data.X` (mirrors `build_context`'s
+/// per-step `with_data` shape).  Returns `None` when the step has no result.
+fn output_namespace(state: &WorkflowState, step_name: &str) -> Option<serde_json::Value> {
+    let result = state.steps.get(step_name)?.result.as_ref()?;
+    let data = extract_user_data(result).unwrap_or_else(|| result.clone());
+    let out = match &data {
+        serde_json::Value::Object(m) if !m.contains_key("data") => {
+            let mut o = m.clone();
+            o.insert("data".to_string(), data.clone());
+            serde_json::Value::Object(o)
+        }
+        _ => data,
+    };
+    Some(out)
+}
+
 /// Per-frame progress of a `mode: cursor` loop, reconstructed from the log.
 #[derive(Default)]
 struct CursorFrame {
@@ -475,7 +493,14 @@ impl WorkflowOrchestrator {
             let Some(set_vars) = &step_def.set_vars else {
                 continue;
             };
-            let shimmed = with_ctx_shims(&context);
+            let mut shimmed = with_ctx_shims(&context);
+            // noetl/ai-meta#100 (PFT parity): expose the completing step's
+            // result as `output` so step-level `set:` expressions like
+            // `ctx.facility_mapping_id: {{ output.data.rows[0].facility_mapping_id }}`
+            // resolve to the real value instead of the `else` default.
+            if let Some(out) = output_namespace(&state, step_name) {
+                shimmed.insert("output".to_string(), out);
+            }
             let mut rendered: HashMap<String, serde_json::Value> =
                 HashMap::with_capacity(set_vars.len());
             for (key, val) in set_vars {
@@ -1027,6 +1052,17 @@ impl WorkflowOrchestrator {
                 None => continue,
             };
             let mut shimmed = with_ctx_shims(context);
+            // noetl/ai-meta#100 (PFT parity): expose the producing step's
+            // result as `output` so arc `when:` conditions like
+            // `{{ output.data.row_count }}` resolve.  Python exposes the
+            // just-completed step's result under `output`; the same data is
+            // also available under the step name, but `output` is the
+            // step-agnostic alias the canonical playbooks use.  Without it the
+            // `when` references an undefined `output`, every arc evaluates
+            // false/errors, and the workflow stalls after the step.
+            if let Some(out) = output_namespace(state, step_name) {
+                shimmed.insert("output".to_string(), out);
+            }
             // A completed loop step surfaces `event.name == "loop.done"`
             // to its next-arc conditions — the canonical DSL gate for
             // "after the loop finishes".  The Python runtime emits a
