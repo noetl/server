@@ -17,7 +17,8 @@ use crate::playbook::types::{LoopMode, NextSpec, Playbook, Step};
 use super::commands::{Command, CommandBuilder, IteratorMetadata};
 use super::evaluator::ConditionEvaluator;
 use super::state::{
-    apply_set_mutations, extract_user_data, ExecutionState, StepState, WorkflowState,
+    apply_set_mutations, extract_command_id, extract_user_data, ExecutionState, StepState,
+    WorkflowState,
 };
 use crate::template::TemplateRenderer;
 
@@ -45,6 +46,95 @@ fn merge_iteration_context(
         serde_json::Value::String(iterator_var.to_string()),
     );
     serde_json::Value::Object(obj)
+}
+
+/// Per-frame progress of a `mode: cursor` loop, reconstructed from the log.
+#[derive(Default)]
+struct CursorFrame {
+    claim_completed: bool,
+    claim_rows: Vec<serde_json::Value>,
+    body_issued: usize,
+    body_completed: usize,
+}
+
+/// Reconstruct a cursor loop's frames for `step_name` from the event log
+/// (noetl/ai-meta#100).  Uses the `cursor` metadata stamped on the
+/// `command.issued` events (phase/frame) and correlates completions back by
+/// `command_id`.  Returns `(entered, frames-by-index)`.
+fn reconstruct_cursor_frames(
+    events: &[Event],
+    step_name: &str,
+) -> (bool, std::collections::BTreeMap<i64, CursorFrame>) {
+    use std::collections::BTreeMap;
+    let mut entered = false;
+    // command_id -> (phase, frame) for issued cursor sub-commands.
+    let mut issued: HashMap<String, (String, i64)> = HashMap::new();
+    let mut completed: HashSet<String> = HashSet::new();
+    let mut frames: BTreeMap<i64, CursorFrame> = BTreeMap::new();
+    for ev in events {
+        if ev.node_name.as_deref() != Some(step_name) {
+            continue;
+        }
+        match ev.event_type.as_str() {
+            "step.enter" | "step_enter" | "step_started" => entered = true,
+            "command.issued" => {
+                let Some(cur) = ev.meta.as_ref().and_then(|m| m.get("cursor")) else {
+                    continue;
+                };
+                let phase = cur
+                    .get("phase")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let frame = cur.get("frame").and_then(|v| v.as_i64()).unwrap_or(0);
+                let Some(cid) = extract_command_id(ev) else { continue };
+                if issued.insert(cid, (phase.clone(), frame)).is_none() {
+                    let f = frames.entry(frame).or_default();
+                    if phase == "body" {
+                        f.body_issued += 1;
+                    }
+                }
+            }
+            // `call.done` carries the tool DATA (the claim's RETURNING rows);
+            // `command.completed` carries only {status, command_id}.  So parse
+            // the claim's frame rows from call.done, keyed by command_id.
+            "call.done" | "action_done" => {
+                let Some(cid) = extract_command_id(ev) else { continue };
+                let Some((phase, frame)) = issued.get(&cid).cloned() else {
+                    continue;
+                };
+                if phase == "claim" {
+                    if let Some(rows) = ev
+                        .result
+                        .as_ref()
+                        .and_then(extract_user_data)
+                        .as_ref()
+                        .and_then(|d| d.get("rows"))
+                        .and_then(|r| r.as_array())
+                    {
+                        frames.entry(frame).or_default().claim_rows = rows.clone();
+                    }
+                }
+            }
+            "command.completed" | "action_completed" => {
+                let Some(cid) = extract_command_id(ev) else { continue };
+                let Some((phase, frame)) = issued.get(&cid).cloned() else {
+                    continue;
+                };
+                if !completed.insert(cid) {
+                    continue; // dedup repeated completion events
+                }
+                let f = frames.entry(frame).or_default();
+                if phase == "claim" {
+                    f.claim_completed = true;
+                } else if phase == "body" {
+                    f.body_completed += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    (entered, frames)
 }
 
 /// Add `ctx` and `workload` namespace shims to a flat variable
@@ -281,7 +371,7 @@ impl WorkflowOrchestrator {
         trigger_event_type: Option<&str>,
     ) -> AppResult<OrchestrationResult> {
         // Reconstruct workflow state from events
-        let state = WorkflowState::from_events(events)
+        let mut state = WorkflowState::from_events(events)
             .ok_or_else(|| AppError::Validation("No events found for execution".to_string()))?;
 
         debug!(
@@ -458,7 +548,13 @@ impl WorkflowOrchestrator {
                     self.dispatch_initial_steps(&state, playbook, &context)?
                 } else {
                     // Process completed steps and determine next steps
-                    self.process_in_progress(&state, &steps, &context, trigger_event_type)?
+                    self.process_in_progress(
+                        &mut state,
+                        &steps,
+                        &context,
+                        trigger_event_type,
+                        events,
+                    )?
                 }
             }
             _ => OrchestrationResult {
@@ -538,10 +634,11 @@ impl WorkflowOrchestrator {
     /// Process an in-progress execution.
     fn process_in_progress(
         &self,
-        state: &WorkflowState,
+        state: &mut WorkflowState,
         steps: &HashMap<&str, &Step>,
         context: &HashMap<String, serde_json::Value>,
         trigger_event_type: Option<&str>,
+        events: &[Event],
     ) -> AppResult<OrchestrationResult> {
         let mut commands = Vec::new();
         let mut events_to_emit = Vec::new();
@@ -722,7 +819,7 @@ impl WorkflowOrchestrator {
 
                 let next_idx = completed as usize;
                 let shimmed = with_ctx_shims(context);
-                let items = self.evaluator.evaluate_loop(&loop_cfg.in_expr, &shimmed)?;
+                let items = self.evaluator.evaluate_loop(loop_cfg.in_expr.as_deref().unwrap_or(""), &shimmed)?;
                 if next_idx >= items.len() {
                     continue;
                 } // safety guard
@@ -753,6 +850,155 @@ impl WorkflowOrchestrator {
                     iter_meta,
                 )?;
                 commands.push(command);
+            }
+        }
+
+        // noetl/ai-meta#100: cursor-loop drive.
+        //
+        // On a completion event, advance each active `mode: cursor` step:
+        //   - claim still in flight        -> wait
+        //   - claim returned 0 rows        -> DRAIN: mark the step completed +
+        //                                     emit a `__cursor_drained` step.exit
+        //                                     so the transition loop below routes
+        //                                     its `next` arcs (event.name=loop.done)
+        //   - claim returned K rows, body
+        //     not all dispatched           -> dispatch body command(s) per row,
+        //                                     bounded by frame.row_concurrency
+        //   - all K body rows done         -> re-claim the next frame
+        // The claim runs as a normal tool command on a worker; no long-lived
+        // worker holds a slot (honors agents/rules/execution-model.md).
+        if matches!(
+            trigger_event_type,
+            Some("command.completed") | Some("action_completed")
+        ) {
+            let drain_ts = events.last().map(|e| e.created_at);
+            let cursor_steps: Vec<String> = state
+                .steps
+                .iter()
+                .filter(|(name, info)| info.is_cursor && !state.is_step_completed(name))
+                .map(|(name, _)| name.clone())
+                .collect();
+
+            for step_name in cursor_steps {
+                let Some(step_def) = steps.get(step_name.as_str()) else {
+                    continue;
+                };
+                let Some(loop_cfg) = step_def.r#loop.as_ref() else {
+                    continue;
+                };
+                let Some(cursor) = loop_cfg.cursor.as_ref() else {
+                    continue;
+                };
+                let frame_spec = loop_cfg.spec.as_ref().and_then(|s| s.frame.as_ref());
+                let max_rows = frame_spec.and_then(|f| f.max_rows).unwrap_or(1).max(1);
+                let row_concurrency = frame_spec
+                    .and_then(|f| f.row_concurrency)
+                    .unwrap_or(1)
+                    .max(1) as usize;
+
+                let (entered, frames) = reconstruct_cursor_frames(events, &step_name);
+                if !entered {
+                    continue;
+                }
+                let Some((&frame_idx, frame)) = frames.iter().next_back() else {
+                    // Entered but no claim issued yet — claim frame 0.
+                    let cmd = self.command_builder.build_cursor_claim_command(
+                        state.execution_id,
+                        state.catalog_id,
+                        step_def,
+                        cursor,
+                        context,
+                        0,
+                        max_rows,
+                    )?;
+                    commands.push(cmd);
+                    continue;
+                };
+                if !frame.claim_completed {
+                    continue; // claim in flight; its completion re-triggers us
+                }
+                let k = frame.claim_rows.len();
+                if k == 0 {
+                    // DRAIN — the claim found no more work.  Complete the step
+                    // in-memory so the transition loop routes it this pass, and
+                    // emit a durable drain step.exit for replay.
+                    if let Some(si) = state.steps.get_mut(&step_name) {
+                        si.state = StepState::Completed;
+                        si.completed_at = drain_ts;
+                        if si.result.is_none() {
+                            si.result = Some(serde_json::json!({
+                                "cursor": "drained",
+                                "frames": frame_idx
+                            }));
+                        }
+                    }
+                    events_to_emit.push(EventToEmit {
+                        event_type: "step.exit".to_string(),
+                        node_name: Some(step_name.clone()),
+                        status: "COMPLETED".to_string(),
+                        context: Some(serde_json::json!({ "__cursor_drained": true })),
+                        result: Some(serde_json::json!({
+                            "cursor": "drained",
+                            "frames": frame_idx
+                        })),
+                        error: None,
+                    });
+                    info!(
+                        "Cursor loop '{}' drained after {} frame(s)",
+                        step_name,
+                        frame_idx + 1
+                    );
+                    continue;
+                }
+                if frame.body_completed >= k {
+                    // Frame fully processed — claim the next frame.
+                    let cmd = self.command_builder.build_cursor_claim_command(
+                        state.execution_id,
+                        state.catalog_id,
+                        step_def,
+                        cursor,
+                        context,
+                        frame_idx + 1,
+                        max_rows,
+                    )?;
+                    commands.push(cmd);
+                    continue;
+                }
+                // Dispatch the next body command(s), bounded by row_concurrency.
+                let in_flight = frame.body_issued.saturating_sub(frame.body_completed);
+                if frame.body_issued < k && in_flight < row_concurrency {
+                    let can_issue =
+                        (row_concurrency - in_flight).min(k - frame.body_issued);
+                    for r in frame.body_issued..(frame.body_issued + can_issue) {
+                        let iter_meta = IteratorMetadata {
+                            parent_execution_id: state.execution_id,
+                            iterator_step: step_name.clone(),
+                            item_var: loop_cfg.iterator.clone(),
+                            item: frame.claim_rows[r].clone(),
+                            index: r,
+                            total: k,
+                        };
+                        let mut body_cmd = self.command_builder.build_iteration_command(
+                            0,
+                            state.execution_id,
+                            state.catalog_id,
+                            0,
+                            step_def,
+                            context,
+                            iter_meta,
+                        )?;
+                        body_cmd.metadata = Some(serde_json::json!({
+                            "cursor": {
+                                "phase": "body",
+                                "step": step_name,
+                                "frame": frame_idx,
+                                "row": r
+                            }
+                        }));
+                        commands.push(body_cmd);
+                    }
+                }
+                // else: body in flight — wait for completions to re-trigger.
             }
         }
 
@@ -1334,10 +1580,60 @@ impl WorkflowOrchestrator {
                     // block above handles subsequent iterations when
                     // each command.completed arrives.
                     if let Some(loop_cfg) = current_step.r#loop.as_ref() {
+                        // noetl/ai-meta#100: `mode: cursor` — claim-based work
+                        // loop.  On entry, emit a `step.enter` carrying the
+                        // `__cursor_loop` marker (so claim/body completions
+                        // don't complete the step) and dispatch the first
+                        // claim command.  The cursor-drive block then fans out
+                        // the body per claimed row, re-claims, and drains.
+                        if loop_cfg.mode() == LoopMode::Cursor {
+                            if let Some(cursor) = loop_cfg.cursor.as_ref() {
+                                let max_rows = loop_cfg
+                                    .spec
+                                    .as_ref()
+                                    .and_then(|s| s.frame.as_ref())
+                                    .and_then(|f| f.max_rows)
+                                    .unwrap_or(1)
+                                    .max(1);
+                                let mut enter_obj = match current_with_params.clone() {
+                                    Some(serde_json::Value::Object(m)) => m,
+                                    _ => serde_json::Map::new(),
+                                };
+                                enter_obj.insert(
+                                    "__cursor_loop".to_string(),
+                                    serde_json::json!(true),
+                                );
+                                events_to_emit.push(EventToEmit {
+                                    event_type: "step.enter".to_string(),
+                                    node_name: Some(current_step_name.clone()),
+                                    status: "ENTERED".to_string(),
+                                    context: Some(serde_json::Value::Object(enter_obj)),
+                                    result: None,
+                                    error: None,
+                                });
+                                let claim_cmd =
+                                    self.command_builder.build_cursor_claim_command(
+                                        state.execution_id,
+                                        state.catalog_id,
+                                        current_step,
+                                        cursor,
+                                        &current_ctx,
+                                        0,
+                                        max_rows,
+                                    )?;
+                                commands.push(claim_cmd);
+                                info!(
+                                    "Cursor loop '{}' entered — claiming frame 0 (max_rows={})",
+                                    current_step_name, max_rows
+                                );
+                                continue;
+                            }
+                        }
+
                         let shimmed_loop = with_ctx_shims(&current_ctx);
                         let items = self
                             .evaluator
-                            .evaluate_loop(&loop_cfg.in_expr, &shimmed_loop)?;
+                            .evaluate_loop(loop_cfg.in_expr.as_deref().unwrap_or(""), &shimmed_loop)?;
                         let total: usize = items.len();
 
                         if total == 0 {
@@ -1642,6 +1938,70 @@ mod tests {
             attempt: None,
             created_at: Utc::now(),
         }
+    }
+
+    #[test]
+    fn cursor_reconstruct_tracks_frames_and_drain() {
+        // noetl/ai-meta#100: reconstruct cursor-loop frame progress from the
+        // event log (claim issued/completed + body issued/completed), keyed by
+        // the `cursor` metadata on command.issued and correlated by command_id.
+        let mut events = vec![make_event("step.enter", Some("cur"))];
+
+        let mut claim0 = make_event("command.issued", Some("cur"));
+        claim0.meta =
+            Some(serde_json::json!({"command_id": "c0", "cursor": {"phase": "claim", "frame": 0}}));
+        events.push(claim0);
+        // The claim's RETURNING rows arrive on call.done (command.completed
+        // carries only {status, command_id}).
+        let mut claim0_data = make_event("call.done", Some("cur"));
+        claim0_data.result = Some(serde_json::json!({
+            "context": {"command_id": "c0", "data": {"rows": [{"id": 1}, {"id": 2}]}}
+        }));
+        events.push(claim0_data);
+        let mut claim0_done = make_event("command.completed", Some("cur"));
+        claim0_done.meta = Some(serde_json::json!({"command_id": "c0"}));
+        events.push(claim0_done);
+
+        // One body row issued + completed.
+        let mut body0 = make_event("command.issued", Some("cur"));
+        body0.meta =
+            Some(serde_json::json!({"command_id": "b0", "cursor": {"phase": "body", "frame": 0}}));
+        events.push(body0);
+        let mut body0_done = make_event("command.completed", Some("cur"));
+        body0_done.meta = Some(serde_json::json!({"command_id": "b0"}));
+        events.push(body0_done);
+
+        let (entered, frames) = reconstruct_cursor_frames(&events, "cur");
+        assert!(entered);
+        let f0 = frames.get(&0).expect("frame 0 present");
+        assert!(f0.claim_completed);
+        assert_eq!(f0.claim_rows.len(), 2, "claim returned 2 rows");
+        assert_eq!(f0.body_issued, 1);
+        assert_eq!(f0.body_completed, 1);
+
+        // Next frame's claim drains (0 rows) → the drive block would complete it.
+        let mut claim1 = make_event("command.issued", Some("cur"));
+        claim1.meta =
+            Some(serde_json::json!({"command_id": "c1", "cursor": {"phase": "claim", "frame": 1}}));
+        events.push(claim1);
+        let mut claim1_data = make_event("call.done", Some("cur"));
+        claim1_data.result =
+            Some(serde_json::json!({"context": {"command_id": "c1", "data": {"rows": []}}}));
+        events.push(claim1_data);
+        let mut claim1_done = make_event("command.completed", Some("cur"));
+        claim1_done.meta = Some(serde_json::json!({"command_id": "c1"}));
+        events.push(claim1_done);
+
+        let (_, frames2) = reconstruct_cursor_frames(&events, "cur");
+        let f1 = frames2.get(&1).expect("frame 1 present");
+        assert!(f1.claim_completed);
+        assert!(f1.claim_rows.is_empty(), "drained frame has no rows");
+        // Repeated completion events for the same command_id are deduped.
+        let mut dup = make_event("command.completed", Some("cur"));
+        dup.meta = Some(serde_json::json!({"command_id": "b0"}));
+        events.push(dup);
+        let (_, frames3) = reconstruct_cursor_frames(&events, "cur");
+        assert_eq!(frames3.get(&0).unwrap().body_completed, 1, "dedup repeat");
     }
 
     #[test]
@@ -2065,11 +2425,13 @@ mod tests {
         let start = make_step("start", Some("looped"));
         let mut looped = make_step("looped", Some("end"));
         looped.r#loop = Some(crate::playbook::types::Loop {
-            in_expr: "{{ [1, 2, 3] }}".to_string(),
+            in_expr: Some("{{ [1, 2, 3] }}".to_string()),
+            cursor: None,
             iterator: "n".to_string(),
             spec: Some(crate::playbook::types::LoopSpec {
                 mode: LoopMode::Parallel,
                 max_in_flight: None,
+                frame: None,
             }),
         });
         let end = make_step("end", None);
@@ -2155,11 +2517,13 @@ mod tests {
         let start = make_step("start", Some("looped"));
         let mut looped = make_step("looped", Some("end"));
         looped.r#loop = Some(crate::playbook::types::Loop {
-            in_expr: "{{ [1, 2, 3] }}".to_string(),
+            in_expr: Some("{{ [1, 2, 3] }}".to_string()),
+            cursor: None,
             iterator: "n".to_string(),
             spec: Some(crate::playbook::types::LoopSpec {
                 mode: LoopMode::Sequential,
                 max_in_flight: None,
+                frame: None,
             }),
         });
         let end = make_step("end", None);
@@ -2243,11 +2607,13 @@ mod tests {
         let start = make_step("start", Some("looped"));
         let mut looped = make_step("looped", Some("end"));
         looped.r#loop = Some(crate::playbook::types::Loop {
-            in_expr: "{{ [10, 20, 30] }}".to_string(),
+            in_expr: Some("{{ [10, 20, 30] }}".to_string()),
+            cursor: None,
             iterator: "n".to_string(),
             spec: Some(crate::playbook::types::LoopSpec {
                 mode: LoopMode::Sequential,
                 max_in_flight: None,
+                frame: None,
             }),
         });
         let end = make_step("end", None);
@@ -2354,11 +2720,13 @@ mod tests {
         let start = make_step("start", Some("looped"));
         let mut looped = make_step("looped", None);
         looped.r#loop = Some(Loop {
-            in_expr: "{{ [10, 20, 30] }}".to_string(),
+            in_expr: Some("{{ [10, 20, 30] }}".to_string()),
+            cursor: None,
             iterator: "n".to_string(),
             spec: Some(LoopSpec {
                 mode: LoopMode::Sequential,
                 max_in_flight: None,
+                frame: None,
             }),
         });
         // next: validate WHEN event.name == "loop.done"
@@ -2459,7 +2827,8 @@ mod tests {
         let start = make_step("start", Some("looped"));
         let mut looped = make_step("looped", Some("end"));
         looped.r#loop = Some(crate::playbook::types::Loop {
-            in_expr: "{{ [1, 2] }}".to_string(),
+            in_expr: Some("{{ [1, 2] }}".to_string()),
+            cursor: None,
             iterator: "x".to_string(),
             spec: None, // default = Sequential
         });
@@ -2519,7 +2888,8 @@ mod tests {
         let start = make_step("start", Some("looped"));
         let mut looped = make_step("looped", Some("end"));
         looped.r#loop = Some(crate::playbook::types::Loop {
-            in_expr: "{{ [] }}".to_string(),
+            in_expr: Some("{{ [] }}".to_string()),
+            cursor: None,
             iterator: "x".to_string(),
             spec: None,
         });
@@ -3512,7 +3882,8 @@ mod tests {
 
         let mut loop_step = make_step("loop_step", Some("end"));
         loop_step.r#loop = Some(Loop {
-            in_expr: "{{ ctx.items }}".to_string(),
+            in_expr: Some("{{ ctx.items }}".to_string()),
+            cursor: None,
             iterator: "item".to_string(),
             spec: None,
         });

@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::error::AppResult;
-use crate::playbook::types::{Step, ToolCall, ToolDefinition, ToolSpec};
+use crate::playbook::types::{CursorClaim, Step, ToolCall, ToolDefinition, ToolSpec};
 use crate::template::TemplateRenderer;
 
 /// Command to be executed by a worker.
@@ -220,6 +220,70 @@ impl CommandBuilder {
             context: Some(render_ctx),
             metadata: None,
             iterator: Some(iterator),
+        })
+    }
+
+    /// Build the claim command for one frame of a `mode: cursor` loop
+    /// (noetl/ai-meta#100).  Runs the `loop.cursor.claim` SQL as a normal
+    /// tool command (default `postgres`); its `RETURNING` rows are the frame
+    /// the orchestrator fans the step body over.  `__frame_max_rows` is
+    /// injected so the claim's `LIMIT {{ __frame_max_rows }}` resolves.  The
+    /// command carries `metadata.cursor = {phase: "claim", frame}` so the
+    /// orchestrator can recognise the completion and continue the loop.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_cursor_claim_command(
+        &self,
+        execution_id: i64,
+        catalog_id: i64,
+        step: &Step,
+        cursor: &CursorClaim,
+        context: &HashMap<String, serde_json::Value>,
+        frame_index: i64,
+        max_rows: i64,
+    ) -> AppResult<Command> {
+        // Inject __frame_max_rows + ctx/workload shims into the render context
+        // so the claim SQL's templates resolve (execution_id, ctx.*, workload.*,
+        // __frame_max_rows).
+        let mut render_ctx = context.clone();
+        render_ctx.insert(
+            "__frame_max_rows".to_string(),
+            serde_json::json!(max_rows),
+        );
+        let ctx_value = serde_json::to_value(&render_ctx).unwrap_or(serde_json::Value::Null);
+        render_ctx
+            .entry("ctx".to_string())
+            .or_insert_with(|| ctx_value.clone());
+        render_ctx
+            .entry("workload".to_string())
+            .or_insert_with(|| ctx_value);
+
+        let claim_sql = self.renderer.render(&cursor.claim, &render_ctx)?;
+
+        let mut config = serde_json::Map::new();
+        config.insert("command".to_string(), serde_json::Value::String(claim_sql));
+        if let Some(auth) = &cursor.auth {
+            config.insert("auth".to_string(), serde_json::Value::String(auth.clone()));
+        }
+        let tool_command = ToolCommand {
+            kind: cursor.kind.clone(),
+            config: Some(serde_json::Value::Object(config)),
+            timeout: None,
+        };
+
+        let metadata = serde_json::json!({
+            "cursor": { "phase": "claim", "step": step.step, "frame": frame_index }
+        });
+
+        Ok(Command {
+            command_id: 0,
+            execution_id,
+            catalog_id,
+            parent_event_id: 0,
+            step_name: step.step.clone(),
+            tool: tool_command,
+            context: Some(render_ctx),
+            metadata: Some(metadata),
+            iterator: None,
         })
     }
 

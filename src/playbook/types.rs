@@ -360,26 +360,89 @@ pub enum LoopMode {
     #[default]
     Sequential,
     Parallel,
+    /// Claim-based work-distribution loop (noetl/ai-meta#100).  Instead of a
+    /// fixed `in:` collection, the orchestrator repeatedly runs the
+    /// `loop.cursor.claim` SQL to lease a frame of work rows, fans out the
+    /// step body per claimed row, then re-claims — until the claim returns
+    /// zero rows (drained).  Honors the Rust execution model: the claim runs
+    /// as a normal postgres tool command on a worker; no long-lived worker.
+    Cursor,
+}
+
+/// Frame sizing / leasing policy for a `mode: cursor` loop.
+///
+/// Only `max_rows` is load-bearing in the orchestrator-driven port (it caps
+/// each claim and is injected as `__frame_max_rows` into the claim render
+/// context).  The lease/heartbeat/byte fields are accepted for playbook
+/// compatibility with the Python engine; stale-reclaim is handled by the
+/// playbook's own claim SQL (its `reclaim_stale` CTE), so they are advisory.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct FrameSpec {
+    /// Max rows claimed per frame (the claim SQL's `LIMIT {{ __frame_max_rows }}`).
+    #[serde(default)]
+    pub max_rows: Option<i64>,
+    #[serde(default)]
+    pub max_seconds: Option<f64>,
+    #[serde(default)]
+    pub max_bytes: Option<i64>,
+    #[serde(default)]
+    pub lease_seconds: Option<f64>,
+    #[serde(default)]
+    pub heartbeat_seconds: Option<f64>,
+    /// Rows of one frame to dispatch concurrently (1 = sequential within frame).
+    #[serde(default)]
+    pub row_concurrency: Option<i32>,
+    /// `row` (default) binds `iter.<name>` to one row; `frame` is reserved.
+    #[serde(default)]
+    pub process: Option<String>,
+}
+
+/// The claim block of a `mode: cursor` loop — a SQL tool that atomically
+/// leases a frame of work rows and returns them (its `RETURNING` columns
+/// become the per-row `iter.<iterator>` object).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CursorClaim {
+    /// Tool kind running the claim (default `postgres`).
+    #[serde(default = "default_cursor_kind")]
+    pub kind: String,
+    /// Credential alias for the claim tool.
+    #[serde(default)]
+    pub auth: Option<String>,
+    /// The claim SQL (atomic lease, e.g. `... FOR UPDATE SKIP LOCKED ... RETURNING ...`).
+    pub claim: String,
+}
+
+fn default_cursor_kind() -> String {
+    "postgres".to_string()
 }
 
 /// Loop runtime specification (canonical format).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoopSpec {
-    /// Execution mode: sequential or parallel.
+    /// Execution mode: sequential, parallel, or cursor.
     #[serde(default)]
     pub mode: LoopMode,
 
-    /// Maximum concurrent iterations in parallel mode.
+    /// Maximum concurrent iterations in parallel mode / frames in cursor mode.
     #[serde(default)]
     pub max_in_flight: Option<i32>,
+
+    /// Frame sizing/leasing policy (cursor mode only).
+    #[serde(default)]
+    pub frame: Option<FrameSpec>,
 }
 
 /// Step-level loop configuration (canonical format).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Loop {
-    /// Jinja expression for collection to iterate over.
-    #[serde(rename = "in")]
-    pub in_expr: String,
+    /// Jinja expression for collection to iterate over.  Required for
+    /// `sequential` / `parallel`; absent for `cursor` (which claims work).
+    #[serde(rename = "in", default)]
+    pub in_expr: Option<String>,
+
+    /// Claim block for `mode: cursor` loops.
+    #[serde(default)]
+    pub cursor: Option<CursorClaim>,
 
     /// Variable name for each item.
     pub iterator: String,
@@ -387,6 +450,16 @@ pub struct Loop {
     /// Loop spec with mode (canonical format).
     #[serde(default)]
     pub spec: Option<LoopSpec>,
+}
+
+impl Loop {
+    /// Resolved loop mode (defaults to sequential when no spec).
+    pub fn mode(&self) -> LoopMode {
+        self.spec
+            .as_ref()
+            .map(|s| s.mode.clone())
+            .unwrap_or(LoopMode::Sequential)
+    }
 }
 
 // ============================================================================
