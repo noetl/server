@@ -51,6 +51,13 @@ pub const EVENT_SUBJECT_WILDCARD: &str = "noetl.events.>";
 /// playbook stays a pure consumer.
 pub const PROJECTOR_CONSUMER: &str = "noetl_projector";
 
+/// Durable pull consumer the `system/event_materializer` playbook drains
+/// (noetl/ai-meta#103 phase 2d-1).  Separate from [`PROJECTOR_CONSUMER`] so the
+/// materializer (batch-writes `noetl.event` from the stream) and the projector
+/// (advances `projection_snapshot`) drain the same stream independently — each
+/// has its own ack cursor.
+pub const MATERIALIZER_CONSUMER: &str = "noetl_materializer";
+
 /// Publishes full events onto the `noetl_events` JetStream stream.
 #[derive(Clone)]
 pub struct EventStreamPublisher {
@@ -71,33 +78,32 @@ impl EventStreamPublisher {
     ) -> Result<Self, NatsError> {
         let js = jetstream::new((*client).clone());
         Self::ensure_stream(&js, dedup_window, max_age).await?;
-        Self::ensure_projector_consumer(&js).await?;
+        // Both system-pool consumers drain the same stream independently — the
+        // projector (→ projection_snapshot) and the materializer (→ noetl.event).
+        Self::ensure_consumer(&js, PROJECTOR_CONSUMER).await?;
+        Self::ensure_consumer(&js, MATERIALIZER_CONSUMER).await?;
         Ok(Self { js })
     }
 
-    /// Ensure the durable `noetl_projector` pull consumer exists on the stream.
-    /// Idempotent: `create_consumer` with a stable durable name + config is a
-    /// no-op when it already exists.  Explicit-ack so the projector controls
-    /// when a batch is acked (the `tool: subscription` poll acks on success).
-    async fn ensure_projector_consumer(js: &Context) -> Result<(), NatsError> {
+    /// Ensure a durable pull consumer exists on the stream.  Idempotent:
+    /// `create_consumer` with a stable durable name + config is a no-op when it
+    /// already exists.  Explicit-ack so the draining playbook controls when a
+    /// batch is acked (the `tool: subscription` poll acks on success).
+    async fn ensure_consumer(js: &Context, name: &str) -> Result<(), NatsError> {
         let stream = js
             .get_stream(EVENT_STREAM)
             .await
             .map_err(|e| NatsError::JetStream(e.to_string()))?;
         stream
             .create_consumer(jetstream::consumer::pull::Config {
-                durable_name: Some(PROJECTOR_CONSUMER.to_string()),
+                durable_name: Some(name.to_string()),
                 filter_subject: EVENT_SUBJECT_WILDCARD.to_string(),
                 ack_policy: jetstream::consumer::AckPolicy::Explicit,
                 ..Default::default()
             })
             .await
             .map_err(|e| NatsError::JetStream(e.to_string()))?;
-        tracing::debug!(
-            stream = EVENT_STREAM,
-            consumer = PROJECTOR_CONSUMER,
-            "ensured projector pull consumer"
-        );
+        tracing::debug!(stream = EVENT_STREAM, consumer = name, "ensured pull consumer");
         Ok(())
     }
 
