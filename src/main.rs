@@ -705,6 +705,25 @@ async fn main() -> anyhow::Result<()> {
     // (only /api/execute writes it) and bounded by age; dedup is opt-in per
     // subscription so the table stays empty unless a critical stream uses it.
     noetl_server::db::queries::subscription_dedup::ensure_table(&db_pool).await?;
+    // CQRS write-path producer (noetl/ai-meta#103 phase 2a) — the
+    // `noetl.event` → `noetl.outbox` transactional-outbox trigger.  Same
+    // idempotent startup-DDL pattern.  Default OFF (`NOETL_EVENT_OUTBOX_ENABLED`
+    // unset) so this lands as a no-op in production until ops opts the cluster
+    // into the CQRS write path; the fold function is created either way, the
+    // trigger only when enabled.
+    {
+        let outbox_enabled = noetl_server::db::queries::event_outbox::outbox_enabled_from_env();
+        noetl_server::db::queries::event_outbox::ensure_event_outbox_trigger(
+            &db_pool,
+            outbox_enabled,
+        )
+        .await?;
+        tracing::info!(
+            target: "noetl_server::startup",
+            event_outbox_enabled = outbox_enabled,
+            "event→outbox producer ensured (CQRS write-path bridge, #103 phase 2a)"
+        );
+    }
     // kind: Subscription (noetl/ai-meta#90 Phase 2) — seed the `subscription`
     // resource kind so a catalog register doesn't trip the
     // `noetl.catalog.kind -> noetl.resource(name)` FK.  Idempotent.

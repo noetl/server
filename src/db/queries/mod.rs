@@ -5,6 +5,7 @@
 pub mod catalog;
 pub mod credential;
 pub mod event;
+pub mod event_outbox;
 pub mod keychain;
 pub mod result_store;
 pub mod secret_audit;
