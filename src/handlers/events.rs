@@ -1913,33 +1913,21 @@ async fn trigger_orchestrator_inner(
         .map(crate::handlers::execute::CommandRouting::from_started_meta)
         .unwrap_or_default();
 
-    // 5. Issue new commands via the shared persist + publish helper.
-    let mut commands_generated = 0i32;
-    for command in &result.commands {
-        let step = playbook.get_step(&command.step_name).ok_or_else(|| {
-            AppError::Internal(format!(
-                "Orchestrator returned command for unknown step '{}'",
-                command.step_name
-            ))
-        })?;
-
-        let render_context: std::collections::HashMap<String, serde_json::Value> =
-            command.context.clone().unwrap_or_default();
-
-        crate::handlers::execute::persist_engine_command(
-            state,
-            execution_id,
-            catalog_id,
-            trigger_event_id,
-            step,
-            command,
-            &render_context,
-            &playbook,
-            &routing,
-        )
-        .await?;
-        commands_generated += 1;
-    }
+    // 5. Issue new commands — batched (noetl/ai-meta#102 step 1).  A cursor
+    //    fan-out's N body commands now persist as two multi-row INSERTs (all
+    //    `command.issued` events, then all `noetl.command` rows) instead of ~2N
+    //    individual round-trips through PgBouncer to Cloud SQL — the write-path
+    //    bottleneck on a small tier.  NATS publishes still loop (in-cluster).
+    let commands_generated = crate::handlers::execute::persist_engine_commands_batch(
+        state,
+        execution_id,
+        catalog_id,
+        trigger_event_id,
+        &result.commands,
+        &playbook,
+        &routing,
+    )
+    .await?;
 
     // 6. Emit terminal playbook event when the orchestrator says so.
     if result.should_complete {

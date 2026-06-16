@@ -832,6 +832,186 @@ pub(crate) async fn persist_engine_command(
     Ok(event_id)
 }
 
+/// Batch variant of [`persist_engine_command`] (noetl/ai-meta#102 step 1).
+///
+/// A cursor fan-out issues one body command per row — on a 50-row frame that's
+/// ~100 individual `INSERT`s (event + command per call) through PgBouncer to a
+/// small Cloud SQL, the write-path bottleneck.  This collapses the whole batch
+/// into **two multi-row `INSERT`s** (all `command.issued` events, then all
+/// `noetl.command` rows) via `QueryBuilder`, then loops the NATS publishes (those
+/// hit in-cluster NATS, not the DB, so they're cheap).  Per-command row content
+/// is identical to the single path — same `command_id` derivation, `cmd_context`,
+/// and `cmd_meta` (iterator / trace / cursor metadata).
+///
+/// Returns the number of commands persisted.
+pub(crate) async fn persist_engine_commands_batch(
+    state: &AppState,
+    execution_id: i64,
+    catalog_id: i64,
+    parent_event_id: i64,
+    commands: &[crate::engine::commands::Command],
+    playbook: &crate::playbook::types::Playbook,
+    routing: &CommandRouting,
+) -> AppResult<i32> {
+    if commands.is_empty() {
+        return Ok(0);
+    }
+
+    // A command whose step is unknown is a hard orchestrator bug (same as the
+    // single path's `ok_or_else`).  Surface it before touching the DB.
+    struct Prepared<'a> {
+        event_id: i64,
+        command_id: String,
+        num_command_id: i64,
+        step_name: &'a str,
+        tool_kind: &'a str,
+        cmd_context: serde_json::Value,
+        cmd_meta: serde_json::Value,
+    }
+
+    let now = chrono::Utc::now();
+    let mut prepared: Vec<Prepared> = Vec::with_capacity(commands.len());
+    for command in commands {
+        let step = playbook.get_step(&command.step_name).ok_or_else(|| {
+            AppError::Internal(format!(
+                "Orchestrator returned command for unknown step '{}'",
+                command.step_name
+            ))
+        })?;
+        let render_context: HashMap<String, serde_json::Value> =
+            command.context.clone().unwrap_or_default();
+
+        let event_id = state.snowflake.generate()?;
+        let command_id = if let Some(iter) = command.iterator.as_ref() {
+            format!("{}:{}:{}:i{}", execution_id, step.step, event_id, iter.index)
+        } else {
+            format!("{}:{}:{}", execution_id, step.step, event_id)
+        };
+
+        let cmd_args = match &step.args {
+            Some(map) => serde_json::to_value(map).unwrap_or_else(|_| serde_json::json!({})),
+            None => serde_json::json!({}),
+        };
+        let cmd_context = serde_json::json!({
+            "tool_config": command.tool.config,
+            "args": cmd_args,
+            "render_context": render_context,
+        });
+
+        let mut cmd_meta = serde_json::json!({
+            "command_id": command_id,
+            "step": step.step,
+            "tool_kind": command.tool.kind,
+            "max_attempts": 3,
+            "attempt": 1,
+            "execution_id": execution_id.to_string(),
+            "catalog_id": catalog_id.to_string(),
+            "actionable": true,
+        });
+        if let Some(iter) = command.iterator.as_ref() {
+            if let serde_json::Value::Object(ref mut map) = cmd_meta {
+                map.insert("iteration_index".to_string(), serde_json::json!(iter.index));
+                map.insert("iteration_total".to_string(), serde_json::json!(iter.total));
+                map.insert(
+                    "iterator_step".to_string(),
+                    serde_json::json!(iter.iterator_step.clone()),
+                );
+                map.insert("item_var".to_string(), serde_json::json!(iter.item_var.clone()));
+            }
+        }
+        if let Some(trace) = routing.trace.as_ref() {
+            if let serde_json::Value::Object(ref mut map) = cmd_meta {
+                map.insert("trace".to_string(), trace.clone());
+            }
+        }
+        if let Some(serde_json::Value::Object(extra)) = command.metadata.as_ref() {
+            if let serde_json::Value::Object(ref mut map) = cmd_meta {
+                for (k, v) in extra {
+                    map.insert(k.clone(), v.clone());
+                }
+            }
+        }
+
+        prepared.push(Prepared {
+            event_id,
+            command_id,
+            num_command_id: state.snowflake.generate()?,
+            step_name: step.step.as_str(),
+            tool_kind: command.tool.kind.as_str(),
+            cmd_context,
+            cmd_meta,
+        });
+    }
+
+    let pool = state.pools.pool_for(execution_id);
+
+    // Multi-row INSERT of all `command.issued` events.
+    let mut qb = sqlx::QueryBuilder::new(
+        "INSERT INTO noetl.event (event_id, execution_id, catalog_id, event_type, \
+         node_id, node_name, node_type, status, context, meta, parent_event_id, created_at) ",
+    );
+    qb.push_values(prepared.iter(), |mut b, p| {
+        b.push_bind(p.event_id)
+            .push_bind(execution_id)
+            .push_bind(catalog_id)
+            .push_bind("command.issued")
+            .push_bind(p.step_name)
+            .push_bind(p.step_name)
+            .push_bind(p.tool_kind)
+            .push_bind("PENDING")
+            .push_bind(&p.cmd_context)
+            .push_bind(&p.cmd_meta)
+            .push_bind(parent_event_id)
+            .push_bind(now);
+    });
+    qb.build().execute(pool).await?;
+
+    // Multi-row INSERT of all `noetl.command` rows (non-fatal — the event log is
+    // the source of truth; mirror the single path's warn-on-failure).
+    let mut cqb = sqlx::QueryBuilder::new(
+        "INSERT INTO noetl.command (command_id, event_id, execution_id, catalog_id, \
+         step_name, tool_kind, status, attempt, context, meta, latest_event_id) ",
+    );
+    cqb.push_values(prepared.iter(), |mut b, p| {
+        b.push_bind(p.num_command_id)
+            .push_bind(p.event_id)
+            .push_bind(execution_id)
+            .push_bind(catalog_id)
+            .push_bind(p.step_name)
+            .push_bind(p.tool_kind)
+            .push_bind("PENDING")
+            .push_bind(1_i32)
+            .push_bind(&p.cmd_context)
+            .push_bind(&p.cmd_meta)
+            .push_bind(parent_event_id);
+    });
+    if let Err(e) = cqb.build().execute(pool).await {
+        tracing::warn!(
+            error = %e,
+            execution_id,
+            count = prepared.len(),
+            "Batch noetl.command insert failed (non-fatal — event log is source of truth)"
+        );
+    }
+
+    // Publish NATS notifications (in-cluster, cheap; loop is fine).
+    for p in &prepared {
+        publish_command_notification(
+            state,
+            execution_id,
+            p.event_id,
+            &p.command_id,
+            p.step_name,
+            p.tool_kind,
+            playbook,
+            routing,
+        )
+        .await?;
+    }
+
+    Ok(prepared.len() as i32)
+}
+
 /// Generate initial commands for the start step.
 ///
 /// If the start step declares a `loop:` block, this function fans out
