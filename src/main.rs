@@ -676,6 +676,12 @@ async fn main() -> anyhow::Result<()> {
     // ids take a clone of `state.snowflake` (an `Arc`).
     let state = AppState::new(db_pool.clone(), pools, app_config.clone(), nats_client);
 
+    // Background reconcile poller (noetl/ai-meta#101 block b): periodically
+    // force-advances any cached execution that got stuck on a missed
+    // non-triggering straggler, so the orchestrator never permanently stalls
+    // under DB backpressure (e.g. a small Cloud SQL tier behind PgBouncer).
+    handlers::events::spawn_orchestrator_reconciler(state.clone());
+
     // Create services. The wallet's envelope cipher is built once over the
     // configured KEK provider (NOETL_KMS_PROVIDER: `local` default, or
     // `gcp-kms` over Cloud KMS — noetl/ai-meta#61 Phase 2) and shared between

@@ -10,6 +10,7 @@ pub mod execution;
 pub mod internal;
 pub mod keychain;
 pub mod keychain_refresh;
+pub mod orch_snapshot;
 pub mod replay;
 pub mod result_store;
 pub mod runtime;

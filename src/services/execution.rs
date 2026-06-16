@@ -353,8 +353,19 @@ impl ExecutionService {
                 .fetch_optional(self.pools.cluster())
                 .await?;
 
-        // Get all events for this execution
-        let event_rows: Vec<(
+        // Get the most recent events for this execution.
+        //
+        // Loading the WHOLE log was an O(events) memory bomb: a high-volume run
+        // (e.g. a 10×1000 cursor flow at ~200k events) blew past the server's
+        // memory limit and OOM-killed it whenever this endpoint was hit.  The
+        // response only needs the recent tail: `determine_status` scans from the
+        // newest event backward for a terminal / FAILED marker (which is always
+        // recent), and `completed_at` reads the terminal event's time.  So cap
+        // the load to the most recent rows — ordered DESC for the LIMIT, then
+        // reversed back to ASC for the response.  A future paginated
+        // `/api/executions/{id}/events` endpoint can serve the full history.
+        const MAX_EVENTS_RETURNED: i64 = 2000;
+        let mut event_rows: Vec<(
             i64,
             String,
             Option<String>,
@@ -374,12 +385,16 @@ impl ExecutionService {
                     error
                 FROM noetl.event
                 WHERE execution_id = $1
-                ORDER BY created_at ASC
+                ORDER BY created_at DESC
+                LIMIT $2
                 "#,
         )
         .bind(execution_id)
+        .bind(MAX_EVENTS_RETURNED)
         .fetch_all(self.pool_for(execution_id))
         .await?;
+        // Restore chronological (ASC) order for the response.
+        event_rows.reverse();
 
         let events: Vec<ExecutionEvent> = event_rows
             .into_iter()
