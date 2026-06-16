@@ -20,20 +20,27 @@
 //!
 //! ## Cursor + ordering
 //!
-//! The cursor is the `noetl.event.id` (BIGSERIAL insert order), persisted in
-//! `noetl.stream_cursor`.  Each poll reads `WHERE id > cursor ORDER BY id ASC
-//! LIMIT batch` and advances the cursor to the max id published.  A row that
-//! commits out of `id` order (a transaction that drew a low `id` but committed
-//! late) could in principle sit just behind the cursor; the projector mirrors
-//! block-b's straggler handling and the stream dedup makes a periodic
-//! re-scan safe, so no event is permanently skipped.  During dual-write
-//! `noetl.event` remains the source of truth, so any stream gap is recoverable.
+//! `noetl.event` has no monotonic insert-order column — its PK is
+//! `(execution_id, event_id)` and it is `PARTITION BY RANGE (execution_id)`.
+//! The cursor is therefore the globally-unique snowflake `event_id`, persisted
+//! in `noetl.stream_cursor`.  Each poll reads `WHERE event_id > cursor ORDER BY
+//! event_id ASC LIMIT batch` and advances to the max `event_id` published.
+//!
+//! Snowflake ids from different worker machines in the same millisecond
+//! interleave, so a below-watermark `event_id` could be inserted late and sit
+//! just behind the cursor (the same straggler shape block-b handles).  That does
+//! NOT corrupt the projection: the `/projection/advance` endpoint recomputes
+//! each snapshot from `noetl.event` via `rebuild_state`, whose `created_at`
+//! margin re-reads the straggler — the stream is only a *"this execution
+//! changed"* trigger, not the projection's source of truth during dual-write.
+//! Each event is published with `Nats-Msg-Id = event_id`, so a re-scan after a
+//! restart is collapsed by the stream's dedup window.
 //!
 //! ## Default off
 //!
 //! Gated by `NOETL_EVENT_STREAM_ENABLED` (default off): landing 2a publishes
-//! nothing until ops opts in.  First enable starts the cursor at `MAX(id)` (tail
-//! from now, no history replay) unless `NOETL_EVENT_STREAM_BACKFILL=true`.
+//! nothing until ops opts in.  First enable starts the cursor at `MAX(event_id)`
+//! (tail from now, no history replay) unless `NOETL_EVENT_STREAM_BACKFILL=true`.
 
 use std::time::Duration;
 
@@ -129,7 +136,7 @@ async fn load_or_init_cursor(pool: &DbPool, backfill: bool) -> AppResult<i64> {
     let start: i64 = if backfill {
         0
     } else {
-        sqlx::query_as::<_, (Option<i64>,)>("SELECT MAX(id) FROM noetl.event")
+        sqlx::query_as::<_, (Option<i64>,)>("SELECT MAX(event_id) FROM noetl.event")
             .fetch_one(pool)
             .await?
             .0
@@ -155,12 +162,12 @@ async fn save_cursor(pool: &DbPool, position: i64) -> AppResult<()> {
     Ok(())
 }
 
-/// One row of the tail read.
+/// One row of the tail read — the full event JSON published to the stream.
 #[derive(sqlx::FromRow)]
 struct TailRow {
-    id: i64,
     event_id: i64,
     event_type: String,
+    payload: serde_json::Value,
 }
 
 /// Spawn the tailer if enabled and NATS is connected.  No-op (with a log) when
@@ -241,10 +248,10 @@ async fn publish_batch(
 ) -> AppResult<Option<i64>> {
     let rows: Vec<TailRow> = sqlx::query_as(
         r#"
-        SELECT id, event_id, event_type
-        FROM noetl.event
-        WHERE id > $1
-        ORDER BY id ASC
+        SELECT event_id, COALESCE(event_type, 'unknown') AS event_type, to_jsonb(e) AS payload
+        FROM noetl.event e
+        WHERE event_id > $1
+        ORDER BY event_id ASC
         LIMIT $2
         "#,
     )
@@ -259,24 +266,15 @@ async fn publish_batch(
 
     let mut max_id = cursor;
     for row in &rows {
-        // Fetch the full event JSON for the payload.  (The id-only tail above
-        // keeps the hot scan narrow; the payload load is per-published-event.)
-        let payload: Option<(serde_json::Value,)> = sqlx::query_as(
-            "SELECT to_jsonb(e) FROM noetl.event e WHERE id = $1",
-        )
-        .bind(row.id)
-        .fetch_optional(pool)
-        .await?;
-        let Some((json,)) = payload else { continue };
-        let bytes = serde_json::to_vec(&json).map_err(|e| {
+        let bytes = serde_json::to_vec(&row.payload).map_err(|e| {
             crate::error::AppError::Internal(format!("event payload encode: {e}"))
         })?;
         publisher
             .publish_event(row.event_id, &row.event_type, &bytes)
             .await
             .map_err(|e| crate::error::AppError::Internal(format!("event publish: {e}")))?;
-        crate::metrics::record_event_stream_published(&row.event_type, 1, row.id);
-        max_id = max_id.max(row.id);
+        crate::metrics::record_event_stream_published(&row.event_type, 1, row.event_id);
+        max_id = max_id.max(row.event_id);
     }
 
     Ok(Some(max_id))
