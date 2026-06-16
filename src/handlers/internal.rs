@@ -25,6 +25,7 @@ use tracing::{debug, info, warn};
 use crate::db::DbPool;
 use crate::error::AppResult;
 use crate::services::internal as svc;
+use crate::state::AppState;
 
 const TOKEN_ENV: &str = "NOETL_INTERNAL_API_TOKEN";
 
@@ -187,6 +188,27 @@ pub struct EventsProjectResponse {
     pub duplicates: i64,
 }
 
+/// Request for `POST /api/internal/projection/advance` (noetl/ai-meta#103
+/// phase 2b).  The `system/projector` playbook extracts the distinct
+/// `execution_id`s from a `noetl_events` stream batch and posts them here; the
+/// server recomputes + saves each one's `projection_snapshot`.
+#[derive(Debug, Deserialize)]
+pub struct ProjectionAdvanceRequest {
+    pub execution_ids: Vec<i64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ProjectionAdvanceResponse {
+    pub advanced: Vec<crate::handlers::events::SnapshotAdvance>,
+    pub failed: Vec<ProjectionAdvanceFailure>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ProjectionAdvanceFailure {
+    pub execution_id: i64,
+    pub error: String,
+}
+
 // ===========================================================================
 // Route handlers
 // ===========================================================================
@@ -291,6 +313,50 @@ pub async fn events_project(
         projected,
         duplicates,
     }))
+}
+
+/// `POST /api/internal/projection/advance`
+///
+/// CQRS read-model write (noetl/ai-meta#103 phase 2b).  For each (deduped)
+/// `execution_id` the `system/projector` playbook extracted from a
+/// `noetl_events` stream batch, recompute + save `projection_snapshot` via the
+/// orchestrator's bounded-rebuild machinery (no command dispatch).  Idempotent
+/// (monotonic snapshot upsert), so a redelivered batch is a forward no-op.  A
+/// per-execution failure is reported in `failed` without aborting the batch, so
+/// one bad execution can't block the projector's progress on the rest.
+pub async fn projection_advance(
+    State(state): State<AppState>,
+    _token: RequireInternalApiToken,
+    Json(request): Json<ProjectionAdvanceRequest>,
+) -> AppResult<Json<ProjectionAdvanceResponse>> {
+    let mut seen = std::collections::HashSet::new();
+    let mut advanced = Vec::new();
+    let mut failed = Vec::new();
+    for execution_id in request
+        .execution_ids
+        .into_iter()
+        .filter(|e| seen.insert(*e))
+    {
+        match crate::handlers::events::advance_snapshot(&state, execution_id).await {
+            Ok(a) => {
+                crate::metrics::record_projection_advanced(a.version);
+                advanced.push(a);
+            }
+            Err(e) => {
+                warn!(execution_id, %e, "projection/advance: execution failed");
+                failed.push(ProjectionAdvanceFailure {
+                    execution_id,
+                    error: e.to_string(),
+                });
+            }
+        }
+    }
+    info!(
+        advanced = advanced.len(),
+        failed = failed.len(),
+        "projection/advance done"
+    );
+    Ok(Json(ProjectionAdvanceResponse { advanced, failed }))
 }
 
 /// `POST /api/internal/cleanup/purge`
