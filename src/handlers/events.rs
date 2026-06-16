@@ -1320,6 +1320,7 @@ fn event_status_from_name(event_name: &str) -> &'static str {
 async fn hydrate_result_references(
     events: &mut [crate::db::models::Event],
     result_store: &crate::services::result_store::ResultStoreService,
+    keep_refs: bool,
 ) {
     use crate::services::result_store::parse_noetl_ref;
 
@@ -1331,6 +1332,7 @@ async fn hydrate_result_references(
     }
 
     let mut hydrated = 0usize;
+    let mut kept = 0usize;
     for ev in events.iter_mut() {
         let Some(result) = ev.result.as_mut() else {
             continue;
@@ -1346,6 +1348,45 @@ async fn hydrate_result_references(
         } else {
             continue;
         };
+
+        // References-in-state (noetl/ai-meta#101 phase 2): when gated on AND the
+        // reference carries an `extracted` predicate block (phase 1), keep the
+        // reference and surface `extracted` as the readable `context.data` —
+        // instead of resolving the full payload inline.  `extract_user_data`
+        // then reads `extracted` for `when:`/`set:` evaluation; the reference
+        // block stays on the event so `build_context` carries it and the worker
+        // resolves the bulk payload at render time.  No `extracted` (pre-phase-1
+        // refs) falls through to the resolve path below for back-compat.
+        if keep_refs {
+            let extracted = match shape {
+                Shape::Nested => result
+                    .pointer("/context/result/reference/extracted")
+                    .cloned(),
+                Shape::TopLevel => result.pointer("/reference/extracted").cloned(),
+            };
+            if let Some(extracted) = extracted {
+                let data = serde_json::json!({ "data": extracted });
+                match shape {
+                    Shape::Nested => {
+                        if let Some(inner) = result
+                            .get_mut("context")
+                            .and_then(|c| c.get_mut("result"))
+                            .and_then(|r| r.as_object_mut())
+                        {
+                            inner.insert("context".to_string(), data);
+                            kept += 1;
+                        }
+                    }
+                    Shape::TopLevel => {
+                        if let Some(obj) = result.as_object_mut() {
+                            obj.insert("context".to_string(), data);
+                            kept += 1;
+                        }
+                    }
+                }
+                continue; // keep the reference; do not resolve
+            }
+        }
 
         let parsed = match parse_noetl_ref(&ref_uri) {
             Ok(p) => p,
@@ -1389,8 +1430,11 @@ async fn hydrate_result_references(
             }
         }
     }
-    if hydrated > 0 {
-        debug!(hydrated, "hydrate_result_references: resolved over-budget result references");
+    if hydrated > 0 || kept > 0 {
+        debug!(
+            hydrated,
+            kept, "hydrate_result_references: resolved / kept-by-reference over-budget results"
+        );
     }
 }
 
@@ -1469,6 +1513,7 @@ async fn rebuild_state(
     pool: &crate::db::DbPool,
     result_store: &crate::services::result_store::ResultStoreService,
     execution_id: i64,
+    keep_refs: bool,
 ) -> AppResult<RebuildResult> {
     use crate::services::orch_snapshot;
     match orch_snapshot::load_latest(pool, execution_id).await? {
@@ -1488,7 +1533,7 @@ async fn rebuild_state(
                 .fetch_all(pool)
                 .await?,
             );
-            hydrate_result_references(&mut events_since, result_store).await;
+            hydrate_result_references(&mut events_since, result_store, keep_refs).await;
             let mut ws = snap.state;
             for e in &events_since {
                 ws.apply_event(e);
@@ -1516,7 +1561,7 @@ async fn rebuild_state(
                 .fetch_all(pool)
                 .await?,
             );
-            hydrate_result_references(&mut all_events, result_store).await;
+            hydrate_result_references(&mut all_events, result_store, keep_refs).await;
             let state = crate::engine::state::WorkflowState::from_events(&all_events)
                 .ok_or_else(|| AppError::Validation("No events found for execution".to_string()))?;
             let last_event_id = all_events.last().map(|e| e.event_id).unwrap_or(0);
@@ -1657,7 +1702,7 @@ async fn trigger_orchestrator_inner(
     // the full (still-small) early log when no snapshot exists yet.
     let mut did_rebuild = false;
     if cache.state.is_none() {
-        let r = rebuild_state(pool, &result_store, execution_id).await?;
+        let r = rebuild_state(pool, &result_store, execution_id, state.config.refs_in_state).await?;
         cache.state = Some(r.state);
         cache.last_event_id = r.last_event_id;
         cache.applied_count = total.unwrap_or(0);
@@ -1684,7 +1729,7 @@ async fn trigger_orchestrator_inner(
             .fetch_all(pool)
             .await?,
         );
-        hydrate_result_references(&mut strag, &result_store).await;
+        hydrate_result_references(&mut strag, &result_store, state.config.refs_in_state).await;
         if let Some(ws) = cache.state.as_mut() {
             for e in &strag {
                 ws.apply_event(e);
@@ -1710,7 +1755,7 @@ async fn trigger_orchestrator_inner(
         .fetch_all(pool)
         .await?,
     );
-    hydrate_result_references(&mut new_events, &result_store).await;
+    hydrate_result_references(&mut new_events, &result_store, state.config.refs_in_state).await;
 
     // Trigger type + drain timestamp.  The trigger event is normally among the
     // new events; after a cold rebuild / straggler apply that already folded it
@@ -1733,7 +1778,7 @@ async fn trigger_orchestrator_inner(
     // incremental apply.
     let mismatch = matches!(total, Some(t) if cache.applied_count + new_events.len() as i64 != t);
     if mismatch {
-        let r = rebuild_state(pool, &result_store, execution_id).await?;
+        let r = rebuild_state(pool, &result_store, execution_id, state.config.refs_in_state).await?;
         cache.state = Some(r.state);
         cache.last_event_id = r.last_event_id;
         cache.applied_count = total.unwrap_or(cache.applied_count);
