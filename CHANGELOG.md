@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.9.0](https://github.com/noetl/server/compare/v3.8.0...v3.9.0) (2026-06-16)
+
+### Features
+
+* **orchestrator:** bounded-memory state + results-by-reference + stall-proof reconcile ([#101](https://github.com/noetl/server/issues/101)) ([#197](https://github.com/noetl/server/issues/197)) ([ee77092](https://github.com/noetl/server/commit/ee77092c090fa18d5b36c54c068880244e6677b0))
+
 ## [3.8.0](https://github.com/noetl/server/compare/v3.7.1...v3.8.0) (2026-06-15)
 
 ### Features
