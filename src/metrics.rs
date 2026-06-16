@@ -204,6 +204,34 @@ pub fn record_event_stream_published(event_type: &str, count: u64, cursor: i64) 
     event_stream_cursor().set(cursor);
 }
 
+/// Counter: events the tailer SKIPPED (payload over NATS max), by type.  A
+/// non-zero rate means oversized events aren't reaching the stream — visible
+/// rather than silently wedging the cursor (noetl/ai-meta#103).
+pub fn event_stream_skipped_total() -> &'static IntCounterVec {
+    static M: OnceLock<IntCounterVec> = OnceLock::new();
+    M.get_or_init(|| {
+        let counter = IntCounterVec::new(
+            Opts::new(
+                "noetl_event_stream_skipped_total",
+                "Events the CQRS write-path tailer skipped because the payload exceeded the NATS max, by event type.",
+            ),
+            &["event_type"],
+        )
+        .expect("static counter spec must be valid");
+        registry()
+            .register(Box::new(counter.clone()))
+            .expect("counter registration must succeed");
+        counter
+    })
+}
+
+/// Record one event skipped by the tailer (oversized payload).
+pub fn record_event_stream_skipped(event_type: &str) {
+    event_stream_skipped_total()
+        .with_label_values(&[event_type])
+        .inc();
+}
+
 /// Counter: executions whose `projection_snapshot` was advanced by the
 /// `system/projector` playbook via `/api/internal/projection/advance`
 /// (noetl/ai-meta#103 phase 2b).  No labels — one global rate.

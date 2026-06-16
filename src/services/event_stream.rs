@@ -269,6 +269,27 @@ async fn publish_batch(
         let bytes = serde_json::to_vec(&row.payload).map_err(|e| {
             crate::error::AppError::Internal(format!("event payload encode: {e}"))
         })?;
+        // NATS rejects messages over its `max_payload` (1MB default) with a hard
+        // "Maximum Payload Violation" — a permanent error that would wedge the
+        // cursor forever if we failed the batch on it.  Pre-skip oversized events
+        // (advance past them) so one fat event can't stop the whole write path.
+        // During dual-write `noetl.event` is the source of truth, so a skipped
+        // stream event is recoverable (the projector advances off `noetl.event`).
+        // The 2d-3 cutover — where the stream becomes the source — needs real
+        // handling (chunk or publish-by-reference); tracked on noetl/ai-meta#103.
+        if bytes.len() > MAX_EVENT_PAYLOAD_BYTES {
+            tracing::warn!(
+                event_id = row.event_id,
+                event_type = %row.event_type,
+                bytes = bytes.len(),
+                "event-stream tailer: payload over max; skipping (recoverable from noetl.event during dual-write)"
+            );
+            crate::metrics::record_event_stream_skipped(&row.event_type);
+            max_id = max_id.max(row.event_id);
+            continue;
+        }
+        // Transient publish errors (timeouts, reconnects) still fail the batch so
+        // the caller backs off and retries — no event silently lost on a blip.
         publisher
             .publish_event(row.event_id, &row.event_type, &bytes)
             .await
@@ -279,6 +300,10 @@ async fn publish_batch(
 
     Ok(Some(max_id))
 }
+
+/// Skip events whose JSON payload exceeds this — below NATS's 1MB default
+/// `max_payload` with headroom for the subject + headers.
+const MAX_EVENT_PAYLOAD_BYTES: usize = 900 * 1024;
 
 #[cfg(test)]
 mod tests {
