@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.10.0](https://github.com/noetl/server/compare/v3.9.0...v3.10.0) (2026-06-16)
+
+### Features
+
+* **orchestrator:** batch cursor-fanout command dispatch (multi-row INSERT) ([#198](https://github.com/noetl/server/issues/198)) ([5a1f7c6](https://github.com/noetl/server/commit/5a1f7c6f36f77d7a233039c74263c6489efb9c83)), closes [noetl/ai-meta#102](https://github.com/noetl/ai-meta/issues/102) [noetl/ai-meta#102](https://github.com/noetl/ai-meta/issues/102)
+
 ## [3.9.0](https://github.com/noetl/server/compare/v3.8.0...v3.9.0) (2026-06-16)
 
 ### Features
