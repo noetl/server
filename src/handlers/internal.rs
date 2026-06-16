@@ -209,6 +209,15 @@ pub struct ProjectionAdvanceFailure {
     pub error: String,
 }
 
+#[derive(Debug, Serialize)]
+pub struct EventsMaterializeResponse {
+    /// Rows actually inserted into `noetl.event` this batch.
+    pub materialized: i64,
+    /// Rows that collided with an existing `(execution_id, event_id)` (already
+    /// materialized — the idempotent re-delivery path).
+    pub duplicates: i64,
+}
+
 // ===========================================================================
 // Route handlers
 // ===========================================================================
@@ -357,6 +366,71 @@ pub async fn projection_advance(
         "projection/advance done"
     );
     Ok(Json(ProjectionAdvanceResponse { advanced, failed }))
+}
+
+/// `POST /api/internal/events/materialize`
+///
+/// CQRS write-path cutover (noetl/ai-meta#103 phase 2d).  Materializes
+/// `noetl.event` rows from a batch of **native producer events** (the worker's
+/// `ExecutorEvent` shape, which deserializes into `EventRequest`).  Each event
+/// is normalized via the **same** `normalize_event_to_row` the synchronous
+/// `POST /api/events` path applies — deriving `status`, building the `result`
+/// envelope, sanitizing `meta`, resolving `catalog_id` — then batch-inserted
+/// idempotently (`ON CONFLICT DO NOTHING` on the `(execution_id, event_id)` PK).
+/// So the materialized log is byte-identical to the synchronous path.
+///
+/// Differs from `events_project` (inserts already-row-shaped envelopes, e.g. the
+/// tailer's `to_jsonb` rows) by **normalizing native shapes**; differs from the
+/// synchronous ingest by **not triggering the orchestrator** — the materializer
+/// only writes the durable log (the orchestrator advances off the stream).
+pub async fn events_materialize(
+    State(state): State<AppState>,
+    _token: RequireInternalApiToken,
+    Json(requests): Json<Vec<crate::handlers::events::EventRequest>>,
+) -> AppResult<Json<EventsMaterializeResponse>> {
+    if requests.is_empty() {
+        return Ok(Json(EventsMaterializeResponse {
+            materialized: 0,
+            duplicates: 0,
+        }));
+    }
+    let total = requests.len() as i64;
+
+    // Normalize each native event into the noetl.event row shape.
+    let mut rows = Vec::with_capacity(requests.len());
+    for req in &requests {
+        rows.push(crate::handlers::events::normalize_event_to_row(&state, req).await?);
+    }
+
+    // Idempotent batch insert.  Single pool (state.db) mirrors `events_project`;
+    // sharding would group by `pool_for(execution_id)` — a shared follow-up with
+    // that endpoint, out of scope here.
+    let mut qb = sqlx::QueryBuilder::new(
+        "INSERT INTO noetl.event (event_id, execution_id, catalog_id, event_type, \
+         node_id, node_name, status, result, meta, created_at) ",
+    );
+    qb.push_values(rows.iter(), |mut b, r| {
+        b.push_bind(r.event_id)
+            .push_bind(r.execution_id)
+            .push_bind(r.catalog_id)
+            .push_bind(&r.event_type)
+            .push_bind(&r.node_name)
+            .push_bind(&r.node_name)
+            .push_bind(&r.status)
+            .push_bind(&r.result)
+            .push_bind(&r.meta)
+            .push_bind(r.created_at);
+    });
+    qb.push(" ON CONFLICT DO NOTHING");
+    let result = qb.build().execute(&state.db).await?;
+    let materialized = result.rows_affected() as i64;
+    let duplicates = (total - materialized).max(0);
+    crate::metrics::record_events_materialized(materialized as u64);
+    info!(materialized, duplicates, "events/materialize done");
+    Ok(Json(EventsMaterializeResponse {
+        materialized,
+        duplicates,
+    }))
 }
 
 /// `POST /api/internal/cleanup/purge`

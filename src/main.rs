@@ -194,6 +194,12 @@ fn build_router(
             "/api/internal/projection/advance",
             post(handlers::internal::projection_advance),
         )
+        // CQRS write-path cutover (#103 phase 2d): materialize noetl.event from
+        // native producer events (normalized via the shared ingest path).
+        .route(
+            "/api/internal/events/materialize",
+            post(handlers::internal::events_materialize),
+        )
         .with_state(state.clone());
 
     // Keychain routes
