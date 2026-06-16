@@ -204,6 +204,29 @@ pub fn record_event_stream_published(event_type: &str, count: u64, cursor: i64) 
     event_stream_cursor().set(cursor);
 }
 
+/// Counter: executions whose `projection_snapshot` was advanced by the
+/// `system/projector` playbook via `/api/internal/projection/advance`
+/// (noetl/ai-meta#103 phase 2b).  No labels — one global rate.
+pub fn projection_advanced_total() -> &'static prometheus::IntCounter {
+    static M: OnceLock<prometheus::IntCounter> = OnceLock::new();
+    M.get_or_init(|| {
+        let counter = prometheus::IntCounter::new(
+            "noetl_projection_advanced_total",
+            "Executions whose projection_snapshot was advanced by the system/projector playbook.",
+        )
+        .expect("static counter spec must be valid");
+        registry()
+            .register(Box::new(counter.clone()))
+            .expect("counter registration must succeed");
+        counter
+    })
+}
+
+/// Record one execution's projection advance.
+pub fn record_projection_advanced(_version: i64) {
+    projection_advanced_total().inc();
+}
+
 // ---------------------------------------------------------------------------
 // Round 2 — generic write-endpoint surface
 // ---------------------------------------------------------------------------

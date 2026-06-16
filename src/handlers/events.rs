@@ -1534,6 +1534,59 @@ async fn rebuild_state(
     }
 }
 
+/// Outcome of advancing one execution's projection snapshot.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SnapshotAdvance {
+    pub execution_id: i64,
+    /// Snapshot version after the advance (the highest `event_id` folded).
+    pub version: i64,
+    /// Events folded into the saved snapshot (the execution's event count).
+    pub events: i64,
+}
+
+/// Advance one execution's `projection_snapshot` from the event log — the
+/// CQRS read-model write the `system/projector` playbook drives
+/// (noetl/ai-meta#103 phase 2b) via `POST /api/internal/projection/advance`.
+///
+/// This is the orchestrator's snapshot-write half **without** command dispatch:
+/// load the latest snapshot + apply events-since (the bounded [`rebuild_state`]
+/// path) and re-save it.  Reuses the block-b machinery verbatim, so the snapshot
+/// the projector writes is byte-for-byte what the orchestrator would have written
+/// itself — the orchestrator just stops doing so when
+/// `projector_owns_snapshot` is set, and reads this instead.
+///
+/// Idempotent: [`orch_snapshot::save`] is a monotonic upsert, so re-advancing
+/// an execution (a redelivered stream batch) is a no-op or a forward move.
+pub(crate) async fn advance_snapshot(
+    state: &AppState,
+    execution_id: i64,
+) -> AppResult<SnapshotAdvance> {
+    let pool = state.pools.pool_for(execution_id);
+    let result_store = crate::services::result_store::ResultStoreService::new(
+        pool.clone(),
+        state.snowflake.clone(),
+    );
+    let r = rebuild_state(pool, &result_store, execution_id).await?;
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM noetl.event WHERE execution_id = $1")
+        .bind(execution_id)
+        .fetch_one(pool)
+        .await?;
+    crate::services::orch_snapshot::save(
+        pool,
+        execution_id,
+        r.last_event_id,
+        count,
+        r.routing_meta.as_ref(),
+        &r.state,
+    )
+    .await?;
+    Ok(SnapshotAdvance {
+        execution_id,
+        version: r.last_event_id,
+        events: count,
+    })
+}
+
 async fn trigger_orchestrator(
     state: &AppState,
     execution_id: i64,
@@ -1763,8 +1816,16 @@ async fn trigger_orchestrator_inner(
     // gated on a *fresh* `total` confirming the state is fully consistent (no
     // outstanding straggler) — so the snapshot is a clean base for rebuilds.
     // Best-effort: a snapshot failure must not fail the trigger.
+    //
+    // CQRS read-model ownership (noetl/ai-meta#103 phase 2b): when
+    // `projector_owns_snapshot` is set, the system/projector playbook folds the
+    // `noetl_events` stream and advances `projection_snapshot` (via
+    // `/api/internal/projection/advance`), so the orchestrator stops self-writing
+    // it here and only reads it.  Default off → the orchestrator self-writes
+    // exactly as block-b does.
     const SNAPSHOT_INTERVAL_EVENTS: i64 = 500;
-    if total == Some(cache.applied_count)
+    if !state.config.projector_owns_snapshot
+        && total == Some(cache.applied_count)
         && cache.last_event_id - cache.snapshot_version >= SNAPSHOT_INTERVAL_EVENTS
     {
         let version = cache.last_event_id;

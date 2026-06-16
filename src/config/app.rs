@@ -43,6 +43,18 @@ pub struct AppConfig {
     #[serde(default)]
     pub disable_metrics: bool,
 
+    /// CQRS read-model ownership (noetl/ai-meta#103 phase 2b).  When true, the
+    /// `system/projector` playbook owns `noetl.projection_snapshot` (it folds
+    /// the `noetl_events` stream and advances the snapshot via
+    /// `POST /api/internal/projection/advance`), so the orchestrator **stops
+    /// self-writing** the snapshot in `trigger_orchestrator` and only reads it.
+    /// Envy maps `NOETL_PROJECTOR_OWNS_SNAPSHOT`.  **Default false** — the
+    /// orchestrator self-writes exactly as block-b does today; flip on only once
+    /// the projector is confirmed running, or the snapshot stops advancing and
+    /// rebuild cost grows.
+    #[serde(default)]
+    pub projector_owns_snapshot: bool,
+
     /// Auto recreate runtime if missing
     #[serde(default = "default_true")]
     pub auto_recreate_runtime: bool,
@@ -153,6 +165,7 @@ impl Default for AppConfig {
             nats_url: None,
             enable_gcp_token_api: true,
             disable_metrics: false,
+            projector_owns_snapshot: false,
             auto_recreate_runtime: true,
             runtime_sweep_interval: default_sweep_interval(),
             runtime_offline_seconds: default_offline_seconds(),
