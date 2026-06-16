@@ -6,6 +6,7 @@
 pub mod catalog;
 pub mod credential;
 pub mod event;
+pub mod event_stream;
 pub mod execution;
 pub mod internal;
 pub mod keychain;

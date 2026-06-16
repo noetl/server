@@ -682,6 +682,16 @@ async fn main() -> anyhow::Result<()> {
     // under DB backpressure (e.g. a small Cloud SQL tier behind PgBouncer).
     handlers::events::spawn_orchestrator_reconciler(state.clone());
 
+    // CQRS write-path producer (noetl/ai-meta#103 phase 2a): a background tailer
+    // that batch-publishes committed `noetl.event` rows onto the `noetl_events`
+    // JetStream stream for the system/projector playbook to fold.  Default OFF
+    // (`NOETL_EVENT_STREAM_ENABLED` unset) so landing 2a publishes nothing until
+    // ops opts the cluster into the CQRS write path; no-op without NATS.
+    noetl_server::services::event_stream::spawn_event_stream_tailer(
+        state.clone(),
+        noetl_server::services::event_stream::EventStreamConfig::from_env(),
+    );
+
     // Create services. The wallet's envelope cipher is built once over the
     // configured KEK provider (NOETL_KMS_PROVIDER: `local` default, or
     // `gcp-kms` over Cloud KMS — noetl/ai-meta#61 Phase 2) and shared between
