@@ -45,6 +45,12 @@ pub const EVENT_SUBJECT_PREFIX: &str = "noetl.events";
 /// Wildcard the stream binds.
 pub const EVENT_SUBJECT_WILDCARD: &str = "noetl.events.>";
 
+/// Durable pull consumer the `system/projector` playbook drains
+/// (noetl/ai-meta#103 phase 2b).  `js_consume` / `tool: subscription` require
+/// the consumer to pre-exist; the server creates it alongside the stream so the
+/// playbook stays a pure consumer.
+pub const PROJECTOR_CONSUMER: &str = "noetl_projector";
+
 /// Publishes full events onto the `noetl_events` JetStream stream.
 #[derive(Clone)]
 pub struct EventStreamPublisher {
@@ -65,7 +71,34 @@ impl EventStreamPublisher {
     ) -> Result<Self, NatsError> {
         let js = jetstream::new((*client).clone());
         Self::ensure_stream(&js, dedup_window, max_age).await?;
+        Self::ensure_projector_consumer(&js).await?;
         Ok(Self { js })
+    }
+
+    /// Ensure the durable `noetl_projector` pull consumer exists on the stream.
+    /// Idempotent: `create_consumer` with a stable durable name + config is a
+    /// no-op when it already exists.  Explicit-ack so the projector controls
+    /// when a batch is acked (the `tool: subscription` poll acks on success).
+    async fn ensure_projector_consumer(js: &Context) -> Result<(), NatsError> {
+        let stream = js
+            .get_stream(EVENT_STREAM)
+            .await
+            .map_err(|e| NatsError::JetStream(e.to_string()))?;
+        stream
+            .create_consumer(jetstream::consumer::pull::Config {
+                durable_name: Some(PROJECTOR_CONSUMER.to_string()),
+                filter_subject: EVENT_SUBJECT_WILDCARD.to_string(),
+                ack_policy: jetstream::consumer::AckPolicy::Explicit,
+                ..Default::default()
+            })
+            .await
+            .map_err(|e| NatsError::JetStream(e.to_string()))?;
+        tracing::debug!(
+            stream = EVENT_STREAM,
+            consumer = PROJECTOR_CONSUMER,
+            "ensured projector pull consumer"
+        );
+        Ok(())
     }
 
     /// Ensure the `noetl_events` stream exists with the dedup window + retention
