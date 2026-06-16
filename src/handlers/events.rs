@@ -486,6 +486,92 @@ pub async fn handle_event(
 ///
 /// Split out so the wrapper can record metrics on both Ok and Err
 /// paths without coupling the body to the recording call.
+/// The normalized `noetl.event` row fields derived from an
+/// [`EventRequest`] (which a native `ExecutorEvent` deserializes into).
+///
+/// This is the shared normalization that the synchronous ingest path
+/// (`handle_event_inner`) and the CQRS write-path materializer
+/// (`/api/internal/events/materialize`, noetl/ai-meta#103 phase 2d) both
+/// apply — so the row materialized from a producer's *native* event is
+/// byte-identical to the one the synchronous path writes.  Without a
+/// single normalization point the two paths would drift (different
+/// `status` derivation, `result` envelope, `meta` shape, `catalog_id`).
+pub(crate) struct NormalizedEventRow {
+    pub event_id: i64,
+    pub execution_id: i64,
+    pub catalog_id: Option<i64>,
+    pub event_type: String,
+    /// `noetl.event.node_id` + `node_name` both take the step name.
+    pub node_name: String,
+    pub status: String,
+    pub result: serde_json::Value,
+    pub meta: serde_json::Value,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Normalize an [`EventRequest`] into the `noetl.event` row shape: derive
+/// the lifecycle `status`, build + sanitize the `result` envelope, resolve
+/// the `event_id` (producer-stamped or server snowflake), look up the
+/// `catalog_id`, and assemble + sanitize `meta`.  Mirrors the inline logic
+/// `handle_event_inner` ran before this was extracted.
+pub(crate) async fn normalize_event_to_row(
+    state: &AppState,
+    request: &EventRequest,
+) -> Result<NormalizedEventRow, AppError> {
+    let execution_id: i64 = request
+        .execution_id
+        .parse()
+        .map_err(|_| AppError::Validation("Invalid execution_id".to_string()))?;
+
+    // Prefer the application-supplied status; fall back to name-based
+    // derivation for pre-PR-EE producers.
+    let status: String = request
+        .status
+        .clone()
+        .unwrap_or_else(|| event_status_from_name(&request.event_type).to_string());
+
+    // Result envelope (must carry a top-level string `status` for the
+    // `chk_event_result_shape` constraint) + credential scrub.
+    let result = sanitize_sensitive_data(&build_result_object(request, &status));
+
+    // Producer-stamped event_id, else a server-side snowflake.
+    let event_id: i64 = match request.event_id.as_deref() {
+        Some(raw) => raw
+            .parse()
+            .map_err(|_| AppError::Validation(format!("Invalid event_id: {raw}")))?,
+        None => state.snowflake.generate()?,
+    };
+
+    let catalog_id = get_catalog_id(state, execution_id).await?;
+
+    let mut meta = request.meta.clone().unwrap_or_else(|| serde_json::json!({}));
+    if let serde_json::Value::Object(ref mut map) = meta {
+        map.insert("actionable".to_string(), serde_json::json!(request.actionable));
+        map.insert(
+            "informative".to_string(),
+            serde_json::json!(request.informative),
+        );
+        if let Some(ref worker_id) = request.worker_id {
+            map.insert("worker_id".to_string(), serde_json::json!(worker_id));
+        }
+    }
+    let meta = sanitize_sensitive_data(&meta);
+
+    let created_at = request.created_at.unwrap_or_else(chrono::Utc::now);
+
+    Ok(NormalizedEventRow {
+        event_id,
+        execution_id,
+        catalog_id,
+        event_type: request.event_type.clone(),
+        node_name: request.step.clone(),
+        status,
+        result,
+        meta,
+        created_at,
+    })
+}
+
 async fn handle_event_inner(
     State(state): State<AppState>,
     Json(request): Json<EventRequest>,
@@ -523,71 +609,12 @@ async fn handle_event_inner(
         }
     }
 
-    // Resolve status BEFORE building the result so the result
-    // envelope can include it (the DB constraint
-    // chk_event_result_shape requires every result row to carry
-    // a string `status` key at the top level).
-    //
-    // R-1.2 PR-EE-2: prefer the application-supplied status when
-    // present (so the worker can distinguish STARTED vs RUNNING
-    // explicitly); fall back to name-based derivation when
-    // omitted for pre-PR-EE clients.
-    let derived_status: String = request
-        .status
-        .clone()
-        .unwrap_or_else(|| event_status_from_name(&request.event_type).to_string());
-
-    // Build result object based on kind, embedding the resolved
-    // status.  See noetl/server#29 — previous shapes
-    // (`{kind, data}`, etc.) violated `chk_event_result_shape`.
-    let result_obj_raw = build_result_object(&request, &derived_status);
-    // SECURITY: Sanitize result data to remove sensitive information (tokens, passwords, etc.)
-    let result_obj = sanitize_sensitive_data(&result_obj_raw);
-
-    // Resolve event_id.  Producers may stamp it client-side per
-    // `agents/rules/observability.md` Principle 3 (worker, CLI in
-    // distributed mode); when omitted, the server now stamps via
-    // its own application-side `SnowflakeGenerator` instead of
-    // the DB-side `noetl.snowflake_id()` function.  Phase F R1.5
-    // (noetl/ai-meta#49) moved the fallback path here so the id
-    // is available before the INSERT span opens and so per-shard
-    // generation can be controlled via `NOETL_SERVER_MACHINE_ID`.
-    let event_id: i64 = match request.event_id.as_deref() {
-        Some(raw) => raw
-            .parse()
-            .map_err(|_| AppError::Validation(format!("Invalid event_id: {raw}")))?,
-        None => state.snowflake.generate()?,
-    };
-
-    // Get catalog_id from existing events
-    let catalog_id = get_catalog_id(&state, execution_id).await?;
-
-    // Build meta object with control flags
-    let mut meta_obj = request.meta.clone().unwrap_or(serde_json::json!({}));
-    if let serde_json::Value::Object(ref mut map) = meta_obj {
-        map.insert(
-            "actionable".to_string(),
-            serde_json::json!(request.actionable),
-        );
-        map.insert(
-            "informative".to_string(),
-            serde_json::json!(request.informative),
-        );
-        if let Some(ref worker_id) = request.worker_id {
-            map.insert("worker_id".to_string(), serde_json::json!(worker_id));
-        }
-    }
-    // SECURITY: Sanitize meta data to remove sensitive information
-    let meta_obj = sanitize_sensitive_data(&meta_obj);
-
-    // `derived_status` is computed earlier (before the result
-    // envelope build) so the constraint-required top-level
-    // `status` key can be embedded; reused here as the `status`
-    // column value.
-
-    // Resolve created_at — prefer the application-supplied stamp
-    // (avoids server-clock skew when ordering bursts).
-    let created_at = request.created_at.unwrap_or_else(chrono::Utc::now);
+    // Normalize into the `noetl.event` row shape via the shared fn (the
+    // same one the CQRS materializer applies to native producer events,
+    // #103 phase 2d) so the synchronous + materialized writes are
+    // byte-identical.
+    let row = normalize_event_to_row(&state, &request).await?;
+    let event_id = row.event_id;
 
     // Persist the event
     sqlx::query(
@@ -598,16 +625,16 @@ async fn handle_event_inner(
         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
         "#,
     )
-    .bind(event_id)
-    .bind(execution_id)
-    .bind(catalog_id)
-    .bind(&request.event_type)
-    .bind(&request.step)
-    .bind(&request.step)
-    .bind(&derived_status)
-    .bind(&result_obj)
-    .bind(&meta_obj)
-    .bind(created_at)
+    .bind(row.event_id)
+    .bind(row.execution_id)
+    .bind(row.catalog_id)
+    .bind(&row.event_type)
+    .bind(&row.node_name)
+    .bind(&row.node_name)
+    .bind(&row.status)
+    .bind(&row.result)
+    .bind(&row.meta)
+    .bind(row.created_at)
     .execute(state.pools.pool_for(execution_id))
     .await?;
 

@@ -227,6 +227,29 @@ pub fn record_projection_advanced(_version: i64) {
     projection_advanced_total().inc();
 }
 
+/// Counter: `noetl.event` rows materialized from the stream by the
+/// `system/event_materializer` playbook via `/api/internal/events/materialize`
+/// (noetl/ai-meta#103 phase 2d).  No labels — one global rate.
+pub fn events_materialized_total() -> &'static prometheus::IntCounter {
+    static M: OnceLock<prometheus::IntCounter> = OnceLock::new();
+    M.get_or_init(|| {
+        let counter = prometheus::IntCounter::new(
+            "noetl_events_materialized_total",
+            "noetl.event rows materialized from the noetl_events stream by the system/event_materializer playbook.",
+        )
+        .expect("static counter spec must be valid");
+        registry()
+            .register(Box::new(counter.clone()))
+            .expect("counter registration must succeed");
+        counter
+    })
+}
+
+/// Record a batch of materialized event rows.
+pub fn record_events_materialized(rows: u64) {
+    events_materialized_total().inc_by(rows);
+}
+
 // ---------------------------------------------------------------------------
 // Round 2 — generic write-endpoint surface
 // ---------------------------------------------------------------------------
