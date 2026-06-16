@@ -1283,43 +1283,133 @@ fn event_status_from_name(event_name: &str) -> &'static str {
 /// triggered this evaluation pass (usually the `command.completed`
 /// row).  It's used as the `parent_event_id` for newly-inserted
 /// events so the event log forms a proper causal chain.
-async fn trigger_orchestrator(
-    state: &AppState,
-    execution_id: i64,
-    trigger_event_id: i64,
-) -> AppResult<i32> {
-    use crate::engine::WorkflowOrchestrator;
-    use sqlx::Row;
+/// Resolve any `{status, reference: {ref: "noetl://..."}}` results in `events`
+/// back to the inline `{status, context: <data>}` shape the orchestrator reads.
+///
+/// Results-by-reference: the worker stages an over-budget tool result in the
+/// result store and emits only a small reference on the event (keeping the
+/// event log lean).  The orchestrator needs the data to evaluate `output.*`
+/// guards / `set:` and to dispatch cursor bodies, so it rehydrates the
+/// reference here — only for the events it's about to apply, not the whole log.
+/// Inline results (no `reference`) and unresolvable refs are left untouched.
+/// Resolve over-budget result references inline before the orchestrator
+/// applies the events.
+///
+/// The worker stages results larger than its inline budget in the durable
+/// result store and emits a `{data: {_ref}}` placeholder plus a sibling
+/// `reference` block instead of the data (see
+/// `repos/worker/src/executor/command.rs` `build_reference_or_inline`).  The
+/// orchestrator's state machine (`extract_user_data`, the cursor drive,
+/// `build_context`) reads the actual data out of the event — a placeholder
+/// makes a cursor claim look like it returned zero rows, which stalls the
+/// loop.  So before `from_events` / `evaluate_state` see the events, we swap
+/// each placeholder for the resolved data.
+///
+/// The reference sits at one of two paths depending on how the `call.done`
+/// envelope wrapped the tool result. Nested (the standard envelope) puts the
+/// tool result under `context.result`, so the reference is at
+/// `result.context.result.reference` and the placeholder at
+/// `result.context.result.context.data._ref`. Top-level (an un-wrapped tool
+/// result) puts the reference at `result.reference` and the placeholder at
+/// `result.context.data._ref`.
+///
+/// In both cases `reference.ref` is the `noetl://` URI and the sibling
+/// `context` is replaced with the resolved store payload (`{data: {...}}`),
+/// then the `reference` block is dropped so the result reads like an inline
+/// one.
+async fn hydrate_result_references(
+    events: &mut [crate::db::models::Event],
+    result_store: &crate::services::result_store::ResultStoreService,
+) {
+    use crate::services::result_store::parse_noetl_ref;
 
-    debug!(
-        execution_id,
-        trigger_event_id, "trigger_orchestrator: loading events"
-    );
+    enum Shape {
+        /// reference at `result.context.result.reference`
+        Nested,
+        /// reference at `result.reference`
+        TopLevel,
+    }
 
-    // 1. Load all events for this execution.
-    //
-    // `attempt` is stored inside `meta` JSONB (no dedicated column on
-    // noetl.event today — same shape Python projector uses), so we
-    // source it via `meta->>'attempt'` cast to int.
-    let rows = sqlx::query(
-        r#"
+    let mut hydrated = 0usize;
+    for ev in events.iter_mut() {
+        let Some(result) = ev.result.as_mut() else {
+            continue;
+        };
+        // Locate the reference URI + remember which envelope shape carried it.
+        let (shape, ref_uri) = if let Some(u) = result
+            .pointer("/context/result/reference/ref")
+            .and_then(|v| v.as_str())
+        {
+            (Shape::Nested, u.to_string())
+        } else if let Some(u) = result.pointer("/reference/ref").and_then(|v| v.as_str()) {
+            (Shape::TopLevel, u.to_string())
+        } else {
+            continue;
+        };
+
+        let parsed = match parse_noetl_ref(&ref_uri) {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(execution_id = ev.execution_id, ref_uri, %e, "unparseable result reference; left as-is");
+                continue;
+            }
+        };
+        let resolved = match result_store.resolve(&parsed).await {
+            Ok(Some(data)) => data,
+            Ok(None) => {
+                warn!(execution_id = ev.execution_id, ref_uri, "result reference not found in store; left as-is");
+                continue;
+            }
+            Err(e) => {
+                warn!(execution_id = ev.execution_id, ref_uri, %e, "result reference resolution failed; left as-is");
+                continue;
+            }
+        };
+
+        // Splice the resolved payload over the `{data: {_ref}}` placeholder
+        // and drop the `reference` block so the event reads as inline.
+        match shape {
+            Shape::Nested => {
+                if let Some(inner) = result
+                    .get_mut("context")
+                    .and_then(|c| c.get_mut("result"))
+                    .and_then(|r| r.as_object_mut())
+                {
+                    inner.insert("context".to_string(), resolved);
+                    inner.remove("reference");
+                    hydrated += 1;
+                }
+            }
+            Shape::TopLevel => {
+                if let Some(obj) = result.as_object_mut() {
+                    obj.insert("context".to_string(), resolved);
+                    obj.remove("reference");
+                    hydrated += 1;
+                }
+            }
+        }
+    }
+    if hydrated > 0 {
+        debug!(hydrated, "hydrate_result_references: resolved over-budget result references");
+    }
+}
+
+/// Columns the orchestrator reads from `noetl.event`, in the order
+/// [`parse_event_rows`] expects.
+const ORCH_EVENT_COLS: &str = r#"
         SELECT event_id, execution_id, catalog_id,
                parent_event_id, parent_execution_id,
                event_type, node_id, node_name, node_type, status,
                context, meta, result, worker_id,
                NULLIF(meta->>'attempt', '')::int AS attempt,
                created_at
-        FROM noetl.event
-        WHERE execution_id = $1
-        ORDER BY event_id ASC
-        "#,
-    )
-    .bind(execution_id)
-    .fetch_all(state.pools.pool_for(execution_id))
-    .await?;
+        FROM noetl.event "#;
 
-    let events: Vec<crate::db::models::Event> = rows
-        .into_iter()
+/// Map rows selected via [`ORCH_EVENT_COLS`] into `Event`s.  `attempt` lives in
+/// `meta` JSONB (no dedicated column), sourced via the `NULLIF(...)::int` alias.
+fn parse_event_rows(rows: Vec<sqlx::postgres::PgRow>) -> Vec<crate::db::models::Event> {
+    use sqlx::Row;
+    rows.into_iter()
         .map(|r| crate::db::models::Event {
             id: r.try_get("event_id").unwrap_or(0),
             execution_id: r.try_get("execution_id").unwrap_or(0),
@@ -1341,31 +1431,373 @@ async fn trigger_orchestrator(
                 .try_get("created_at")
                 .unwrap_or_else(|_| chrono::Utc::now()),
         })
-        .collect();
+        .collect()
+}
 
-    if events.is_empty() {
-        debug!(
-            execution_id,
-            "No events to evaluate — orchestrator exit early"
+/// Outcome of a bounded state rebuild (noetl/ai-meta#101 block b).  The caller
+/// sets `applied_count = total` (the live event count) after a rebuild: a
+/// rebuild folds in every event after the snapshot, so the state reflects all
+/// events; any straggler the window still missed is caught by the next
+/// trigger's count mismatch.
+struct RebuildResult {
+    state: crate::engine::state::WorkflowState,
+    last_event_id: i64,
+    snapshot_version: i64,
+    routing_meta: Option<serde_json::Value>,
+}
+
+/// Margin (seconds) the snapshot rebuild re-scans behind the snapshot's write
+/// time.  A straggler that lands below the snapshot `version` *after* the
+/// snapshot is written carries a recent-ish `created_at` (the column is the
+/// event's emit time, not its snowflake id), so loading events with
+/// `created_at > snapshot.updated_at - MARGIN` catches it.  Covers worker
+/// clock skew + emit-to-insert latency; re-applying the overlap is safe because
+/// cursor counters are gated by the snapshot's `cursor_issued`/`cursor_completed`
+/// id-sets.  Bounded small: machine-id interleaving makes a straggler's
+/// `created_at` only milliseconds off; the margin only needs to cover
+/// emit-to-insert latency + worker clock skew (NTP keeps this sub-second).
+const REBUILD_STRAGGLER_MARGIN_SECS: i64 = 30;
+
+/// Rebuild orchestrator state with a **bounded** event load: from the latest
+/// `projection_snapshot` + the events after it (by id, plus a `created_at`
+/// margin window to catch below-watermark stragglers), or — when no snapshot
+/// exists yet — the full (still-small) early log.  This replaced the unbounded
+/// full-log replay that OOM'd the server at scale: a straggler below the
+/// incremental watermark used to trigger a reload of the entire (growing) event
+/// log on nearly every completion under high concurrency.
+async fn rebuild_state(
+    pool: &crate::db::DbPool,
+    result_store: &crate::services::result_store::ResultStoreService,
+    execution_id: i64,
+) -> AppResult<RebuildResult> {
+    use crate::services::orch_snapshot;
+    match orch_snapshot::load_latest(pool, execution_id).await? {
+        Some(snap) => {
+            // Events after the snapshot: newer by id, OR (straggler) below the
+            // version watermark but emitted within the margin of the snapshot.
+            let margin_floor =
+                snap.updated_at - chrono::Duration::seconds(REBUILD_STRAGGLER_MARGIN_SECS);
+            let mut events_since = parse_event_rows(
+                sqlx::query(&format!(
+                    "{ORCH_EVENT_COLS} WHERE execution_id = $1 \
+                       AND (event_id > $2 OR created_at > $3) ORDER BY event_id ASC"
+                ))
+                .bind(execution_id)
+                .bind(snap.version)
+                .bind(margin_floor)
+                .fetch_all(pool)
+                .await?,
+            );
+            hydrate_result_references(&mut events_since, result_store).await;
+            let mut ws = snap.state;
+            for e in &events_since {
+                ws.apply_event(e);
+            }
+            // The window includes everything after the snapshot, so the highest
+            // loaded id is the current head.
+            let last_event_id = events_since
+                .iter()
+                .map(|e| e.event_id)
+                .max()
+                .unwrap_or(snap.version);
+            Ok(RebuildResult {
+                state: ws,
+                last_event_id,
+                snapshot_version: snap.version,
+                routing_meta: snap.routing_meta,
+            })
+        }
+        None => {
+            let mut all_events = parse_event_rows(
+                sqlx::query(&format!(
+                    "{ORCH_EVENT_COLS} WHERE execution_id = $1 ORDER BY event_id ASC"
+                ))
+                .bind(execution_id)
+                .fetch_all(pool)
+                .await?,
+            );
+            hydrate_result_references(&mut all_events, result_store).await;
+            let state = crate::engine::state::WorkflowState::from_events(&all_events)
+                .ok_or_else(|| AppError::Validation("No events found for execution".to_string()))?;
+            let last_event_id = all_events.last().map(|e| e.event_id).unwrap_or(0);
+            let routing_meta = all_events
+                .iter()
+                .find(|e| e.event_type == "playbook_started")
+                .and_then(|e| e.meta.clone());
+            Ok(RebuildResult {
+                state,
+                last_event_id,
+                snapshot_version: 0,
+                routing_meta,
+            })
+        }
+    }
+}
+
+async fn trigger_orchestrator(
+    state: &AppState,
+    execution_id: i64,
+    trigger_event_id: i64,
+) -> AppResult<i32> {
+    trigger_orchestrator_inner(state, execution_id, trigger_event_id, false).await
+}
+
+/// Background reconcile poller (noetl/ai-meta#101 block b — small-tier
+/// resilience).  Guarantees the orchestrator never permanently stalls.
+///
+/// The hot path advances state incrementally and only does the (O(events))
+/// consistency `COUNT` on a throttle, so a non-triggering straggler that lands
+/// in a throttle gap can leave a cursor unable to fan out — and once the cursor
+/// stops, no further `command.completed` events arrive, so there is no trigger
+/// to retry on.  On a constrained backend (e.g. a small Cloud SQL tier behind
+/// PgBouncer, where DB latency widens the gap) this is exactly the deadlock that
+/// stopped a 10×1000 run.
+///
+/// This task periodically force-reconciles every cached (non-terminal)
+/// execution: a fresh `COUNT` + bounded rebuild folds in any missed straggler
+/// and re-evaluates, so processing always resumes — slow under backpressure is
+/// fine; stopping is not.  Cost is bounded: one cheap rebuild per active
+/// execution per tick.
+pub fn spawn_orchestrator_reconciler(state: AppState) {
+    tokio::spawn(async move {
+        const RECONCILE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(8);
+        loop {
+            tokio::time::sleep(RECONCILE_INTERVAL).await;
+            for execution_id in state.orch_cache.active_executions() {
+                // `i64::MAX` as the trigger id keeps the immediate-straggler
+                // shortcut from firing on an already-applied event.
+                match trigger_orchestrator_inner(&state, execution_id, i64::MAX, true).await {
+                    Ok(n) if n > 0 => {
+                        info!(execution_id, commands = n, "reconcile poller advanced a stuck execution")
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        warn!(execution_id, %e, "reconcile poller: orchestrator trigger failed")
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// Orchestrator trigger.  `force_count` is set by the background reconcile
+/// poller ([`spawn_orchestrator_reconciler`]): it forces a fresh consistency
+/// `COUNT` (bypassing the throttle) and proceeds to evaluate even when no new
+/// events arrived, so a stuck execution — one whose cursor missed a
+/// non-triggering straggler and therefore stopped emitting events, leaving no
+/// trigger to retry on — is reconciled and advanced.  The poller passes
+/// `trigger_event_id = i64::MAX` so the immediate-straggler shortcut is skipped.
+async fn trigger_orchestrator_inner(
+    state: &AppState,
+    execution_id: i64,
+    trigger_event_id: i64,
+    force_count: bool,
+) -> AppResult<i32> {
+    use crate::engine::WorkflowOrchestrator;
+
+    debug!(
+        execution_id,
+        trigger_event_id, force_count, "trigger_orchestrator: loading events"
+    );
+
+    // 1. Incremental state with bounded rebuild (noetl/ai-meta#100, #101 block b).
+    //
+    // The cached `WorkflowState` advances by applying only events newer than
+    // `last_event_id` behind a per-execution lock (serialising one execution's
+    // triggers).  When the cache is cold, or a straggler is detected (an event
+    // below the incremental watermark — workers' snowflake ids from different
+    // machines in the same millisecond interleave), it rebuilds from the latest
+    // `projection_snapshot` + events-since (bounded), NOT the whole event log:
+    // the unbounded replay spiked memory and OOM'd the server at scale.  See
+    // `rebuild_state` + `services::orch_snapshot`.
+
+    let pool = state.pools.pool_for(execution_id);
+    // Results-by-reference: an over-budget tool result is stored in the result
+    // store and the event carries `{status, reference}` (no inline data).  The
+    // orchestrator resolves those references back to inline data before reading
+    // them so referenced results are transparent to state/templates.
+    let result_store = crate::services::result_store::ResultStoreService::new(
+        pool.clone(),
+        state.snowflake.clone(),
+    );
+
+    // Per-execution lock: serialises this execution's concurrent completion
+    // triggers so only one advances the cached state at a time.
+    let cache_slot = state.orch_cache.entry(execution_id);
+    let mut cache = cache_slot.lock().await;
+
+    // The consistency `COUNT(*)` over this execution's event partition is
+    // O(events) — ≈27ms at 60k events — and only detects a *non-triggering*
+    // straggler (an event type that doesn't fire the orchestrator, inserted
+    // below the high-water mark).  Running it on every trigger throttles the
+    // whole orchestrator on a large log.  So throttle it: a fresh `total` gates
+    // the mismatch→rebuild + snapshot paths; between checks the incremental
+    // apply + the immediate straggler handling below carry correctness.  Cold
+    // cache always counts (it needs `total` to seed `applied_count`).
+    const COUNT_THROTTLE: std::time::Duration = std::time::Duration::from_millis(1000);
+    let now = std::time::Instant::now();
+    let do_count = force_count
+        || cache.state.is_none()
+        || cache
+            .last_count_check
+            .is_none_or(|t| now.duration_since(t) >= COUNT_THROTTLE);
+    let total: Option<i64> = if do_count {
+        cache.last_count_check = Some(now);
+        Some(
+            sqlx::query_scalar("SELECT COUNT(*) FROM noetl.event WHERE execution_id = $1")
+                .bind(execution_id)
+                .fetch_one(pool)
+                .await?,
+        )
+    } else {
+        None
+    };
+
+    // Warm a cold cache from the latest snapshot + events-since (bounded), or
+    // the full (still-small) early log when no snapshot exists yet.
+    let mut did_rebuild = false;
+    if cache.state.is_none() {
+        let r = rebuild_state(pool, &result_store, execution_id).await?;
+        cache.state = Some(r.state);
+        cache.last_event_id = r.last_event_id;
+        cache.applied_count = total.unwrap_or(0);
+        cache.snapshot_version = r.snapshot_version;
+        cache.routing_meta = r.routing_meta;
+        did_rebuild = true;
+    }
+
+    // Immediate straggler: the event that fired this trigger is at/below the
+    // watermark (a late insert below the high-water mark — interleaved snowflake
+    // ids).  It is not in the `> watermark` load below, so apply it directly.
+    // `command.completed`/`failed` are the only types that trigger, so this
+    // catches the cursor-relevant stragglers (body completions) with no COUNT
+    // and no rebuild.  Idempotent: cursor counters are gated by the
+    // `cursor_issued`/`cursor_completed` id-sets.
+    let mut straggler_applied = false;
+    if !did_rebuild && trigger_event_id <= cache.last_event_id {
+        let mut strag = parse_event_rows(
+            sqlx::query(&format!(
+                "{ORCH_EVENT_COLS} WHERE execution_id = $1 AND event_id = $2"
+            ))
+            .bind(execution_id)
+            .bind(trigger_event_id)
+            .fetch_all(pool)
+            .await?,
         );
+        hydrate_result_references(&mut strag, &result_store).await;
+        if let Some(ws) = cache.state.as_mut() {
+            for e in &strag {
+                ws.apply_event(e);
+            }
+        }
+        straggler_applied = !strag.is_empty();
+        // Count the straggler so the next consistency check matches and does NOT
+        // fire an (expensive) bounded rebuild for an event we already applied.
+        // The straggler is below the watermark, so it is never in the
+        // `> watermark` load — no double count.  A rare double-trigger overcount
+        // self-heals: the next check mismatches once and the rebuild resets
+        // `applied_count = total`.
+        cache.applied_count += strag.len() as i64;
+    }
+
+    // Events newer than what's applied.
+    let mut new_events: Vec<crate::db::models::Event> = parse_event_rows(
+        sqlx::query(&format!(
+            "{ORCH_EVENT_COLS} WHERE execution_id = $1 AND event_id > $2 ORDER BY event_id ASC"
+        ))
+        .bind(execution_id)
+        .bind(cache.last_event_id)
+        .fetch_all(pool)
+        .await?,
+    );
+    hydrate_result_references(&mut new_events, &result_store).await;
+
+    // Trigger type + drain timestamp.  The trigger event is normally among the
+    // new events; after a cold rebuild / straggler apply that already folded it
+    // in, fall back to a default type (and a None drain timestamp).
+    let trigger_event_type = new_events
+        .iter()
+        .find(|e| e.event_id == trigger_event_id)
+        .map(|e| e.event_type.clone())
+        .unwrap_or_else(|| "command.completed".to_string());
+    let latest_ts = new_events.last().map(|e| e.created_at);
+
+    // Consistency.  With a fresh `total`, applying the new events should account
+    // for ALL events; a shortfall means a straggler is below the watermark — and
+    // crucially it may be a *non-triggering* one (the cursor claim's `call.done`
+    // carrying the row batch), which would otherwise leave the cursor unable to
+    // fan out and stop emitting events entirely.  A bounded rebuild re-scans the
+    // recent window and folds it in.  This check runs whether or not there are
+    // new events, so the reconcile poller (no new events, fresh count) still
+    // catches a stuck execution.  Without a fresh `total` (throttled), trust the
+    // incremental apply.
+    let mismatch = matches!(total, Some(t) if cache.applied_count + new_events.len() as i64 != t);
+    if mismatch {
+        let r = rebuild_state(pool, &result_store, execution_id).await?;
+        cache.state = Some(r.state);
+        cache.last_event_id = r.last_event_id;
+        cache.applied_count = total.unwrap_or(cache.applied_count);
+        cache.snapshot_version = r.snapshot_version;
+        cache.routing_meta = r.routing_meta;
+        did_rebuild = true;
+    } else if !new_events.is_empty() {
+        let ws = cache.state.as_mut().unwrap();
+        for e in &new_events {
+            ws.apply_event(e);
+        }
+        cache.applied_count += new_events.len() as i64;
+        cache.last_event_id = new_events
+            .last()
+            .map(|e| e.event_id)
+            .unwrap_or(cache.last_event_id);
+    }
+
+    // Nothing changed and this is not a forced reconcile → exit early.  A forced
+    // reconcile still evaluates (to drive a cursor that may now advance).
+    if new_events.is_empty() && !did_rebuild && !straggler_applied && !force_count {
+        debug!(execution_id, "No new events to evaluate — orchestrator exit early");
         return Ok(0);
     }
 
-    // 2. Look up catalog_id + playbook content.
-    let catalog_id = events
-        .iter()
-        .find_map(|e| {
-            if e.catalog_id > 0 {
-                Some(e.catalog_id)
-            } else {
-                None
+    // Persist a snapshot once enough events have accrued since the last one,
+    // gated on a *fresh* `total` confirming the state is fully consistent (no
+    // outstanding straggler) — so the snapshot is a clean base for rebuilds.
+    // Best-effort: a snapshot failure must not fail the trigger.
+    const SNAPSHOT_INTERVAL_EVENTS: i64 = 500;
+    if total == Some(cache.applied_count)
+        && cache.last_event_id - cache.snapshot_version >= SNAPSHOT_INTERVAL_EVENTS
+    {
+        let version = cache.last_event_id;
+        let applied = cache.applied_count;
+        let routing = cache.routing_meta.clone();
+        let saved = if let Some(ws) = cache.state.as_ref() {
+            crate::services::orch_snapshot::save(
+                pool,
+                execution_id,
+                version,
+                applied,
+                routing.as_ref(),
+                ws,
+            )
+            .await
+        } else {
+            Ok(())
+        };
+        match saved {
+            Ok(()) => cache.snapshot_version = version,
+            Err(e) => {
+                warn!(execution_id, %e, "orch_snapshot.save failed; continuing without snapshot")
             }
-        })
-        .ok_or_else(|| {
-            AppError::Internal(format!(
-                "No catalog_id found in events for execution {execution_id}"
-            ))
-        })?;
+        }
+    }
+
+    // 2. Look up catalog_id (from the cached state) + playbook content.
+    let catalog_id = cache.state.as_ref().map(|s| s.catalog_id).unwrap_or(0);
+    if catalog_id == 0 {
+        return Err(AppError::Internal(format!(
+            "No catalog_id found for execution {execution_id}"
+        )));
+    }
 
     // Phase F R4-3: noetl.catalog is a cluster-wide table.
     let playbook_yaml: String =
@@ -1380,22 +1812,15 @@ async fn trigger_orchestrator(
             })?;
     let playbook = crate::playbook::parser::parse_playbook(&playbook_yaml)?;
 
-    // 3. Evaluate.
-    //
-    // Resolve the real trigger event's type from the loaded events
-    // list instead of hard-coding `command.completed` — the same
-    // path serves `command.failed` triggers (noetl/ai-meta#58) and
-    // future trigger sources (e.g. `iterator_completed`,
-    // `step.exit`).  Without this lookup, a failure trigger would
-    // be misreported as a completion to the orchestrator, and the
-    // failure-termination branch would never run.
-    let trigger_event_type = events
-        .iter()
-        .find(|e| e.event_id == trigger_event_id)
-        .map(|e| e.event_type.as_str())
-        .unwrap_or("command.completed");
+    // 3. Evaluate against the cached state.
     let orchestrator = WorkflowOrchestrator::new();
-    let result = match orchestrator.evaluate(&events, &playbook, Some(trigger_event_type)) {
+    let ws = cache.state.as_mut().unwrap();
+    let result = match orchestrator.evaluate_state(
+        ws,
+        latest_ts,
+        &playbook,
+        Some(trigger_event_type.as_str()),
+    ) {
         Ok(r) => r,
         Err(e) => {
             // A deterministic orchestrator evaluate failure (invalid
@@ -1482,10 +1907,9 @@ async fn trigger_orchestrator(
     // the `/api/execute` caller supplied, persisted on the `playbook_started`
     // event meta, so every follow-up command lands on the same segment and
     // carries the same trace context (noetl/ai-meta#90 Phase 2).
-    let routing = events
-        .iter()
-        .find(|e| e.event_type == "playbook_started")
-        .and_then(|e| e.meta.as_ref())
+    let routing = cache
+        .routing_meta
+        .as_ref()
         .map(crate::handlers::execute::CommandRouting::from_started_meta)
         .unwrap_or_default();
 
@@ -1551,6 +1975,10 @@ async fn trigger_orchestrator(
             terminal_event = %event_type,
             "Orchestrator marked execution as terminal"
         );
+        // Free the cached state for a terminal execution (noetl/ai-meta#100).
+        // Drop the guard first so the slot's Arc refcount can fall to zero.
+        drop(cache);
+        state.orch_cache.evict(execution_id);
     }
 
     Ok(commands_generated)

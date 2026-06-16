@@ -81,6 +81,82 @@ pub struct AppState {
 
     /// Server start time for uptime calculation
     pub start_time: std::time::Instant,
+
+    /// Per-execution orchestrator state cache (noetl/ai-meta#100 perf).  The
+    /// orchestrator advances a cached `WorkflowState` by applying only NEW
+    /// events each trigger instead of reloading + replaying the whole event
+    /// log (the per-trigger O(n) rebuild + the concurrent-completion memory
+    /// spike were the scaling bottleneck — a high-concurrency run OOM'd the
+    /// server).  The per-execution lock inside also serialises a single
+    /// execution's concurrent completion triggers.
+    pub orch_cache: Arc<OrchStateCache>,
+}
+
+/// Cached orchestrator state for one execution, advanced incrementally.
+#[derive(Default)]
+pub struct ExecOrchState {
+    /// The reconstructed workflow state (None until first built).
+    pub state: Option<crate::engine::state::WorkflowState>,
+    /// Highest event_id applied to `state`.
+    pub last_event_id: i64,
+    /// Number of events applied — compared against the live event COUNT to
+    /// detect a straggler (an event with id <= last_event_id inserted late);
+    /// on mismatch the cache falls back to a full rebuild for correctness.
+    pub applied_count: i64,
+    /// The `playbook_started` event's meta (pool segment + W3C trace routing),
+    /// cached so follow-up command dispatch needn't reload the first event.
+    pub routing_meta: Option<serde_json::Value>,
+    /// Highest `event_id` folded into the last persisted
+    /// `projection_snapshot` (noetl/ai-meta#101 block b).  A rebuild loads
+    /// that snapshot + only events newer than this, so the rebuild cost is
+    /// bounded by the snapshot interval instead of the whole (growing) event
+    /// log — which is what OOM'd the server at scale.
+    pub snapshot_version: i64,
+    /// Last time the O(events) consistency `COUNT(*)` ran for this execution
+    /// (noetl/ai-meta#101 block b throughput).  That count grows with the log
+    /// (≈27ms at 60k events) and would dominate the hot path if run on every
+    /// trigger, so it's throttled; between checks the incremental apply + the
+    /// immediate `trigger_event_id`-straggler handling carry correctness.  Not
+    /// serialized (in-memory only).
+    pub last_count_check: Option<std::time::Instant>,
+}
+
+
+/// Per-execution orchestrator state cache.  The outer `std::Mutex` guards a
+/// short get-or-insert; the inner per-execution `tokio::Mutex` is held across
+/// the orchestrator's DB round-trips so a single execution's triggers serialise
+/// (different executions never contend).
+#[derive(Default)]
+pub struct OrchStateCache {
+    map: std::sync::Mutex<
+        std::collections::HashMap<i64, Arc<tokio::sync::Mutex<ExecOrchState>>>,
+    >,
+}
+
+impl OrchStateCache {
+    /// Get (or create) the per-execution state slot.
+    pub fn entry(&self, execution_id: i64) -> Arc<tokio::sync::Mutex<ExecOrchState>> {
+        self.map
+            .lock()
+            .unwrap()
+            .entry(execution_id)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(ExecOrchState::default())))
+            .clone()
+    }
+
+    /// Drop a terminal execution's cached state (frees memory).
+    pub fn evict(&self, execution_id: i64) {
+        self.map.lock().unwrap().remove(&execution_id);
+    }
+
+    /// Snapshot of the currently-cached (i.e. non-terminal, not-yet-evicted)
+    /// execution ids.  The background reconcile poller iterates these to
+    /// force-advance any execution that got stuck — e.g. a cursor that missed a
+    /// non-triggering straggler and stopped emitting events, so no trigger would
+    /// otherwise retry.  Cheap: a short lock + clone of the keys.
+    pub fn active_executions(&self) -> Vec<i64> {
+        self.map.lock().unwrap().keys().copied().collect()
+    }
 }
 
 impl AppState {
@@ -169,6 +245,7 @@ impl AppState {
             snowflake: Arc::new(snowflake),
             shard: Arc::new(shard),
             start_time: std::time::Instant::now(),
+            orch_cache: Arc::new(OrchStateCache::default()),
         }
     }
 
