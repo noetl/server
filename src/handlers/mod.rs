@@ -15,6 +15,7 @@ pub mod health;
 pub mod ingress;
 pub mod internal;
 pub mod keychain;
+pub mod plugins;
 pub mod replay;
 pub mod result_store;
 pub mod runtime;
