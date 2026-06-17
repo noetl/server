@@ -43,6 +43,12 @@ pub enum ToolKind {
     /// through the noetl-tools registry; the server only needs to accept
     /// the kind so playbook validation passes.
     Subscription,
+    /// Compiled WASM system plug-in (noetl/ai-meta#105). The step's tool
+    /// carries `plugin: { path, version }` (+ optional `input`); the server
+    /// only accepts the kind so playbook validation passes, and the worker's
+    /// `wasm-plugin` dispatcher routes `tool_kind: "wasm"` to the host (load
+    /// from the catalog → run → flush capability intents).
+    Wasm,
 }
 
 impl std::fmt::Display for ToolKind {
@@ -72,6 +78,7 @@ impl std::fmt::Display for ToolKind {
             ToolKind::TaskSequence => "task_sequence",
             ToolKind::Rhai => "rhai",
             ToolKind::Subscription => "subscription",
+            ToolKind::Wasm => "wasm",
         };
         write!(f, "{}", s)
     }
