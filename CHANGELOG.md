@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.15.3](https://github.com/noetl/server/compare/v3.15.2...v3.15.3) (2026-06-17)
+
+### Performance Improvements
+
+* **orch:** stop persisting ctx/workload shim copies on commands ([#207](https://github.com/noetl/server/issues/207)) ([2cfb59d](https://github.com/noetl/server/commit/2cfb59d8e93b4e2b2d95f426f76af5cb400e65ed)), closes [noetl/ai-meta#103](https://github.com/noetl/ai-meta/issues/103) [noetl/ai-meta#103](https://github.com/noetl/ai-meta/issues/103)
+
 ## [3.15.2](https://github.com/noetl/server/compare/v3.15.1...v3.15.2) (2026-06-17)
 
 ### Performance Improvements
