@@ -411,6 +411,13 @@ fn build_router(
             "/api/internal/plugins/{*path}",
             post(handlers::plugins::register).get(handlers::plugins::fetch),
         )
+        // Object store (noetl/ai-meta#105 Round 5) — server-mediated backend for
+        // a plug-in's `noetl.object_put` capability (the Feather tier), keyed by
+        // the §7 physical object key.
+        .route(
+            "/api/internal/objects/{*key}",
+            put(handlers::objects::put).get(handlers::objects::get),
+        )
         .with_state(db_pool.clone());
 
     // Gateway push-ingress config endpoint (noetl/ai-meta#90 Phase 3).  The
@@ -711,6 +718,9 @@ async fn main() -> anyhow::Result<()> {
     // for the system worker pool's wasmtime PluginSource.  Same idempotent
     // startup-DDL pattern; server-owned end-to-end.
     noetl_server::db::queries::plugin_module::ensure_table(&db_pool).await?;
+    // Object store (noetl/ai-meta#105 Round 5) — durable Feather tier backing a
+    // plug-in's `noetl.object_put`. Same idempotent startup-DDL pattern.
+    noetl_server::db::queries::object_store::ensure_table(&db_pool).await?;
     // Opt-in subscription dedup window (noetl/ai-meta#90 Phase 7, RFC §10
     // OQ1) — same idempotent startup-DDL pattern.  The table is server-owned
     // (only /api/execute writes it) and bounded by age; dedup is opt-in per
