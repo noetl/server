@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.13.0](https://github.com/noetl/server/compare/v3.12.0...v3.13.0) (2026-06-17)
+
+### Features
+
+* **playbook:** accept tool_kind "wasm" in the playbook schema ([#105](https://github.com/noetl/server/issues/105) Round 5) ([#214](https://github.com/noetl/server/issues/214)) ([fe2e865](https://github.com/noetl/server/commit/fe2e86536b9e6c4aee18076b0961c777b0d8f188))
+
 ## [3.12.0](https://github.com/noetl/server/compare/v3.11.0...v3.12.0) (2026-06-17)
 
 ### Features
