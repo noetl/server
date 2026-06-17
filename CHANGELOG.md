@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.15.4](https://github.com/noetl/server/compare/v3.15.3...v3.15.4) (2026-06-17)
+
+### Bug Fixes
+
+* **internal:** accept timezone-less timestamps in EventEnvelope ([#106](https://github.com/noetl/server/issues/106)) ([#217](https://github.com/noetl/server/issues/217)) ([cdf829a](https://github.com/noetl/server/commit/cdf829a7b1075268d2b4208774e6ed28964f27a2)), closes [noetl/ai-meta#103](https://github.com/noetl/ai-meta/issues/103)
+
 ## [3.15.3](https://github.com/noetl/server/compare/v3.15.2...v3.15.3) (2026-06-17)
 
 ### Performance Improvements
