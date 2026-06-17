@@ -105,6 +105,15 @@ impl CommandBuilder {
         // inserts `workload` as the structured YAML workload block, which must
         // take precedence over the flat-dict alias for
         // `{{ workload.session_token }}` style templates.
+        // The `ctx`/`workload` shims are namespace ALIASES — each one deep-copies
+        // the *entire* context.  They're needed only transiently for template
+        // rendering, so build them into a throwaway `render_ctx` here but DO NOT
+        // persist them on the Command: persisting doubled (and with `steps`,
+        // tripled) every step output in the durable `command.issued` payload — a
+        // 1.7MB drain output ballooned to 5MB across the ctx/steps/flat copies,
+        // re-written every cursor frame (noetl/ai-meta#103).  The worker rebuilds
+        // the shims from the flat context at render time
+        // (`executor::command` — `ctx`/`workload` namespace).
         let mut render_ctx = context.clone();
         let ctx_value = serde_json::to_value(context).unwrap_or(serde_json::Value::Null);
         render_ctx
@@ -118,11 +127,6 @@ impl CommandBuilder {
         // {{ ctx.foo }} and {{ workload.foo }} templates resolve correctly.
         let tool_command = self.build_tool_from_definition(&step.tool, &render_ctx)?;
 
-        // Persist the shimmed render context (with `ctx` and `workload`
-        // namespace aliases) on the Command so the worker can resolve
-        // `{{ ctx.X }}` and `{{ workload.X }}` templates in pipeline
-        // `input:` blocks that render_pipeline_config preserved unrendered
-        // for worker-side resolution.
         Ok(Command {
             command_id,
             execution_id,
@@ -130,7 +134,8 @@ impl CommandBuilder {
             parent_event_id,
             step_name: step.step.clone(),
             tool: tool_command,
-            context: Some(render_ctx),
+            // FLAT context (no ctx/workload self-copies) — the worker re-shims.
+            context: Some(context.clone()),
             metadata: metadata.cloned(),
             iterator: None,
         })
@@ -207,9 +212,9 @@ impl CommandBuilder {
             }
         }
 
-        // Persist the shimmed render context so the worker can resolve
-        // `{{ ctx.X }}` / `{{ workload.X }}` templates in pipeline
-        // `input:` blocks (same rationale as build_command).
+        // Persist the FLAT iteration context (iter vars but no ctx/workload
+        // self-copies) — the worker rebuilds the shims at render time.  Same
+        // payload-bloat rationale as build_command (noetl/ai-meta#103).
         Ok(Command {
             command_id,
             execution_id,
@@ -217,7 +222,7 @@ impl CommandBuilder {
             parent_event_id,
             step_name: step.step.clone(),
             tool: tool_command,
-            context: Some(render_ctx),
+            context: Some(iter_context),
             metadata: None,
             iterator: Some(iterator),
         })
@@ -822,13 +827,19 @@ mod tests {
             Some("https://example.com/42"),
             "{{ ctx.foo }} should resolve to 42 via the ctx namespace shim"
         );
-        // The persisted context MUST contain the shim keys so the worker
-        // can resolve `{{ ctx.X }}` templates in pipeline `input:` blocks
-        // that render_pipeline_config preserved unrendered.
+        // The server-side render resolved `{{ ctx.foo }}` transiently (asserted
+        // above).  The PERSISTED context is now FLAT — it carries the bare vars
+        // but NOT the `ctx`/`workload` self-copies (noetl/ai-meta#103: persisting
+        // them doubled/tripled the command payload).  The worker rebuilds the
+        // shims at render time for its own pipeline `input:` templates.
         let persisted = command.context.unwrap();
         assert!(
-            persisted.contains_key("ctx"),
-            "persisted context must carry ctx shim for worker-side pipeline input rendering"
+            persisted.contains_key("foo"),
+            "persisted context keeps the flat dispatch vars"
+        );
+        assert!(
+            !persisted.contains_key("ctx"),
+            "persisted context must NOT carry the ctx self-copy — that was the 5MB bloat"
         );
     }
 
@@ -932,12 +943,18 @@ mod tests {
             Some("https://example.com/42"),
             "{{ ctx.num }} must resolve to 42 via the ctx shim in an iteration command"
         );
-        // The persisted iter_context MUST contain the shim keys so the
-        // worker can resolve `{{ ctx.X }}` templates in pipeline `input:`.
+        // The server-side render resolved `{{ ctx.num }}` transiently (above).
+        // The persisted iter_context is FLAT — the iterator var is present so the
+        // worker can rebuild the shim + resolve, but the `ctx` self-copy is gone
+        // (noetl/ai-meta#103 payload dedup).
         let persisted = command.context.unwrap();
         assert!(
-            persisted.contains_key("ctx"),
-            "persisted iter_context must carry ctx shim for worker-side pipeline input rendering"
+            persisted.contains_key("num"),
+            "persisted iter_context keeps the iterator var"
+        );
+        assert!(
+            !persisted.contains_key("ctx"),
+            "persisted iter_context must NOT carry the ctx self-copy"
         );
     }
 }
