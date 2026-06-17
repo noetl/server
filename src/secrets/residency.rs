@@ -28,38 +28,17 @@
 //! a broker in B that re-seals to A's worker."  Until that ships, `strict`
 //! mode is a fail-closed boundary, not a routed-around constraint.
 
-use serde::{Deserialize, Serialize};
 
 use crate::error::{AppError, AppResult};
 use crate::metrics::record_secret_residency_check;
 use crate::playbook::types::KeychainDef;
 use crate::secrets::server_region;
 
-/// Residency policy for a [`KeychainDef`].  See module docs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum Residency {
-    /// No check; resolution proceeds regardless of server region.
-    /// Back-compat default for entries without an explicit policy.
-    #[default]
-    None,
-    /// Check but proceed on mismatch — observability without enforcement.
-    /// Used during the migration window before flipping to `strict`.
-    Advisory,
-    /// Fail-closed on mismatch; resolution short-circuits with
-    /// [`AppError::ResidencyViolation`] before any provider call.
-    Strict,
-}
+/// The `Residency` policy enum is part of the playbook model and lives in
+/// `noetl-orchestrate-core` (noetl/ai-meta#108); re-exported here so this
+/// module's region-check logic and `KeychainDef.residency` keep using it.
+pub use noetl_orchestrate_core::playbook::Residency;
 
-impl Residency {
-    fn as_label(self) -> &'static str {
-        match self {
-            Residency::None => "none",
-            Residency::Advisory => "advisory",
-            Residency::Strict => "strict",
-        }
-    }
-}
 
 /// Outcome of [`evaluate`] — used by the resolver to decide whether to
 /// proceed and which metric label to record.  Not `Clone`/`PartialEq`

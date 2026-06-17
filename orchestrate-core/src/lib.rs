@@ -16,4 +16,5 @@
 //! the first slice; `evaluator`, `state`, `commands`, and `orchestrator` follow.
 
 pub mod error;
+pub mod playbook;
 pub mod template;
