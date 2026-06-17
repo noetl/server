@@ -7,6 +7,7 @@ pub mod credential;
 pub mod event;
 pub mod keychain;
 pub mod plugin_module;
+pub mod object_store;
 pub mod result_store;
 pub mod secret_audit;
 pub mod subscription_dedup;

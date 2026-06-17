@@ -16,6 +16,7 @@ pub mod ingress;
 pub mod internal;
 pub mod keychain;
 pub mod plugins;
+pub mod objects;
 pub mod replay;
 pub mod result_store;
 pub mod runtime;
