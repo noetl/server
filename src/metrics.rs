@@ -53,7 +53,9 @@
 
 use std::sync::OnceLock;
 
-use prometheus::{HistogramOpts, HistogramVec, IntCounterVec, Opts, Registry, TextEncoder};
+use prometheus::{
+    HistogramOpts, HistogramVec, IntCounterVec, IntGauge, Opts, Registry, TextEncoder,
+};
 
 /// Bucket boundaries for the event-ingest histogram (seconds).
 ///
@@ -152,6 +154,54 @@ pub fn record_event_ingest(event_type: &str, status: &str, duration_seconds: f64
     event_ingest_duration_seconds()
         .with_label_values(&[event_type])
         .observe(duration_seconds);
+}
+
+/// Counter: events published onto the `noetl_events` JetStream stream by the
+/// CQRS write-path tailer (noetl/ai-meta#103 phase 2a), by event type.  Lets the
+/// producer's throughput be observed without a log line per event.
+pub fn event_stream_published_total() -> &'static IntCounterVec {
+    static M: OnceLock<IntCounterVec> = OnceLock::new();
+    M.get_or_init(|| {
+        let counter = IntCounterVec::new(
+            Opts::new(
+                "noetl_event_stream_published_total",
+                "Total events published to the noetl_events JetStream stream by the CQRS write-path tailer, by event type.",
+            ),
+            &["event_type"],
+        )
+        .expect("static counter spec must be valid");
+        registry()
+            .register(Box::new(counter.clone()))
+            .expect("counter registration must succeed");
+        counter
+    })
+}
+
+/// Gauge: the tailer's current cursor (`noetl.event.id` last published).  Pair
+/// with the table's `MAX(id)` to read publish lag.  Single series (no labels) —
+/// one tailer per server.
+pub fn event_stream_cursor() -> &'static IntGauge {
+    static M: OnceLock<IntGauge> = OnceLock::new();
+    M.get_or_init(|| {
+        let gauge = IntGauge::new(
+            "noetl_event_stream_cursor",
+            "noetl.event.id last published to the noetl_events stream by the CQRS write-path tailer.",
+        )
+        .expect("static gauge spec must be valid");
+        registry()
+            .register(Box::new(gauge.clone()))
+            .expect("gauge registration must succeed");
+        gauge
+    })
+}
+
+/// Record a batch published by the tailer: bump the per-type counter for each
+/// event and advance the cursor gauge.
+pub fn record_event_stream_published(event_type: &str, count: u64, cursor: i64) {
+    event_stream_published_total()
+        .with_label_values(&[event_type])
+        .inc_by(count);
+    event_stream_cursor().set(cursor);
 }
 
 // ---------------------------------------------------------------------------
