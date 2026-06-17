@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.11.0](https://github.com/noetl/server/compare/v3.10.0...v3.11.0) (2026-06-17)
+
+### Features
+
+* **plugins:** plug-in module registry endpoints (v3.11.0) ([#210](https://github.com/noetl/server/issues/210)) ([62a5727](https://github.com/noetl/server/commit/62a5727f758d4da2b1d0f14153e275cd7b820511)), closes [noetl/ai-meta#101](https://github.com/noetl/ai-meta/issues/101) [worker#91](https://github.com/noetl/worker/issues/91) [noetl/ai-meta#101](https://github.com/noetl/ai-meta/issues/101) [noetl/ai-meta#101](https://github.com/noetl/ai-meta/issues/101) [noetl/ai-meta#101](https://github.com/noetl/ai-meta/issues/101) [#105](https://github.com/noetl/server/issues/105) [noetl/ai-meta#105](https://github.com/noetl/ai-meta/issues/105) [noetl/ai-meta#105](https://github.com/noetl/ai-meta/issues/105)
+
 ## [3.10.0](https://github.com/noetl/server/compare/v3.9.0...v3.10.0) (2026-06-16)
 
 ### Features
