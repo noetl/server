@@ -1362,6 +1362,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "noetl-orchestrate-core"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "minijinja",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "noetl-server"
 version = "3.15.4"
 dependencies = [
@@ -1382,6 +1392,7 @@ dependencies = [
  "hmac",
  "minijinja",
  "noetl-events",
+ "noetl-orchestrate-core",
  "prometheus",
  "rand 0.8.6",
  "rand_core 0.6.4",

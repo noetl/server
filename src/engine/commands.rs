@@ -439,7 +439,7 @@ fn render_pipeline_config(
 ) -> AppResult<serde_json::Value> {
     let arr = match config.as_array() {
         Some(a) => a,
-        None => return renderer.render_value(config, context),
+        None => return renderer.render_value(config, context).map_err(Into::into),
     };
 
     let mut result = Vec::with_capacity(arr.len());

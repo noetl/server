@@ -7,7 +7,7 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use minijinja::{value::ValueKind, Environment, Error, ErrorKind, UndefinedBehavior, Value};
 use std::collections::HashMap;
 
-use crate::error::{AppError, AppResult};
+use crate::error::{CoreError, CoreResult};
 
 /// Template renderer with custom filters and context.
 pub struct TemplateRenderer {
@@ -79,7 +79,7 @@ impl TemplateRenderer {
         &self,
         template: &str,
         context: &HashMap<String, serde_json::Value>,
-    ) -> AppResult<String> {
+    ) -> CoreResult<String> {
         // Quick check for non-template strings
         if !contains_template_syntax(template) {
             return Ok(template.to_string());
@@ -91,10 +91,10 @@ impl TemplateRenderer {
         let tmpl = self
             .env
             .template_from_str(template)
-            .map_err(|e| AppError::Template(format!("Template parse error: {}", e)))?;
+            .map_err(|e| CoreError::Template(format!("Template parse error: {}", e)))?;
 
         tmpl.render(ctx)
-            .map_err(|e| AppError::Template(format!("Template render error: {}", e)))
+            .map_err(|e| CoreError::Template(format!("Template render error: {}", e)))
     }
 
     /// Render a template and return the result as a JSON value.
@@ -103,7 +103,7 @@ impl TemplateRenderer {
         &self,
         template: &str,
         context: &HashMap<String, serde_json::Value>,
-    ) -> AppResult<serde_json::Value> {
+    ) -> CoreResult<serde_json::Value> {
         let rendered = self.render(template, context)?;
 
         // Try to parse as JSON if it looks like JSON
@@ -184,7 +184,7 @@ impl TemplateRenderer {
         &self,
         value: &serde_json::Value,
         context: &HashMap<String, serde_json::Value>,
-    ) -> AppResult<serde_json::Value> {
+    ) -> CoreResult<serde_json::Value> {
         match value {
             serde_json::Value::String(s) => self.render_to_value(s, context),
             serde_json::Value::Object(map) => {
@@ -210,7 +210,7 @@ impl TemplateRenderer {
         &self,
         condition: &str,
         context: &HashMap<String, serde_json::Value>,
-    ) -> AppResult<bool> {
+    ) -> CoreResult<bool> {
         // Wrap condition in {{ }} if not already
         let template = if contains_template_syntax(condition) {
             condition.to_string()

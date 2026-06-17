@@ -1069,7 +1069,7 @@ async fn generate_initial_commands(
         // JSON array.  Unlike orchestrator.rs (which coerces numbers to
         // ranges and strings to splits), the initial-dispatch boundary
         // enforces strict array typing so callers pass an explicit list.
-        let renderer = crate::template::jinja::TemplateRenderer::new();
+        let renderer = crate::template::TemplateRenderer::new();
         let raw_value = renderer.render_to_value(loop_cfg.in_expr.as_deref().unwrap_or(""), &context)?;
 
         let items: Vec<serde_json::Value> = match raw_value {
@@ -1372,7 +1372,7 @@ mod tests {
     use super::*;
     use crate::engine::commands::{CommandBuilder, IteratorMetadata};
     use crate::playbook::types::{Loop, Step, ToolDefinition, ToolKind, ToolSpec};
-    use crate::template::jinja::TemplateRenderer;
+    use crate::template::TemplateRenderer;
 
     // -----------------------------------------------------------------------
     // Helper: build a minimal Step for tests (no loop by default).
