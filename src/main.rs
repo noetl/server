@@ -404,6 +404,13 @@ fn build_router(
             "/api/internal/cleanup/purge",
             post(handlers::internal::cleanup_purge),
         )
+        // Plug-in module registry (noetl/ai-meta#105 Round 4) — the live
+        // PluginSource backend the system worker pool's wasmtime host fetches
+        // from. Catch-all `{*path}` so `system/materialiser`-style paths resolve.
+        .route(
+            "/api/internal/plugins/{*path}",
+            post(handlers::plugins::register).get(handlers::plugins::fetch),
+        )
         .with_state(db_pool.clone());
 
     // Gateway push-ingress config endpoint (noetl/ai-meta#90 Phase 3).  The
@@ -700,6 +707,10 @@ async fn main() -> anyhow::Result<()> {
     // pattern as secret_audit above.  The table is server-owned end-to-end;
     // no out-of-band migration required.
     noetl_server::db::queries::result_store::ensure_table(&db_pool).await?;
+    // Plug-in module registry (noetl/ai-meta#105 Round 4) — the durable backing
+    // for the system worker pool's wasmtime PluginSource.  Same idempotent
+    // startup-DDL pattern; server-owned end-to-end.
+    noetl_server::db::queries::plugin_module::ensure_table(&db_pool).await?;
     // Opt-in subscription dedup window (noetl/ai-meta#90 Phase 7, RFC §10
     // OQ1) — same idempotent startup-DDL pattern.  The table is server-owned
     // (only /api/execute writes it) and bounded by age; dedup is opt-in per

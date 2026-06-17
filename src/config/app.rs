@@ -43,6 +43,19 @@ pub struct AppConfig {
     #[serde(default)]
     pub disable_metrics: bool,
 
+    /// References-in-state (noetl/ai-meta#101 phase 2).  When true, the
+    /// orchestrator stops resolving over-budget result references back to inline
+    /// data — it keeps `{reference, extracted}` on the event so the state +
+    /// command context carry references, not bulk payloads (a 1.7MB step output
+    /// no longer balloons every `command.issued`).  The orchestrator evaluates
+    /// `when:`/`set:` off the small `extracted` predicate block; the worker
+    /// resolves the full reference at render time.  Envy maps
+    /// `NOETL_REFS_IN_STATE`.  **Default false** — preserves block-b's
+    /// resolve-inline behavior exactly until the consume side (worker resolve +
+    /// cursor-claim handling) is in place.
+    #[serde(default)]
+    pub refs_in_state: bool,
+
     /// Auto recreate runtime if missing
     #[serde(default = "default_true")]
     pub auto_recreate_runtime: bool,
@@ -153,6 +166,7 @@ impl Default for AppConfig {
             nats_url: None,
             enable_gcp_token_api: true,
             disable_metrics: false,
+            refs_in_state: false,
             auto_recreate_runtime: true,
             runtime_sweep_interval: default_sweep_interval(),
             runtime_offline_seconds: default_offline_seconds(),

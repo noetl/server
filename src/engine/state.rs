@@ -203,6 +203,14 @@ pub struct CursorFrame {
     pub claim_rows: Vec<serde_json::Value>,
     pub body_issued: usize,
     pub body_completed: usize,
+    /// References-in-state (noetl/ai-meta#101 phase 2): when the claim result is
+    /// over budget the orchestrator keeps the reference instead of the inline
+    /// rows, so `claim_rows` can't be filled in the sync `apply_event` pass.
+    /// The `noetl://` URI is stashed here; `trigger_orchestrator` resolves it
+    /// (async) into `claim_rows` before the cursor drive runs.  `None` on the
+    /// common inline path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_ref: Option<String>,
 }
 
 impl StepInfo {
@@ -750,6 +758,16 @@ impl WorkflowState {
                         .and_then(|d| d.get("rows"))
                         .and_then(|r| r.as_array())
                         .cloned();
+                    // References-in-state (noetl/ai-meta#101 phase 2): when the
+                    // claim is over budget the orchestrator kept the reference,
+                    // so there are no inline `rows` here.  Capture the URI so the
+                    // async pre-drive pass can resolve it into `claim_rows` —
+                    // otherwise the cursor would see 0 rows and wrongly DRAIN.
+                    let claim_ref = if rows.is_none() {
+                        event.result.as_ref().and_then(result_reference_uri)
+                    } else {
+                        None
+                    };
                     let step = self
                         .steps
                         .entry(name.clone())
@@ -758,10 +776,15 @@ impl WorkflowState {
                     // must not overwrite the cursor step's result (the drive
                     // block sets it on drain).
                     if step.is_cursor {
-                        if let (Some(cid), Some(rows)) = (cid, rows) {
+                        if let Some(cid) = cid {
                             if let Some((phase, frame)) = step.cursor_issued.get(&cid).cloned() {
                                 if phase == "claim" {
-                                    step.cursor_frames.entry(frame).or_default().claim_rows = rows;
+                                    let f = step.cursor_frames.entry(frame).or_default();
+                                    if let Some(rows) = rows {
+                                        f.claim_rows = rows;
+                                    } else if let Some(cref) = claim_ref {
+                                        f.claim_ref = Some(cref);
+                                    }
                                 }
                             }
                         }
@@ -1057,6 +1080,17 @@ pub fn apply_set_mutations(
 /// that reference `{{ step_name.field }}` in next.arcs / step.when
 /// see an undefined value because the envelope's `status` /
 /// `context` keys swallowed the user fields.
+/// Locate a `noetl://` result-reference URI on an event result envelope
+/// (references-in-state, noetl/ai-meta#101 phase 2).  Nested envelope:
+/// `context.result.reference.ref`; top-level: `reference.ref`.
+pub(crate) fn result_reference_uri(result: &serde_json::Value) -> Option<String> {
+    result
+        .pointer("/context/result/reference/ref")
+        .and_then(|v| v.as_str())
+        .or_else(|| result.pointer("/reference/ref").and_then(|v| v.as_str()))
+        .map(str::to_string)
+}
+
 pub(crate) fn extract_user_data(result: &serde_json::Value) -> Option<serde_json::Value> {
     if result.is_null() {
         return None;
