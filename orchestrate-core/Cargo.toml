@@ -11,6 +11,10 @@ license = "Apache-2.0"
 # for the filter set the evaluator uses.  Proven to compile to wasm32-unknown-unknown
 # with no WASI imports (noetl/ai-meta#108 spike).
 minijinja = { version = "2.5", features = ["serde"] }
+serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 base64 = "0.22"
 thiserror = "2.0"
+
+[dev-dependencies]
+serde_yaml = "0.9"

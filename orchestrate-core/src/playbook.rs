@@ -11,6 +11,37 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// Residency policy for a [`KeychainDef`] — part of the playbook model, so it
+/// lives in the core with the rest of the types (noetl/ai-meta#108).  The
+/// server's `secrets::residency` module re-exports this enum and holds the
+/// region-check *logic* (which needs server-only deps); the enum itself is pure
+/// data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Residency {
+    /// No check; resolution proceeds regardless of server region.
+    /// Back-compat default for entries without an explicit policy.
+    #[default]
+    None,
+    /// Check but proceed on mismatch — observability without enforcement.
+    /// Used during the migration window before flipping to `strict`.
+    Advisory,
+    /// Fail-closed on mismatch; resolution short-circuits before any provider
+    /// call (the server maps this to an `AppError::ResidencyViolation`).
+    Strict,
+}
+
+impl Residency {
+    /// Stable metric label for this policy.
+    pub fn as_label(self) -> &'static str {
+        match self {
+            Residency::None => "none",
+            Residency::Advisory => "advisory",
+            Residency::Strict => "strict",
+        }
+    }
+}
+
 /// Supported tool kinds.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -713,7 +744,7 @@ pub struct KeychainDef {
     /// server in a different region than this entry's `region` is allowed
     /// to resolve it.  See [`crate::secrets::residency::Residency`].
     #[serde(default)]
-    pub residency: crate::secrets::residency::Residency,
+    pub residency: Residency,
 
     /// Secrets Wallet Phase 6c — extra regions (besides the entry's own
     /// `region`) from which resolution is allowed when `residency` is
