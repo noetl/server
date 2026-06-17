@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.15.2](https://github.com/noetl/server/compare/v3.15.1...v3.15.2) (2026-06-17)
+
+### Performance Improvements
+
+* **events:** handle_batch_events does one multi-row INSERT (not N) ([#199](https://github.com/noetl/server/issues/199)) ([36867f8](https://github.com/noetl/server/commit/36867f8fa4f664adf126fe8552052d5e24b03ce9)), closes [noetl/ai-meta#102](https://github.com/noetl/ai-meta/issues/102) [noetl/ai-meta#102](https://github.com/noetl/ai-meta/issues/102)
+
 ## [3.15.1](https://github.com/noetl/server/compare/v3.15.0...v3.15.1) (2026-06-17)
 
 ### Bug Fixes
