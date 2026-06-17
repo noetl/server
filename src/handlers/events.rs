@@ -1021,19 +1021,30 @@ pub async fn handle_batch_events(
     let mut tx = state.pools.pool_for(execution_id).begin().await?;
     let mut event_ids = Vec::with_capacity(request.events.len());
 
+    // noetl/ai-meta#102 step 1 (worker side): a worker that batches a command's
+    // lifecycle events (started / call.done / completed) into one POST lands them
+    // as a single multi-row INSERT here — every event preserved (full per-item
+    // granularity), but the N writes collapse to one round-trip.  Build all the
+    // rows first, then one `QueryBuilder` multi-row INSERT (was: N individual
+    // INSERTs in the txn loop).
+    struct PreparedEvent {
+        event_id: i64,
+        event_type: String,
+        step: String,
+        status: String,
+        result_obj: serde_json::Value,
+        meta_obj: serde_json::Value,
+    }
+    let mut rows: Vec<PreparedEvent> = Vec::with_capacity(request.events.len());
     for item in &request.events {
-        // Batch path uses the application-side snowflake
-        // generator (Phase F R1.5 of noetl/ai-meta#49).  Per-item
-        // app-side event_id isn't carried in BatchEventItem yet;
-        // left as a follow-up if batch becomes the worker's
-        // primary path.
+        // Batch path uses the application-side snowflake generator (Phase F R1.5
+        // of noetl/ai-meta#49).  Per-item app-side event_id isn't carried in
+        // BatchEventItem yet; left as a follow-up.
         let event_id = state.snowflake.generate()?;
         let status = event_status_from_name(&item.event_type);
 
-        // Constraint-compliant `{status, context}` envelope per
-        // noetl/server#29.  Same shape rule as build_result_object
-        // in handle_event_inner: `context` only when payload is
-        // an object; otherwise emit `{status}` alone.
+        // Constraint-compliant `{status, context}` envelope per noetl/server#29 —
+        // `context` only when payload is an object; otherwise `{status}` alone.
         let mut result_map = serde_json::Map::new();
         result_map.insert(
             "status".to_string(),
@@ -1042,8 +1053,7 @@ pub async fn handle_batch_events(
         if let serde_json::Value::Object(_) = item.payload {
             result_map.insert("context".to_string(), item.payload.clone());
         }
-        let result_obj_raw = serde_json::Value::Object(result_map);
-        let result_obj = sanitize_sensitive_data(&result_obj_raw);
+        let result_obj = sanitize_sensitive_data(&serde_json::Value::Object(result_map));
 
         let mut meta_obj = serde_json::json!({
             "actionable": item.actionable,
@@ -1056,33 +1066,36 @@ pub async fn handle_batch_events(
         }
         let meta_obj = sanitize_sensitive_data(&meta_obj);
 
-        sqlx::query(
-            r#"
-            INSERT INTO noetl.event (
-                event_id, execution_id, catalog_id, event_type,
-                node_id, node_name, status, result, meta, worker_id, created_at
-            ) VALUES (
-                $1, $2, $3, $4,
-                $5, $6, $7, $8, $9, $10, $11
-            )
-            "#,
-        )
-        .bind(event_id)
-        .bind(execution_id)
-        .bind(catalog_id)
-        .bind(&item.event_type)
-        .bind(&item.step)
-        .bind(&item.step)
-        .bind(status)
-        .bind(result_obj)
-        .bind(meta_obj)
-        .bind(&request.worker_id)
-        .bind(chrono::Utc::now())
-        .execute(&mut *tx)
-        .await?;
-
         event_ids.push(event_id);
+        rows.push(PreparedEvent {
+            event_id,
+            event_type: item.event_type.clone(),
+            step: item.step.clone(),
+            status: status.to_string(),
+            result_obj,
+            meta_obj,
+        });
     }
+
+    let now = chrono::Utc::now();
+    let mut qb = sqlx::QueryBuilder::new(
+        "INSERT INTO noetl.event (event_id, execution_id, catalog_id, event_type, \
+         node_id, node_name, status, result, meta, worker_id, created_at) ",
+    );
+    qb.push_values(rows.iter(), |mut b, r| {
+        b.push_bind(r.event_id)
+            .push_bind(execution_id)
+            .push_bind(catalog_id)
+            .push_bind(&r.event_type)
+            .push_bind(&r.step)
+            .push_bind(&r.step)
+            .push_bind(&r.status)
+            .push_bind(&r.result_obj)
+            .push_bind(&r.meta_obj)
+            .push_bind(&request.worker_id)
+            .push_bind(now);
+    });
+    qb.build().execute(&mut *tx).await?;
 
     tx.commit().await?;
 
