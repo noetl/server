@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.12.0](https://github.com/noetl/server/compare/v3.11.0...v3.12.0) (2026-06-17)
+
+### Features
+
+* **objects:** object-store endpoint — the Feather tier (v3.12.0, [#105](https://github.com/noetl/server/issues/105) Round 5) ([#212](https://github.com/noetl/server/issues/212)) ([a08c5d4](https://github.com/noetl/server/commit/a08c5d4e81f9a9e12732857445eb97402d9b88fb)), closes [noetl/server#211](https://github.com/noetl/server/issues/211)
+
 ## [3.11.0](https://github.com/noetl/server/compare/v3.10.0...v3.11.0) (2026-06-17)
 
 ### Features
