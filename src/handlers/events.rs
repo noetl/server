@@ -1509,6 +1509,61 @@ const REBUILD_STRAGGLER_MARGIN_SECS: i64 = 30;
 /// full-log replay that OOM'd the server at scale: a straggler below the
 /// incremental watermark used to trigger a reload of the entire (growing) event
 /// log on nearly every completion under high concurrency.
+/// Resolve over-budget cursor claim references into inline `claim_rows` before
+/// the drive runs (references-in-state, noetl/ai-meta#101 phase 2).  A referenced
+/// claim has `claim_ref` set + empty `claim_rows` (the sync `apply_event` can't
+/// resolve); this async pass fills the rows so the cursor fans out instead of
+/// wrongly draining.  No-op unless the flag kept a claim reference.
+async fn resolve_cursor_claim_refs(
+    ws: &mut crate::engine::state::WorkflowState,
+    result_store: &crate::services::result_store::ResultStoreService,
+) {
+    use crate::services::result_store::parse_noetl_ref;
+    for step in ws.steps.values_mut() {
+        if !step.is_cursor {
+            continue;
+        }
+        for frame in step.cursor_frames.values_mut() {
+            if !frame.claim_rows.is_empty() {
+                continue;
+            }
+            let Some(uri) = frame.claim_ref.clone() else {
+                continue;
+            };
+            let parsed = match parse_noetl_ref(&uri) {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!(uri, %e, "cursor claim reference unparseable; left as drain");
+                    continue;
+                }
+            };
+            match result_store.resolve(&parsed).await {
+                Ok(Some(data)) => match extract_claim_rows(&data) {
+                    Some(rows) => {
+                        frame.claim_rows = rows;
+                        frame.claim_ref = None;
+                    }
+                    None => warn!(uri, "cursor claim reference resolved but no rows array found"),
+                },
+                Ok(None) => warn!(uri, "cursor claim reference not found in store"),
+                Err(e) => warn!(uri, %e, "cursor claim reference resolve failed"),
+            }
+        }
+    }
+}
+
+/// Pull the claimed rows array out of a resolved claim payload, trying the
+/// common shapes the store may hold for a tool result.
+fn extract_claim_rows(data: &serde_json::Value) -> Option<Vec<serde_json::Value>> {
+    for ptr in ["/rows", "/data/rows", "/result/rows", "/context/data/rows"] {
+        if let Some(arr) = data.pointer(ptr).and_then(|v| v.as_array()) {
+            return Some(arr.clone());
+        }
+    }
+    crate::engine::state::extract_user_data(data)
+        .and_then(|d| d.get("rows").and_then(|r| r.as_array()).cloned())
+}
+
 async fn rebuild_state(
     pool: &crate::db::DbPool,
     result_store: &crate::services::result_store::ResultStoreService,
@@ -1860,6 +1915,12 @@ async fn trigger_orchestrator_inner(
     // 3. Evaluate against the cached state.
     let orchestrator = WorkflowOrchestrator::new();
     let ws = cache.state.as_mut().unwrap();
+    // References-in-state (noetl/ai-meta#101 phase 2): resolve any over-budget
+    // cursor claim references into inline rows before the drive reads them — a
+    // referenced claim has `claim_ref` set + empty `claim_rows`, and without
+    // this the cursor would see 0 rows and wrongly DRAIN.  No-op unless the flag
+    // kept a claim reference (flag-off claims are resolved inline by hydrate).
+    resolve_cursor_claim_refs(ws, &result_store).await;
     let result = match orchestrator.evaluate_state(
         ws,
         latest_ts,
