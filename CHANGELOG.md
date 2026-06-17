@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.14.0](https://github.com/noetl/server/compare/v3.13.0...v3.14.0) (2026-06-17)
+
+### Features
+
+* **cqrs:** event-log → JetStream tailer (write-path producer, default off) ([#202](https://github.com/noetl/server/issues/202)) ([ee9b160](https://github.com/noetl/server/commit/ee9b16089f3b6bb483dfaa680b55bf37a06ef92a)), closes [noetl/ai-meta#103](https://github.com/noetl/ai-meta/issues/103) [server#201](https://github.com/noetl/server/issues/201) [noetl/ai-meta#103](https://github.com/noetl/ai-meta/issues/103) [noetl/ai-meta#103](https://github.com/noetl/ai-meta/issues/103)
+
 ## [3.13.0](https://github.com/noetl/server/compare/v3.12.0...v3.13.0) (2026-06-17)
 
 ### Features
