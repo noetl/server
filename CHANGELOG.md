@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.16.0](https://github.com/noetl/server/compare/v3.15.4...v3.16.0) (2026-06-17)
+
+### Features
+
+* **orchestrate-core:** stand up the pure drive-core crate, two-target ([#108](https://github.com/noetl/server/issues/108)) ([#218](https://github.com/noetl/server/issues/218)) ([200e37e](https://github.com/noetl/server/commit/200e37e28ed8074b9cf2aff591aa8bea66a55c3c))
+
 ## [3.15.4](https://github.com/noetl/server/compare/v3.15.3...v3.15.4) (2026-06-17)
 
 ### Bug Fixes
