@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.15.0](https://github.com/noetl/server/compare/v3.14.0...v3.15.0) (2026-06-17)
+
+### Features
+
+* **cqrs:** projector snapshot ownership + materializer + normalize ([#103](https://github.com/noetl/server/issues/103) phase 2b/2d, rebased) ([#215](https://github.com/noetl/server/issues/215)) ([f5beddc](https://github.com/noetl/server/commit/f5beddc3e1ac51c605efdc27c248e53409a85d0e)), closes [server#202](https://github.com/noetl/server/issues/202) [#202](https://github.com/noetl/server/issues/202)
+
 ## [3.14.0](https://github.com/noetl/server/compare/v3.13.0...v3.14.0) (2026-06-17)
 
 ### Features
