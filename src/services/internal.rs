@@ -12,7 +12,7 @@
 //! the system pool's playbooks must work against either server during
 //! migration.  Tracks noetl/server#11 → noetl/ai-meta#49 Phase C.
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::types::JsonValue;
 
@@ -409,6 +409,50 @@ pub async fn pending_count(pool: &DbPool) -> AppResult<i64> {
 /// projector must be loose-coupled with the event emitter (worker,
 /// executor, server).  Required fields mirror what the projector's
 /// batch INSERT writes.
+/// Deserialize an event timestamp tolerantly.  Accepts RFC3339 / ISO-8601 with
+/// an explicit offset or `Z`, **and** timezone-less timestamps like
+/// `2026-06-17T16:48:21.379403` — what Postgres `to_jsonb` emits for a
+/// `timestamp without time zone` column, which is exactly what the event-log
+/// tailer publishes onto `noetl_events` (`noetl.event.created_at` is tz-less).
+/// Timezone-less forms are assumed UTC.
+///
+/// Without this, chrono's strict `DateTime<Utc>` deserialize rejects the
+/// tz-less form — it scans the string and hits the end looking for the offset,
+/// surfacing the *misleading* serde error `events[0].timestamp: premature end
+/// of input` even though the body is complete, valid JSON.  That broke the CQRS
+/// materializer's `POST /api/internal/events/project` for every drained batch
+/// (noetl/ai-meta#106).
+fn deserialize_flexible_timestamp<'de, D>(
+    deserializer: D,
+) -> Result<Option<DateTime<Utc>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt = Option::<String>::deserialize(deserializer)?;
+    let Some(raw) = opt else { return Ok(None) };
+    let s = raw.trim();
+    if s.is_empty() {
+        return Ok(None);
+    }
+    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+        return Ok(Some(dt.with_timezone(&Utc)));
+    }
+    const NAIVE_FORMATS: &[&str] = &[
+        "%Y-%m-%dT%H:%M:%S%.f",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d %H:%M:%S%.f",
+        "%Y-%m-%d %H:%M:%S",
+    ];
+    for fmt in NAIVE_FORMATS {
+        if let Ok(naive) = NaiveDateTime::parse_from_str(s, fmt) {
+            return Ok(Some(DateTime::from_naive_utc_and_offset(naive, Utc)));
+        }
+    }
+    Err(serde::de::Error::custom(format!(
+        "unrecognized timestamp format: {s}"
+    )))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct EventEnvelope {
     pub event_id: i64,
@@ -428,7 +472,11 @@ pub struct EventEnvelope {
     pub status: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duration: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_flexible_timestamp",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub timestamp: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context: Option<JsonValue>,
@@ -548,6 +596,47 @@ pub async fn project_events(pool: &DbPool, events: &[EventEnvelope]) -> AppResul
 #[cfg(test)]
 mod tests {
     use super::CleanupPolicy;
+    use super::EventEnvelope;
+
+    // noetl/ai-meta#106: an EventEnvelope whose `timestamp` is timezone-less
+    // (Postgres `to_jsonb` of `timestamp without time zone` — what the tailer
+    // publishes) must deserialize, assuming UTC, instead of failing with the
+    // misleading "premature end of input".
+    #[test]
+    fn envelope_accepts_timezone_less_timestamp() {
+        let env: EventEnvelope = serde_json::from_str(
+            r#"{"event_id":1,"timestamp":"2026-06-17T16:48:21.379403"}"#,
+        )
+        .expect("tz-less timestamp must deserialize (#106)");
+        let ts = env.timestamp.expect("timestamp parsed");
+        assert_eq!(ts.to_rfc3339(), "2026-06-17T16:48:21.379403+00:00");
+    }
+
+    #[test]
+    fn envelope_still_accepts_rfc3339_and_null_timestamp() {
+        let with_tz: EventEnvelope =
+            serde_json::from_str(r#"{"event_id":2,"timestamp":"2026-06-17T16:48:21Z"}"#).unwrap();
+        assert!(with_tz.timestamp.is_some());
+        let none: EventEnvelope =
+            serde_json::from_str(r#"{"event_id":3,"timestamp":null}"#).unwrap();
+        assert!(none.timestamp.is_none());
+        let absent: EventEnvelope = serde_json::from_str(r#"{"event_id":4}"#).unwrap();
+        assert!(absent.timestamp.is_none());
+    }
+
+    // The full request shape the CQRS materializer POSTs — a batch of envelopes
+    // with tz-less timestamps — must deserialize end to end.
+    #[test]
+    fn events_project_request_accepts_tz_less_batch() {
+        use crate::handlers::internal::EventsProjectRequest;
+        let body = r#"{"events":[
+            {"event_id":10,"event_type":"call.done","timestamp":"2026-06-17T16:48:21.379403"},
+            {"event_id":11,"event_type":"command.completed","timestamp":"2026-06-17T16:48:22.001"}
+        ]}"#;
+        let req: EventsProjectRequest = serde_json::from_str(body).expect("batch deserializes (#106)");
+        assert_eq!(req.events.len(), 2);
+        assert!(req.events[0].timestamp.is_some());
+    }
 
     #[test]
     fn cleanup_empty_body_uses_safe_defaults_and_skips_events() {
