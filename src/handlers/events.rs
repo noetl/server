@@ -1693,7 +1693,7 @@ pub(crate) async fn advance_snapshot(
         pool.clone(),
         state.snowflake.clone(),
     );
-    let r = rebuild_state(pool, &result_store, execution_id).await?;
+    let r = rebuild_state(pool, &result_store, execution_id, state.config.refs_in_state).await?;
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM noetl.event WHERE execution_id = $1")
         .bind(execution_id)
         .fetch_one(pool)
