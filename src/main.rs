@@ -184,6 +184,24 @@ fn build_router(
         )
         .with_state(state.clone());
 
+    // CQRS read-model advance endpoint (noetl/ai-meta#103 phase 2b).  The
+    // system/projector playbook posts the execution_ids from a noetl_events
+    // stream batch; the server recomputes + saves each one's
+    // projection_snapshot.  Carries AppState (needs pools + snowflake), so it's
+    // a separate router from the DbPool-stated internal group above.
+    let projection_routes = Router::new()
+        .route(
+            "/api/internal/projection/advance",
+            post(handlers::internal::projection_advance),
+        )
+        // CQRS write-path cutover (#103 phase 2d): materialize noetl.event from
+        // native producer events (normalized via the shared ingest path).
+        .route(
+            "/api/internal/events/materialize",
+            post(handlers::internal::events_materialize),
+        )
+        .with_state(state.clone());
+
     // Keychain routes
     let keychain_routes = Router::new()
         .route(
@@ -474,6 +492,7 @@ fn build_router(
         .merge(wallet_rotate_routes)
         .merge(secret_audit_routes)
         .merge(container_callback_routes)
+        .merge(projection_routes)
         .merge(keychain_routes)
         .merge(execution_routes)
         .merge(executions_routes)
