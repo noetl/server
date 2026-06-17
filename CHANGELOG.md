@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.15.1](https://github.com/noetl/server/compare/v3.15.0...v3.15.1) (2026-06-17)
+
+### Bug Fixes
+
+* **cqrs:** pass refs_in_state to rebuild_state in projection/advance handler ([#216](https://github.com/noetl/server/issues/216)) ([59f7b8a](https://github.com/noetl/server/commit/59f7b8a4ee6d5f81d51aa852a39c1a8c0cba1ea6)), closes [#215](https://github.com/noetl/server/issues/215) [#215](https://github.com/noetl/server/issues/215) [noetl/ai-meta#103](https://github.com/noetl/ai-meta/issues/103)
+
 ## [3.15.0](https://github.com/noetl/server/compare/v3.14.0...v3.15.0) (2026-06-17)
 
 ### Features
