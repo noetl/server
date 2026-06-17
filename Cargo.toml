@@ -7,7 +7,15 @@ repository = "https://github.com/noetl/noetl"
 homepage = "https://noetl.io"
 description = "NoETL Control Plane - Async Rust server for workflow orchestration"
 
+# Workspace root: the server package plus the pure drive core extracted for the
+# server-dissolution program (noetl/ai-meta#108).  The core compiles to both
+# this binary (native) and a wasm32 system plug-in from one source.
+[workspace]
+members = ["orchestrate-core"]
+
 [dependencies]
+# Pure orchestrator drive core (one source → native + wasm32; noetl/ai-meta#108).
+noetl-orchestrate-core = { path = "orchestrate-core" }
 # Async runtime
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time", "sync"] }
 

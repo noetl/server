@@ -151,7 +151,7 @@ impl ConditionEvaluator {
         condition: &str,
         context: &HashMap<String, serde_json::Value>,
     ) -> AppResult<bool> {
-        self.renderer.evaluate_condition(condition, context)
+        self.renderer.evaluate_condition(condition, context).map_err(Into::into)
     }
 
     /// Evaluate step enable guard (step.when).

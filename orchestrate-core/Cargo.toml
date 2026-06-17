@@ -1,0 +1,16 @@
+[package]
+name = "noetl-orchestrate-core"
+version = "0.1.0"
+edition = "2021"
+description = "Pure orchestrator drive core for NoETL — compiles to the server (native) and to a wasm32 system plug-in (the system/orchestrate kernel service). noetl/ai-meta#108."
+license = "Apache-2.0"
+
+[dependencies]
+# minijinja WITHOUT `loader` (no std::fs on wasm32-unknown-unknown); templates come
+# from the playbook, not files.  `serde` for serde_json value bridging; `builtins`
+# for the filter set the evaluator uses.  Proven to compile to wasm32-unknown-unknown
+# with no WASI imports (noetl/ai-meta#108 spike).
+minijinja = { version = "2.5", features = ["serde"] }
+serde_json = "1.0"
+base64 = "0.22"
+thiserror = "2.0"

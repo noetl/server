@@ -87,7 +87,7 @@ pub async fn resolve_keychain_entry_with_meta(
                     Ok(p) => p,
                     Err(e) => {
                         record_secret_resolve(provider_id, &region, "template_error");
-                        return Err(e);
+                        return Err(e.into());
                     }
                 };
                 let secret = match provider
