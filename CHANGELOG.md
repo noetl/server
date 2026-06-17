@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.17.0](https://github.com/noetl/server/compare/v3.16.0...v3.17.0) (2026-06-17)
+
+### Features
+
+* **orchestrate-core:** move the playbook type model into the core ([#108](https://github.com/noetl/server/issues/108)) ([#219](https://github.com/noetl/server/issues/219)) ([260de72](https://github.com/noetl/server/commit/260de7227a3f3c9829e27f917e49fcd09f89cc85))
+
 ## [3.16.0](https://github.com/noetl/server/compare/v3.15.4...v3.16.0) (2026-06-17)
 
 ### Features
