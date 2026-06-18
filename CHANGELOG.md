@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.29.0](https://github.com/noetl/server/compare/v3.28.0...v3.29.0) (2026-06-18)
+
+### Features
+
+* **cqrs:** emit_event chokepoint + PUBLISH_ONLY sole-writer gate ([#103](https://github.com/noetl/server/issues/103) 2d-3, default-off) ([#235](https://github.com/noetl/server/issues/235)) ([aafb91c](https://github.com/noetl/server/commit/aafb91c4e3d4e7802ba9fd4624e1662354d558bc))
+
 ## [3.28.0](https://github.com/noetl/server/compare/v3.27.0...v3.28.0) (2026-06-18)
 
 ### Features
