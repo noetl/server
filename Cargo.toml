@@ -12,6 +12,12 @@ description = "NoETL Control Plane - Async Rust server for workflow orchestratio
 # this binary (native) and a wasm32 system plug-in from one source.
 [workspace]
 members = ["orchestrate-core"]
+# The orchestrate plug-in is a standalone cdylib built only for wasm32
+# (noetl/ai-meta#108); excluded so the native server build/test/clippy never
+# pulls it in.  Built explicitly:
+#   cargo build --release --target wasm32-unknown-unknown \
+#     --manifest-path plugins/orchestrate/Cargo.toml
+exclude = ["plugins/orchestrate"]
 
 [dependencies]
 # Pure orchestrator drive core (one source → native + wasm32; noetl/ai-meta#108).
