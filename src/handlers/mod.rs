@@ -8,6 +8,7 @@ pub mod credentials;
 pub mod cross_region;
 pub mod dashboard;
 pub mod database;
+pub mod event_write;
 pub mod events;
 pub mod execute;
 pub mod executions;

@@ -629,25 +629,26 @@ async fn handle_event_inner(
     let is_meta_command =
         request.step == noetl_orchestrate_core::state::WorkflowState::ORCHESTRATE_META_STEP;
     if !is_meta_command {
-        sqlx::query(
-            r#"
-            INSERT INTO noetl.event (
-                event_id, execution_id, catalog_id, event_type,
-                node_id, node_name, status, result, meta, created_at
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-            "#,
+        // CQRS write-path chokepoint (#103 2d-3): INSERT (gate off, default) or
+        // publish to noetl_events (gate on → materializer is the sole writer).
+        // `catalog_id` is always Some here — the playbook_started event wrote
+        // one before any worker event, and the column is NOT NULL.
+        let ev = crate::handlers::event_write::EventRow::new(
+            row.event_id,
+            row.execution_id,
+            row.catalog_id.unwrap_or(0),
+            row.event_type.clone(),
+            row.status.clone(),
+            row.created_at,
         )
-        .bind(row.event_id)
-        .bind(row.execution_id)
-        .bind(row.catalog_id)
-        .bind(&row.event_type)
-        .bind(&row.node_name)
-        .bind(&row.node_name)
-        .bind(&row.status)
-        .bind(&row.result)
-        .bind(&row.meta)
-        .bind(row.created_at)
-        .execute(state.pools.pool_for(execution_id))
+        .with_node(row.node_name.clone())
+        .with_result(row.result.clone())
+        .with_meta(row.meta.clone());
+        crate::handlers::event_write::emit_event(
+            &state,
+            state.pools.pool_for(execution_id),
+            ev,
+        )
         .await?;
     } else {
         crate::metrics::record_orchestrate_drive("event_suppressed");
@@ -709,7 +710,15 @@ async fn handle_event_inner(
                 Err(e) => warn!(execution_id, error = %e, "worker-driven: apply failed"),
             }
         }
-    } else if request.event_type == "command.completed" || request.event_type == "command.failed" {
+    } else if (request.event_type == "command.completed" || request.event_type == "command.failed")
+        && !crate::handlers::event_write::should_publish(&state, row.catalog_id.unwrap_or(0)).await
+    {
+        // CQRS write-path cutover (#103 2d-3): when the gate is on, this event was
+        // PUBLISHED, not written — `noetl.event` doesn't have it yet, so triggering
+        // here would rebuild stale state. The trigger relocates to the materializer's
+        // write endpoint (`handlers::internal::events_project`), which fires it AFTER
+        // the row is durably inserted (read-your-writes). Gate off (default): trigger
+        // inline exactly as today.
         match trigger_orchestrator(&state, execution_id, event_id).await {
             Ok(cmds) => {
                 info!(
@@ -1010,34 +1019,65 @@ pub async fn claim_command(
     // below). One drive at a time per execution is already guaranteed by the
     // `orchestrate_in_flight` guard + the single NATS dispatch, so skipping the
     // claimed-event idempotency anchor is safe here.
+    // CQRS write-path chokepoint (#103 2d-3).  Gate-off: the command.claimed
+    // event is written INSIDE the claim transaction exactly as before (atomic
+    // with the noetl.command claim update).  Gate-on: the event is PUBLISHED
+    // after the tx commits (the noetl.command claim stays in-tx — it's the queue
+    // the worker reads), so it materializes like every other event and the
+    // claim audit isn't lost.
+    let publish_claim =
+        crate::handlers::event_write::should_publish(&state, catalog_id.unwrap_or(0)).await;
+    let mut claim_event_to_publish: Option<crate::handlers::event_write::EventRow> = None;
     if step != noetl_orchestrate_core::state::WorkflowState::ORCHESTRATE_META_STEP {
-        sqlx::query(
-            r#"
-            INSERT INTO noetl.event (
-                event_id, execution_id, catalog_id, event_type,
-                node_id, node_name, status, result, meta, worker_id, created_at
-            ) VALUES (
-                $1, $2, $3, $4,
-                $5, $6, $7, $8, $9, $10, $11
+        if publish_claim {
+            claim_event_to_publish = Some(
+                crate::handlers::event_write::EventRow::new(
+                    claim_event_id,
+                    execution_id,
+                    catalog_id.unwrap_or(0),
+                    "command.claimed",
+                    "RUNNING",
+                    chrono::Utc::now(),
+                )
+                .with_node(step.clone())
+                .with_result(claim_result.clone())
+                .with_meta(claim_meta.clone())
+                .with_worker_id(Some(request.worker_id.clone())),
+            );
+        } else {
+            sqlx::query(
+                r#"
+                INSERT INTO noetl.event (
+                    event_id, execution_id, catalog_id, event_type,
+                    node_id, node_name, status, result, meta, worker_id, created_at
+                ) VALUES (
+                    $1, $2, $3, $4,
+                    $5, $6, $7, $8, $9, $10, $11
+                )
+                "#,
             )
-            "#,
-        )
-        .bind(claim_event_id)
-        .bind(execution_id)
-        .bind(catalog_id)
-        .bind("command.claimed")
-        .bind(&step)
-        .bind(&step)
-        .bind("RUNNING")
-        .bind(claim_result)
-        .bind(claim_meta)
-        .bind(&request.worker_id)
-        .bind(chrono::Utc::now())
-        .execute(&mut *tx)
-        .await?;
+            .bind(claim_event_id)
+            .bind(execution_id)
+            .bind(catalog_id)
+            .bind("command.claimed")
+            .bind(&step)
+            .bind(&step)
+            .bind("RUNNING")
+            .bind(claim_result)
+            .bind(claim_meta)
+            .bind(&request.worker_id)
+            .bind(chrono::Utc::now())
+            .execute(&mut *tx)
+            .await?;
+        }
     }
 
     tx.commit().await?;
+
+    if let Some(ev) = claim_event_to_publish {
+        crate::handlers::event_write::emit_event(&state, state.pools.pool_for(execution_id), ev)
+            .await?;
+    }
 
     Ok(Json(ClaimResponse {
         status: "ok".to_string(),
@@ -1133,26 +1173,58 @@ pub async fn handle_batch_events(
     }
 
     let now = chrono::Utc::now();
-    let mut qb = sqlx::QueryBuilder::new(
-        "INSERT INTO noetl.event (event_id, execution_id, catalog_id, event_type, \
-         node_id, node_name, status, result, meta, worker_id, created_at) ",
-    );
-    qb.push_values(rows.iter(), |mut b, r| {
-        b.push_bind(r.event_id)
-            .push_bind(execution_id)
-            .push_bind(catalog_id)
-            .push_bind(&r.event_type)
-            .push_bind(&r.step)
-            .push_bind(&r.step)
-            .push_bind(&r.status)
-            .push_bind(&r.result_obj)
-            .push_bind(&r.meta_obj)
-            .push_bind(&request.worker_id)
-            .push_bind(now);
-    });
-    qb.build().execute(&mut *tx).await?;
-
-    tx.commit().await?;
+    // CQRS write-path chokepoint (#103 2d-3).  Gate-off: in-tx multi-row INSERT
+    // (byte-identical).  Gate-on: publish post-commit + the orchestrator trigger
+    // relocates to the materializer endpoint.
+    let publish_batch =
+        crate::handlers::event_write::should_publish(&state, catalog_id.unwrap_or(0)).await;
+    if publish_batch {
+        let event_rows: Vec<crate::handlers::event_write::EventRow> = rows
+            .iter()
+            .map(|r| {
+                crate::handlers::event_write::EventRow::new(
+                    r.event_id,
+                    execution_id,
+                    catalog_id.unwrap_or(0),
+                    r.event_type.clone(),
+                    r.status.clone(),
+                    now,
+                )
+                .with_node(r.step.clone())
+                .with_result(r.result_obj.clone())
+                .with_meta(r.meta_obj.clone())
+                .with_worker_id(request.worker_id.clone())
+            })
+            .collect();
+        // Commit the (possibly empty) claim tx first, then publish.
+        tx.commit().await?;
+        crate::handlers::event_write::emit_events(
+            &state,
+            state.pools.pool_for(execution_id),
+            &event_rows,
+        )
+        .await?;
+    } else {
+        let mut qb = sqlx::QueryBuilder::new(
+            "INSERT INTO noetl.event (event_id, execution_id, catalog_id, event_type, \
+             node_id, node_name, status, result, meta, worker_id, created_at) ",
+        );
+        qb.push_values(rows.iter(), |mut b, r| {
+            b.push_bind(r.event_id)
+                .push_bind(execution_id)
+                .push_bind(catalog_id)
+                .push_bind(&r.event_type)
+                .push_bind(&r.step)
+                .push_bind(&r.step)
+                .push_bind(&r.status)
+                .push_bind(&r.result_obj)
+                .push_bind(&r.meta_obj)
+                .push_bind(&request.worker_id)
+                .push_bind(now);
+        });
+        qb.build().execute(&mut *tx).await?;
+        tx.commit().await?;
+    }
 
     // Trigger orchestrator for any command.completed in the batch,
     // including end (end is now a real dispatched step per
@@ -1162,8 +1234,10 @@ pub async fn handle_batch_events(
     // event so a batch with multiple completions can still advance
     // multi-step playbooks.  Errors are logged and swallowed so a
     // bad-state evaluation doesn't fail the whole batch ingest.
+    // Gate-on (publish_batch): skip — the trigger relocates to the materializer's
+    // write endpoint (events_project), which fires it after the row materializes.
     for (idx, item) in request.events.iter().enumerate() {
-        if item.event_type == "command.completed" {
+        if item.event_type == "command.completed" && !publish_batch {
             let trigger_event_id = event_ids[idx];
             match trigger_orchestrator(&state, execution_id, trigger_event_id).await {
                 Ok(cmds) => {
@@ -1782,7 +1856,7 @@ pub(crate) async fn advance_snapshot(
     })
 }
 
-async fn trigger_orchestrator(
+pub(crate) async fn trigger_orchestrator(
     state: &AppState,
     execution_id: i64,
     trigger_event_id: i64,
@@ -2239,27 +2313,23 @@ async fn apply_orchestration_result(
             _ => serde_json::json!({"status": event_status}),
         };
 
-        sqlx::query(
-            r#"
-            INSERT INTO noetl.event (
-                event_id, execution_id, catalog_id, event_type,
-                node_id, node_name, status, result, meta, created_at, parent_event_id
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-            "#,
+        // CQRS write-path chokepoint (#103 2d-3).
+        let mut ev = crate::handlers::event_write::EventRow::new(
+            event_id,
+            execution_id,
+            catalog_id,
+            emit.event_type.clone(),
+            event_status.clone(),
+            chrono::Utc::now(),
         )
-        .bind(event_id)
-        .bind(execution_id)
-        .bind(catalog_id)
-        .bind(&emit.event_type)
-        .bind(emit.node_name.as_deref())
-        .bind(emit.node_name.as_deref())
-        .bind(&event_status)
-        .bind(&result_obj)
-        .bind(serde_json::json!({"emitted_by": "orchestrator"}))
-        .bind(chrono::Utc::now())
-        .bind(trigger_event_id)
-        .execute(state.pools.pool_for(execution_id))
-        .await?;
+        .with_result(result_obj.clone())
+        .with_meta(serde_json::json!({"emitted_by": "orchestrator"}))
+        .with_parent_event_id(trigger_event_id);
+        if let Some(n) = emit.node_name.as_deref() {
+            ev = ev.with_node(n);
+        }
+        crate::handlers::event_write::emit_event(state, state.pools.pool_for(execution_id), ev)
+            .await?;
     }
 
     // 5. Issue new commands — batched (noetl/ai-meta#102 step 1).  A cursor
@@ -2286,27 +2356,21 @@ async fn apply_orchestration_result(
         };
         let event_id = state.snowflake.generate()?;
         let terminal_meta = serde_json::to_value(&result.completion_status).unwrap_or_default();
-        sqlx::query(
-            r#"
-            INSERT INTO noetl.event (
-                event_id, execution_id, catalog_id, event_type,
-                node_id, node_name, status, result, meta, created_at, parent_event_id
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-            "#,
+        // CQRS write-path chokepoint (#103 2d-3).
+        let ev = crate::handlers::event_write::EventRow::new(
+            event_id,
+            execution_id,
+            catalog_id,
+            event_type,
+            status,
+            chrono::Utc::now(),
         )
-        .bind(event_id)
-        .bind(execution_id)
-        .bind(catalog_id)
-        .bind(event_type)
-        .bind("playbook")
-        .bind("playbook")
-        .bind(status)
-        .bind(serde_json::json!({"status": status}))
-        .bind(terminal_meta)
-        .bind(chrono::Utc::now())
-        .bind(trigger_event_id)
-        .execute(state.pools.pool_for(execution_id))
-        .await?;
+        .with_node("playbook")
+        .with_result(serde_json::json!({"status": status}))
+        .with_meta(terminal_meta)
+        .with_parent_event_id(trigger_event_id);
+        crate::handlers::event_write::emit_event(state, state.pools.pool_for(execution_id), ev)
+            .await?;
         info!(
             execution_id,
             terminal_event = %event_type,
@@ -2432,27 +2496,24 @@ async fn emit_playbook_failed(
     error: &str,
 ) -> AppResult<()> {
     let event_id = state.snowflake.generate()?;
-    sqlx::query(
-        r#"
-        INSERT INTO noetl.event (
-            event_id, execution_id, catalog_id, event_type,
-            node_id, node_name, status, result, meta, created_at, parent_event_id
-        ) VALUES ($1, $2, $3, 'playbook.failed', 'playbook', 'playbook', 'FAILED', $4, $5, $6, $7)
-        "#,
+    // CQRS write-path chokepoint (#103 2d-3).
+    let ev = crate::handlers::event_write::EventRow::new(
+        event_id,
+        execution_id,
+        catalog_id,
+        "playbook.failed",
+        "FAILED",
+        chrono::Utc::now(),
     )
-    .bind(event_id)
-    .bind(execution_id)
-    .bind(catalog_id)
-    .bind(serde_json::json!({"status": "FAILED", "context": {"error": error}}))
-    .bind(serde_json::json!({
+    .with_node("playbook")
+    .with_result(serde_json::json!({"status": "FAILED", "context": {"error": error}}))
+    .with_meta(serde_json::json!({
         "emitted_by": "orchestrator",
         "reason": "evaluate_error",
         "error": error,
     }))
-    .bind(chrono::Utc::now())
-    .bind(trigger_event_id)
-    .execute(state.pools.pool_for(execution_id))
-    .await?;
+    .with_parent_event_id(trigger_event_id);
+    crate::handlers::event_write::emit_event(state, state.pools.pool_for(execution_id), ev).await?;
     info!(
         execution_id,
         terminal_event = "playbook.failed",

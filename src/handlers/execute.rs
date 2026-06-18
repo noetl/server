@@ -495,28 +495,23 @@ async fn emit_deduplicated_event(
         "emitted_at": chrono::Utc::now().to_rfc3339(),
         "emitter": "control_plane",
     });
-    let res = sqlx::query(
-        r#"
-        INSERT INTO noetl.event (
-            execution_id, catalog_id, event_id, event_type, node_id, node_name, node_type,
-            status, context, meta, created_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-        "#,
+    // CQRS write-path chokepoint (#103 2d-3); best-effort, mirrors the prior
+    // warn-on-failure.
+    let ev = crate::handlers::event_write::EventRow::new(
+        event_id,
+        scope,
+        catalog_id,
+        "subscription.message.deduplicated",
+        "DEDUPLICATED",
+        chrono::Utc::now(),
     )
-    .bind(scope)
-    .bind(catalog_id)
-    .bind(event_id)
-    .bind("subscription.message.deduplicated")
-    .bind("subscription")
-    .bind("ingress")
-    .bind("subscription")
-    .bind("DEDUPLICATED")
-    .bind(&context)
-    .bind(&meta)
-    .bind(chrono::Utc::now())
-    .execute(state.pools.pool_for(scope))
-    .await;
-    if let Err(e) = res {
+    .with_nodes("subscription", "ingress")
+    .with_node_type("subscription")
+    .with_context(context)
+    .with_meta(meta);
+    if let Err(e) =
+        crate::handlers::event_write::emit_event(state, state.pools.pool_for(scope), ev).await
+    {
         tracing::warn!(subscription_id = scope, error = %e, "dedup audit event insert failed (non-fatal)");
     }
 }
@@ -616,31 +611,21 @@ async fn emit_playbook_started_event(
         }
     }
 
-    sqlx::query(
-        r#"
-        INSERT INTO noetl.event (
-            execution_id, catalog_id, event_id, parent_execution_id,
-            event_type, node_id, node_name, node_type, status,
-            context, meta, created_at
-        ) VALUES (
-            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12
-        )
-        "#,
+    // CQRS write-path chokepoint (#103 2d-3): INSERT (gate off) or publish (on).
+    let ev = crate::handlers::event_write::EventRow::new(
+        event_id,
+        execution_id,
+        catalog_id,
+        "playbook_started",
+        "STARTED",
+        chrono::Utc::now(),
     )
-    .bind(execution_id)
-    .bind(catalog_id)
-    .bind(event_id)
-    .bind(parent_execution_id)
-    .bind("playbook_started")
-    .bind("playbook")
-    .bind(path)
-    .bind("execution")
-    .bind("STARTED")
-    .bind(&context)
-    .bind(&meta)
-    .bind(chrono::Utc::now())
-    .execute(state.pools.pool_for(execution_id))
-    .await?;
+    .with_nodes("playbook", path)
+    .with_node_type("execution")
+    .with_parent_execution_id(parent_execution_id)
+    .with_context(context)
+    .with_meta(meta);
+    crate::handlers::event_write::emit_event(state, state.pools.pool_for(execution_id), ev).await?;
 
     Ok(event_id)
 }
@@ -770,31 +755,25 @@ pub(crate) async fn persist_engine_command(
         }
     }
 
-    sqlx::query(
-        r#"
-        INSERT INTO noetl.event (
-            event_id, execution_id, catalog_id, event_type,
-            node_id, node_name, node_type, status,
-            context, meta, parent_event_id, created_at
-        ) VALUES (
-            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12
-        )
-        "#,
+    // CQRS write-path chokepoint (#103 2d-3): the command.issued EVENT goes
+    // through emit_event (INSERT gate-off / publish gate-on).  The noetl.command
+    // ROW below stays a synchronous INSERT — it's the command queue, not the
+    // event log (#103 is event-log-scoped), and the worker fetches command
+    // config from noetl.command, so it must be present read-your-writes.
+    let ev = crate::handlers::event_write::EventRow::new(
+        event_id,
+        execution_id,
+        catalog_id,
+        "command.issued",
+        "PENDING",
+        chrono::Utc::now(),
     )
-    .bind(event_id)
-    .bind(execution_id)
-    .bind(catalog_id)
-    .bind("command.issued")
-    .bind(&step.step)
-    .bind(&step.step)
-    .bind(command.tool.kind.as_str())
-    .bind("PENDING")
-    .bind(&cmd_context)
-    .bind(&cmd_meta)
-    .bind(parent_event_id)
-    .bind(chrono::Utc::now())
-    .execute(state.pools.pool_for(execution_id))
-    .await?;
+    .with_node(&step.step)
+    .with_node_type(command.tool.kind.as_str())
+    .with_context(cmd_context.clone())
+    .with_meta(cmd_meta.clone())
+    .with_parent_event_id(parent_event_id);
+    crate::handlers::event_write::emit_event(state, state.pools.pool_for(execution_id), ev).await?;
 
     if let Err(e) = insert_command_row(
         state,
@@ -945,26 +924,28 @@ pub(crate) async fn persist_engine_commands_batch(
 
     let pool = state.pools.pool_for(execution_id);
 
-    // Multi-row INSERT of all `command.issued` events.
-    let mut qb = sqlx::QueryBuilder::new(
-        "INSERT INTO noetl.event (event_id, execution_id, catalog_id, event_type, \
-         node_id, node_name, node_type, status, context, meta, parent_event_id, created_at) ",
-    );
-    qb.push_values(prepared.iter(), |mut b, p| {
-        b.push_bind(p.event_id)
-            .push_bind(execution_id)
-            .push_bind(catalog_id)
-            .push_bind("command.issued")
-            .push_bind(p.step_name)
-            .push_bind(p.step_name)
-            .push_bind(p.tool_kind)
-            .push_bind("PENDING")
-            .push_bind(&p.cmd_context)
-            .push_bind(&p.cmd_meta)
-            .push_bind(parent_event_id)
-            .push_bind(now);
-    });
-    qb.build().execute(pool).await?;
+    // Multi-row `command.issued` EVENTS through the CQRS chokepoint (#103 2d-3):
+    // one multi-row INSERT (gate off) or one publish per row (gate on). The
+    // noetl.command ROWS below stay synchronous (command queue, not event log).
+    let event_rows: Vec<crate::handlers::event_write::EventRow> = prepared
+        .iter()
+        .map(|p| {
+            crate::handlers::event_write::EventRow::new(
+                p.event_id,
+                execution_id,
+                catalog_id,
+                "command.issued",
+                "PENDING",
+                now,
+            )
+            .with_node(p.step_name)
+            .with_node_type(p.tool_kind)
+            .with_context(p.cmd_context.clone())
+            .with_meta(p.cmd_meta.clone())
+            .with_parent_event_id(parent_event_id)
+        })
+        .collect();
+    crate::handlers::event_write::emit_events(state, pool, &event_rows).await?;
 
     // Multi-row INSERT of all `noetl.command` rows (non-fatal — the event log is
     // the source of truth; mirror the single path's warn-on-failure).
@@ -1219,27 +1200,21 @@ async fn generate_initial_commands(
                 "iterator_var": loop_cfg.iterator,
             },
         });
-        sqlx::query(
-            r#"
-            INSERT INTO noetl.event (
-                event_id, execution_id, catalog_id, event_type,
-                node_id, node_name, status, result, meta, created_at, parent_event_id
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-            "#,
+        // CQRS write-path chokepoint (#103 2d-3).
+        let ev = crate::handlers::event_write::EventRow::new(
+            enter_event_id,
+            execution_id,
+            catalog_id,
+            "step.enter",
+            "ENTERED",
+            chrono::Utc::now(),
         )
-        .bind(enter_event_id)
-        .bind(execution_id)
-        .bind(catalog_id)
-        .bind("step.enter")
-        .bind(&start_step.step)
-        .bind(&start_step.step)
-        .bind("ENTERED")
-        .bind(&enter_result)
-        .bind(serde_json::json!({"emitted_by": "execute_handler"}))
-        .bind(chrono::Utc::now())
-        .bind(parent_event_id)
-        .execute(state.pools.pool_for(execution_id))
-        .await?;
+        .with_node(&start_step.step)
+        .with_result(enter_result.clone())
+        .with_meta(serde_json::json!({"emitted_by": "execute_handler"}))
+        .with_parent_event_id(parent_event_id);
+        crate::handlers::event_write::emit_event(state, state.pools.pool_for(execution_id), ev)
+            .await?;
 
         // #76: parallel = all items; sequential = only iteration 0.
         let dispatch_count = if is_parallel { total } else { 1 };

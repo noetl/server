@@ -273,26 +273,19 @@ pub async fn container_callback(
     // schema — so every callback POST 500'd with
     // `column "attempt" of relation "event" does not exist`, which
     // blocked the noetl/ai-meta#43 container-callback chain end to end.
-    sqlx::query(
-        r#"
-        INSERT INTO noetl.event (
-            event_id, execution_id, catalog_id, event_type,
-            node_id, node_name, status, result, meta, created_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-        "#,
+    // CQRS write-path chokepoint (#103 2d-3).
+    let ev = crate::handlers::event_write::EventRow::new(
+        event_id,
+        execution_id,
+        catalog_id,
+        "call.done",
+        status_label,
+        chrono::Utc::now(),
     )
-    .bind(event_id)
-    .bind(execution_id)
-    .bind(catalog_id)
-    .bind("call.done")
-    .bind(&step)
-    .bind(&step)
-    .bind(status_label)
-    .bind(&result_obj)
-    .bind(serde_json::json!({ "node_type": "container" }))
-    .bind(chrono::Utc::now())
-    .execute(pool)
-    .await?;
+    .with_node(&step)
+    .with_result(result_obj.clone())
+    .with_meta(serde_json::json!({ "node_type": "container" }));
+    crate::handlers::event_write::emit_event(&state, pool, ev).await?;
 
     crate::metrics::record_container_callback(request.state.as_str());
     tracing::info!(

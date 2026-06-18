@@ -472,28 +472,21 @@ async fn write_lifecycle_event(
         "emitter": "control_plane",
         "subscription_lifecycle": true,
     });
-    sqlx::query(
-        r#"
-        INSERT INTO noetl.event (
-            execution_id, catalog_id, event_id,
-            event_type, node_id, node_name, node_type, status,
-            context, meta, created_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-        "#,
+    // CQRS write-path chokepoint (#103 2d-3).
+    let ev = crate::handlers::event_write::EventRow::new(
+        event_id,
+        subscription_id,
+        catalog_id,
+        event_type,
+        to.as_status(),
+        chrono::Utc::now(),
     )
-    .bind(subscription_id)
-    .bind(catalog_id)
-    .bind(event_id)
-    .bind(event_type)
-    .bind("subscription")
-    .bind(path)
-    .bind("subscription")
-    .bind(to.as_status())
-    .bind(&context)
-    .bind(&meta)
-    .bind(chrono::Utc::now())
-    .execute(state.pools.pool_for(subscription_id))
-    .await?;
+    .with_nodes("subscription", path)
+    .with_node_type("subscription")
+    .with_context(context)
+    .with_meta(meta);
+    crate::handlers::event_write::emit_event(state, state.pools.pool_for(subscription_id), ev)
+        .await?;
     Ok(())
 }
 
