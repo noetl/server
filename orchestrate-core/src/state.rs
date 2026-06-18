@@ -3,15 +3,14 @@
 //! Provides state reconstruction for event-sourced workflow execution.
 
 use std::collections::HashMap;
-use std::time::Instant;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::db::models::Event;
+use crate::event::Event;
 
 /// Serde skip predicate for `i32` fields that default to 0.
-pub(crate) fn is_zero(v: &i32) -> bool {
+pub fn is_zero(v: &i32) -> bool {
     *v == 0
 }
 
@@ -111,7 +110,7 @@ pub struct StepInfo {
     ///
     /// noetl/ai-meta#85: used as the **stable** per-completion key for
     /// durable `set:` persistence.  `completed_at` derives from
-    /// `event.created_at`, which the event loader fills with
+    /// `event.timestamp`, which the event loader fills with
     /// `Utc::now()` when the row's `created_at` is unreadable — so it is
     /// NOT stable across reconstructions and can't gate once-per-
     /// completion emission.  `event_id` is the row's snowflake primary
@@ -168,7 +167,7 @@ pub struct StepInfo {
     // consulted.  Non-iterator steps leave it at 0.
     /// Number of `command.issued` events observed for this iterator
     /// step.  Always 0 for non-iterator steps.
-    #[serde(default, skip_serializing_if = "crate::engine::state::is_zero")]
+    #[serde(default, skip_serializing_if = "crate::state::is_zero")]
     pub iterations_dispatched: i32,
 
     /// True when this step is a `mode: cursor` loop (noetl/ai-meta#100).  Set
@@ -309,7 +308,7 @@ pub struct WorkflowState {
 /// (constraint-compliant envelope), or — in older shapes — on
 /// `result.data`.  Returns the first match.  Used by R3b iterator
 /// state aggregation to deduplicate `command.completed` events.
-pub(crate) fn extract_command_id(event: &Event) -> Option<String> {
+pub fn extract_command_id(event: &Event) -> Option<String> {
     if let Some(meta) = &event.meta {
         if let Some(s) = meta.get("command_id").and_then(|v| v.as_str()) {
             return Some(s.to_string());
@@ -355,7 +354,8 @@ impl WorkflowState {
 
     /// Reconstruct workflow state from a list of events.
     pub fn from_events(events: &[Event]) -> Option<Self> {
-        let start = Instant::now();
+        #[cfg(not(target_arch = "wasm32"))]
+        let start = std::time::Instant::now();
 
         if events.is_empty() {
             return None;
@@ -370,29 +370,35 @@ impl WorkflowState {
             state.apply_event(event);
         }
 
-        let duration = start.elapsed();
-        let event_count = events.len();
+        // Perf logging — native only.  `Instant` isn't portable to
+        // wasm32-unknown-unknown (no clock); in the plug-in the host times the
+        // invoke instead, so this self-timing is compiled out (noetl/ai-meta#109).
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let duration = start.elapsed();
+            let event_count = events.len();
 
-        // Log performance metrics for state reconstruction
-        tracing::info!(
-            target: "noetl.performance",
-            execution_id = %first.execution_id,
-            phase = "state_reconstruction",
-            event_count = %event_count,
-            step_count = %state.steps.len(),
-            duration_ms = %duration.as_millis(),
-            "State reconstructed from events"
-        );
-
-        // Warn if reconstruction is slow (potential bottleneck)
-        if duration.as_millis() > 100 || event_count > 50 {
-            tracing::warn!(
+            // Log performance metrics for state reconstruction
+            tracing::info!(
                 target: "noetl.performance",
                 execution_id = %first.execution_id,
+                phase = "state_reconstruction",
                 event_count = %event_count,
+                step_count = %state.steps.len(),
                 duration_ms = %duration.as_millis(),
-                "Slow state reconstruction detected - consider optimizing event loading"
+                "State reconstructed from events"
             );
+
+            // Warn if reconstruction is slow (potential bottleneck)
+            if duration.as_millis() > 100 || event_count > 50 {
+                tracing::warn!(
+                    target: "noetl.performance",
+                    execution_id = %first.execution_id,
+                    event_count = %event_count,
+                    duration_ms = %duration.as_millis(),
+                    "Slow state reconstruction detected - consider optimizing event loading"
+                );
+            }
         }
 
         Some(state)
@@ -403,7 +409,7 @@ impl WorkflowState {
         match event.event_type.as_str() {
             "playbook_started" => {
                 self.state = ExecutionState::InProgress;
-                self.started_at = Some(event.created_at);
+                self.started_at = Some(event.timestamp);
                 self.parent_execution_id = event.parent_execution_id;
 
                 // Extract workload from context
@@ -421,15 +427,15 @@ impl WorkflowState {
             }
             "playbook_completed" | "playbook.completed" => {
                 self.state = ExecutionState::Completed;
-                self.completed_at = Some(event.created_at);
+                self.completed_at = Some(event.timestamp);
             }
             "playbook_failed" | "playbook.failed" => {
                 self.state = ExecutionState::Failed;
-                self.completed_at = Some(event.created_at);
+                self.completed_at = Some(event.timestamp);
             }
             "playbook.cancelled" => {
                 self.state = ExecutionState::Cancelled;
-                self.completed_at = Some(event.created_at);
+                self.completed_at = Some(event.timestamp);
             }
             "ctx.updated" => {
                 // noetl/ai-meta#85: durable loop-variable propagation.
@@ -482,7 +488,7 @@ impl WorkflowState {
                         .entry(name.clone())
                         .or_insert_with(|| StepInfo::new(name));
                     step.state = StepState::Entered;
-                    step.entered_at = Some(event.created_at);
+                    step.entered_at = Some(event.timestamp);
                     // R3b iterator fan-out: orchestrator stamps the
                     // iteration total onto the step.enter event so
                     // state reconstruction knows how many
@@ -566,8 +572,8 @@ impl WorkflowState {
                         .entry(name.clone())
                         .or_insert_with(|| StepInfo::new(name));
                     step.state = StepState::Skipped;
-                    step.entered_at = Some(event.created_at);
-                    step.completed_at = Some(event.created_at);
+                    step.entered_at = Some(event.timestamp);
+                    step.completed_at = Some(event.timestamp);
                 }
             }
             "command.issued" => {
@@ -704,7 +710,7 @@ impl WorkflowState {
                         }
                         if step.iterations_completed() >= expected {
                             step.state = StepState::Completed;
-                            step.completed_at = Some(event.created_at);
+                            step.completed_at = Some(event.timestamp);
                             step.completed_event_id = Some(event.event_id);
                             // Aggregate result = list of per-iteration
                             // results in arrival order (may not match
@@ -719,7 +725,7 @@ impl WorkflowState {
                     } else {
                         // Plain (non-iterator) step.
                         step.state = StepState::Completed;
-                        step.completed_at = Some(event.created_at);
+                        step.completed_at = Some(event.timestamp);
                         step.completed_event_id = Some(event.event_id);
                         // Only overwrite step.result with command.completed's
                         // envelope if the user-data hasn't been written yet
@@ -808,7 +814,7 @@ impl WorkflowState {
                         .entry(name.clone())
                         .or_insert_with(|| StepInfo::new(name));
                     step.state = StepState::Failed;
-                    step.completed_at = Some(event.created_at);
+                    step.completed_at = Some(event.timestamp);
                     // Extract error from result.  Two shapes seen in
                     // the wild — top-level `result.error` and the
                     // nested `result.context.error` (the worker's
@@ -1083,7 +1089,7 @@ pub fn apply_set_mutations(
 /// Locate a `noetl://` result-reference URI on an event result envelope
 /// (references-in-state, noetl/ai-meta#101 phase 2).  Nested envelope:
 /// `context.result.reference.ref`; top-level: `reference.ref`.
-pub(crate) fn result_reference_uri(result: &serde_json::Value) -> Option<String> {
+pub fn result_reference_uri(result: &serde_json::Value) -> Option<String> {
     result
         .pointer("/context/result/reference/ref")
         .and_then(|v| v.as_str())
@@ -1091,7 +1097,7 @@ pub(crate) fn result_reference_uri(result: &serde_json::Value) -> Option<String>
         .map(str::to_string)
 }
 
-pub(crate) fn extract_user_data(result: &serde_json::Value) -> Option<serde_json::Value> {
+pub fn extract_user_data(result: &serde_json::Value) -> Option<serde_json::Value> {
     if result.is_null() {
         return None;
     }
@@ -1172,23 +1178,19 @@ mod tests {
 
     fn make_event(event_type: &str, node_name: Option<&str>) -> Event {
         Event {
-            id: 1,
+            event_id: 1,
             execution_id: 12345,
             catalog_id: 67890,
-            event_id: 1,
-            parent_event_id: None,
-            parent_execution_id: None,
             event_type: event_type.to_string(),
-            node_id: None,
             node_name: node_name.map(|s| s.to_string()),
-            node_type: None,
             status: "".to_string(),
             context: None,
-            meta: None,
             result: None,
-            worker_id: None,
+            meta: None,
+            // Fixed epoch — the core has no clock (deterministic fixtures).
+            timestamp: DateTime::from_timestamp(0, 0).unwrap(),
+            parent_execution_id: None,
             attempt: None,
-            created_at: Utc::now(),
         }
     }
 
@@ -1754,82 +1756,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_auth0_login_full_orchestrator_arc_routing_repro() {
-        use crate::engine::WorkflowOrchestrator;
-        let yaml = r#"
-apiVersion: noetl.io/v2
-kind: Playbook
-metadata:
-  name: t
-  path: t
-workload:
-  request_id: "req-123"
-workflow:
-  - step: start
-    tool:
-      kind: python
-      code: |
-        result = {"error": "Invalid JWT format"}
-    next:
-      spec:
-        mode: exclusive
-      arcs:
-        - step: err_cb
-          when: "{{ (start.error is defined) and request_id }}"
-        - step: end_step
-          when: "{{ start.error is defined and not request_id }}"
-        - step: create
-          when: "{{ start.sub is defined }}"
-  - step: err_cb
-    tool: { kind: python, code: "result = {}" }
-  - step: end_step
-    tool: { kind: python, code: "result = {}" }
-  - step: create
-    tool: { kind: python, code: "result = {}" }
-"#;
-        let playbook = crate::playbook::parser::parse_playbook(yaml).unwrap();
-
-        let mut e_started = make_event("playbook_started", None);
-        e_started.event_id = 1;
-        e_started.context = Some(serde_json::json!({
-            "workload": { "request_id": "req-123" },
-            "path": "t"
-        }));
-        let mut e_issued = make_event("command.issued", Some("start"));
-        e_issued.event_id = 2;
-        let mut e_done = make_event("call.done", Some("start"));
-        e_done.event_id = 3;
-        e_done.result = Some(serde_json::json!({
-            "status": "COMPLETED",
-            "context": { "result": { "status": "success", "context": {
-                "data": { "error": "Invalid JWT format" }, "status": "success" } } }
-        }));
-        let mut e_completed = make_event("command.completed", Some("start"));
-        e_completed.event_id = 4;
-        e_completed.result = Some(serde_json::json!({
-            "status": "success", "context": { "status": "success", "command_id": "x" }
-        }));
-
-        let events = vec![e_started, e_issued, e_done, e_completed];
-        let orch = WorkflowOrchestrator::new();
-        let result = orch
-            .evaluate(&events, &playbook, Some("command.completed"))
-            .expect("evaluate ok");
-
-        let skipped: Vec<String> = result
-            .events_to_emit
-            .iter()
-            .filter(|e| e.event_type == "step.skipped")
-            .filter_map(|e| e.node_name.clone())
-            .collect();
-        let cmds: Vec<String> = result.commands.iter().map(|c| c.step_name.clone()).collect();
-        assert!(
-            !skipped.contains(&"err_cb".to_string()),
-            "err_cb arc must fire (start.error defined + request_id truthy), not skip. \
-             skipped={skipped:?} commands={cmds:?}"
-        );
-    }
 
     #[test]
     fn test_build_context_data_accessor_does_not_clobber_existing_data_field() {

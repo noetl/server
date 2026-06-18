@@ -23,6 +23,10 @@ pub struct Event {
     /// Application-side snowflake id — the drive's ordering key.
     pub event_id: i64,
     pub execution_id: i64,
+    /// Catalog (playbook) id — the drive seeds WorkflowState with it.  Defaulted
+    /// so a wire event that omits it still deserializes.
+    #[serde(default)]
+    pub catalog_id: i64,
     pub event_type: String,
     /// The step name (`node_name` in the DB / envelope).
     #[serde(default, skip_serializing_if = "Option::is_none")]
