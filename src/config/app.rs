@@ -78,6 +78,18 @@ pub struct AppConfig {
     #[serde(default)]
     pub orchestrate_plugin_shadow: bool,
 
+    /// Worker-driven orchestrator drive (noetl/ai-meta#108 slice 3).  When true,
+    /// on a triggering event the server issues the `system/orchestrate` plug-in
+    /// as a command to the worker pool (step `__orchestrate__`, `entry:
+    /// run_state`) instead of driving in-process; the worker runs the drive and
+    /// its completion is applied via `apply_orchestration_result`.  Envy maps
+    /// `NOETL_ORCHESTRATE_PLUGIN_DRIVE`.  **Default false** — the in-process
+    /// drive stays the untouched fallback; flip on only after the shadow
+    /// (`orchestrate_plugin_shadow`) is clean and `system/orchestrate@1` is
+    /// registered.  Requires the worker pool to carry the `wasm-plugin` feature.
+    #[serde(default)]
+    pub orchestrate_plugin_drive: bool,
+
     /// Auto recreate runtime if missing
     #[serde(default = "default_true")]
     pub auto_recreate_runtime: bool,
@@ -191,6 +203,7 @@ impl Default for AppConfig {
             refs_in_state: false,
             projector_owns_snapshot: false,
             orchestrate_plugin_shadow: false,
+            orchestrate_plugin_drive: false,
             auto_recreate_runtime: true,
             runtime_sweep_interval: default_sweep_interval(),
             runtime_offline_seconds: default_offline_seconds(),

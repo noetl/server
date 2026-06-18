@@ -676,9 +676,25 @@ async fn handle_event_inner(
     // `check_completion` sees end as done and emits
     // `playbook.completed`.  Without this trigger the playbook
     // stalled at `command.completed [end]` with no terminal event.
-    let should_trigger_orchestrator =
-        request.event_type == "command.completed" || request.event_type == "command.failed";
-    if should_trigger_orchestrator {
+    if request.step == noetl_orchestrate_core::state::WorkflowState::ORCHESTRATE_META_STEP {
+        // Worker-driven drive (noetl/ai-meta#108 slice 3): the `system/orchestrate`
+        // plug-in's output (the OrchestrationResult) rides the `call.done` event
+        // — the lifecycle `command.completed`/`claimed`/`started` carry no output.
+        // Apply it (emit events + issue the real commands) instead of triggering
+        // the orchestrator. Those real commands' completions re-trigger the drive
+        // — the loop continues; the meta-command's own events never do.
+        if request.event_type == "call.done" {
+            match apply_worker_orchestration(&state, execution_id, event_id, &request.payload).await
+            {
+                Ok(cmds) => info!(
+                    execution_id,
+                    commands = cmds,
+                    "worker-driven: applied orchestrate result"
+                ),
+                Err(e) => warn!(execution_id, error = %e, "worker-driven: apply failed"),
+            }
+        }
+    } else if request.event_type == "command.completed" || request.event_type == "command.failed" {
         match trigger_orchestrator(&state, execution_id, event_id).await {
             Ok(cmds) => {
                 info!(
@@ -2013,15 +2029,59 @@ async fn trigger_orchestrator_inner(
             })?;
     let playbook = crate::playbook::parser::parse_playbook(&playbook_yaml)?;
 
-    // 3. Evaluate against the cached state.
+    // 3. Resolve over-budget cursor claim references into inline rows before the
+    //    drive reads them (noetl/ai-meta#101 phase 2) — a referenced claim has
+    //    `claim_ref` set + empty `claim_rows`; without this the cursor sees 0
+    //    rows and wrongly DRAINs.  No-op unless the flag kept a claim reference.
+    //    Scoped so the `&mut` borrow ends before the drive branches read `cache`.
+    {
+        let ws = cache.state.as_mut().unwrap();
+        resolve_cursor_claim_refs(ws, &result_store).await;
+    }
+
+    // Worker-driven drive (noetl/ai-meta#108 slice 3): issue `system/orchestrate`
+    // to the worker pool instead of evaluating in-process.  The worker runs the
+    // drive on the bounded `WorkflowState`; `apply_worker_orchestration` applies
+    // its result on the command's completion.  Default off → the in-process path
+    // below runs unchanged.
+    if state.config.orchestrate_plugin_drive {
+        // Serialise drives per execution: if one is already dispatched, don't
+        // double-issue (two near-simultaneous triggers / the reconcile poller
+        // would otherwise produce two orchestrate commands → duplicate work).
+        if cache.orchestrate_in_flight {
+            crate::metrics::record_orchestrate_drive("skipped_in_flight");
+            debug!(execution_id, "worker-driven: orchestrate already in flight; skip");
+            return Ok(0);
+        }
+        let routing = cache
+            .routing_meta
+            .as_ref()
+            .map(crate::handlers::execute::CommandRouting::from_started_meta)
+            .unwrap_or_default();
+        let input = serde_json::json!({
+            "state": cache.state.as_ref().expect("state present after rebuild"),
+            "latest_ts": latest_ts,
+            "playbook": &playbook,
+            "trigger_event_type": trigger_event_type,
+        });
+        crate::handlers::execute::dispatch_orchestrate_command(
+            state,
+            execution_id,
+            catalog_id,
+            trigger_event_id,
+            input,
+            &playbook,
+            &routing,
+        )
+        .await?;
+        cache.orchestrate_in_flight = true;
+        debug!(execution_id, "worker-driven: dispatched system/orchestrate to the pool");
+        return Ok(0);
+    }
+
+    // In-process drive (the default, and the shadow's reference half).
     let orchestrator = WorkflowOrchestrator::new();
     let ws = cache.state.as_mut().unwrap();
-    // References-in-state (noetl/ai-meta#101 phase 2): resolve any over-budget
-    // cursor claim references into inline rows before the drive reads them — a
-    // referenced claim has `claim_ref` set + empty `claim_rows`, and without
-    // this the cursor would see 0 rows and wrongly DRAIN.  No-op unless the flag
-    // kept a claim reference (flag-off claims are resolved inline by hydrate).
-    resolve_cursor_claim_refs(ws, &result_store).await;
     // Orchestrate plug-in shadow (noetl/ai-meta#108 slice 4): snapshot the state
     // BEFORE `evaluate_state` mutates it, so the plug-in evaluates the identical
     // input. Cloned only when the shadow is loaded (default off → no cost).
@@ -2239,6 +2299,103 @@ async fn apply_orchestration_result(
         );
     }
 
+    Ok(commands_generated)
+}
+
+/// Recursively find the `output_b64` string a wasm plug-in's tool result carries
+/// (the worker base64-wraps the plug-in's output bytes; the exact nesting
+/// depends on the result-envelope shape, so search rather than assume a path).
+fn find_output_b64(v: &serde_json::Value) -> Option<&str> {
+    match v {
+        serde_json::Value::Object(m) => {
+            if let Some(serde_json::Value::String(s)) = m.get("output_b64") {
+                return Some(s);
+            }
+            m.values().find_map(find_output_b64)
+        }
+        serde_json::Value::Array(a) => a.iter().find_map(find_output_b64),
+        _ => None,
+    }
+}
+
+/// Apply the `OrchestrationResult` a worker computed for the worker-driven drive
+/// (noetl/ai-meta#108 slice 3): decode it from the `system/orchestrate`
+/// completion, then emit events + issue commands via `apply_orchestration_result`
+/// — the same emission the in-process drive uses. Always clears the per-execution
+/// in-flight guard so the next trigger can dispatch again.
+async fn apply_worker_orchestration(
+    state: &AppState,
+    execution_id: i64,
+    trigger_event_id: i64,
+    payload: &serde_json::Value,
+) -> AppResult<i32> {
+    use base64::Engine;
+
+    // Clear the in-flight guard first (the drive completed, success or not) so a
+    // decode failure doesn't wedge the execution — the reconcile can re-drive.
+    let cache_slot = state.orch_cache.entry(execution_id);
+    let mut cache = cache_slot.lock().await;
+    cache.orchestrate_in_flight = false;
+
+    let decoded = find_output_b64(payload)
+        .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())
+        .and_then(|bytes| {
+            serde_json::from_slice::<noetl_orchestrate_core::orchestrator::OrchestrationResult>(
+                &bytes,
+            )
+            .ok()
+        });
+    let Some(result) = decoded else {
+        warn!(
+            execution_id,
+            "worker-driven: could not decode OrchestrationResult from orchestrate completion \
+             (missing output_b64, bad base64, or an error envelope)"
+        );
+        crate::metrics::record_orchestrate_drive("decode_error");
+        return Ok(0);
+    };
+
+    let catalog_id = cache.state.as_ref().map(|s| s.catalog_id).unwrap_or(0);
+    if catalog_id == 0 {
+        warn!(
+            execution_id,
+            "worker-driven: cold cache (no catalog_id); cannot apply orchestrate result this pass"
+        );
+        return Ok(0);
+    }
+    let routing = cache
+        .routing_meta
+        .as_ref()
+        .map(crate::handlers::execute::CommandRouting::from_started_meta)
+        .unwrap_or_default();
+
+    // Phase F R4-3: noetl.catalog is a cluster-wide table.
+    let playbook_yaml: String =
+        sqlx::query_scalar("SELECT content FROM noetl.catalog WHERE catalog_id = $1")
+            .bind(catalog_id)
+            .fetch_one(state.pools.cluster())
+            .await
+            .map_err(|e| {
+                AppError::Internal(format!("worker-driven: load playbook {catalog_id}: {e}"))
+            })?;
+    let playbook = crate::playbook::parser::parse_playbook(&playbook_yaml)?;
+
+    let commands_generated = apply_orchestration_result(
+        state,
+        execution_id,
+        catalog_id,
+        trigger_event_id,
+        &result,
+        &playbook,
+        &routing,
+    )
+    .await?;
+    crate::metrics::record_orchestrate_drive("applied");
+
+    if result.should_complete {
+        drop(cache);
+        state.orch_cache.evict(execution_id);
+    }
     Ok(commands_generated)
 }
 

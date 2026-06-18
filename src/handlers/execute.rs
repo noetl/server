@@ -1012,6 +1012,113 @@ pub(crate) async fn persist_engine_commands_batch(
     Ok(prepared.len() as i32)
 }
 
+/// Dispatch the worker-driven orchestrate "meta" command (noetl/ai-meta#108
+/// slice 3): issue `system/orchestrate` (entry `run_state`) as a single wasm
+/// command under the reserved `__orchestrate__` step, carrying the serialized
+/// `OrchestrateStateInput` as its args. The worker runs the drive and reports
+/// the `OrchestrationResult`; the server applies it on the command's completion
+/// (`apply_worker_orchestration` in `handlers::events`).
+///
+/// Unlike `persist_engine_commands_batch` this does NOT require the step to
+/// exist in the playbook — `__orchestrate__` is infrastructure, not a workflow
+/// step, and its `command.*` events are ignored by `WorkflowState::apply_event`
+/// (the `ORCHESTRATE_META_STEP` guard) so it never pollutes the drive state.
+pub(crate) async fn dispatch_orchestrate_command(
+    state: &AppState,
+    execution_id: i64,
+    catalog_id: i64,
+    parent_event_id: i64,
+    input: serde_json::Value,
+    playbook: &crate::playbook::types::Playbook,
+    routing: &CommandRouting,
+) -> AppResult<()> {
+    const STEP: &str = "__orchestrate__";
+    let event_id = state.snowflake.generate()?;
+    let command_id = format!("{execution_id}:{STEP}:{event_id}");
+    let now = chrono::Utc::now();
+
+    // The worker reads `tool_config.plugin` + `tool_config.args` (its
+    // `wasm_config_to_ref`); `args` carries the OrchestrateStateInput.
+    let tool_config = serde_json::json!({
+        "plugin": { "path": "system/orchestrate", "version": 1, "entry": "run_state" },
+        "args": input,
+    });
+    let cmd_context = serde_json::json!({
+        "tool_config": tool_config,
+        "args": {},
+        "render_context": {},
+    });
+    let cmd_meta = serde_json::json!({
+        "command_id": command_id,
+        "step": STEP,
+        "tool_kind": "wasm",
+        "max_attempts": 1,
+        "attempt": 1,
+        "execution_id": execution_id.to_string(),
+        "catalog_id": catalog_id.to_string(),
+        "actionable": true,
+    });
+
+    let pool = state.pools.pool_for(execution_id);
+    sqlx::query(
+        "INSERT INTO noetl.event (event_id, execution_id, catalog_id, event_type, \
+         node_id, node_name, node_type, status, context, meta, parent_event_id, created_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+    )
+    .bind(event_id)
+    .bind(execution_id)
+    .bind(catalog_id)
+    .bind("command.issued")
+    .bind(STEP)
+    .bind(STEP)
+    .bind("wasm")
+    .bind("PENDING")
+    .bind(&cmd_context)
+    .bind(&cmd_meta)
+    .bind(parent_event_id)
+    .bind(now)
+    .execute(pool)
+    .await?;
+
+    // noetl.command row — non-fatal (event log is the source of truth).
+    let num_command_id = state.snowflake.generate()?;
+    if let Err(e) = sqlx::query(
+        "INSERT INTO noetl.command (command_id, event_id, execution_id, catalog_id, \
+         step_name, tool_kind, status, attempt, context, meta, latest_event_id) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+    )
+    .bind(num_command_id)
+    .bind(event_id)
+    .bind(execution_id)
+    .bind(catalog_id)
+    .bind(STEP)
+    .bind("wasm")
+    .bind("PENDING")
+    .bind(1_i32)
+    .bind(&cmd_context)
+    .bind(&cmd_meta)
+    .bind(parent_event_id)
+    .execute(pool)
+    .await
+    {
+        tracing::warn!(error = %e, execution_id, "orchestrate command row insert failed (non-fatal)");
+    }
+
+    publish_command_notification(
+        state,
+        execution_id,
+        event_id,
+        &command_id,
+        STEP,
+        "wasm",
+        playbook,
+        routing,
+    )
+    .await?;
+    crate::metrics::record_orchestrate_drive("dispatched");
+    Ok(())
+}
+
 /// Generate initial commands for the start step.
 ///
 /// If the start step declares a `loop:` block, this function fans out

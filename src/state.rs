@@ -119,6 +119,14 @@ pub struct ExecOrchState {
     /// immediate `trigger_event_id`-straggler handling carry correctness.  Not
     /// serialized (in-memory only).
     pub last_count_check: Option<std::time::Instant>,
+    /// Worker-driven drive (noetl/ai-meta#108 slice 3): true while an
+    /// `system/orchestrate` command is dispatched to the pool but its result
+    /// has not yet been applied.  Set when the scheduler dispatches, cleared
+    /// when the completion is applied.  Serialises drives per execution so two
+    /// near-simultaneous triggers (or the reconcile poller) don't dispatch two
+    /// orchestrate commands → double-issue the same next commands.  In-memory
+    /// only; a server restart re-derives the drive from the event log.
+    pub orchestrate_in_flight: bool,
 }
 
 

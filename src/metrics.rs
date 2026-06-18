@@ -148,6 +148,35 @@ pub fn record_orchestrate_shadow(result: &str) {
         .inc();
 }
 
+/// Counter: worker-driven orchestrate drive events, by stage (`dispatched` —
+/// the server issued the orchestrate command to the pool; `applied` — its
+/// result was applied; `decode_error` — the worker's result couldn't be
+/// decoded; `skipped_in_flight` — a drive was already running). The drive loop's
+/// health at a glance (noetl/ai-meta#108).
+pub fn orchestrate_drive_total() -> &'static IntCounterVec {
+    static M: OnceLock<IntCounterVec> = OnceLock::new();
+    M.get_or_init(|| {
+        let counter = IntCounterVec::new(
+            Opts::new(
+                "noetl_orchestrate_drive_total",
+                "Worker-driven orchestrate drive events, by stage.",
+            ),
+            &["stage"],
+        )
+        .expect("static counter spec must be valid");
+        registry()
+            .register(Box::new(counter.clone()))
+            .expect("counter registration must succeed");
+        counter
+    })
+}
+
+/// Record one worker-driven drive event (`dispatched` / `applied` /
+/// `decode_error` / `skipped_in_flight`).
+pub fn record_orchestrate_drive(stage: &str) {
+    orchestrate_drive_total().with_label_values(&[stage]).inc();
+}
+
 /// Histogram: wall-clock time spent inside the `POST /api/events` handler.
 pub fn event_ingest_duration_seconds() -> &'static HistogramVec {
     static M: OnceLock<HistogramVec> = OnceLock::new();
