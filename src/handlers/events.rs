@@ -616,27 +616,42 @@ async fn handle_event_inner(
     let row = normalize_event_to_row(&state, &request).await?;
     let event_id = row.event_id;
 
-    // Persist the event
-    sqlx::query(
-        r#"
-        INSERT INTO noetl.event (
-            event_id, execution_id, catalog_id, event_type,
-            node_id, node_name, status, result, meta, created_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-        "#,
-    )
-    .bind(row.event_id)
-    .bind(row.execution_id)
-    .bind(row.catalog_id)
-    .bind(&row.event_type)
-    .bind(&row.node_name)
-    .bind(&row.node_name)
-    .bind(&row.status)
-    .bind(&row.result)
-    .bind(&row.meta)
-    .bind(row.created_at)
-    .execute(state.pools.pool_for(execution_id))
-    .await?;
+    // System meta-command events are NOT workflow events — they're the
+    // infrastructure of the worker-driven drive (noetl/ai-meta#108). A single
+    // drive emits command.claimed/started/call.done/command.completed for
+    // `__orchestrate__`; at scale (thousands of drives) persisting them would
+    // burst noetl.event + Postgres for no benefit — the drive state is a pure
+    // function of the *real* step events, and the result is applied from the
+    // in-memory `call.done` payload, not from a persisted row. So skip the
+    // write for the meta-step. (The `command.issued` that delivers the command
+    // is written separately by `dispatch_orchestrate_command`; eliminating that
+    // last row needs a noetl.event-free claim path — tracked as a follow-up.)
+    let is_meta_command =
+        request.step == noetl_orchestrate_core::state::WorkflowState::ORCHESTRATE_META_STEP;
+    if !is_meta_command {
+        sqlx::query(
+            r#"
+            INSERT INTO noetl.event (
+                event_id, execution_id, catalog_id, event_type,
+                node_id, node_name, status, result, meta, created_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            "#,
+        )
+        .bind(row.event_id)
+        .bind(row.execution_id)
+        .bind(row.catalog_id)
+        .bind(&row.event_type)
+        .bind(&row.node_name)
+        .bind(&row.node_name)
+        .bind(&row.status)
+        .bind(&row.result)
+        .bind(&row.meta)
+        .bind(row.created_at)
+        .execute(state.pools.pool_for(execution_id))
+        .await?;
+    } else {
+        crate::metrics::record_orchestrate_drive("event_suppressed");
+    }
 
     info!(
         "Event persisted: event_id={}, execution_id={}, event_type={}",
@@ -973,30 +988,38 @@ pub async fn claim_command(
         "informative": true,
     });
 
-    sqlx::query(
-        r#"
-        INSERT INTO noetl.event (
-            event_id, execution_id, catalog_id, event_type,
-            node_id, node_name, status, result, meta, worker_id, created_at
-        ) VALUES (
-            $1, $2, $3, $4,
-            $5, $6, $7, $8, $9, $10, $11
+    // Suppress the `command.claimed` event for the worker-driven orchestrate
+    // meta-command (noetl/ai-meta#108): it's infrastructure, not a workflow step,
+    // so it must not write to noetl.event (the claim's own state lives in the tx
+    // below). One drive at a time per execution is already guaranteed by the
+    // `orchestrate_in_flight` guard + the single NATS dispatch, so skipping the
+    // claimed-event idempotency anchor is safe here.
+    if step != noetl_orchestrate_core::state::WorkflowState::ORCHESTRATE_META_STEP {
+        sqlx::query(
+            r#"
+            INSERT INTO noetl.event (
+                event_id, execution_id, catalog_id, event_type,
+                node_id, node_name, status, result, meta, worker_id, created_at
+            ) VALUES (
+                $1, $2, $3, $4,
+                $5, $6, $7, $8, $9, $10, $11
+            )
+            "#,
         )
-        "#,
-    )
-    .bind(claim_event_id)
-    .bind(execution_id)
-    .bind(catalog_id)
-    .bind("command.claimed")
-    .bind(&step)
-    .bind(&step)
-    .bind("RUNNING")
-    .bind(claim_result)
-    .bind(claim_meta)
-    .bind(&request.worker_id)
-    .bind(chrono::Utc::now())
-    .execute(&mut *tx)
-    .await?;
+        .bind(claim_event_id)
+        .bind(execution_id)
+        .bind(catalog_id)
+        .bind("command.claimed")
+        .bind(&step)
+        .bind(&step)
+        .bind("RUNNING")
+        .bind(claim_result)
+        .bind(claim_meta)
+        .bind(&request.worker_id)
+        .bind(chrono::Utc::now())
+        .execute(&mut *tx)
+        .await?;
+    }
 
     tx.commit().await?;
 
