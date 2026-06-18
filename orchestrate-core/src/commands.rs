@@ -6,8 +6,8 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::AppResult;
-use crate::playbook::types::{CursorClaim, Step, ToolCall, ToolDefinition, ToolSpec};
+use crate::error::CoreResult;
+use crate::playbook::{CursorClaim, Step, ToolCall, ToolDefinition, ToolSpec};
 use crate::template::TemplateRenderer;
 
 /// Command to be executed by a worker.
@@ -96,7 +96,7 @@ impl CommandBuilder {
         step: &Step,
         context: &HashMap<String, serde_json::Value>,
         metadata: Option<&serde_json::Value>,
-    ) -> AppResult<Command> {
+    ) -> CoreResult<Command> {
         // Build a render context that includes `ctx` and `workload` namespace
         // aliases pointing at the flat dispatch context, mirroring Python's
         // `context["ctx"] = state.variables` + `context["workload"] = state.variables`
@@ -152,7 +152,7 @@ impl CommandBuilder {
         step: &Step,
         context: &HashMap<String, serde_json::Value>,
         iterator: IteratorMetadata,
-    ) -> AppResult<Command> {
+    ) -> CoreResult<Command> {
         // Build context with iterator variables.
         // Insert both at the top level (so `{{ num }}` works) AND
         // under an `iter` namespace map (so `{{ iter.num }}` works).
@@ -245,7 +245,7 @@ impl CommandBuilder {
         context: &HashMap<String, serde_json::Value>,
         frame_index: i64,
         max_rows: i64,
-    ) -> AppResult<Command> {
+    ) -> CoreResult<Command> {
         // Inject __frame_max_rows + ctx/workload shims into the render context
         // so the claim SQL's templates resolve (execution_id, ctx.*, workload.*,
         // __frame_max_rows).
@@ -297,7 +297,7 @@ impl CommandBuilder {
         &self,
         tool: &ToolDefinition,
         context: &HashMap<String, serde_json::Value>,
-    ) -> AppResult<ToolCommand> {
+    ) -> CoreResult<ToolCommand> {
         match tool {
             ToolDefinition::Single(spec) => self.build_tool_command(spec, context),
             ToolDefinition::Pipeline(tasks) => {
@@ -329,7 +329,7 @@ impl CommandBuilder {
         &self,
         tool: &ToolSpec,
         context: &HashMap<String, serde_json::Value>,
-    ) -> AppResult<ToolCommand> {
+    ) -> CoreResult<ToolCommand> {
         // Get kind as string
         let kind = tool.kind.to_string();
 
@@ -436,10 +436,10 @@ fn render_pipeline_config(
     renderer: &TemplateRenderer,
     config: &serde_json::Value,
     context: &HashMap<String, serde_json::Value>,
-) -> AppResult<serde_json::Value> {
+) -> CoreResult<serde_json::Value> {
     let arr = match config.as_array() {
         Some(a) => a,
-        None => return renderer.render_value(config, context).map_err(Into::into),
+        None => return renderer.render_value(config, context),
     };
 
     let mut result = Vec::with_capacity(arr.len());
@@ -545,7 +545,7 @@ fn render_pipeline_config(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::playbook::types::ToolKind;
+    use crate::playbook::ToolKind;
 
     #[test]
     fn test_command_serialization() {
@@ -758,8 +758,8 @@ mod tests {
             set_vars: None,
             r#loop: None,
             tool: ToolDefinition::Pipeline(vec![
-                crate::playbook::types::PipelineItem::Nested(fetch_task),
-                crate::playbook::types::PipelineItem::Nested(transform_task),
+                crate::playbook::PipelineItem::Nested(fetch_task),
+                crate::playbook::PipelineItem::Nested(transform_task),
             ]),
             next: None,
         };

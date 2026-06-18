@@ -8,6 +8,11 @@ pub enum CoreError {
     /// Template parse / render / condition-evaluation failure.
     #[error("Template error: {0}")]
     Template(String),
+
+    /// Invalid playbook shape / drive precondition (e.g. a malformed loop or
+    /// command spec).  Maps to the server's `AppError::Validation`.
+    #[error("Validation error: {0}")]
+    Validation(String),
 }
 
 /// Result alias for the core.
