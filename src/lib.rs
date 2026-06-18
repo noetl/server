@@ -53,7 +53,6 @@ pub mod error;
 pub mod handlers;
 pub mod metrics;
 pub mod nats;
-pub mod orchestrate_shadow;
 pub mod playbook;
 pub mod result_ext;
 pub mod sanitize;

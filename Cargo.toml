@@ -19,18 +19,9 @@ members = ["orchestrate-core"]
 #     --manifest-path plugins/orchestrate/Cargo.toml
 exclude = ["plugins/orchestrate"]
 
-[features]
-# In-server shadow of the system/orchestrate plug-in (noetl/ai-meta#108 slice 4):
-# pulls in wasmtime so the server can run the plug-in alongside the in-process
-# drive and diff. Off by default — the production server stays lean; enable when
-# building a shadow-validation image.
-orchestrate-shadow = ["dep:wasmtime"]
-
 [dependencies]
 # Pure orchestrator drive core (one source → native + wasm32; noetl/ai-meta#108).
 noetl-orchestrate-core = { path = "orchestrate-core" }
-# wasmtime host for the orchestrate-shadow feature; pinned to the worker's major.
-wasmtime = { version = "27", optional = true }
 # Async runtime
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time", "sync"] }
 
