@@ -1,4 +1,9 @@
 target
+# Nested Cargo target dirs (e.g. the excluded plugins/orchestrate crate) — the
+# top-level `target` glob does not match these, and shipping them in the build
+# context is huge + breaks the COPY. The wasm plug-in is rebuilt in its own
+# Docker stage, so the local artifact is never needed in the context.
+**/target
 .git
 .github
 .DS_Store

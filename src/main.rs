@@ -747,6 +747,16 @@ async fn main() -> anyhow::Result<()> {
     // for the system worker pool's wasmtime PluginSource.  Same idempotent
     // startup-DDL pattern; server-owned end-to-end.
     noetl_server::db::queries::plugin_module::ensure_table(&db_pool).await?;
+    // Seed built-in system plug-ins (noetl/ai-meta#108 slice 3) — the
+    // server-owned `system/orchestrate` (+ future built-ins) compiled to wasm32
+    // and baked into the image are registered into noetl.plugin_module on boot,
+    // so the worker pool can fetch them without an out-of-band operator POST.
+    // Non-fatal: a seed failure must not block the server from starting.
+    match noetl_server::system_plugins::seed_system_plugins(&db_pool).await {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(count = n, "seeded built-in system plug-ins"),
+        Err(e) => tracing::warn!(error = %e, "failed to seed system plug-ins; continuing"),
+    }
     // Object store (noetl/ai-meta#105 Round 5) — durable Feather tier backing a
     // plug-in's `noetl.object_put`. Same idempotent startup-DDL pattern.
     noetl_server::db::queries::object_store::ensure_table(&db_pool).await?;
