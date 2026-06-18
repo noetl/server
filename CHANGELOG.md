@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.21.0](https://github.com/noetl/server/compare/v3.20.0...v3.21.0) (2026-06-18)
+
+### Features
+
+* **orchestrate-plugin:** system/orchestrate wasm plug-in wrapping the drive core ([#224](https://github.com/noetl/server/issues/224)) ([10a629b](https://github.com/noetl/server/commit/10a629b68c1e37141456c5194fa76cbb7f6cd22d)), closes [noetl/ai-meta#108](https://github.com/noetl/ai-meta/issues/108) [#107](https://github.com/noetl/server/issues/107) [#108](https://github.com/noetl/server/issues/108) [noetl/ai-meta#109](https://github.com/noetl/ai-meta/issues/109) [#108](https://github.com/noetl/server/issues/108) [noetl/ai-meta#108](https://github.com/noetl/ai-meta/issues/108)
+
 ## [3.20.0](https://github.com/noetl/server/compare/v3.19.0...v3.20.0) (2026-06-18)
 
 ### Features
