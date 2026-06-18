@@ -405,7 +405,22 @@ impl WorkflowState {
     }
 
     /// Apply a single event to update the workflow state.
+    /// The reserved step name of the worker-driven orchestrate "meta" command
+    /// (noetl/ai-meta#108). The server issues `system/orchestrate` as a command
+    /// under this step so the worker pool runs the drive; its lifecycle events
+    /// are infrastructure, NOT workflow steps, so they are ignored here (see
+    /// `apply_event`) — otherwise `steps.entry(name).or_insert_with(..)` below
+    /// would create a phantom step and corrupt the drive state.
+    pub const ORCHESTRATE_META_STEP: &'static str = "__orchestrate__";
+
     pub fn apply_event(&mut self, event: &Event) {
+        // Ignore the worker-driven orchestrate meta-command's own events: they
+        // drive the execution but are not workflow steps. Without this, a
+        // `command.issued`/`command.completed` for `__orchestrate__` would
+        // phantom-create a step in `self.steps` (noetl/ai-meta#108).
+        if event.node_name.as_deref() == Some(Self::ORCHESTRATE_META_STEP) {
+            return;
+        }
         match event.event_type.as_str() {
             "playbook_started" => {
                 self.state = ExecutionState::InProgress;
@@ -1884,6 +1899,32 @@ mod tests {
     // -----------------------------------------------------------------------
     // apply_set_mutations tests (arc-level `set:` DSL contract)
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn orchestrate_meta_command_events_do_not_pollute_state() {
+        // The worker-driven orchestrate meta-command (noetl/ai-meta#108) issues
+        // `command.issued`/`command.completed` under the reserved `__orchestrate__`
+        // step. Those must NOT create a phantom step — otherwise the drive would
+        // see a step that isn't in the playbook.
+        let mut ws = WorkflowState::new(12345, 67890);
+        ws.apply_event(&make_event(
+            "command.issued",
+            Some(WorkflowState::ORCHESTRATE_META_STEP),
+        ));
+        ws.apply_event(&make_event(
+            "command.completed",
+            Some(WorkflowState::ORCHESTRATE_META_STEP),
+        ));
+        assert!(
+            !ws.steps.contains_key(WorkflowState::ORCHESTRATE_META_STEP),
+            "the meta-command must not create a workflow step"
+        );
+        assert!(ws.steps.is_empty(), "no steps should exist, got {:?}", ws.steps.keys().collect::<Vec<_>>());
+
+        // A real step's command.issued still creates its step (guard is scoped).
+        ws.apply_event(&make_event("command.issued", Some("real_step")));
+        assert!(ws.steps.contains_key("real_step"));
+    }
 
     #[test]
     fn test_apply_set_mutations_strips_ctx_prefix() {
