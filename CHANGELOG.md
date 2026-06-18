@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.22.0](https://github.com/noetl/server/compare/v3.21.0...v3.22.0) (2026-06-18)
+
+### Features
+
+* **system-plugins:** seed built-in system plug-ins into the registry on boot ([#226](https://github.com/noetl/server/issues/226)) ([b21b589](https://github.com/noetl/server/commit/b21b5893628bb801138d3c910cfc787f2ca24a8d)), closes [noetl/ai-meta#108](https://github.com/noetl/ai-meta/issues/108) [noetl/ai-meta#108](https://github.com/noetl/ai-meta/issues/108)
+
 ## [3.21.0](https://github.com/noetl/server/compare/v3.20.0...v3.21.0) (2026-06-18)
 
 ### Features
