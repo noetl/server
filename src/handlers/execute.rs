@@ -1035,7 +1035,6 @@ pub(crate) async fn dispatch_orchestrate_command(
     const STEP: &str = "__orchestrate__";
     let event_id = state.snowflake.generate()?;
     let command_id = format!("{execution_id}:{STEP}:{event_id}");
-    let now = chrono::Utc::now();
 
     // The worker reads `tool_config.plugin` + `tool_config.args` (its
     // `wasm_config_to_ref`); `args` carries the OrchestrateStateInput.
@@ -1059,30 +1058,16 @@ pub(crate) async fn dispatch_orchestrate_command(
         "actionable": true,
     });
 
+    // The meta-command writes NOTHING to noetl.event (noetl/ai-meta#108): it is
+    // infrastructure, not a workflow step, and at scale a `command.issued` row
+    // per drive would burst noetl.event + Postgres. Its delivery record lives
+    // only in noetl.command — the worker's claim/get path falls back to it when
+    // noetl.event has no `command.issued` for the event_id. So this row is the
+    // sole record the worker fetches: it is FATAL on error (no event-log
+    // fallback), unlike the best-effort mirror in `persist_engine_commands_batch`.
     let pool = state.pools.pool_for(execution_id);
-    sqlx::query(
-        "INSERT INTO noetl.event (event_id, execution_id, catalog_id, event_type, \
-         node_id, node_name, node_type, status, context, meta, parent_event_id, created_at) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
-    )
-    .bind(event_id)
-    .bind(execution_id)
-    .bind(catalog_id)
-    .bind("command.issued")
-    .bind(STEP)
-    .bind(STEP)
-    .bind("wasm")
-    .bind("PENDING")
-    .bind(&cmd_context)
-    .bind(&cmd_meta)
-    .bind(parent_event_id)
-    .bind(now)
-    .execute(pool)
-    .await?;
-
-    // noetl.command row — non-fatal (event log is the source of truth).
     let num_command_id = state.snowflake.generate()?;
-    if let Err(e) = sqlx::query(
+    sqlx::query(
         "INSERT INTO noetl.command (command_id, event_id, execution_id, catalog_id, \
          step_name, tool_kind, status, attempt, context, meta, latest_event_id) \
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
@@ -1099,10 +1084,7 @@ pub(crate) async fn dispatch_orchestrate_command(
     .bind(&cmd_meta)
     .bind(parent_event_id)
     .execute(pool)
-    .await
-    {
-        tracing::warn!(error = %e, execution_id, "orchestrate command row insert failed (non-fatal)");
-    }
+    .await?;
 
     // Route the drive to the dedicated `system` worker pool (noetl/ai-meta#108)
     // so it doesn't compete with user compute for slots — the system pool

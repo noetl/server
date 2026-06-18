@@ -746,14 +746,22 @@ pub async fn get_command(
     // lookup.  Use the cross-shard resolver: probe every shard,
     // first hit wins.  In single-pool fallback mode this is a
     // single probe against the one pool.
+    // noetl.event is authoritative for normal commands; the event-free
+    // `system/orchestrate` meta-command (noetl/ai-meta#108) is served from
+    // noetl.command as a fallback (`pri` ordering keeps noetl.event first).
     let found = state
         .pools
         .find_first(|_shard_idx, pool| async move {
             sqlx::query_as::<_, (i64, String, String, serde_json::Value, serde_json::Value)>(
                 r#"
-                SELECT execution_id, node_name, node_type, context, meta
-                FROM noetl.event
-                WHERE event_id = $1 AND event_type = 'command.issued'
+                SELECT execution_id, node_name, node_type, context, meta FROM (
+                    SELECT execution_id, node_name, node_type, context, meta, 0 AS pri
+                    FROM noetl.event WHERE event_id = $1 AND event_type = 'command.issued'
+                    UNION ALL
+                    SELECT execution_id, step_name AS node_name, tool_kind AS node_type,
+                           context, meta, 1 AS pri
+                    FROM noetl.command WHERE event_id = $1
+                ) s ORDER BY pri LIMIT 1
                 "#,
             )
             .bind(event_id)
@@ -772,10 +780,7 @@ pub async fn get_command(
             context,
             meta,
         })),
-        None => Err(AppError::NotFound(format!(
-            "command.issued event not found: {}",
-            event_id
-        ))),
+        None => Err(AppError::NotFound(format!("command not found: {}", event_id))),
     }
 }
 
@@ -803,14 +808,24 @@ pub async fn claim_command(
     //
     // In single-pool fallback mode the resolver short-circuits
     // (one pool, one probe).
+    // Resolve event_id -> execution_id. Normal commands carry a `command.issued`
+    // event in noetl.event; the worker-driven `system/orchestrate` meta-command
+    // (noetl/ai-meta#108) deliberately writes NO event (it would burst Postgres
+    // at scale) — its command lives only in noetl.command. The `pri` ordering
+    // keeps noetl.event authoritative when present (normal commands: exact prior
+    // behavior); noetl.command is the fallback that only fires for the
+    // event-free meta-command.
     let resolved_execution_id: Option<i64> = state
         .pools
         .find_first(|_shard_idx, pool| async move {
             sqlx::query_scalar::<_, i64>(
                 r#"
-                SELECT execution_id
-                FROM noetl.event
-                WHERE event_id = $1 AND event_type = 'command.issued'
+                SELECT execution_id FROM (
+                    SELECT execution_id, 0 AS pri FROM noetl.event
+                    WHERE event_id = $1 AND event_type = 'command.issued'
+                    UNION ALL
+                    SELECT execution_id, 1 AS pri FROM noetl.command WHERE event_id = $1
+                ) s ORDER BY pri LIMIT 1
                 "#,
             )
             .bind(event_id)
@@ -820,17 +835,21 @@ pub async fn claim_command(
         .await?
         .map(|(_shard_idx, eid)| eid);
 
-    let resolved_execution_id = resolved_execution_id.ok_or_else(|| {
-        AppError::NotFound(format!("command.issued event not found: {}", event_id))
-    })?;
+    let resolved_execution_id = resolved_execution_id
+        .ok_or_else(|| AppError::NotFound(format!("command not found: {}", event_id)))?;
 
     let mut tx = state.pools.pool_for(resolved_execution_id).begin().await?;
 
     let cmd_row = sqlx::query(
         r#"
-        SELECT execution_id, catalog_id, node_name, node_type, context, meta
-        FROM noetl.event
-        WHERE event_id = $1 AND event_type = 'command.issued'
+        SELECT execution_id, catalog_id, node_name, node_type, context, meta FROM (
+            SELECT execution_id, catalog_id, node_name, node_type, context, meta, 0 AS pri
+            FROM noetl.event WHERE event_id = $1 AND event_type = 'command.issued'
+            UNION ALL
+            SELECT execution_id, catalog_id, step_name AS node_name, tool_kind AS node_type,
+                   context, meta, 1 AS pri
+            FROM noetl.command WHERE event_id = $1
+        ) s ORDER BY pri LIMIT 1
         "#,
     )
     .bind(event_id)
@@ -838,10 +857,7 @@ pub async fn claim_command(
     .await?;
 
     let Some(row) = cmd_row else {
-        return Err(AppError::NotFound(format!(
-            "command.issued event not found: {}",
-            event_id
-        )));
+        return Err(AppError::NotFound(format!("command not found: {}", event_id)));
     };
 
     let execution_id: i64 = row.try_get("execution_id")?;
