@@ -9,9 +9,14 @@ RUN cargo chef prepare --recipe-path recipe.json
 
 FROM chef AS builder
 COPY --from=planner /app/recipe.json recipe.json
-RUN cargo chef cook --release --recipe-path recipe.json
+# Build deps for the recipe + the orchestrate-shadow feature (wasmtime) so the
+# cook layer caches them (noetl/ai-meta#108 slice 4).
+RUN cargo chef cook --release --features orchestrate-shadow --recipe-path recipe.json
 COPY . .
-RUN cargo build --release --bin noetl-control-plane
+# Built with the orchestrate-shadow feature so the image can run the in-server
+# plug-in shadow; the behaviour is still gated at runtime by
+# NOETL_ORCHESTRATE_PLUGIN_SHADOW (default off).
+RUN cargo build --release --features orchestrate-shadow --bin noetl-control-plane
 
 # Build the built-in system plug-ins to wasm32 (noetl/ai-meta#108 slice 3).
 # The `plugins/orchestrate` crate is excluded from the server workspace, so it is
