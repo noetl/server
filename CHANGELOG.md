@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.26.0](https://github.com/noetl/server/compare/v3.25.0...v3.26.0) (2026-06-18)
+
+### Features
+
+* **orchestrate-drive:** zero noetl.event rows for the meta-command (claim from noetl.command) ([#231](https://github.com/noetl/server/issues/231)) ([9438f3b](https://github.com/noetl/server/commit/9438f3b1879da6c22e6e85fa146cf290a2a4fb45)), closes [noetl/ai-meta#108](https://github.com/noetl/ai-meta/issues/108) [noetl/ai-meta#108](https://github.com/noetl/ai-meta/issues/108)
+
 ## [3.25.0](https://github.com/noetl/server/compare/v3.24.0...v3.25.0) (2026-06-18)
 
 ### Features
