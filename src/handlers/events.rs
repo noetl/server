@@ -2091,6 +2091,59 @@ async fn trigger_orchestrator_inner(
         "Orchestrator evaluate complete"
     );
 
+    // Recover the per-execution routing (dedicated pool segment + W3C trace)
+    // the `/api/execute` caller supplied, persisted on the `playbook_started`
+    // event meta, so every follow-up command lands on the same segment and
+    // carries the same trace context (noetl/ai-meta#90 Phase 2).
+    let routing = cache
+        .routing_meta
+        .as_ref()
+        .map(crate::handlers::execute::CommandRouting::from_started_meta)
+        .unwrap_or_default();
+
+    // 4-6. Apply the orchestration result — emit pure events, issue commands,
+    // write the terminal event. Extracted (noetl/ai-meta#108) so the
+    // worker-driven drive can apply a result computed on a worker identically.
+    let commands_generated = apply_orchestration_result(
+        state,
+        execution_id,
+        catalog_id,
+        trigger_event_id,
+        &result,
+        &playbook,
+        &routing,
+    )
+    .await?;
+
+    // Free the cached state for a terminal execution (noetl/ai-meta#100). The
+    // caller owns the cache guard, so the evict lives here, not in the apply fn.
+    if result.should_complete {
+        drop(cache);
+        state.orch_cache.evict(execution_id);
+    }
+
+    Ok(commands_generated)
+}
+
+/// Apply an [`OrchestrationResult`](noetl_orchestrate_core::orchestrator::OrchestrationResult)
+/// to the event log: emit the pure events (`step.enter` etc.) in causal order,
+/// issue the new commands (batched), then write the terminal
+/// `playbook.completed`/`failed` event when the drive says the run is done.
+///
+/// Extracted verbatim from `trigger_orchestrator_inner` (noetl/ai-meta#108) so
+/// the worker-driven drive can apply a result computed on a worker the same way
+/// the in-process drive applies its own. Returns the number of commands issued.
+/// The caller owns the per-execution cache guard and performs the terminal
+/// evict (this fn has no cache access).
+async fn apply_orchestration_result(
+    state: &AppState,
+    execution_id: i64,
+    catalog_id: i64,
+    trigger_event_id: i64,
+    result: &noetl_orchestrate_core::orchestrator::OrchestrationResult,
+    playbook: &crate::playbook::types::Playbook,
+    routing: &crate::handlers::execute::CommandRouting,
+) -> AppResult<i32> {
     // 4. Emit pure events (step.enter etc.) before issuing new
     //    commands so the causal chain is correct.
     for emit in &result.events_to_emit {
@@ -2134,16 +2187,6 @@ async fn trigger_orchestrator_inner(
         .await?;
     }
 
-    // Recover the per-execution routing (dedicated pool segment + W3C trace)
-    // the `/api/execute` caller supplied, persisted on the `playbook_started`
-    // event meta, so every follow-up command lands on the same segment and
-    // carries the same trace context (noetl/ai-meta#90 Phase 2).
-    let routing = cache
-        .routing_meta
-        .as_ref()
-        .map(crate::handlers::execute::CommandRouting::from_started_meta)
-        .unwrap_or_default();
-
     // 5. Issue new commands — batched (noetl/ai-meta#102 step 1).  A cursor
     //    fan-out's N body commands now persist as two multi-row INSERTs (all
     //    `command.issued` events, then all `noetl.command` rows) instead of ~2N
@@ -2155,8 +2198,8 @@ async fn trigger_orchestrator_inner(
         catalog_id,
         trigger_event_id,
         &result.commands,
-        &playbook,
-        &routing,
+        playbook,
+        routing,
     )
     .await?;
 
@@ -2194,10 +2237,6 @@ async fn trigger_orchestrator_inner(
             terminal_event = %event_type,
             "Orchestrator marked execution as terminal"
         );
-        // Free the cached state for a terminal execution (noetl/ai-meta#100).
-        // Drop the guard first so the slot's Arc refcount can fall to zero.
-        drop(cache);
-        state.orch_cache.evict(execution_id);
     }
 
     Ok(commands_generated)
