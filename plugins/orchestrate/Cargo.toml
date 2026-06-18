@@ -1,0 +1,36 @@
+# The `system/orchestrate` WASM plug-in (noetl/ai-meta#108, step 2 of #107).
+#
+# Wraps the pure drive core (`noetl-orchestrate-core`, native + wasm32) behind
+# the worker plug-in ABI: input bytes = the bounded event slice + the playbook,
+# output bytes = the `OrchestrationResult` (the commands + completion + events).
+# A standalone crate — NOT a member of the server workspace; built explicitly:
+#   cargo build --release --target wasm32-unknown-unknown
+# The compiled `.wasm` is the first non-trivial compiled system playbook; the
+# server registers it in the catalog + serves it to workers via the existing
+# `HttpPluginSource` (workers never compile it).
+[package]
+name = "noetl-orchestrate-plugin"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+# `cdylib` for the wasm32 artifact; `rlib` so native tests can call the pure
+# `orchestrate()` round-trip (the in-process half of the shadow-diff).
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+noetl-orchestrate-core = { path = "../../orchestrate-core" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[dev-dependencies]
+# Native-only: the parity test builds the playbook from YAML and stamps fixed
+# event timestamps (chrono matches the core's `DateTime<Utc>`).
+serde_yaml = "0.9"
+chrono = { version = "0.4", default-features = false, features = ["serde", "std"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
