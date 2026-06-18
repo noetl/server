@@ -162,10 +162,43 @@ impl EventRow {
     }
 }
 
-/// True when the gate is on AND NATS is connected (so a publisher can be built).
-/// Gate-on without NATS falls back to the INSERT path.
-fn publish_only(state: &AppState) -> bool {
-    state.config.event_ingest_publish_only && state.nats.is_some()
+/// Cache of `catalog_id → is a `system/*` playbook`.  `catalog_id → path` is
+/// immutable, so this is populated once per catalog and read lock-free after.
+static SYSTEM_CATALOG: std::sync::LazyLock<
+    std::sync::RwLock<std::collections::HashMap<i64, bool>>,
+> = std::sync::LazyLock::new(|| std::sync::RwLock::new(std::collections::HashMap::new()));
+
+/// Is this execution a **system-pool playbook** (`system/*`)?  System playbooks —
+/// the `system/event_materializer` + `system/projector` that DRAIN the stream —
+/// must be **exempt** from the publish gate: if their own events published, they
+/// could never bootstrap (the drainer would deadlock waiting for itself to
+/// drain). So they always write synchronously, even under the gate.
+async fn is_system_execution(state: &AppState, catalog_id: i64) -> bool {
+    if let Some(v) = SYSTEM_CATALOG.read().ok().and_then(|m| m.get(&catalog_id).copied()) {
+        return v;
+    }
+    let path: Option<String> =
+        sqlx::query_scalar("SELECT path FROM noetl.catalog WHERE catalog_id = $1")
+            .bind(catalog_id)
+            .fetch_optional(state.pools.cluster())
+            .await
+            .ok()
+            .flatten();
+    let is_sys = path.as_deref().map(|p| p.starts_with("system/")).unwrap_or(false);
+    if let Ok(mut m) = SYSTEM_CATALOG.write() {
+        m.insert(catalog_id, is_sys);
+    }
+    is_sys
+}
+
+/// True when this execution's events should be PUBLISHED rather than INSERTed:
+/// the gate is on, NATS is connected, AND the execution is not a system-pool
+/// playbook (those drain the stream — see [`is_system_execution`]).  This is the
+/// single decision the chokepoint and the relocated trigger both consult.
+pub async fn should_publish(state: &AppState, catalog_id: i64) -> bool {
+    state.config.event_ingest_publish_only
+        && state.nats.is_some()
+        && !is_system_execution(state, catalog_id).await
 }
 
 /// Lazily build (once) + return the `noetl_events` publisher.  Returns `None`
@@ -204,7 +237,9 @@ pub async fn emit_events(state: &AppState, pool: &DbPool, rows: &[EventRow]) -> 
         return Ok(());
     }
 
-    if publish_only(state) {
+    // All rows in a batch share the same execution + catalog, so one decision
+    // covers the batch.
+    if should_publish(state, rows[0].catalog_id).await {
         if let Some(pubr) = publisher(state).await {
             for row in rows {
                 let bytes = serde_json::to_vec(&row.to_stream_json()).map_err(|e| {

@@ -711,7 +711,7 @@ async fn handle_event_inner(
             }
         }
     } else if (request.event_type == "command.completed" || request.event_type == "command.failed")
-        && !(state.config.event_ingest_publish_only && state.nats.is_some())
+        && !crate::handlers::event_write::should_publish(&state, row.catalog_id.unwrap_or(0)).await
     {
         // CQRS write-path cutover (#103 2d-3): when the gate is on, this event was
         // PUBLISHED, not written — `noetl.event` doesn't have it yet, so triggering
@@ -1025,7 +1025,8 @@ pub async fn claim_command(
     // after the tx commits (the noetl.command claim stays in-tx — it's the queue
     // the worker reads), so it materializes like every other event and the
     // claim audit isn't lost.
-    let publish_claim = state.config.event_ingest_publish_only && state.nats.is_some();
+    let publish_claim =
+        crate::handlers::event_write::should_publish(&state, catalog_id.unwrap_or(0)).await;
     let mut claim_event_to_publish: Option<crate::handlers::event_write::EventRow> = None;
     if step != noetl_orchestrate_core::state::WorkflowState::ORCHESTRATE_META_STEP {
         if publish_claim {
@@ -1175,7 +1176,8 @@ pub async fn handle_batch_events(
     // CQRS write-path chokepoint (#103 2d-3).  Gate-off: in-tx multi-row INSERT
     // (byte-identical).  Gate-on: publish post-commit + the orchestrator trigger
     // relocates to the materializer endpoint.
-    let publish_batch = state.config.event_ingest_publish_only && state.nats.is_some();
+    let publish_batch =
+        crate::handlers::event_write::should_publish(&state, catalog_id.unwrap_or(0)).await;
     if publish_batch {
         let event_rows: Vec<crate::handlers::event_write::EventRow> = rows
             .iter()
