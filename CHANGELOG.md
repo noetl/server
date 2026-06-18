@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.20.0](https://github.com/noetl/server/compare/v3.19.0...v3.20.0) (2026-06-18)
+
+### Features
+
+* **orchestrate-core:** move WorkflowState into the core on the pure event ([#109](https://github.com/noetl/server/issues/109)) ([#222](https://github.com/noetl/server/issues/222)) ([0a148e4](https://github.com/noetl/server/commit/0a148e415b9c2c37c9020f449ba070b955c50a85))
+
 ## [3.19.0](https://github.com/noetl/server/compare/v3.18.0...v3.19.0) (2026-06-18)
 
 ### Features
