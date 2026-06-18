@@ -83,11 +83,18 @@ pub struct AppConfig {
     /// as a command to the worker pool (step `__orchestrate__`, `entry:
     /// run_state`) instead of driving in-process; the worker runs the drive and
     /// its completion is applied via `apply_orchestration_result`.  Envy maps
-    /// `NOETL_ORCHESTRATE_PLUGIN_DRIVE`.  **Default false** — the in-process
-    /// drive stays the untouched fallback; flip on only after the shadow
-    /// (`orchestrate_plugin_shadow`) is clean and `system/orchestrate@1` is
-    /// registered.  Requires the worker pool to carry the `wasm-plugin` feature.
-    #[serde(default)]
+    /// `NOETL_ORCHESTRATE_PLUGIN_DRIVE`.
+    ///
+    /// **Default true** (noetl/ai-meta#108 (c) — the deliberate default-flip,
+    /// after the scale soak proved the drive runs off-server with zero
+    /// `noetl.event` burst and full system-pool isolation).  The deployment must
+    /// carry a system worker pool with the `wasm-plugin` feature (on by default)
+    /// and the seeded `system/orchestrate@1` plug-in; the standard ops manifests
+    /// provide both.  **Revert:** set `NOETL_ORCHESTRATE_PLUGIN_DRIVE=false` to
+    /// fall back to the in-process drive (`trigger_orchestrator_inner`, kept as
+    /// the untouched fallback below) — no rebuild needed, per-deployment and
+    /// immediate.
+    #[serde(default = "default_true")]
     pub orchestrate_plugin_drive: bool,
 
     /// Auto recreate runtime if missing
@@ -203,7 +210,8 @@ impl Default for AppConfig {
             refs_in_state: false,
             projector_owns_snapshot: false,
             orchestrate_plugin_shadow: false,
-            orchestrate_plugin_drive: false,
+            // noetl/ai-meta#108 (c): worker-driven drive is the default.
+            orchestrate_plugin_drive: true,
             auto_recreate_runtime: true,
             runtime_sweep_interval: default_sweep_interval(),
             runtime_offline_seconds: default_offline_seconds(),
@@ -231,5 +239,12 @@ mod tests {
     fn test_bind_address() {
         let config = AppConfig::default();
         assert_eq!(config.bind_address(), "0.0.0.0:8082");
+    }
+
+    #[test]
+    fn test_orchestrate_drive_defaults_on() {
+        // noetl/ai-meta#108 (c): the worker-driven orchestrator drive is the
+        // default.  Revert is `NOETL_ORCHESTRATE_PLUGIN_DRIVE=false`.
+        assert!(AppConfig::default().orchestrate_plugin_drive);
     }
 }
