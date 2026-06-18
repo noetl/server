@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.24.0](https://github.com/noetl/server/compare/v3.23.0...v3.24.0) (2026-06-18)
+
+### Features
+
+* **orchestrate-drive:** worker-driven orchestrator drive (flag-gated) ([#229](https://github.com/noetl/server/issues/229)) ([465cdbb](https://github.com/noetl/server/commit/465cdbb742286a17431b2e3fd815485e6707170a)), closes [noetl/ai-meta#108](https://github.com/noetl/ai-meta/issues/108) [worker#113](https://github.com/noetl/worker/issues/113) [noetl/ai-meta#108](https://github.com/noetl/ai-meta/issues/108)
+
 ## [3.23.0](https://github.com/noetl/server/compare/v3.22.0...v3.23.0) (2026-06-18)
 
 ### Features
