@@ -1437,6 +1437,11 @@ async fn publish_command_notification(
         "command_id": command_id,
         "step": step,
         "server_url": server_url,
+        // Stamp the resolved pool segment on the dispatch so the worker can
+        // decline commands that aren't for its pool — defence-in-depth against a
+        // JetStream consumer whose filter_subject drifted broad and so receives
+        // another pool's commands (noetl/ai-meta#108).
+        "execution_pool": pool_segment,
     });
     // Carry the W3C trace context on the command notification so the worker
     // can attach it to its dispatch span (RFC §7.4).
