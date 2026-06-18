@@ -87,6 +87,25 @@ pub struct AppConfig {
     #[serde(default = "default_true")]
     pub orchestrate_plugin_drive: bool,
 
+    /// CQRS write-path cutover (noetl/ai-meta#103 phase 2d-3).  When true, every
+    /// server-originated `noetl.event` write goes through the `emit_event`
+    /// chokepoint as a **publish** to the `noetl_events` JetStream stream
+    /// (instead of a synchronous `INSERT`), so the `system/event_materializer`
+    /// playbook becomes the **sole** `noetl.event` writer.  The orchestrator
+    /// trigger then fires from the materializer's write endpoint
+    /// (`/api/internal/events/project`) rather than the synchronous ingest, so
+    /// the drive still advances when writes are asynchronous.  Envy maps
+    /// `NOETL_EVENT_INGEST_PUBLISH_ONLY`.
+    ///
+    /// **Default false** — the ingest path INSERTs synchronously exactly as
+    /// today (byte-identical); the materializer runs in shadow (idempotent
+    /// duplicates).  Flip on only with the materializer deployed + a lag
+    /// metric/alert, one revert away (the producer cutover is an operator
+    /// decision).  Requires NATS; a no-op (stays on the synchronous INSERT
+    /// path) if NATS is not connected.
+    #[serde(default)]
+    pub event_ingest_publish_only: bool,
+
     /// Auto recreate runtime if missing
     #[serde(default = "default_true")]
     pub auto_recreate_runtime: bool,
@@ -201,6 +220,8 @@ impl Default for AppConfig {
             projector_owns_snapshot: false,
             // noetl/ai-meta#108 (c): worker-driven drive is the default.
             orchestrate_plugin_drive: true,
+            // noetl/ai-meta#103 2d-3: synchronous INSERT path by default.
+            event_ingest_publish_only: false,
             auto_recreate_runtime: true,
             runtime_sweep_interval: default_sweep_interval(),
             runtime_offline_seconds: default_offline_seconds(),

@@ -305,9 +305,18 @@ pub async fn outbox_pending_count(
 ///
 /// Batch-INSERT events into `noetl.event`.  Idempotent via
 /// `ON CONFLICT (event_id) DO NOTHING`.
-#[tracing::instrument(skip(pool, _token), fields(batch_size = request.events.len()))]
+///
+/// CQRS write-path cutover (noetl/ai-meta#103 phase 2d-3): this is the **sole**
+/// `noetl.event` writer when `NOETL_EVENT_INGEST_PUBLISH_ONLY` is on.  Because
+/// the synchronous ingest no longer triggers the orchestrator on a
+/// `command.completed`/`command.failed` (it only published the row), the trigger
+/// **relocates here** — fired AFTER the row is durably materialized, so the drive
+/// rebuilds off committed state (read-your-writes).  Only when the gate is on
+/// (off → the ingest path triggers inline exactly as before, so we must not
+/// double-trigger).
+#[tracing::instrument(skip(state, _token), fields(batch_size = request.events.len()))]
 pub async fn events_project(
-    State(pool): State<DbPool>,
+    State(state): State<AppState>,
     _token: RequireInternalApiToken,
     Json(request): Json<EventsProjectRequest>,
 ) -> AppResult<Json<EventsProjectResponse>> {
@@ -316,8 +325,38 @@ pub async fn events_project(
             "events must not be empty".to_string(),
         ));
     }
-    let (projected, duplicates) = svc::project_events(&pool, &request.events).await?;
+    let (projected, duplicates) = svc::project_events(&state.db, &request.events).await?;
     info!(projected, duplicates, "events/project done");
+
+    // Relocated orchestrator trigger (gate-on only).  For each execution whose
+    // just-materialized batch carried a triggering event, fire the drive with
+    // the highest such `event_id` as the trigger.  trigger_orchestrator is
+    // idempotent (the orch-cache reconcile folds any events it didn't see), so
+    // a redelivered batch re-triggering is a forward no-op.
+    if state.config.event_ingest_publish_only {
+        let mut triggers: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
+        for e in &request.events {
+            let is_trigger = matches!(
+                e.event_type.as_deref(),
+                Some("command.completed") | Some("command.failed")
+            );
+            if let (true, Some(eid)) = (is_trigger, e.execution_id) {
+                triggers
+                    .entry(eid)
+                    .and_modify(|m| *m = (*m).max(e.event_id))
+                    .or_insert(e.event_id);
+            }
+        }
+        for (execution_id, trigger_event_id) in triggers {
+            if let Err(e) =
+                crate::handlers::events::trigger_orchestrator(&state, execution_id, trigger_event_id)
+                    .await
+            {
+                warn!(execution_id, %e, "publish-only: post-materialize orchestrator trigger failed");
+            }
+        }
+    }
+
     Ok(Json(EventsProjectResponse {
         projected,
         duplicates,

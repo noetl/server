@@ -200,6 +200,13 @@ fn build_router(
             "/api/internal/events/materialize",
             post(handlers::internal::events_materialize),
         )
+        // events/project (the materializer's row-shape writer) carries AppState
+        // so it can fire the relocated orchestrator trigger after materializing
+        // a batch under NOETL_EVENT_INGEST_PUBLISH_ONLY (#103 phase 2d-3).
+        .route(
+            "/api/internal/events/project",
+            post(handlers::internal::events_project),
+        )
         .with_state(state.clone());
 
     // Keychain routes
@@ -413,10 +420,6 @@ fn build_router(
         .route(
             "/api/internal/outbox/pending-count",
             get(handlers::internal::outbox_pending_count),
-        )
-        .route(
-            "/api/internal/events/project",
-            post(handlers::internal::events_project),
         )
         .route(
             "/api/internal/cleanup/purge",
@@ -724,6 +727,26 @@ async fn main() -> anyhow::Result<()> {
         state.clone(),
         noetl_server::services::event_stream::EventStreamConfig::from_env(),
     );
+
+    // CQRS write-path cutover (noetl/ai-meta#103 phase 2d-3): when
+    // `NOETL_EVENT_INGEST_PUBLISH_ONLY` is on, server-originated events publish to
+    // `noetl_events` instead of INSERTing — the materializer is the sole writer.
+    // Loud at startup because it changes the durability boundary; also flags the
+    // two paths still on the synchronous INSERT (ExecutionService cancel/finalize —
+    // they lack AppState; correct, no lost/double writes, staged for a follow-up).
+    if app_config.event_ingest_publish_only {
+        if state.nats.is_some() {
+            tracing::warn!(
+                target: "noetl_server::startup",
+                "NOETL_EVENT_INGEST_PUBLISH_ONLY=ON — server-originated noetl.event writes PUBLISH to noetl_events (materializer is the sole writer); ExecutionService cancel/finalize remain synchronous (staged)"
+            );
+        } else {
+            tracing::warn!(
+                target: "noetl_server::startup",
+                "NOETL_EVENT_INGEST_PUBLISH_ONLY set but NATS is not connected — falling back to synchronous INSERT (gate inert)"
+            );
+        }
+    }
 
     // Create services. The wallet's envelope cipher is built once over the
     // configured KEK provider (NOETL_KMS_PROVIDER: `local` default, or

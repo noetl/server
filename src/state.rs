@@ -90,6 +90,14 @@ pub struct AppState {
     /// server).  The per-execution lock inside also serialises a single
     /// execution's concurrent completion triggers.
     pub orch_cache: Arc<OrchStateCache>,
+
+    /// CQRS write-path publisher (noetl/ai-meta#103 phase 2d-3).  Lazily built
+    /// on first use from [`Self::nats`] so the `emit_event` chokepoint can
+    /// publish to the `noetl_events` stream when
+    /// `config.event_ingest_publish_only` is on.  `OnceCell` so the gate-off
+    /// (default) path never builds it and the gate-on path ensures the stream
+    /// exactly once.  `None` inner stays uninitialised until the first publish.
+    pub event_stream_publisher: Arc<tokio::sync::OnceCell<crate::nats::EventStreamPublisher>>,
 }
 
 /// Cached orchestrator state for one execution, advanced incrementally.
@@ -254,6 +262,7 @@ impl AppState {
             shard: Arc::new(shard),
             start_time: std::time::Instant::now(),
             orch_cache: Arc::new(OrchStateCache::default()),
+            event_stream_publisher: Arc::new(tokio::sync::OnceCell::new()),
         }
     }
 

@@ -206,6 +206,36 @@ pub fn event_stream_published_total() -> &'static IntCounterVec {
     })
 }
 
+/// Counter: events published through the `emit_event` chokepoint when the
+/// `NOETL_EVENT_INGEST_PUBLISH_ONLY` gate is on (noetl/ai-meta#103 phase 2d-3),
+/// by event type.  Distinct from the tailer's `event_stream_published_total`:
+/// this is the **producer cutover** path (the synchronous INSERT replaced by a
+/// publish), so a non-zero rate here means the materializer is the sole writer.
+pub fn event_ingest_published_total() -> &'static IntCounterVec {
+    static M: OnceLock<IntCounterVec> = OnceLock::new();
+    M.get_or_init(|| {
+        let counter = IntCounterVec::new(
+            Opts::new(
+                "noetl_event_ingest_published_total",
+                "Total events published to noetl_events by the emit_event chokepoint under NOETL_EVENT_INGEST_PUBLISH_ONLY (2d-3 cutover), by event type.",
+            ),
+            &["event_type"],
+        )
+        .expect("static counter spec must be valid");
+        registry()
+            .register(Box::new(counter.clone()))
+            .expect("counter registration must succeed");
+        counter
+    })
+}
+
+/// Record one event published through the chokepoint (gate-on path).
+pub fn record_event_published(event_type: &str) {
+    event_ingest_published_total()
+        .with_label_values(&[event_type])
+        .inc();
+}
+
 /// Gauge: the tailer's current cursor (`noetl.event.id` last published).  Pair
 /// with the table's `MAX(id)` to read publish lag.  Single series (no labels) —
 /// one tailer per server.
