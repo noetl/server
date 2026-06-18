@@ -10,10 +10,11 @@
 // `commands` + `evaluator` moved into the pure `noetl-orchestrate-core` crate
 // (noetl/ai-meta#108); re-exported here so `crate::engine::commands` /
 // `super::commands` call sites (orchestrator, handlers) are unchanged.
-pub use noetl_orchestrate_core::{commands, evaluator, state};
-pub mod orchestrator;
+// The whole drive core now lives in noetl-orchestrate-core (native + wasm32);
+// re-exported so `crate::engine::*` call sites are unchanged (noetl/ai-meta#109).
+pub use noetl_orchestrate_core::{commands, evaluator, orchestrator, state};
 
 pub use noetl_orchestrate_core::commands::{Command, CommandBuilder};
 pub use noetl_orchestrate_core::evaluator::ConditionEvaluator;
+pub use noetl_orchestrate_core::orchestrator::WorkflowOrchestrator;
 pub use noetl_orchestrate_core::state::{ExecutionState, StepState, WorkflowState};
-pub use orchestrator::WorkflowOrchestrator;

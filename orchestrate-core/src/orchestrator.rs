@@ -10,13 +10,13 @@ use std::collections::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
-use crate::db::models::Event;
-use crate::error::{AppError, AppResult};
-use crate::playbook::types::{LoopMode, NextSpec, Playbook, Step};
+use crate::event::Event;
+use crate::error::{CoreError, CoreResult};
+use crate::playbook::{LoopMode, NextSpec, Playbook, Step};
 
-use super::commands::{Command, CommandBuilder, IteratorMetadata};
-use super::evaluator::ConditionEvaluator;
-use super::state::{
+use crate::commands::{Command, CommandBuilder, IteratorMetadata};
+use crate::evaluator::ConditionEvaluator;
+use crate::state::{
     apply_set_mutations, extract_user_data, ExecutionState, StepState, WorkflowState,
 };
 use crate::template::TemplateRenderer;
@@ -297,16 +297,14 @@ impl WorkflowOrchestrator {
         events: &[Event],
         playbook: &Playbook,
         trigger_event_type: Option<&str>,
-    ) -> AppResult<OrchestrationResult> {
+    ) -> CoreResult<OrchestrationResult> {
         // Reconstruct workflow state from events (full path — used by tests and
         // by trigger_orchestrator on a cold cache).  `state` lives in
         // noetl-orchestrate-core on the pure `core::event::Event`; convert the
         // server's `db::Event` slice at this boundary (noetl/ai-meta#109).
-        let core_events: Vec<noetl_orchestrate_core::event::Event> =
-            events.iter().map(Into::into).collect();
-        let mut state = WorkflowState::from_events(&core_events)
-            .ok_or_else(|| AppError::Validation("No events found for execution".to_string()))?;
-        let latest_ts = events.last().map(|e| e.created_at);
+        let mut state = WorkflowState::from_events(events)
+            .ok_or_else(|| CoreError::Validation("No events found for execution".to_string()))?;
+        let latest_ts = events.last().map(|e| e.timestamp);
         self.evaluate_state(&mut state, latest_ts, playbook, trigger_event_type)
     }
 
@@ -321,7 +319,7 @@ impl WorkflowOrchestrator {
         latest_ts: Option<chrono::DateTime<chrono::Utc>>,
         playbook: &Playbook,
         trigger_event_type: Option<&str>,
-    ) -> AppResult<OrchestrationResult> {
+    ) -> CoreResult<OrchestrationResult> {
         debug!(
             "Evaluating execution {}, state: {}, trigger: {:?}",
             state.execution_id, state.state, trigger_event_type
@@ -394,7 +392,7 @@ impl WorkflowOrchestrator {
         // most-recent one wins the ephemeral context (matches the
         // latest-wins fold the durable persistence does across passes).
         // `event_id` is the stable completion key — `completed_at` can't
-        // be used because the event loader fills it with `Utc::now()`
+        // be used because the event loader fills it with `DateTime::from_timestamp(0, 0).unwrap()`
         // when the row's created_at is unreadable, so it varies across
         // reconstructions and would defeat the once-per-completion guard.
         let mut ctx_update_events: Vec<EventToEmit> = Vec::new();
@@ -542,14 +540,14 @@ impl WorkflowOrchestrator {
         state: &WorkflowState,
         playbook: &Playbook,
         context: &HashMap<String, serde_json::Value>,
-    ) -> AppResult<OrchestrationResult> {
+    ) -> CoreResult<OrchestrationResult> {
         let mut commands = Vec::new();
         let mut events_to_emit = Vec::new();
 
         // Find start step (always named "start")
         let start_step = playbook
             .get_step("start")
-            .ok_or_else(|| AppError::Validation("Start step 'start' not found".to_string()))?;
+            .ok_or_else(|| CoreError::Validation("Start step 'start' not found".to_string()))?;
 
         info!("Dispatching initial step: {}", start_step.step);
 
@@ -594,7 +592,7 @@ impl WorkflowOrchestrator {
         context: &HashMap<String, serde_json::Value>,
         trigger_event_type: Option<&str>,
         latest_ts: Option<chrono::DateTime<chrono::Utc>>,
-    ) -> AppResult<OrchestrationResult> {
+    ) -> CoreResult<OrchestrationResult> {
         let mut commands = Vec::new();
         let mut events_to_emit = Vec::new();
         // R3c parallel-branch completion: track whether the
@@ -658,7 +656,7 @@ impl WorkflowOrchestrator {
             let failed_steps: Vec<String> = state
                 .steps
                 .iter()
-                .filter(|(_, info)| matches!(info.state, crate::engine::state::StepState::Failed))
+                .filter(|(_, info)| matches!(info.state, crate::state::StepState::Failed))
                 .map(|(name, _)| name.clone())
                 .collect();
 
@@ -978,7 +976,7 @@ impl WorkflowOrchestrator {
         let mut per_step_evals: Vec<(
             String,
             &Step,
-            Vec<crate::engine::evaluator::EvaluationResult>,
+            Vec<crate::evaluator::EvaluationResult>,
         )> = Vec::new();
         for step_name in state.steps.keys() {
             if !state.is_step_completed(step_name) {
@@ -1792,7 +1790,7 @@ impl WorkflowOrchestrator {
         &self,
         state: &WorkflowState,
         steps: &HashMap<&str, &Step>,
-    ) -> AppResult<bool> {
+    ) -> CoreResult<bool> {
         // Check if there are any running steps
         if state.has_running_steps() {
             return Ok(false);
@@ -1820,7 +1818,7 @@ impl WorkflowOrchestrator {
         _state: &WorkflowState,
         step_name: &str,
         error: &str,
-    ) -> AppResult<OrchestrationResult> {
+    ) -> CoreResult<OrchestrationResult> {
         info!("Handling failure for step '{}': {}", step_name, error);
 
         let events_to_emit = vec![EventToEmit {
@@ -1857,8 +1855,8 @@ fn value_to_hashmap(value: &serde_json::Value) -> HashMap<String, serde_json::Va
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::playbook::types::{Metadata, NextSpec, ToolDefinition, ToolKind, ToolSpec};
-    use chrono::Utc;
+    use crate::playbook::{Metadata, NextSpec, ToolDefinition, ToolKind, ToolSpec};
+    use chrono::{DateTime, Utc};
 
     fn make_step(name: &str, next: Option<&str>) -> Step {
         Step {
@@ -1893,23 +1891,19 @@ mod tests {
 
     fn make_event(event_type: &str, node_name: Option<&str>) -> Event {
         Event {
-            id: 1,
+            event_id: 1,
             execution_id: 12345,
             catalog_id: 67890,
-            event_id: 1,
-            parent_event_id: None,
-            parent_execution_id: None,
             event_type: event_type.to_string(),
-            node_id: None,
             node_name: node_name.map(|s| s.to_string()),
-            node_type: None,
             status: "".to_string(),
             context: None,
-            meta: None,
             result: None,
-            worker_id: None,
+            meta: None,
+            // Fixed epoch — the core has no clock (deterministic fixtures).
+            timestamp: DateTime::from_timestamp(0, 0).unwrap(),
+            parent_execution_id: None,
             attempt: None,
-            created_at: Utc::now(),
         }
     }
 
@@ -1918,7 +1912,7 @@ mod tests {
     // lives with the orchestrator (a server type) until the orchestrator moves too.
     #[test]
     fn test_auth0_login_full_orchestrator_arc_routing_repro() {
-        use crate::engine::WorkflowOrchestrator;
+        use crate::orchestrator::WorkflowOrchestrator;
         let yaml = r#"
 apiVersion: noetl.io/v2
 kind: Playbook
@@ -2002,22 +1996,22 @@ workflow:
         // step.enter carrying the __cursor_loop marker -> is_cursor.
         let mut enter = make_event("step.enter", Some("cur"));
         enter.result = Some(serde_json::json!({"context": {"__cursor_loop": true}}));
-        ws.apply_event(&(&enter).into());
+        ws.apply_event(&enter);
         assert!(ws.steps.get("cur").unwrap().is_cursor);
 
         let mut claim0 = make_event("command.issued", Some("cur"));
         claim0.meta =
             Some(serde_json::json!({"command_id": "c0", "cursor": {"phase": "claim", "frame": 0}}));
-        ws.apply_event(&(&claim0).into());
+        ws.apply_event(&claim0);
         // The claim's RETURNING rows arrive on call.done.
         let mut claim0_data = make_event("call.done", Some("cur"));
         claim0_data.result = Some(serde_json::json!({
             "context": {"command_id": "c0", "data": {"rows": [{"id": 1}, {"id": 2}]}}
         }));
-        ws.apply_event(&(&claim0_data).into());
+        ws.apply_event(&claim0_data);
         let mut claim0_done = make_event("command.completed", Some("cur"));
         claim0_done.meta = Some(serde_json::json!({"command_id": "c0"}));
-        ws.apply_event(&(&claim0_done).into());
+        ws.apply_event(&claim0_done);
 
         let f0 = ws.steps.get("cur").unwrap().cursor_frames[&0].clone();
         assert!(f0.claim_completed);
@@ -2029,16 +2023,16 @@ workflow:
         let mut body0 = make_event("command.issued", Some("cur"));
         body0.meta =
             Some(serde_json::json!({"command_id": "b0", "cursor": {"phase": "body", "frame": 0}}));
-        ws.apply_event(&(&body0).into());
+        ws.apply_event(&body0);
         let mut body0_done = make_event("command.completed", Some("cur"));
         body0_done.meta = Some(serde_json::json!({"command_id": "b0"}));
-        ws.apply_event(&(&body0_done).into());
+        ws.apply_event(&body0_done);
         let f0 = ws.steps.get("cur").unwrap().cursor_frames[&0].clone();
         assert_eq!(f0.body_issued, 1);
         assert_eq!(f0.body_completed, 1);
 
         // Repeated completion events for the same command_id are deduped.
-        ws.apply_event(&(&body0_done).into());
+        ws.apply_event(&body0_done);
         assert_eq!(
             ws.steps.get("cur").unwrap().cursor_frames[&0].body_completed,
             1,
@@ -2049,19 +2043,19 @@ workflow:
         let mut claim1 = make_event("command.issued", Some("cur"));
         claim1.meta =
             Some(serde_json::json!({"command_id": "c1", "cursor": {"phase": "claim", "frame": 1}}));
-        ws.apply_event(&(&claim1).into());
+        ws.apply_event(&claim1);
         let mut claim1_data = make_event("call.done", Some("cur"));
         claim1_data.result =
             Some(serde_json::json!({"context": {"command_id": "c1", "data": {"rows": []}}}));
-        ws.apply_event(&(&claim1_data).into());
+        ws.apply_event(&claim1_data);
         let mut claim1_done = make_event("command.completed", Some("cur"));
         claim1_done.meta = Some(serde_json::json!({"command_id": "c1"}));
-        ws.apply_event(&(&claim1_done).into());
+        ws.apply_event(&claim1_done);
         let f1 = ws.steps.get("cur").unwrap().cursor_frames[&1].clone();
         assert!(f1.claim_completed && f1.claim_rows.is_empty());
 
         // Re-entry (loop-back): a fresh step.enter resets frame tracking.
-        ws.apply_event(&(&enter).into());
+        ws.apply_event(&enter);
         assert!(ws.steps.get("cur").unwrap().cursor_frames.is_empty());
     }
 
@@ -2485,11 +2479,11 @@ workflow:
 
         let start = make_step("start", Some("looped"));
         let mut looped = make_step("looped", Some("end"));
-        looped.r#loop = Some(crate::playbook::types::Loop {
+        looped.r#loop = Some(crate::playbook::Loop {
             in_expr: Some("{{ [1, 2, 3] }}".to_string()),
             cursor: None,
             iterator: "n".to_string(),
-            spec: Some(crate::playbook::types::LoopSpec {
+            spec: Some(crate::playbook::LoopSpec {
                 mode: LoopMode::Parallel,
                 max_in_flight: None,
                 frame: None,
@@ -2577,11 +2571,11 @@ workflow:
 
         let start = make_step("start", Some("looped"));
         let mut looped = make_step("looped", Some("end"));
-        looped.r#loop = Some(crate::playbook::types::Loop {
+        looped.r#loop = Some(crate::playbook::Loop {
             in_expr: Some("{{ [1, 2, 3] }}".to_string()),
             cursor: None,
             iterator: "n".to_string(),
-            spec: Some(crate::playbook::types::LoopSpec {
+            spec: Some(crate::playbook::LoopSpec {
                 mode: LoopMode::Sequential,
                 max_in_flight: None,
                 frame: None,
@@ -2667,11 +2661,11 @@ workflow:
 
         let start = make_step("start", Some("looped"));
         let mut looped = make_step("looped", Some("end"));
-        looped.r#loop = Some(crate::playbook::types::Loop {
+        looped.r#loop = Some(crate::playbook::Loop {
             in_expr: Some("{{ [10, 20, 30] }}".to_string()),
             cursor: None,
             iterator: "n".to_string(),
-            spec: Some(crate::playbook::types::LoopSpec {
+            spec: Some(crate::playbook::LoopSpec {
                 mode: LoopMode::Sequential,
                 max_in_flight: None,
                 frame: None,
@@ -2774,7 +2768,7 @@ workflow:
         // the fix, `event` was never injected, the arc never matched, the
         // downstream step was skipped, and the execution hung after the
         // loop (concurrency-probe + load-test fixtures).
-        use crate::playbook::types::{Loop, LoopSpec, NextArc, NextRouter, NextRouterSpec};
+        use crate::playbook::{Loop, LoopSpec, NextArc, NextRouter, NextRouterSpec};
 
         let orchestrator = WorkflowOrchestrator::new();
 
@@ -2887,7 +2881,7 @@ workflow:
 
         let start = make_step("start", Some("looped"));
         let mut looped = make_step("looped", Some("end"));
-        looped.r#loop = Some(crate::playbook::types::Loop {
+        looped.r#loop = Some(crate::playbook::Loop {
             in_expr: Some("{{ [1, 2] }}".to_string()),
             cursor: None,
             iterator: "x".to_string(),
@@ -2948,7 +2942,7 @@ workflow:
 
         let start = make_step("start", Some("looped"));
         let mut looped = make_step("looped", Some("end"));
-        looped.r#loop = Some(crate::playbook::types::Loop {
+        looped.r#loop = Some(crate::playbook::Loop {
             in_expr: Some("{{ [] }}".to_string()),
             cursor: None,
             iterator: "x".to_string(),
@@ -3006,7 +3000,7 @@ workflow:
     /// multiple unconditional arcs (parallel fan-out) in inclusive
     /// mode.
     fn make_step_with_parallel_next(name: &str, targets: &[&str]) -> Step {
-        use crate::playbook::types::{NextArc, NextRouter, NextRouterSpec};
+        use crate::playbook::{NextArc, NextRouter, NextRouterSpec};
         let mut step = make_step(name, None);
         step.next = Some(NextSpec::Router(NextRouter {
             spec: Some(NextRouterSpec {
@@ -3052,17 +3046,17 @@ workflow:
         // event sets up the routing). process_high → summarize.
         let start = {
             let mut s = make_step("start", None);
-            s.next = Some(NextSpec::Router(crate::playbook::types::NextRouter {
-                spec: Some(crate::playbook::types::NextRouterSpec {
+            s.next = Some(NextSpec::Router(crate::playbook::NextRouter {
+                spec: Some(crate::playbook::NextRouterSpec {
                     mode: Some("exclusive".to_string()),
                 }),
                 arcs: vec![
-                    crate::playbook::types::NextArc {
+                    crate::playbook::NextArc {
                         step: "process_high".to_string(),
                         when: Some("{{ start.random_value > 10 }}".to_string()),
                         set_vars: None,
                     },
-                    crate::playbook::types::NextArc {
+                    crate::playbook::NextArc {
                         step: "process_low".to_string(),
                         when: Some("{{ start.random_value <= 10 }}".to_string()),
                         set_vars: None,
@@ -3738,7 +3732,7 @@ workflow:
         // excluded so `fetch_page` is NOT treated as a reduce boundary
         // — otherwise the barrier waits on `check_pagination`, which
         // only runs *after* `fetch_page`, deadlocking the loop.
-        use crate::playbook::types::{NextArc, NextRouter, NextRouterSpec};
+        use crate::playbook::{NextArc, NextRouter, NextRouterSpec};
 
         let start = make_step("start", Some("fetch_page"));
         let fetch_page = make_step("fetch_page", Some("check_pagination"));
@@ -3765,7 +3759,7 @@ workflow:
         };
         let validate = make_step("validate", Some("end"));
         let end = make_step("end", None);
-        let workflow = vec![start, fetch_page, check_pagination, validate, end];
+        let workflow = [start, fetch_page, check_pagination, validate, end];
         let steps: HashMap<&str, &Step> = workflow.iter().map(|s| (s.step.as_str(), s)).collect();
 
         let incoming = build_incoming_arcs(&steps);
@@ -3800,7 +3794,7 @@ workflow:
         // After start.command.completed the orchestrator evaluates the arc,
         // applies the mutation, and builds the command for use_vars.
         // We inspect the command's context (tool_config.args) for the key.
-        use crate::playbook::types::{
+        use crate::playbook::{
             NextArc, NextRouter, NextRouterSpec, ToolDefinition, ToolKind, ToolSpec,
         };
 
@@ -3856,7 +3850,7 @@ workflow:
         let playbook = Playbook {
             api_version: "noetl.io/v2".to_string(),
             kind: "Playbook".to_string(),
-            metadata: crate::playbook::types::Metadata {
+            metadata: crate::playbook::Metadata {
                 name: "arc_set_test".to_string(),
                 path: None,
                 description: None,
@@ -3914,7 +3908,7 @@ workflow:
     /// "Loop expression did not evaluate to an iterable".
     #[test]
     fn test_loop_in_resolves_ctx_namespace() {
-        use crate::playbook::types::{
+        use crate::playbook::{
             Loop, NextArc, NextRouter, NextRouterSpec, ToolDefinition, ToolKind, ToolSpec,
         };
 
@@ -3969,7 +3963,7 @@ workflow:
         let playbook = Playbook {
             api_version: "noetl.io/v2".to_string(),
             kind: "Playbook".to_string(),
-            metadata: crate::playbook::types::Metadata {
+            metadata: crate::playbook::Metadata {
                 name: "ctx_loop_test".to_string(),
                 path: None,
                 description: None,
@@ -4031,7 +4025,7 @@ workflow:
     ///   check_pagination -> fetch_page (when has_more) | validate_results (else)
     ///   validate_results -> end
     fn make_pagination_workflow() -> Vec<Step> {
-        use crate::playbook::types::{NextArc, NextRouter, NextRouterSpec};
+        use crate::playbook::{NextArc, NextRouter, NextRouterSpec};
         let start = make_step("start", Some("fetch_page"));
         let fetch_page = make_step("fetch_page", Some("check_pagination"));
         let check_pagination = {
@@ -4108,21 +4102,21 @@ workflow:
         // head) rather than be suppressed by the is_step_done guard.
         let orchestrator = WorkflowOrchestrator::new();
 
-        let t0 = Utc::now();
+        let t0 = DateTime::from_timestamp(0, 0).unwrap();
         let mut started = make_event("playbook_started", None);
         started.context = Some(serde_json::json!({
             "workload": { "has_more": true },
             "path": "test/pagination",
             "version": "1",
         }));
-        started.created_at = t0;
+        started.timestamp = t0;
 
         let mut fetch_done = make_event("command.completed", Some("fetch_page"));
-        fetch_done.created_at = t0 + chrono::Duration::seconds(1);
+        fetch_done.timestamp = t0 + chrono::Duration::seconds(1);
         fetch_done.result = Some(serde_json::json!({"page": 1}));
 
         let mut check_done = make_event("command.completed", Some("check_pagination"));
-        check_done.created_at = t0 + chrono::Duration::seconds(2);
+        check_done.timestamp = t0 + chrono::Duration::seconds(2);
         check_done.result = Some(serde_json::json!({"has_more": true}));
 
         let events = vec![started, fetch_done, check_done];
@@ -4177,23 +4171,23 @@ workflow:
         // branch must stay Pending here.
         let orchestrator = WorkflowOrchestrator::new();
 
-        let t0 = Utc::now();
+        let t0 = DateTime::from_timestamp(0, 0).unwrap();
         let mut started = make_event("playbook_started", None);
         started.context = Some(serde_json::json!({
             "workload": { "has_more": true },
             "path": "test/pagination",
             "version": "1",
         }));
-        started.created_at = t0;
+        started.timestamp = t0;
 
         // check_pagination completed FIRST (an earlier iteration), then
         // fetch_page completed (the loop body, newer).
         let mut check_done = make_event("command.completed", Some("check_pagination"));
-        check_done.created_at = t0 + chrono::Duration::seconds(1);
+        check_done.timestamp = t0 + chrono::Duration::seconds(1);
         check_done.result = Some(serde_json::json!({"has_more": true}));
 
         let mut fetch_done = make_event("command.completed", Some("fetch_page"));
-        fetch_done.created_at = t0 + chrono::Duration::seconds(2);
+        fetch_done.timestamp = t0 + chrono::Duration::seconds(2);
         fetch_done.result = Some(serde_json::json!({"page": 2}));
 
         let events = vec![started, check_done, fetch_done];
@@ -4220,21 +4214,21 @@ workflow:
         // dispatches normally.
         let orchestrator = WorkflowOrchestrator::new();
 
-        let t0 = Utc::now();
+        let t0 = DateTime::from_timestamp(0, 0).unwrap();
         let mut started = make_event("playbook_started", None);
         started.context = Some(serde_json::json!({
             "workload": { "has_more": false },
             "path": "test/pagination",
             "version": "1",
         }));
-        started.created_at = t0;
+        started.timestamp = t0;
 
         let mut fetch_done = make_event("command.completed", Some("fetch_page"));
-        fetch_done.created_at = t0 + chrono::Duration::seconds(1);
+        fetch_done.timestamp = t0 + chrono::Duration::seconds(1);
         fetch_done.result = Some(serde_json::json!({"page": 1}));
 
         let mut check_done = make_event("command.completed", Some("check_pagination"));
-        check_done.created_at = t0 + chrono::Duration::seconds(2);
+        check_done.timestamp = t0 + chrono::Duration::seconds(2);
         check_done.result = Some(serde_json::json!({"has_more": false}));
 
         let events = vec![started, fetch_done, check_done];
@@ -4304,7 +4298,7 @@ workflow:
     /// `ctx.counter = 0` on every pass and competed non-deterministically
     /// with `gate`'s advancing set.
     fn make_counter_loop_playbook() -> Playbook {
-        use crate::playbook::types::{NextArc, NextRouter, NextRouterSpec};
+        use crate::playbook::{NextArc, NextRouter, NextRouterSpec};
         let start = make_step_with_set(
             "start",
             NextSpec::Single("work".to_string()),
@@ -4369,8 +4363,8 @@ workflow:
         *seq += 1;
         let mut e = make_event(&emit.event_type, emit.node_name.as_deref());
         e.event_id = *seq;
-        e.id = *seq;
-        e.created_at = t0 + chrono::Duration::milliseconds(*seq);
+        e.event_id = *seq;
+        e.timestamp = t0 + chrono::Duration::milliseconds(*seq);
         let status = if emit.status.is_empty() {
             "STARTED".to_string()
         } else {
@@ -4400,8 +4394,8 @@ workflow:
             *seq += 1;
             let mut e = make_event(ev, Some(step_name));
             e.event_id = *seq;
-            e.id = *seq;
-            e.created_at = t0 + chrono::Duration::milliseconds(*seq);
+            e.event_id = *seq;
+            e.timestamp = t0 + chrono::Duration::milliseconds(*seq);
             e.meta = Some(serde_json::json!({ "command_id": format!("{step_name}-{seq}") }));
             if ev == "call.done" {
                 e.result = Some(done_result.clone());
@@ -4419,15 +4413,15 @@ workflow:
         // worker + event-log simulation.
         let orchestrator = WorkflowOrchestrator::new();
         let playbook = make_counter_loop_playbook();
-        let t0 = Utc::now();
+        let t0 = DateTime::from_timestamp(0, 0).unwrap();
         let mut seq = 0i64;
 
         let mut log: Vec<Event> = Vec::new();
         {
             let mut started = make_event("playbook_started", None);
             started.event_id = 0;
-            started.id = 0;
-            started.created_at = t0;
+            started.event_id = 0;
+            started.timestamp = t0;
             started.context = Some(serde_json::json!({
                 "workload": { "counter": 0 },
                 "path": "test/counter_loop",
@@ -4503,10 +4497,10 @@ workflow:
         // default.
         let orchestrator = WorkflowOrchestrator::new();
         let playbook = make_counter_loop_playbook();
-        let t0 = Utc::now();
+        let t0 = DateTime::from_timestamp(0, 0).unwrap();
 
         let mut started = make_event("playbook_started", None);
-        started.created_at = t0;
+        started.timestamp = t0;
         started.event_id = 1;
         started.context = Some(serde_json::json!({
             "workload": { "counter": 0 }, "path": "test/counter_loop", "version": "1",
@@ -4516,13 +4510,13 @@ workflow:
         // persisted), work completed, gate completed with next_counter=1.
         let mut start_done = make_event("command.completed", Some("start"));
         start_done.event_id = 2;
-        start_done.created_at = t0 + chrono::Duration::seconds(1);
+        start_done.timestamp = t0 + chrono::Duration::seconds(1);
 
         // start's set already persisted at its completion — `gen`
         // references start's command.completed event_id (= 2).
         let mut start_ctx = make_event("ctx.updated", None);
         start_ctx.event_id = 3;
-        start_ctx.created_at = t0 + chrono::Duration::seconds(1);
+        start_ctx.timestamp = t0 + chrono::Duration::seconds(1);
         start_ctx.result = Some(serde_json::json!({
             "status": "CONTEXT",
             "context": {
@@ -4534,16 +4528,16 @@ workflow:
 
         let mut work_done = make_event("command.completed", Some("work"));
         work_done.event_id = 4;
-        work_done.created_at = t0 + chrono::Duration::seconds(2);
+        work_done.timestamp = t0 + chrono::Duration::seconds(2);
 
         let mut gate_call = make_event("call.done", Some("gate"));
         gate_call.event_id = 5;
-        gate_call.created_at = t0 + chrono::Duration::seconds(3);
+        gate_call.timestamp = t0 + chrono::Duration::seconds(3);
         gate_call.result = Some(serde_json::json!({ "next_counter": 1 }));
 
         let mut gate_done = make_event("command.completed", Some("gate"));
         gate_done.event_id = 6;
-        gate_done.created_at = t0 + chrono::Duration::seconds(3);
+        gate_done.timestamp = t0 + chrono::Duration::seconds(3);
         gate_done.meta = Some(serde_json::json!({ "command_id": "gate-1" }));
 
         let events = vec![
@@ -4598,22 +4592,22 @@ workflow:
         // log must NOT emit a duplicate ctx.updated for that completion.
         let orchestrator = WorkflowOrchestrator::new();
         let playbook = make_counter_loop_playbook();
-        let t0 = Utc::now();
+        let t0 = DateTime::from_timestamp(0, 0).unwrap();
 
         let mut started = make_event("playbook_started", None);
-        started.created_at = t0;
+        started.timestamp = t0;
         started.context = Some(serde_json::json!({
             "workload": { "counter": 0 }, "path": "test/counter_loop", "version": "1",
         }));
 
         let mut start_done = make_event("command.completed", Some("start"));
         start_done.event_id = 2;
-        start_done.created_at = t0 + chrono::Duration::seconds(1);
+        start_done.timestamp = t0 + chrono::Duration::seconds(1);
 
         // gen references start's command.completed event_id (= 2).
         let mut start_ctx = make_event("ctx.updated", None);
         start_ctx.event_id = 3;
-        start_ctx.created_at = t0 + chrono::Duration::seconds(1);
+        start_ctx.timestamp = t0 + chrono::Duration::seconds(1);
         start_ctx.result = Some(serde_json::json!({
             "status": "CONTEXT",
             "context": {

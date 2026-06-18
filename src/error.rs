@@ -197,6 +197,18 @@ impl From<crate::snowflake::SnowflakeError> for AppError {
     }
 }
 
+/// Map the pure drive core's error into the server's `AppError` at the
+/// boundary, so call sites that `?` a `CoreResult` keep returning `AppResult`
+/// unchanged (noetl/ai-meta#108).
+impl From<noetl_orchestrate_core::error::CoreError> for AppError {
+    fn from(e: noetl_orchestrate_core::error::CoreError) -> Self {
+        match e {
+            noetl_orchestrate_core::error::CoreError::Template(msg) => AppError::Template(msg),
+            noetl_orchestrate_core::error::CoreError::Validation(msg) => AppError::Validation(msg),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -211,17 +223,5 @@ mod tests {
     fn test_validation_error() {
         let err = AppError::Validation("Invalid email".to_string());
         assert_eq!(err.to_string(), "Validation error: Invalid email");
-    }
-}
-
-/// Map the pure drive core's error into the server's `AppError` at the
-/// boundary, so call sites that `?` a `CoreResult` keep returning `AppResult`
-/// unchanged (noetl/ai-meta#108).
-impl From<noetl_orchestrate_core::error::CoreError> for AppError {
-    fn from(e: noetl_orchestrate_core::error::CoreError) -> Self {
-        match e {
-            noetl_orchestrate_core::error::CoreError::Template(msg) => AppError::Template(msg),
-            noetl_orchestrate_core::error::CoreError::Validation(msg) => AppError::Validation(msg),
-        }
     }
 }

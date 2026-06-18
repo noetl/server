@@ -19,6 +19,7 @@ pub mod commands;
 pub mod error;
 pub mod event;
 pub mod evaluator;
+pub mod orchestrator;
 pub mod playbook;
 pub mod state;
 pub mod template;
