@@ -377,3 +377,74 @@ mod tests {
         assert_eq!(EventStatus::from("Failed"), EventStatus::Failed);
     }
 }
+
+/// Convert a persisted `db::Event` into the pure drive-core event the
+/// orchestrator reads (noetl/ai-meta#109).  A field copy that drops the DB-only
+/// columns the drive never touches (`id`, `catalog_id`, `parent_event_id`,
+/// `node_id`, `node_type`, `worker_id`).  `trigger_orchestrator` maps a bounded
+/// event slice through this before calling `evaluate`; the `context`/`result`
+/// clones are cheap because references-in-state keeps those small.
+impl From<&Event> for noetl_orchestrate_core::event::Event {
+    fn from(e: &Event) -> Self {
+        noetl_orchestrate_core::event::Event {
+            event_id: e.event_id,
+            execution_id: e.execution_id,
+            event_type: e.event_type.clone(),
+            node_name: e.node_name.clone(),
+            status: e.status.clone(),
+            context: e.context.clone(),
+            result: e.result.clone(),
+            meta: e.meta.clone(),
+            timestamp: e.created_at,
+            parent_execution_id: e.parent_execution_id,
+            attempt: e.attempt,
+        }
+    }
+}
+
+#[cfg(test)]
+mod drive_event_conversion_tests {
+    use super::*;
+
+    #[test]
+    fn db_event_converts_to_core_drive_event() {
+        let db = Event {
+            id: 7,
+            execution_id: 42,
+            catalog_id: 99,
+            event_id: 1000,
+            parent_event_id: Some(1),
+            parent_execution_id: Some(2),
+            event_type: "call.done".to_string(),
+            node_id: Some("n1".to_string()),
+            node_name: Some("fetch".to_string()),
+            node_type: Some("python".to_string()),
+            status: "COMPLETED".to_string(),
+            context: Some(serde_json::json!({"k": "v"})),
+            meta: None,
+            result: Some(serde_json::json!({"rows": 3})),
+            worker_id: Some("w1".to_string()),
+            attempt: Some(0),
+            created_at: chrono::Utc::now(),
+        };
+        let core: noetl_orchestrate_core::event::Event = (&db).into();
+        // the read-set carries over ...
+        assert_eq!(core.event_id, 1000);
+        assert_eq!(core.execution_id, 42);
+        assert_eq!(core.event_type, "call.done");
+        assert_eq!(core.node_name.as_deref(), Some("fetch"));
+        assert_eq!(core.status, "COMPLETED");
+        assert_eq!(core.result, Some(serde_json::json!({"rows": 3})));
+        assert_eq!(core.timestamp, db.created_at);
+        // ... and `created_at` is accepted as the `timestamp` alias on the wire.
+        let wire = serde_json::to_value(&core).unwrap();
+        assert!(wire.get("timestamp").is_some());
+        let back: noetl_orchestrate_core::event::Event =
+            serde_json::from_value(serde_json::json!({
+                "event_id": 1, "execution_id": 1, "event_type": "x",
+                "status": "OK", "created_at": "2026-06-17T00:00:00Z"
+            }))
+            .expect("created_at alias deserializes");
+        assert_eq!(back.event_id, 1);
+    }
+}
