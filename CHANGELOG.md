@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.19.0](https://github.com/noetl/server/compare/v3.18.0...v3.19.0) (2026-06-18)
+
+### Features
+
+* **orchestrate-core:** core event type + db::Event boundary conversion ([#109](https://github.com/noetl/server/issues/109)) ([#221](https://github.com/noetl/server/issues/221)) ([757ad5e](https://github.com/noetl/server/commit/757ad5eb2cf403ea0a6a088a202f13bb5d1a34a6)), closes [#104](https://github.com/noetl/server/issues/104)
+
 ## [3.18.0](https://github.com/noetl/server/compare/v3.17.0...v3.18.0) (2026-06-18)
 
 ### Features
