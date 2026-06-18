@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.25.0](https://github.com/noetl/server/compare/v3.24.0...v3.25.0) (2026-06-18)
+
+### Features
+
+* **orchestrate-drive:** suppress meta-command events from noetl.event + route drive to system pool ([#230](https://github.com/noetl/server/issues/230)) ([6aef3a6](https://github.com/noetl/server/commit/6aef3a6383a7035c2af1342269f204520a335566)), closes [noetl/ai-meta#108](https://github.com/noetl/ai-meta/issues/108) [noetl/ai-meta#108](https://github.com/noetl/ai-meta/issues/108)
+
 ## [3.24.0](https://github.com/noetl/server/compare/v3.23.0...v3.24.0) (2026-06-18)
 
 ### Features
