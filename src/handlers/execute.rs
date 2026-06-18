@@ -1104,6 +1104,15 @@ pub(crate) async fn dispatch_orchestrate_command(
         tracing::warn!(error = %e, execution_id, "orchestrate command row insert failed (non-fatal)");
     }
 
+    // Route the drive to the dedicated `system` worker pool (noetl/ai-meta#108)
+    // so it doesn't compete with user compute for slots — the system pool
+    // subscribes to `noetl.commands.system.>`. The user pool's segment is derived
+    // from the playbook path; override it to `system` here, preserving the
+    // execution's W3C trace so the drive stays on the same trace.
+    let system_routing = CommandRouting {
+        pool: Some("system".to_string()),
+        trace: routing.trace.clone(),
+    };
     publish_command_notification(
         state,
         execution_id,
@@ -1112,7 +1121,7 @@ pub(crate) async fn dispatch_orchestrate_command(
         STEP,
         "wasm",
         playbook,
-        routing,
+        &system_routing,
     )
     .await?;
     crate::metrics::record_orchestrate_drive("dispatched");
