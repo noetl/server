@@ -1631,7 +1631,7 @@ async fn rebuild_state(
             hydrate_result_references(&mut events_since, result_store, keep_refs).await;
             let mut ws = snap.state;
             for e in &events_since {
-                ws.apply_event(e);
+                ws.apply_event(&e.into());
             }
             // The window includes everything after the snapshot, so the highest
             // loaded id is the current head.
@@ -1657,7 +1657,7 @@ async fn rebuild_state(
                 .await?,
             );
             hydrate_result_references(&mut all_events, result_store, keep_refs).await;
-            let state = crate::engine::state::WorkflowState::from_events(&all_events)
+            let state = crate::engine::state::WorkflowState::from_events(&all_events.iter().map(Into::into).collect::<Vec<_>>())
                 .ok_or_else(|| AppError::Validation("No events found for execution".to_string()))?;
             let last_event_id = all_events.last().map(|e| e.event_id).unwrap_or(0);
             let routing_meta = all_events
@@ -1880,7 +1880,7 @@ async fn trigger_orchestrator_inner(
         hydrate_result_references(&mut strag, &result_store, state.config.refs_in_state).await;
         if let Some(ws) = cache.state.as_mut() {
             for e in &strag {
-                ws.apply_event(e);
+                ws.apply_event(&e.into());
             }
         }
         straggler_applied = !strag.is_empty();
@@ -1936,7 +1936,7 @@ async fn trigger_orchestrator_inner(
     } else if !new_events.is_empty() {
         let ws = cache.state.as_mut().unwrap();
         for e in &new_events {
-            ws.apply_event(e);
+            ws.apply_event(&e.into());
         }
         cache.applied_count += new_events.len() as i64;
         cache.last_event_id = new_events

@@ -10,11 +10,10 @@
 // `commands` + `evaluator` moved into the pure `noetl-orchestrate-core` crate
 // (noetl/ai-meta#108); re-exported here so `crate::engine::commands` /
 // `super::commands` call sites (orchestrator, handlers) are unchanged.
-pub use noetl_orchestrate_core::{commands, evaluator};
+pub use noetl_orchestrate_core::{commands, evaluator, state};
 pub mod orchestrator;
-pub mod state;
 
 pub use noetl_orchestrate_core::commands::{Command, CommandBuilder};
 pub use noetl_orchestrate_core::evaluator::ConditionEvaluator;
+pub use noetl_orchestrate_core::state::{ExecutionState, StepState, WorkflowState};
 pub use orchestrator::WorkflowOrchestrator;
-pub use state::{ExecutionState, StepState, WorkflowState};

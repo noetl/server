@@ -389,6 +389,7 @@ impl From<&Event> for noetl_orchestrate_core::event::Event {
         noetl_orchestrate_core::event::Event {
             event_id: e.event_id,
             execution_id: e.execution_id,
+            catalog_id: e.catalog_id,
             event_type: e.event_type.clone(),
             node_name: e.node_name.clone(),
             status: e.status.clone(),

@@ -299,8 +299,12 @@ impl WorkflowOrchestrator {
         trigger_event_type: Option<&str>,
     ) -> AppResult<OrchestrationResult> {
         // Reconstruct workflow state from events (full path — used by tests and
-        // by trigger_orchestrator on a cold cache).
-        let mut state = WorkflowState::from_events(events)
+        // by trigger_orchestrator on a cold cache).  `state` lives in
+        // noetl-orchestrate-core on the pure `core::event::Event`; convert the
+        // server's `db::Event` slice at this boundary (noetl/ai-meta#109).
+        let core_events: Vec<noetl_orchestrate_core::event::Event> =
+            events.iter().map(Into::into).collect();
+        let mut state = WorkflowState::from_events(&core_events)
             .ok_or_else(|| AppError::Validation("No events found for execution".to_string()))?;
         let latest_ts = events.last().map(|e| e.created_at);
         self.evaluate_state(&mut state, latest_ts, playbook, trigger_event_type)
@@ -1909,6 +1913,86 @@ mod tests {
         }
     }
 
+    // Moved from state.rs when state moved into noetl-orchestrate-core
+    // (noetl/ai-meta#109): this is a state+orchestrator integration test, so it
+    // lives with the orchestrator (a server type) until the orchestrator moves too.
+    #[test]
+    fn test_auth0_login_full_orchestrator_arc_routing_repro() {
+        use crate::engine::WorkflowOrchestrator;
+        let yaml = r#"
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata:
+  name: t
+  path: t
+workload:
+  request_id: "req-123"
+workflow:
+  - step: start
+    tool:
+      kind: python
+      code: |
+        result = {"error": "Invalid JWT format"}
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: err_cb
+          when: "{{ (start.error is defined) and request_id }}"
+        - step: end_step
+          when: "{{ start.error is defined and not request_id }}"
+        - step: create
+          when: "{{ start.sub is defined }}"
+  - step: err_cb
+    tool: { kind: python, code: "result = {}" }
+  - step: end_step
+    tool: { kind: python, code: "result = {}" }
+  - step: create
+    tool: { kind: python, code: "result = {}" }
+"#;
+        let playbook = serde_yaml::from_str::<crate::playbook::Playbook>(yaml).unwrap();
+
+        let mut e_started = make_event("playbook_started", None);
+        e_started.event_id = 1;
+        e_started.context = Some(serde_json::json!({
+            "workload": { "request_id": "req-123" },
+            "path": "t"
+        }));
+        let mut e_issued = make_event("command.issued", Some("start"));
+        e_issued.event_id = 2;
+        let mut e_done = make_event("call.done", Some("start"));
+        e_done.event_id = 3;
+        e_done.result = Some(serde_json::json!({
+            "status": "COMPLETED",
+            "context": { "result": { "status": "success", "context": {
+                "data": { "error": "Invalid JWT format" }, "status": "success" } } }
+        }));
+        let mut e_completed = make_event("command.completed", Some("start"));
+        e_completed.event_id = 4;
+        e_completed.result = Some(serde_json::json!({
+            "status": "success", "context": { "status": "success", "command_id": "x" }
+        }));
+
+        let events = vec![e_started, e_issued, e_done, e_completed];
+        let orch = WorkflowOrchestrator::new();
+        let result = orch
+            .evaluate(&events, &playbook, Some("command.completed"))
+            .expect("evaluate ok");
+
+        let skipped: Vec<String> = result
+            .events_to_emit
+            .iter()
+            .filter(|e| e.event_type == "step.skipped")
+            .filter_map(|e| e.node_name.clone())
+            .collect();
+        let cmds: Vec<String> = result.commands.iter().map(|c| c.step_name.clone()).collect();
+        assert!(
+            !skipped.contains(&"err_cb".to_string()),
+            "err_cb arc must fire (start.error defined + request_id truthy), not skip. \
+             skipped={skipped:?} commands={cmds:?}"
+        );
+    }
+
     #[test]
     fn cursor_frame_tracking_via_apply_event() {
         // noetl/ai-meta#100: cursor frame progress is maintained INCREMENTALLY
@@ -1918,22 +2002,22 @@ mod tests {
         // step.enter carrying the __cursor_loop marker -> is_cursor.
         let mut enter = make_event("step.enter", Some("cur"));
         enter.result = Some(serde_json::json!({"context": {"__cursor_loop": true}}));
-        ws.apply_event(&enter);
+        ws.apply_event(&(&enter).into());
         assert!(ws.steps.get("cur").unwrap().is_cursor);
 
         let mut claim0 = make_event("command.issued", Some("cur"));
         claim0.meta =
             Some(serde_json::json!({"command_id": "c0", "cursor": {"phase": "claim", "frame": 0}}));
-        ws.apply_event(&claim0);
+        ws.apply_event(&(&claim0).into());
         // The claim's RETURNING rows arrive on call.done.
         let mut claim0_data = make_event("call.done", Some("cur"));
         claim0_data.result = Some(serde_json::json!({
             "context": {"command_id": "c0", "data": {"rows": [{"id": 1}, {"id": 2}]}}
         }));
-        ws.apply_event(&claim0_data);
+        ws.apply_event(&(&claim0_data).into());
         let mut claim0_done = make_event("command.completed", Some("cur"));
         claim0_done.meta = Some(serde_json::json!({"command_id": "c0"}));
-        ws.apply_event(&claim0_done);
+        ws.apply_event(&(&claim0_done).into());
 
         let f0 = ws.steps.get("cur").unwrap().cursor_frames[&0].clone();
         assert!(f0.claim_completed);
@@ -1945,16 +2029,16 @@ mod tests {
         let mut body0 = make_event("command.issued", Some("cur"));
         body0.meta =
             Some(serde_json::json!({"command_id": "b0", "cursor": {"phase": "body", "frame": 0}}));
-        ws.apply_event(&body0);
+        ws.apply_event(&(&body0).into());
         let mut body0_done = make_event("command.completed", Some("cur"));
         body0_done.meta = Some(serde_json::json!({"command_id": "b0"}));
-        ws.apply_event(&body0_done);
+        ws.apply_event(&(&body0_done).into());
         let f0 = ws.steps.get("cur").unwrap().cursor_frames[&0].clone();
         assert_eq!(f0.body_issued, 1);
         assert_eq!(f0.body_completed, 1);
 
         // Repeated completion events for the same command_id are deduped.
-        ws.apply_event(&body0_done);
+        ws.apply_event(&(&body0_done).into());
         assert_eq!(
             ws.steps.get("cur").unwrap().cursor_frames[&0].body_completed,
             1,
@@ -1965,19 +2049,19 @@ mod tests {
         let mut claim1 = make_event("command.issued", Some("cur"));
         claim1.meta =
             Some(serde_json::json!({"command_id": "c1", "cursor": {"phase": "claim", "frame": 1}}));
-        ws.apply_event(&claim1);
+        ws.apply_event(&(&claim1).into());
         let mut claim1_data = make_event("call.done", Some("cur"));
         claim1_data.result =
             Some(serde_json::json!({"context": {"command_id": "c1", "data": {"rows": []}}}));
-        ws.apply_event(&claim1_data);
+        ws.apply_event(&(&claim1_data).into());
         let mut claim1_done = make_event("command.completed", Some("cur"));
         claim1_done.meta = Some(serde_json::json!({"command_id": "c1"}));
-        ws.apply_event(&claim1_done);
+        ws.apply_event(&(&claim1_done).into());
         let f1 = ws.steps.get("cur").unwrap().cursor_frames[&1].clone();
         assert!(f1.claim_completed && f1.claim_rows.is_empty());
 
         // Re-entry (loop-back): a fresh step.enter resets frame tracking.
-        ws.apply_event(&enter);
+        ws.apply_event(&(&enter).into());
         assert!(ws.steps.get("cur").unwrap().cursor_frames.is_empty());
     }
 

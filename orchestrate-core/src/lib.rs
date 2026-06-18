@@ -20,4 +20,5 @@ pub mod error;
 pub mod event;
 pub mod evaluator;
 pub mod playbook;
+pub mod state;
 pub mod template;
