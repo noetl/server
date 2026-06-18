@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.18.0](https://github.com/noetl/server/compare/v3.17.0...v3.18.0) (2026-06-18)
+
+### Features
+
+* **orchestrate-core:** move commands + evaluator into the core ([#108](https://github.com/noetl/server/issues/108)) ([#220](https://github.com/noetl/server/issues/220)) ([9da453d](https://github.com/noetl/server/commit/9da453d942d83db907c1c98969485039655cb211))
+
 ## [3.17.0](https://github.com/noetl/server/compare/v3.16.0...v3.17.0) (2026-06-17)
 
 ### Features
