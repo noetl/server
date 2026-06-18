@@ -68,6 +68,16 @@ pub struct AppConfig {
     #[serde(default)]
     pub projector_owns_snapshot: bool,
 
+    /// In-server shadow of the `system/orchestrate` WASM plug-in
+    /// (noetl/ai-meta#108 slice 4).  When true (and the binary is built with
+    /// the `orchestrate-shadow` feature), every orchestrator evaluation also
+    /// runs the plug-in on the same `WorkflowState` and diffs the emitted
+    /// commands — the in-process result stays authoritative.  Envy maps
+    /// `NOETL_ORCHESTRATE_PLUGIN_SHADOW`.  **Default false** — a clean shadow
+    /// over the PFT (all `match`) is the gate before any worker-driven cutover.
+    #[serde(default)]
+    pub orchestrate_plugin_shadow: bool,
+
     /// Auto recreate runtime if missing
     #[serde(default = "default_true")]
     pub auto_recreate_runtime: bool,
@@ -180,6 +190,7 @@ impl Default for AppConfig {
             disable_metrics: false,
             refs_in_state: false,
             projector_owns_snapshot: false,
+            orchestrate_plugin_shadow: false,
             auto_recreate_runtime: true,
             runtime_sweep_interval: default_sweep_interval(),
             runtime_offline_seconds: default_offline_seconds(),

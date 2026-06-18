@@ -120,6 +120,34 @@ pub fn record_cleanup_purged(table: &str, rows: u64) {
         .inc_by(rows);
 }
 
+/// Counter: in-server `system/orchestrate` plug-in shadow evaluations, bucketed
+/// by `result` (`match` / `mismatch` / `error`).  A clean shadow over the PFT —
+/// all `match`, zero `mismatch` — is the cutover gate (noetl/ai-meta#108).
+pub fn orchestrate_shadow_total() -> &'static IntCounterVec {
+    static M: OnceLock<IntCounterVec> = OnceLock::new();
+    M.get_or_init(|| {
+        let counter = IntCounterVec::new(
+            Opts::new(
+                "noetl_orchestrate_shadow_total",
+                "Orchestrate plug-in shadow evaluations vs the in-process drive, by result.",
+            ),
+            &["result"],
+        )
+        .expect("static counter spec must be valid");
+        registry()
+            .register(Box::new(counter.clone()))
+            .expect("counter registration must succeed");
+        counter
+    })
+}
+
+/// Record one shadow evaluation outcome (`match` / `mismatch` / `error`).
+pub fn record_orchestrate_shadow(result: &str) {
+    orchestrate_shadow_total()
+        .with_label_values(&[result])
+        .inc();
+}
+
 /// Histogram: wall-clock time spent inside the `POST /api/events` handler.
 pub fn event_ingest_duration_seconds() -> &'static HistogramVec {
     static M: OnceLock<HistogramVec> = OnceLock::new();

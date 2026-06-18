@@ -757,6 +757,21 @@ async fn main() -> anyhow::Result<()> {
         Ok(n) => tracing::info!(count = n, "seeded built-in system plug-ins"),
         Err(e) => tracing::warn!(error = %e, "failed to seed system plug-ins; continuing"),
     }
+    // Orchestrate plug-in shadow (noetl/ai-meta#108 slice 4) — load the just-seeded
+    // `system/orchestrate@1` into the in-server wasmtime host so every drive can
+    // be diffed against the plug-in. Gated by `NOETL_ORCHESTRATE_PLUGIN_SHADOW` +
+    // the `orchestrate-shadow` build feature; without the feature `init` is a
+    // no-op. Best-effort: a missing plug-in just leaves the shadow disabled.
+    if app_config.orchestrate_plugin_shadow {
+        match noetl_server::db::queries::plugin_module::get(&db_pool, "system/orchestrate", 1).await
+        {
+            Ok(Some(row)) => noetl_server::orchestrate_shadow::init(&row.bytes),
+            Ok(None) => {
+                tracing::warn!("orchestrate shadow on but system/orchestrate@1 not registered")
+            }
+            Err(e) => tracing::warn!(error = %e, "orchestrate shadow: failed to load plug-in"),
+        }
+    }
     // Object store (noetl/ai-meta#105 Round 5) — durable Feather tier backing a
     // plug-in's `noetl.object_put`. Same idempotent startup-DDL pattern.
     noetl_server::db::queries::object_store::ensure_table(&db_pool).await?;
