@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.23.0](https://github.com/noetl/server/compare/v3.22.0...v3.23.0) (2026-06-18)
+
+### Features
+
+* **orchestrate-shadow:** in-server live shadow of the system/orchestrate plug-in ([#227](https://github.com/noetl/server/issues/227)) ([bd652ab](https://github.com/noetl/server/commit/bd652ab5134f6135ec7bf0cc5b10d287deb1a5fa)), closes [noetl/ai-meta#108](https://github.com/noetl/ai-meta/issues/108) [noetl/ai-meta#108](https://github.com/noetl/ai-meta/issues/108)
+
 ## [3.22.0](https://github.com/noetl/server/compare/v3.21.0...v3.22.0) (2026-06-18)
 
 ### Features
