@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.28.0](https://github.com/noetl/server/compare/v3.27.0...v3.28.0) (2026-06-18)
+
+### Features
+
+* **orchestrate-drive:** default the worker-driven drive ON ([#108](https://github.com/noetl/server/issues/108) (c)) ([#233](https://github.com/noetl/server/issues/233)) ([d293ba8](https://github.com/noetl/server/commit/d293ba8d2ec621792f8525a5280d14f4ea1c6ff9)), closes [#229](https://github.com/noetl/server/issues/229) [#230](https://github.com/noetl/server/issues/230) [#231](https://github.com/noetl/server/issues/231) [#232](https://github.com/noetl/server/issues/232) [worker#114](https://github.com/noetl/worker/issues/114) [ops#191](https://github.com/noetl/ops/issues/191)
+
 ## [3.27.0](https://github.com/noetl/server/compare/v3.26.0...v3.27.0) (2026-06-18)
 
 ### Features
