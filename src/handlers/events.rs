@@ -1394,13 +1394,37 @@ fn build_result_object(request: &EventRequest, status: &str) -> serde_json::Valu
     serde_json::Value::Object(result)
 }
 
-/// Get catalog_id from existing events.
+/// Get catalog_id for an execution.
+///
+/// Reads `noetl.event` first (authoritative when present), then falls back to
+/// `noetl.command`.  The fallback is load-bearing under the CQRS write-path
+/// cutover (noetl/ai-meta#103 2d-3): with `NOETL_EVENT_INGEST_PUBLISH_ONLY` on,
+/// `noetl.event` is EMPTY (events are published to `noetl_events` and not
+/// INSERTed until the materializer drains them), so a worker-emitted event's
+/// `normalize_event_to_row` would resolve `catalog_id = None → 0` and the
+/// published row would carry `catalog_id = 0`, FK-violating
+/// `event_catalog_id_fkey` when the materializer INSERTs it (→ the whole batch
+/// fails + the events are lost).  `noetl.command` is written synchronously even
+/// under the gate (it's the command queue the worker reads), so it always
+/// carries the execution's `catalog_id`.
 async fn get_catalog_id(state: &AppState, execution_id: i64) -> AppResult<Option<i64>> {
-    let row: Option<(i64,)> = sqlx::query_as::<_, (i64,)>(
+    let pool = state.pools.pool_for(execution_id);
+    if let Some((id,)) = sqlx::query_as::<_, (i64,)>(
         "SELECT catalog_id FROM noetl.event WHERE execution_id = $1 LIMIT 1",
     )
     .bind(execution_id)
-    .fetch_optional(state.pools.pool_for(execution_id))
+    .fetch_optional(pool)
+    .await?
+    {
+        return Ok(Some(id));
+    }
+
+    // Fallback: noetl.command (synchronous under PUBLISH_ONLY).
+    let row: Option<(i64,)> = sqlx::query_as::<_, (i64,)>(
+        "SELECT catalog_id FROM noetl.command WHERE execution_id = $1 LIMIT 1",
+    )
+    .bind(execution_id)
+    .fetch_optional(pool)
     .await?;
 
     Ok(row.map(|(id,)| id))
