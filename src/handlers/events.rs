@@ -2118,19 +2118,9 @@ async fn trigger_orchestrator_inner(
         return Ok(0);
     }
 
-    // In-process drive (the default, and the shadow's reference half).
+    // In-process drive (the `NOETL_ORCHESTRATE_PLUGIN_DRIVE=false` fallback).
     let orchestrator = WorkflowOrchestrator::new();
     let ws = cache.state.as_mut().unwrap();
-    // Orchestrate plug-in shadow (noetl/ai-meta#108 slice 4): snapshot the state
-    // BEFORE `evaluate_state` mutates it, so the plug-in evaluates the identical
-    // input. Cloned only when the shadow is loaded (default off → no cost).
-    let shadow_pre_state = if state.config.orchestrate_plugin_shadow
-        && crate::orchestrate_shadow::enabled()
-    {
-        Some(ws.clone())
-    } else {
-        None
-    };
     let result = match orchestrator.evaluate_state(
         ws,
         latest_ts,
@@ -2166,20 +2156,6 @@ async fn trigger_orchestrator_inner(
             return Ok(0);
         }
     };
-
-    // Orchestrate plug-in shadow (noetl/ai-meta#108 slice 4): run the plug-in on
-    // the pre-evaluate state and diff its commands against the in-process
-    // `result`. Observation only — the live result above is authoritative.
-    if let Some(pre_state) = shadow_pre_state {
-        crate::orchestrate_shadow::shadow_diff(
-            pre_state,
-            latest_ts,
-            &playbook,
-            trigger_event_type.as_str(),
-            &result,
-            execution_id,
-        );
-    }
 
     info!(
         execution_id,
