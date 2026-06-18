@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.27.0](https://github.com/noetl/server/compare/v3.26.0...v3.27.0) (2026-06-18)
+
+### Features
+
+* **dispatch:** stamp execution_pool on the command notification (pool affinity) ([#232](https://github.com/noetl/server/issues/232)) ([846166b](https://github.com/noetl/server/commit/846166bb99d0518c815a09099bbcbb16d4a75d8f)), closes [noetl/ai-meta#108](https://github.com/noetl/ai-meta/issues/108) [worker#114](https://github.com/noetl/worker/issues/114) [noetl/ai-meta#108](https://github.com/noetl/ai-meta/issues/108)
+
 ## [3.26.0](https://github.com/noetl/server/compare/v3.25.0...v3.26.0) (2026-06-18)
 
 ### Features
