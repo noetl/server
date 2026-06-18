@@ -221,6 +221,7 @@ impl From<noetl_orchestrate_core::error::CoreError> for AppError {
     fn from(e: noetl_orchestrate_core::error::CoreError) -> Self {
         match e {
             noetl_orchestrate_core::error::CoreError::Template(msg) => AppError::Template(msg),
+            noetl_orchestrate_core::error::CoreError::Validation(msg) => AppError::Validation(msg),
         }
     }
 }

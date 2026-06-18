@@ -12,8 +12,8 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::{AppError, AppResult};
-use crate::playbook::types::{NextSpec, Step};
+use crate::error::{CoreError, CoreResult};
+use crate::playbook::{NextSpec, Step};
 use crate::template::TemplateRenderer;
 
 /// Result of evaluating a condition.
@@ -150,8 +150,8 @@ impl ConditionEvaluator {
         &self,
         condition: &str,
         context: &HashMap<String, serde_json::Value>,
-    ) -> AppResult<bool> {
-        self.renderer.evaluate_condition(condition, context).map_err(Into::into)
+    ) -> CoreResult<bool> {
+        self.renderer.evaluate_condition(condition, context)
     }
 
     /// Evaluate step enable guard (step.when).
@@ -162,7 +162,7 @@ impl ConditionEvaluator {
         &self,
         step: &Step,
         context: &HashMap<String, serde_json::Value>,
-    ) -> AppResult<bool> {
+    ) -> CoreResult<bool> {
         match &step.when {
             Some(when_expr) => self.evaluate_condition(when_expr, context),
             None => Ok(true), // No guard = always execute
@@ -180,7 +180,7 @@ impl ConditionEvaluator {
         &self,
         step: &Step,
         context: &HashMap<String, serde_json::Value>,
-    ) -> AppResult<Vec<EvaluationResult>> {
+    ) -> CoreResult<Vec<EvaluationResult>> {
         let mut results = Vec::new();
 
         // Determine next_mode
@@ -317,7 +317,7 @@ impl ConditionEvaluator {
         &self,
         step: &Step,
         context: &HashMap<String, serde_json::Value>,
-    ) -> AppResult<Vec<EvaluationResult>> {
+    ) -> CoreResult<Vec<EvaluationResult>> {
         // Delegate to the canonical evaluation method
         self.evaluate_next_transitions(step, context)
     }
@@ -329,7 +329,7 @@ impl ConditionEvaluator {
         &self,
         loop_expr: &str,
         context: &HashMap<String, serde_json::Value>,
-    ) -> AppResult<Vec<serde_json::Value>> {
+    ) -> CoreResult<Vec<serde_json::Value>> {
         // Render the loop expression to get the collection
         let value = self.renderer.render_to_value(loop_expr, context)?;
 
@@ -360,7 +360,7 @@ impl ConditionEvaluator {
                 let n = n.as_u64().unwrap_or(0) as usize;
                 Ok((0..n).map(|i| serde_json::json!(i)).collect())
             }
-            _ => Err(AppError::Validation(format!(
+            _ => Err(CoreError::Validation(format!(
                 "Loop expression did not evaluate to an iterable: {}",
                 loop_expr
             ))),
