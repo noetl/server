@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.29.3](https://github.com/noetl/server/compare/v3.29.2...v3.29.3) (2026-06-19)
+
+### Bug Fixes
+
+* **cqrs:** route ExecutionService cancel/finalize through emit_event chokepoint ([#103](https://github.com/noetl/server/issues/103) 2d-3) ([#240](https://github.com/noetl/server/issues/240)) ([22208cc](https://github.com/noetl/server/commit/22208cc40fcb232407b72500df60c9f9e1f4a54d)), closes [server#235](https://github.com/noetl/server/issues/235) [server#236](https://github.com/noetl/server/issues/236)
+
 ## [3.29.2](https://github.com/noetl/server/compare/v3.29.1...v3.29.2) (2026-06-19)
 
 ### Bug Fixes
