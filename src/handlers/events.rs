@@ -2221,6 +2221,7 @@ async fn trigger_orchestrator_inner(
         let st = cache.state.as_ref().map(|ws| ws.state);
         drop(cache);
         state.orch_cache.evict(execution_id);
+        state.chain_heads.evict(execution_id); // RFC #115 §4: drop the chain head too
         debug!(
             execution_id,
             state = ?st,
@@ -2424,6 +2425,7 @@ async fn trigger_orchestrator_inner(
     if result.should_complete {
         drop(cache);
         state.orch_cache.evict(execution_id);
+        state.chain_heads.evict(execution_id); // RFC #115 §4: drop the chain head too
     }
 
     Ok(commands_generated)
@@ -2771,6 +2773,7 @@ async fn apply_worker_orchestration(
     if result.should_complete {
         drop(cache);
         state.orch_cache.evict(execution_id);
+        state.chain_heads.evict(execution_id); // RFC #115 §4: drop the chain head too
     }
     Ok(commands_generated)
 }

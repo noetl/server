@@ -91,6 +91,12 @@ pub struct AppState {
     /// execution's concurrent completion triggers.
     pub orch_cache: Arc<OrchStateCache>,
 
+    /// Per-execution chain head for the one-level event chain (RFC #115 Phase
+    /// 2, noetl/ai-meta#115 §4).  The event-write chokepoint reads + advances it
+    /// to stamp each row's `prev_event_id`, so per-execution events form a
+    /// walkable singly-linked list.  See [`ChainHeads`].
+    pub chain_heads: Arc<ChainHeads>,
+
     /// CQRS write-path publisher (noetl/ai-meta#103 phase 2d-3).  Lazily built
     /// on first use from [`Self::nats`] so the `emit_event` chokepoint can
     /// publish to the `noetl_events` stream when
@@ -137,6 +143,62 @@ pub struct ExecOrchState {
     pub orchestrate_in_flight: bool,
 }
 
+
+/// Per-execution chain head for the one-level event chain (RFC #115 Phase 2,
+/// noetl/ai-meta#115 §4).  Maps `execution_id → event_id of the last event
+/// appended to the chain`.  The event-write chokepoint
+/// ([`crate::handlers::event_write::emit_events`]) reads the head as the next
+/// row's `prev_event_id`, then advances it — so the per-execution events form a
+/// singly-linked list walkable pointer-by-pointer, no `noetl.event` scan.
+///
+/// In-memory only and **no DB read on the hot path**: a cold slot (execution's
+/// first event, or an execution whose earlier events were handled by a
+/// different replica / before a restart) yields `None`, i.e. a chain root.
+/// This shares the locality assumption the existing [`OrchStateCache`] already
+/// relies on — an execution's drive is serialised on one replica — so the chain
+/// is continuous for the single-writer / single-replica topology the kind gate
+/// validates.  Restart-spanning repair is a Phase 3 builder concern (it
+/// re-walks from a durable head); nothing reads `prev_event_id` yet, so a chain
+/// restart here is additive metadata, never a regression.
+#[derive(Default)]
+pub struct ChainHeads {
+    map: std::sync::Mutex<std::collections::HashMap<i64, i64>>,
+}
+
+impl ChainHeads {
+    /// Stamp the chain link for a batch of event ids emitted (in order) for one
+    /// execution, advancing the head as it goes.  Returns, for each id, the
+    /// `prev_event_id` it should carry (`None` for a chain root).  One short
+    /// `std::Mutex` critical section, no `await` held — safe to call from any
+    /// chokepoint path without lock-ordering hazards against
+    /// [`OrchStateCache`]'s per-execution `tokio::Mutex`.
+    ///
+    /// An empty `event_ids` is a no-op returning an empty vec.
+    pub fn link_batch(&self, execution_id: i64, event_ids: &[i64]) -> Vec<Option<i64>> {
+        let mut map = self.map.lock().unwrap();
+        let mut head = map.get(&execution_id).copied();
+        let mut prevs = Vec::with_capacity(event_ids.len());
+        for &eid in event_ids {
+            prevs.push(head);
+            head = Some(eid);
+        }
+        if let Some(h) = head {
+            map.insert(execution_id, h);
+        }
+        prevs
+    }
+
+    /// Drop a terminal execution's head (frees memory).  Called alongside
+    /// [`OrchStateCache::evict`] on the terminal-event paths.
+    pub fn evict(&self, execution_id: i64) {
+        self.map.lock().unwrap().remove(&execution_id);
+    }
+
+    /// Current head for an execution, if any.  Test/diagnostic helper.
+    pub fn head(&self, execution_id: i64) -> Option<i64> {
+        self.map.lock().unwrap().get(&execution_id).copied()
+    }
+}
 
 /// Per-execution orchestrator state cache.  The outer `std::Mutex` guards a
 /// short get-or-insert; the inner per-execution `tokio::Mutex` is held across
@@ -262,6 +324,7 @@ impl AppState {
             shard: Arc::new(shard),
             start_time: std::time::Instant::now(),
             orch_cache: Arc::new(OrchStateCache::default()),
+            chain_heads: Arc::new(ChainHeads::default()),
             event_stream_publisher: Arc::new(tokio::sync::OnceCell::new()),
         }
     }
@@ -298,6 +361,8 @@ impl AppState {
 
 #[cfg(test)]
 mod tests {
+    use super::ChainHeads;
+
     // Note: Full tests require a database connection
     // These are placeholder tests for documentation
 
@@ -305,5 +370,87 @@ mod tests {
     fn test_uptime() {
         // AppState::new requires a real DB pool, so we can't easily test here
         // This is a documentation placeholder
+    }
+
+    // RFC #115 §4: the per-execution chain head turns a stream of emitted event
+    // ids into a walkable singly-linked list.
+    #[test]
+    fn chain_head_links_first_event_is_root() {
+        let heads = ChainHeads::default();
+        // First batch: the execution's first event has no predecessor (root).
+        let prevs = heads.link_batch(7, &[100]);
+        assert_eq!(prevs, vec![None], "execution's first event is a chain root");
+        assert_eq!(heads.head(7), Some(100));
+    }
+
+    #[test]
+    fn chain_head_links_batch_in_order() {
+        let heads = ChainHeads::default();
+        // A multi-row batch (e.g. a cursor fan-out's N command.issued events)
+        // links each row to the previous one in order; the first to the head.
+        let prevs = heads.link_batch(7, &[10, 11, 12]);
+        assert_eq!(prevs, vec![None, Some(10), Some(11)]);
+        assert_eq!(heads.head(7), Some(12), "head advances to the last id");
+        // A following batch continues the chain from the advanced head.
+        let prevs = heads.link_batch(7, &[20, 21]);
+        assert_eq!(prevs, vec![Some(12), Some(20)]);
+        assert_eq!(heads.head(7), Some(21));
+    }
+
+    #[test]
+    fn chain_head_is_per_execution() {
+        let heads = ChainHeads::default();
+        heads.link_batch(1, &[10, 11]);
+        heads.link_batch(2, &[90]);
+        // Distinct executions never share a head.
+        assert_eq!(heads.head(1), Some(11));
+        assert_eq!(heads.head(2), Some(90));
+        let p1 = heads.link_batch(1, &[12]);
+        let p2 = heads.link_batch(2, &[91]);
+        assert_eq!(p1, vec![Some(11)]);
+        assert_eq!(p2, vec![Some(90)]);
+    }
+
+    #[test]
+    fn chain_head_walk_reconstructs_full_sequence_no_gaps() {
+        // Property the kind validation asserts in SQL: walking prev_event_id
+        // from the head reconstructs the full per-execution sequence with no
+        // gaps.  Model it over the in-memory linker.
+        let heads = ChainHeads::default();
+        let ids = [5_i64, 6, 7, 8, 9];
+        let prevs = heads.link_batch(42, &ids);
+        // Build the prev map the chain would persist.
+        let mut prev_of = std::collections::HashMap::new();
+        for (id, prev) in ids.iter().zip(&prevs) {
+            prev_of.insert(*id, *prev);
+        }
+        // Walk backward from the head.
+        let mut walked = Vec::new();
+        let mut cur = heads.head(42);
+        while let Some(id) = cur {
+            walked.push(id);
+            cur = prev_of.get(&id).copied().flatten();
+        }
+        walked.reverse();
+        assert_eq!(walked, ids, "pointer walk == full emit sequence, no gaps");
+    }
+
+    #[test]
+    fn chain_head_evict_drops_state() {
+        let heads = ChainHeads::default();
+        heads.link_batch(7, &[10]);
+        assert_eq!(heads.head(7), Some(10));
+        heads.evict(7);
+        assert_eq!(heads.head(7), None, "evicted execution starts a fresh chain");
+        // After eviction the next event is treated as a root again.
+        let prevs = heads.link_batch(7, &[20]);
+        assert_eq!(prevs, vec![None]);
+    }
+
+    #[test]
+    fn chain_head_empty_batch_is_noop() {
+        let heads = ChainHeads::default();
+        assert_eq!(heads.link_batch(7, &[]), Vec::<Option<i64>>::new());
+        assert_eq!(heads.head(7), None);
     }
 }
