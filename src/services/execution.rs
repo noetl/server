@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::db::{DbPool, DbPoolMap};
 use crate::error::{AppError, AppResult};
+use crate::handlers::event_write::{emit_event, EventRow};
+use crate::state::AppState;
 
 /// Execution summary for listing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -91,6 +93,17 @@ pub struct ExecutionFilter {
 pub struct ExecutionService {
     pools: DbPoolMap,
     snowflake: std::sync::Arc<crate::snowflake::SnowflakeGenerator>,
+    /// Full application state.  Present in the production wiring
+    /// (`main.rs` builds the service from the constructed `AppState`)
+    /// and absent only in the pool-less unit-test shim
+    /// ([`Self::new_legacy`], which exercises the in-memory
+    /// `determine_status` path).  `cancel` / `finalize` route their
+    /// `noetl.event` writes through the `emit_event` chokepoint
+    /// (noetl/ai-meta#103 2d-3) so they honour
+    /// `NOETL_EVENT_INGEST_PUBLISH_ONLY` like the other producer sites —
+    /// that needs `&AppState` (the gate flag, the NATS publisher, the
+    /// catalog pool for the system-pool exemption).
+    state: Option<AppState>,
 }
 
 impl ExecutionService {
@@ -105,22 +118,38 @@ impl ExecutionService {
     /// with `AppState` and the other services.  Phase F R1.5 of
     /// noetl/ai-meta#49 moved id generation out of the DB-side
     /// `noetl.snowflake_id()` function.
+    /// `state` is the full [`AppState`]; `pools` + `snowflake` are
+    /// kept as direct fields (every other accessor reads them) and
+    /// the whole state is retained so `cancel` / `finalize` can reach
+    /// the `emit_event` chokepoint.
     pub fn new(
         pools: DbPoolMap,
         snowflake: std::sync::Arc<crate::snowflake::SnowflakeGenerator>,
+        state: AppState,
     ) -> Self {
-        Self { pools, snowflake }
+        Self {
+            pools,
+            snowflake,
+            state: Some(state),
+        }
     }
 
     /// Build an [`ExecutionService`] wrapping a single legacy
     /// pool — for test / example code paths that don't have a
     /// [`DbPoolMap`] in scope.  Internally wraps the pool via
     /// [`DbPoolMap::from_single_pool`].
+    /// `state` is `None`: this shim has no `AppState`, so it must not
+    /// be used for `cancel` / `finalize` (those require the chokepoint).
+    /// It exists only for the in-memory `determine_status` unit tests.
     pub fn new_legacy(
         db: DbPool,
         snowflake: std::sync::Arc<crate::snowflake::SnowflakeGenerator>,
     ) -> Self {
-        Self::new(DbPoolMap::from_single_pool(db), snowflake)
+        Self {
+            pools: DbPoolMap::from_single_pool(db),
+            snowflake,
+            state: None,
+        }
     }
 
     /// Borrow the per-execution pool for the given `execution_id`.
@@ -128,6 +157,54 @@ impl ExecutionService {
     #[inline]
     fn pool_for(&self, execution_id: i64) -> &DbPool {
         self.pools.pool_for(execution_id)
+    }
+
+    /// The `&AppState` the chokepoint needs.  Present in every
+    /// production path; `None` only in the pool-less `new_legacy`
+    /// test shim, which never calls `cancel` / `finalize`.  Returning
+    /// a clear error (rather than silently falling back to a raw
+    /// INSERT) keeps the gate contract intact — there is exactly one
+    /// `noetl.event` write path for these events.
+    fn require_state(&self) -> AppResult<&AppState> {
+        self.state.as_ref().ok_or_else(|| {
+            AppError::Internal(
+                "ExecutionService built without AppState (test shim); \
+                 cancel/finalize require the emit_event chokepoint"
+                    .to_string(),
+            )
+        })
+    }
+
+    /// Resolve the execution's `catalog_id`, reading `noetl.event`
+    /// first and falling back to `noetl.command`.  The fallback is
+    /// load-bearing under the CQRS write-path cutover
+    /// (noetl/ai-meta#103 2d-3): with `NOETL_EVENT_INGEST_PUBLISH_ONLY`
+    /// on, `noetl.event` may be empty (events are published to
+    /// `noetl_events` and not INSERTed until the materializer drains
+    /// them), so an event-only lookup would `NotFound` a still-running
+    /// execution.  `noetl.command` is written synchronously even under
+    /// the gate (it's the command queue the worker reads), so it
+    /// always carries the execution's `catalog_id`.  Mirrors
+    /// `handlers::events::get_catalog_id`.
+    async fn resolve_catalog_id(&self, execution_id: i64) -> AppResult<i64> {
+        let pool = self.pool_for(execution_id);
+        if let Some((id,)) = sqlx::query_as::<_, (i64,)>(
+            "SELECT catalog_id FROM noetl.event WHERE execution_id = $1 LIMIT 1",
+        )
+        .bind(execution_id)
+        .fetch_optional(pool)
+        .await?
+        {
+            return Ok(id);
+        }
+        let row: Option<(i64,)> = sqlx::query_as::<_, (i64,)>(
+            "SELECT catalog_id FROM noetl.command WHERE execution_id = $1 LIMIT 1",
+        )
+        .bind(execution_id)
+        .fetch_optional(pool)
+        .await?;
+        row.map(|(id,)| id)
+            .ok_or_else(|| AppError::NotFound(format!("Execution not found: {}", execution_id)))
     }
 
     /// List executions with optional filters.
@@ -642,40 +719,36 @@ impl ExecutionService {
             )));
         }
 
-        // Get catalog_id for the event
-        let catalog_id: Option<(i64,)> =
-            sqlx::query_as("SELECT catalog_id FROM noetl.event WHERE execution_id = $1 LIMIT 1")
-                .bind(execution_id)
-                .fetch_optional(self.pool_for(execution_id))
-                .await?;
+        // The chokepoint needs the full state; fail fast if this is a
+        // pool-less test shim (which never reaches here in production).
+        let state = self.require_state()?;
 
-        let catalog_id = catalog_id
-            .ok_or_else(|| AppError::NotFound(format!("Execution not found: {}", execution_id)))?
-            .0;
+        // Get catalog_id for the event (event-log first, command-queue
+        // fallback under the gate — see `resolve_catalog_id`).
+        let catalog_id = self.resolve_catalog_id(execution_id).await?;
 
         // Generate event ID via the application-side snowflake
         // generator (Phase F R1.5 of noetl/ai-meta#49).
-        let event_id: (i64,) = (self.snowflake.generate()?,);
+        let event_id = self.snowflake.generate()?;
 
-        // Insert cancellation event
-        sqlx::query(
-            r#"
-            INSERT INTO noetl.event (
-                event_id, execution_id, catalog_id, event_type,
-                node_id, node_name, status, created_at
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-            "#,
+        // Write the cancellation event through the CQRS write-path
+        // chokepoint (noetl/ai-meta#103 2d-3): gate-off INSERTs the row
+        // synchronously (byte-identical to the prior inline INSERT — the
+        // canonical INSERT binds the full column superset, the columns
+        // this site omits default to NULL); gate-on PUBLISHES it to
+        // `noetl_events` so the materializer is the sole writer.  The
+        // relocated trigger then drives the execution to its terminal
+        // CANCELLED state from the materialized row.
+        let row = EventRow::new(
+            event_id,
+            execution_id,
+            catalog_id,
+            "playbook_cancelled",
+            "CANCELLED",
+            Utc::now(),
         )
-        .bind(event_id.0)
-        .bind(execution_id)
-        .bind(catalog_id)
-        .bind("playbook_cancelled")
-        .bind("playbook")
-        .bind("playbook")
-        .bind("CANCELLED")
-        .bind(Utc::now())
-        .execute(self.pool_for(execution_id))
-        .await?;
+        .with_node("playbook");
+        emit_event(state, self.pool_for(execution_id), row).await?;
 
         Ok(())
     }
@@ -713,20 +786,17 @@ impl ExecutionService {
             )));
         }
 
-        // Get catalog_id
-        let catalog_id: Option<(i64,)> =
-            sqlx::query_as("SELECT catalog_id FROM noetl.event WHERE execution_id = $1 LIMIT 1")
-                .bind(execution_id)
-                .fetch_optional(self.pool_for(execution_id))
-                .await?;
+        // The chokepoint needs the full state; fail fast if this is a
+        // pool-less test shim (which never reaches here in production).
+        let state = self.require_state()?;
 
-        let catalog_id = catalog_id
-            .ok_or_else(|| AppError::NotFound(format!("Execution not found: {}", execution_id)))?
-            .0;
+        // Get catalog_id (event-log first, command-queue fallback under
+        // the gate — see `resolve_catalog_id`).
+        let catalog_id = self.resolve_catalog_id(execution_id).await?;
 
         // Generate event ID via the application-side snowflake
         // generator (Phase F R1.5 of noetl/ai-meta#49).
-        let event_id: (i64,) = (self.snowflake.generate()?,);
+        let event_id = self.snowflake.generate()?;
 
         let event_type = if status == "COMPLETED" {
             "playbook_completed"
@@ -734,26 +804,23 @@ impl ExecutionService {
             "playbook_failed"
         };
 
-        // Insert finalization event
-        sqlx::query(
-            r#"
-            INSERT INTO noetl.event (
-                event_id, execution_id, catalog_id, event_type,
-                node_id, node_name, status, error, created_at
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-            "#,
+        // Write the finalization event through the CQRS write-path
+        // chokepoint (noetl/ai-meta#103 2d-3): gate-off INSERTs the row
+        // synchronously (byte-identical to the prior inline INSERT,
+        // including the `error` column); gate-on PUBLISHES it to
+        // `noetl_events` so the materializer is the sole writer and the
+        // relocated trigger drives the execution to its terminal state.
+        let row = EventRow::new(
+            event_id,
+            execution_id,
+            catalog_id,
+            event_type,
+            status,
+            Utc::now(),
         )
-        .bind(event_id.0)
-        .bind(execution_id)
-        .bind(catalog_id)
-        .bind(event_type)
-        .bind("playbook")
-        .bind("playbook")
-        .bind(status)
-        .bind(error)
-        .bind(Utc::now())
-        .execute(self.pool_for(execution_id))
-        .await?;
+        .with_node("playbook")
+        .with_error(error.map(str::to_string));
+        emit_event(state, self.pool_for(execution_id), row).await?;
 
         Ok(())
     }
@@ -1033,5 +1100,27 @@ mod tests {
             make_event("playbook.completed", "COMPLETED"),
         ];
         assert_eq!(service.determine_status(&events), "COMPLETED");
+    }
+
+    // ===== noetl/ai-meta#103 2d-3 — cancel/finalize chokepoint =====
+
+    /// The pool-less unit-test shim (`new_legacy`) carries no
+    /// `AppState`, so `require_state` must reject it with a clear error
+    /// rather than silently falling back to a raw INSERT.  This pins the
+    /// contract: there is exactly one `noetl.event` write path for
+    /// cancel/finalize (the `emit_event` chokepoint), and it always runs
+    /// with a real `AppState` in production.  `cancel` / `finalize`
+    /// themselves can't be unit-tested without a live DB (the catalog
+    /// lookup + write are validated on kind), but this guards against a
+    /// future shim accidentally bypassing the gate.
+    #[tokio::test(flavor = "current_thread")]
+    async fn require_state_errors_without_app_state() {
+        let service = make_service();
+        let result = service.require_state();
+        assert!(result.is_err(), "test shim must not yield an AppState");
+        assert!(
+            matches!(result, Err(AppError::Internal(_))),
+            "expected an Internal error variant"
+        );
     }
 }

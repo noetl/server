@@ -731,14 +731,15 @@ async fn main() -> anyhow::Result<()> {
     // CQRS write-path cutover (noetl/ai-meta#103 phase 2d-3): when
     // `NOETL_EVENT_INGEST_PUBLISH_ONLY` is on, server-originated events publish to
     // `noetl_events` instead of INSERTing — the materializer is the sole writer.
-    // Loud at startup because it changes the durability boundary; also flags the
-    // two paths still on the synchronous INSERT (ExecutionService cancel/finalize —
-    // they lack AppState; correct, no lost/double writes, staged for a follow-up).
+    // Loud at startup because it changes the durability boundary.  Every
+    // server-originated producer — including ExecutionService cancel/finalize —
+    // now routes through the chokepoint, so the server writes ZERO noetl.event
+    // rows under the gate (the materializer is the only writer).
     if app_config.event_ingest_publish_only {
         if state.nats.is_some() {
             tracing::warn!(
                 target: "noetl_server::startup",
-                "NOETL_EVENT_INGEST_PUBLISH_ONLY=ON — server-originated noetl.event writes PUBLISH to noetl_events (materializer is the sole writer); ExecutionService cancel/finalize remain synchronous (staged)"
+                "NOETL_EVENT_INGEST_PUBLISH_ONLY=ON — ALL server-originated noetl.event writes PUBLISH to noetl_events (materializer is the sole writer; the server writes zero event rows)"
             );
         } else {
             tracing::warn!(
@@ -802,7 +803,11 @@ async fn main() -> anyhow::Result<()> {
     // its per-execution methods route via pool_for(execution_id)
     // and `list()` fan-outs via for_each_shard.  In single-pool
     // fallback mode this is the same handle as db_pool.
-    let execution_service = ExecutionService::new(state.pools.clone(), state.snowflake.clone());
+    // Pass the full `state` so the service's cancel/finalize paths can
+    // route their noetl.event writes through the emit_event chokepoint
+    // (noetl/ai-meta#103 2d-3) — honouring NOETL_EVENT_INGEST_PUBLISH_ONLY.
+    let execution_service =
+        ExecutionService::new(state.pools.clone(), state.snowflake.clone(), state.clone());
     let runtime_service = RuntimeService::new(db_pool.clone(), state.snowflake.clone());
 
     // Phase D R5 Round 1 (noetl/ai-meta#49 → noetl/server#148).
