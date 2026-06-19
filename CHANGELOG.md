@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.29.2](https://github.com/noetl/server/compare/v3.29.1...v3.29.2) (2026-06-19)
+
+### Bug Fixes
+
+* **orchestrate:** rebuild WorkflowState on cold-cache apply (off-server drive × gate crash-recovery) ([#238](https://github.com/noetl/server/issues/238)) ([03f0e2d](https://github.com/noetl/server/commit/03f0e2dbe4af9f791f796fdda7cbc36c946e1044)), closes [noetl/ai-meta#104](https://github.com/noetl/ai-meta/issues/104) [noetl/ai-meta#104](https://github.com/noetl/ai-meta/issues/104) [noetl/ai-meta#103](https://github.com/noetl/ai-meta/issues/103) [noetl/ai-meta#111](https://github.com/noetl/ai-meta/issues/111)
+
 ## [3.29.1](https://github.com/noetl/server/compare/v3.29.0...v3.29.1) (2026-06-19)
 
 ### Bug Fixes
