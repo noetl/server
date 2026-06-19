@@ -54,7 +54,7 @@
 use std::sync::OnceLock;
 
 use prometheus::{
-    HistogramOpts, HistogramVec, IntCounterVec, IntGauge, Opts, Registry, TextEncoder,
+    Histogram, HistogramOpts, HistogramVec, IntCounterVec, IntGauge, Opts, Registry, TextEncoder,
 };
 
 /// Bucket boundaries for the event-ingest histogram (seconds).
@@ -147,6 +147,123 @@ pub fn orchestrate_drive_total() -> &'static IntCounterVec {
 /// `decode_error` / `skipped_in_flight`).
 pub fn record_orchestrate_drive(stage: &str) {
     orchestrate_drive_total().with_label_values(&[stage]).inc();
+}
+
+// ── State-build mode (RFC noetl/ai-meta#115 Phase 3) ─────────────────────────
+
+/// `noetl_state_build_total{mode, outcome}` — how the drive built `WorkflowState`
+/// for a trigger. `mode` = `chain_walk` | `event_scan`. `outcome` = `ok`
+/// (built via that mode) | `fallback_cold_head` / `fallback_node_missing` /
+/// `fallback_non_genesis` / `fallback_empty` (chain_walk asked for, but a guard
+/// sent it to the event-scan path — correctness preserved). Watching
+/// `chain_walk/ok` vs the `fallback_*` outcomes shows how often the in-memory
+/// chain head served the build without a scan.
+pub fn state_build_total() -> &'static IntCounterVec {
+    static M: OnceLock<IntCounterVec> = OnceLock::new();
+    M.get_or_init(|| {
+        let counter = IntCounterVec::new(
+            Opts::new(
+                "noetl_state_build_total",
+                "Orchestrator WorkflowState builds, by mode and outcome (RFC #115 Phase 3).",
+            ),
+            &["mode", "outcome"],
+        )
+        .expect("static counter spec must be valid");
+        registry()
+            .register(Box::new(counter.clone()))
+            .expect("counter registration must succeed");
+        counter
+    })
+}
+
+/// Record one state build (`mode` = `chain_walk`|`event_scan`; `outcome` = `ok`
+/// or a `fallback_*` reason).
+pub fn record_state_build(mode: &str, outcome: &str) {
+    state_build_total().with_label_values(&[mode, outcome]).inc();
+}
+
+/// `noetl_state_build_event_scans_total` — incremented once each time the drive
+/// path enters the **event-scan** state-construction block (the block that issues
+/// `WHERE execution_id = $1 …` scans of `noetl.event`: the consistency `COUNT`,
+/// the `event_id > $2` window, and the bounded `rebuild_state`). This is the
+/// no-scan proof counter for RFC #115 tenet 3: with `NOETL_STATE_BUILD_MODE=chain_walk`
+/// and no fallback, the drive never enters that block, so this counter's delta
+/// over a run is **0** while `noetl_state_build_chain_hops` shows the PK-only walk
+/// did the work.
+pub fn state_build_event_scans_total() -> &'static prometheus::IntCounter {
+    static M: OnceLock<prometheus::IntCounter> = OnceLock::new();
+    M.get_or_init(|| {
+        let counter = prometheus::IntCounter::new(
+            "noetl_state_build_event_scans_total",
+            "Times the drive entered the noetl.event-scanning state-build block (RFC #115 \
+             tenet 3 no-scan proof; chain_walk keeps this at 0).",
+        )
+        .expect("static counter spec must be valid");
+        registry()
+            .register(Box::new(counter.clone()))
+            .expect("counter registration must succeed");
+        counter
+    })
+}
+
+/// Record that the drive used the event-scanning state-build path for a trigger.
+pub fn record_state_build_event_scan() {
+    state_build_event_scans_total().inc();
+}
+
+/// `noetl_state_build_chain_hops` — distribution of chain-walk depth (number of
+/// `(execution_id, event_id)` PK lookups) per successful chain-walk build. Each
+/// observation == the events collected by following `prev_event_id` head→root.
+/// Non-zero observations are the positive evidence the PK-only walk is doing the
+/// state construction.
+pub fn state_build_chain_hops() -> &'static Histogram {
+    static M: OnceLock<Histogram> = OnceLock::new();
+    M.get_or_init(|| {
+        let hist = Histogram::with_opts(
+            HistogramOpts::new(
+                "noetl_state_build_chain_hops",
+                "Chain-walk depth (prev_event_id PK lookups) per state build (RFC #115 Phase 3).",
+            )
+            .buckets(vec![1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0]),
+        )
+        .expect("static histogram spec must be valid");
+        registry()
+            .register(Box::new(hist.clone()))
+            .expect("histogram registration must succeed");
+        hist
+    })
+}
+
+/// Record the depth of one chain-walk build.
+pub fn record_state_build_chain_hops(hops: usize) {
+    state_build_chain_hops().observe(hops as f64);
+}
+
+/// `noetl_state_build_parity_total{result}` — when `NOETL_STATE_BUILD_PARITY_CHECK`
+/// is on, each shadow comparison of the event-scan vs chain-walk build records
+/// `match` or `mismatch`. A non-zero `mismatch` is a correctness alarm (the two
+/// builders disagree for an execution) and is the parity proof's failure signal.
+pub fn state_build_parity_total() -> &'static IntCounterVec {
+    static M: OnceLock<IntCounterVec> = OnceLock::new();
+    M.get_or_init(|| {
+        let counter = IntCounterVec::new(
+            Opts::new(
+                "noetl_state_build_parity_total",
+                "Shadow event-scan vs chain-walk state-build comparisons, by result (RFC #115).",
+            ),
+            &["result"],
+        )
+        .expect("static counter spec must be valid");
+        registry()
+            .register(Box::new(counter.clone()))
+            .expect("counter registration must succeed");
+        counter
+    })
+}
+
+/// Record one parity-check result (`match` | `mismatch`).
+pub fn record_state_build_parity(result: &str) {
+    state_build_parity_total().with_label_values(&[result]).inc();
 }
 
 /// Histogram: wall-clock time spent inside the `POST /api/events` handler.
