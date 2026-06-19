@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.32.0](https://github.com/noetl/server/compare/v3.31.0...v3.32.0) (2026-06-19)
+
+### Features
+
+* **events:** chain-walk state builder behind NOETL_STATE_BUILD_MODE (RFC [#115](https://github.com/noetl/server/issues/115) Phase 3) ([a66ade1](https://github.com/noetl/server/commit/a66ade1321870f95f1e846c98eb008f5c8080251))
+* **events:** make the Phase-3 parity check rigorous (snapshot-isolated + normalized) ([6253f34](https://github.com/noetl/server/commit/6253f34e8f9f06507581b098680c9bcf3df6aa2d)), closes [noetl/ai-meta#115](https://github.com/noetl/ai-meta/issues/115)
+
 ## [3.31.0](https://github.com/noetl/server/compare/v3.30.0...v3.31.0) (2026-06-19)
 
 ### Features
