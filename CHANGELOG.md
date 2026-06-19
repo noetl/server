@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.29.1](https://github.com/noetl/server/compare/v3.29.0...v3.29.1) (2026-06-19)
+
+### Bug Fixes
+
+* **cqrs:** get_catalog_id falls back to noetl.command under PUBLISH_ONLY ([#103](https://github.com/noetl/server/issues/103) 2d-3) ([#236](https://github.com/noetl/server/issues/236)) ([cffec49](https://github.com/noetl/server/commit/cffec49bd95801836851d412c0aa1a54d0f768ac))
+
 ## [3.29.0](https://github.com/noetl/server/compare/v3.28.0...v3.29.0) (2026-06-18)
 
 ### Features
