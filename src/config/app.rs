@@ -43,17 +43,20 @@ pub struct AppConfig {
     #[serde(default)]
     pub disable_metrics: bool,
 
-    /// References-in-state (noetl/ai-meta#101 phase 2).  When true, the
+    /// References-in-state (noetl/ai-meta#101 → #115 Phase 1).  When true, the
     /// orchestrator stops resolving over-budget result references back to inline
-    /// data — it keeps `{reference, extracted}` on the event so the state +
-    /// command context carry references, not bulk payloads (a 1.7MB step output
-    /// no longer balloons every `command.issued`).  The orchestrator evaluates
-    /// `when:`/`set:` off the small `extracted` predicate block; the worker
-    /// resolves the full reference at render time.  Envy maps
-    /// `NOETL_REFS_IN_STATE`.  **Default false** — preserves block-b's
-    /// resolve-inline behavior exactly until the consume side (worker resolve +
-    /// cursor-claim handling) is in place.
-    #[serde(default)]
+    /// data — it keeps `{reference, extracted}` (+ the `_ref`/`_store` locator
+    /// accessors) on the event so the state + command context carry references,
+    /// not bulk payloads (a 1.7MB step output no longer balloons every
+    /// `command.issued`, and the drive state stays bounded).  The orchestrator
+    /// evaluates `when:`/`set:` off the small `extracted` predicate block; the
+    /// worker resolves the full reference at render time **only** for inputs that
+    /// bind the bulk (`resolve_context_references` selective consume side).  Envy
+    /// maps `NOETL_REFS_IN_STATE`.  **Default true** — the consume side (worker
+    /// selective resolve + `_ref`/`_store` surfacing) landed with #115 Phase 1,
+    /// so references stay out of state/commands by default.  Set
+    /// `NOETL_REFS_IN_STATE=false` to revert to the resolve-inline behavior.
+    #[serde(default = "default_true")]
     pub refs_in_state: bool,
 
     /// CQRS read-model ownership (noetl/ai-meta#103 phase 2b).  When true, the
@@ -242,7 +245,9 @@ impl Default for AppConfig {
             nats_url: None,
             enable_gcp_token_api: true,
             disable_metrics: false,
-            refs_in_state: false,
+            // noetl/ai-meta#115 Phase 1: references stay out of state/commands by
+            // default now that the worker selective-resolve consume side landed.
+            refs_in_state: true,
             projector_owns_snapshot: false,
             // noetl/ai-meta#108 (c): worker-driven drive is the default.
             orchestrate_plugin_drive: true,

@@ -1545,6 +1545,30 @@ fn event_status_from_name(event_name: &str) -> &'static str {
 /// triggered this evaluation pass (usually the `command.completed`
 /// row).  It's used as the `parent_event_id` for newly-inserted
 /// events so the event log forms a proper causal chain.
+/// Merge the locator accessors (`_ref`, `_store`, `_uri`) from a kept
+/// `reference` block into the bounded `extracted` summary, so the flat step
+/// binding (`{{ step._ref }}`, `{{ step._store }}`) carries them without the
+/// bulk payload.  Only injects when `extracted` is a JSON object and the keys
+/// aren't already present (the worker's own inline `{data:{_ref}}` shape wins).
+/// A non-object `extracted` (scalar / array summary) is returned untouched.
+fn with_ref_accessors(
+    mut extracted: serde_json::Value,
+    ref_block: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let (Some(obj), Some(reference)) = (extracted.as_object_mut(), ref_block) else {
+        return extracted;
+    };
+    for (accessor, field) in [("_ref", "ref"), ("_store", "store"), ("_uri", "uri")] {
+        if obj.contains_key(accessor) {
+            continue;
+        }
+        if let Some(v) = reference.get(field) {
+            obj.insert(accessor.to_string(), v.clone());
+        }
+    }
+    extracted
+}
+
 /// Resolve any `{status, reference: {ref: "noetl://..."}}` results in `events`
 /// back to the inline `{status, context: <data>}` shape the orchestrator reads.
 ///
@@ -1620,14 +1644,28 @@ async fn hydrate_result_references(
         // resolves the bulk payload at render time.  No `extracted` (pre-phase-1
         // refs) falls through to the resolve path below for back-compat.
         if keep_refs {
-            let extracted = match shape {
-                Shape::Nested => result
-                    .pointer("/context/result/reference/extracted")
-                    .cloned(),
-                Shape::TopLevel => result.pointer("/reference/extracted").cloned(),
+            let (extracted, ref_block) = match shape {
+                Shape::Nested => (
+                    result
+                        .pointer("/context/result/reference/extracted")
+                        .cloned(),
+                    result.pointer("/context/result/reference").cloned(),
+                ),
+                Shape::TopLevel => (
+                    result.pointer("/reference/extracted").cloned(),
+                    result.pointer("/reference").cloned(),
+                ),
             };
             if let Some(extracted) = extracted {
-                let data = serde_json::json!({ "data": extracted });
+                // Surface the locator accessors (`_ref`, `_store`, `_uri`) on the
+                // kept summary so reference-only consumers — `{{ step._ref }}`
+                // (artifact.get lazy-load), `{{ step._ref is defined }}` /
+                // `{{ step._store }}` (storage-tier predicates) — resolve off the
+                // bounded block without pulling the bulk payload (the consume
+                // side of noetl/ai-meta#115 Phase 1). The bulk stays in the store
+                // behind `reference.ref`; the worker resolves it only for inputs
+                // that bind the bulk (see worker `resolve_context_references`).
+                let data = serde_json::json!({ "data": with_ref_accessors(extracted, ref_block.as_ref()) });
                 match shape {
                     Shape::Nested => {
                         if let Some(inner) = result
@@ -2784,6 +2822,37 @@ async fn emit_playbook_failed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn with_ref_accessors_injects_locator_keys() {
+        // #115 Phase 1: keep_refs surfaces `_ref`/`_store`/`_uri` on the bounded
+        // summary so `{{ step._ref }}` / `{{ step._store }}` resolve without bulk.
+        let extracted = serde_json::json!({ "status": "ok", "count": 500 });
+        let reference = serde_json::json!({
+            "ref": "noetl://execution/1/result/start/9",
+            "store": "kv",
+            "uri": "noetl://t/p/results/1/start/0/0/1",
+            "extracted": {},
+        });
+        let out = with_ref_accessors(extracted, Some(&reference));
+        assert_eq!(out["_ref"], serde_json::json!("noetl://execution/1/result/start/9"));
+        assert_eq!(out["_store"], serde_json::json!("kv"));
+        assert_eq!(out["_uri"], serde_json::json!("noetl://t/p/results/1/start/0/0/1"));
+        // The summary scalars are preserved.
+        assert_eq!(out["status"], serde_json::json!("ok"));
+        assert_eq!(out["count"], serde_json::json!(500));
+    }
+
+    #[test]
+    fn with_ref_accessors_preserves_existing_and_skips_non_object() {
+        // A worker-provided inline `_ref` wins; a non-object summary is untouched.
+        let extracted = serde_json::json!({ "_ref": "worker-set", "x": 1 });
+        let reference = serde_json::json!({ "ref": "server-set" });
+        let out = with_ref_accessors(extracted, Some(&reference));
+        assert_eq!(out["_ref"], serde_json::json!("worker-set"));
+        let scalar = serde_json::json!("just-a-string");
+        assert_eq!(with_ref_accessors(scalar.clone(), Some(&reference)), scalar);
+    }
 
     fn test_request_skeleton() -> EventRequest {
         EventRequest {
