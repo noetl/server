@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.29.5](https://github.com/noetl/server/compare/v3.29.4...v3.29.5) (2026-06-19)
+
+### Bug Fixes
+
+* **orchestrate:** offload oversized command context to result store ([#114](https://github.com/noetl/server/issues/114)) ([#242](https://github.com/noetl/server/issues/242)) ([e44de49](https://github.com/noetl/server/commit/e44de4912ae62fc842b7b34761354f61594eef9e))
+
 ## [3.29.4](https://github.com/noetl/server/compare/v3.29.3...v3.29.4) (2026-06-19)
 
 ### Bug Fixes
