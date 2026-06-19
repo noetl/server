@@ -2098,6 +2098,30 @@ async fn trigger_orchestrator_inner(
             .unwrap_or(cache.last_event_id);
     }
 
+    // Terminal-state guard (noetl/ai-meta#113 facet 2).  A cancel
+    // (`playbook_cancelled`) — or any terminal event — transitions the cached
+    // `WorkflowState` to a terminal `ExecutionState` via `apply_event`.  Once
+    // terminal, no further `__orchestrate__` must be dispatched: a straggler
+    // `command.completed` from an in-flight command, or the background reconcile
+    // poller (which forces a re-trigger on every still-cached execution), would
+    // otherwise keep re-issuing the drive for a cancelled execution forever —
+    // before this guard only a `rollout restart` of the server cleared the
+    // in-memory loop.  Evicting the slot also drops it from
+    // `active_executions()`, so the reconcile poller stops re-visiting it.  This
+    // runs ahead of the early-exit below so the forced-reconcile path is caught
+    // even when no new events arrived this pass.
+    if cache.state.as_ref().is_some_and(|ws| ws.state.is_terminal()) {
+        let st = cache.state.as_ref().map(|ws| ws.state);
+        drop(cache);
+        state.orch_cache.evict(execution_id);
+        debug!(
+            execution_id,
+            state = ?st,
+            "drive: execution is terminal; evicted orch cache, no further orchestrate dispatch"
+        );
+        return Ok(0);
+    }
+
     // Nothing changed and this is not a forced reconcile → exit early.  A forced
     // reconcile still evaluates (to drive a cursor that may now advance).
     if new_events.is_empty() && !did_rebuild && !straggler_applied && !force_count {
@@ -2421,6 +2445,42 @@ fn find_output_b64(v: &serde_json::Value) -> Option<&str> {
     }
 }
 
+/// Find the first durable result-store URI (`noetl://…`) carried by a `ref`
+/// field anywhere in the value.  The worker stamps it on the `reference` block
+/// of an over-budget `call.done` result (`build_call_done_result`'s durable
+/// path).  Used to recover an offloaded `OrchestrationResult` whose
+/// `output_b64` was staged to the result store instead of inlined — see
+/// [`apply_worker_orchestration`] and noetl/ai-meta#113.  Matches the exact key
+/// `"ref"` (the durable reference URI), not `"_ref"` (the inline navigation
+/// hint) — both point at the same row, but `"ref"` is the durable contract.
+fn find_noetl_ref(v: &serde_json::Value) -> Option<&str> {
+    match v {
+        serde_json::Value::Object(m) => {
+            if let Some(serde_json::Value::String(s)) = m.get("ref") {
+                if s.starts_with("noetl://") {
+                    return Some(s);
+                }
+            }
+            m.values().find_map(find_noetl_ref)
+        }
+        serde_json::Value::Array(a) => a.iter().find_map(find_noetl_ref),
+        _ => None,
+    }
+}
+
+/// Decode a base64-wrapped `OrchestrationResult` (the worker base64-wraps the
+/// `system/orchestrate` plug-in's output bytes).  Returns `None` on a missing
+/// input, a base64 error, or a JSON error (an error envelope rather than a
+/// result).  Shared by the inline and offloaded decode paths in
+/// [`apply_worker_orchestration`].
+fn decode_orchestration_result(
+    b64: Option<&str>,
+) -> Option<noetl_orchestrate_core::orchestrator::OrchestrationResult> {
+    use base64::Engine;
+    b64.and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+}
+
 /// Apply the `OrchestrationResult` a worker computed for the worker-driven drive
 /// (noetl/ai-meta#108 slice 3): decode it from the `system/orchestrate`
 /// completion, then emit events + issue commands via `apply_orchestration_result`
@@ -2432,22 +2492,74 @@ async fn apply_worker_orchestration(
     trigger_event_id: i64,
     payload: &serde_json::Value,
 ) -> AppResult<i32> {
-    use base64::Engine;
-
     // Clear the in-flight guard first (the drive completed, success or not) so a
     // decode failure doesn't wedge the execution — the reconcile can re-drive.
     let cache_slot = state.orch_cache.entry(execution_id);
     let mut cache = cache_slot.lock().await;
     cache.orchestrate_in_flight = false;
 
-    let decoded = find_output_b64(payload)
-        .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())
-        .and_then(|bytes| {
-            serde_json::from_slice::<noetl_orchestrate_core::orchestrator::OrchestrationResult>(
-                &bytes,
-            )
-            .ok()
-        });
+    // Inline path: the drive result fit the worker's inline budget
+    // (`NOETL_EVENT_RESULT_CONTEXT_MAX_BYTES`, default 100KB) and rides the
+    // `call.done` payload as an `output_b64` string.
+    let mut decoded = decode_orchestration_result(find_output_b64(payload));
+
+    // Offloaded path (noetl/ai-meta#113): a large drive result (≈ the full
+    // execution context — e.g. http_to_postgres, save_edge_cases) exceeds the
+    // inline budget, so the worker stages the whole tool result (which carries
+    // the `output_b64`) to the durable result store and emits only a
+    // `reference.ref` (`noetl://…`) — no inline `output_b64`.  Before this
+    // fallback the server dropped the drive decision, re-issued `__orchestrate__`,
+    // re-evaluated the same large state, re-offloaded, and never converged
+    // (a runaway PENDING-orchestrate loop, no terminal event).  Resolve the ref
+    // from the store (the same `result_store.resolve` the cursor/reference paths
+    // already use) and decode `output_b64` from the stored result instead.
+    if decoded.is_none() {
+        if let Some(ref_uri) = find_noetl_ref(payload) {
+            let pool = state.pools.pool_for(execution_id);
+            let result_store = crate::services::result_store::ResultStoreService::new(
+                pool.clone(),
+                state.snowflake.clone(),
+            );
+            match crate::services::result_store::parse_noetl_ref(ref_uri) {
+                Ok(parsed) => match result_store.resolve(&parsed).await {
+                    Ok(Some(stored)) => {
+                        decoded = decode_orchestration_result(find_output_b64(&stored));
+                        if decoded.is_some() {
+                            crate::metrics::record_orchestrate_drive("ref_resolved");
+                            info!(
+                                execution_id,
+                                ref_uri,
+                                "worker-driven: decoded offloaded OrchestrationResult from the \
+                                 durable result store (over-budget drive result, noetl/ai-meta#113)"
+                            );
+                        } else {
+                            warn!(
+                                execution_id,
+                                ref_uri,
+                                "worker-driven: resolved orchestrate result ref but it carried no \
+                                 decodable output_b64"
+                            );
+                        }
+                    }
+                    Ok(None) => warn!(
+                        execution_id,
+                        ref_uri, "worker-driven: orchestrate result ref not found in store"
+                    ),
+                    Err(e) => warn!(
+                        execution_id,
+                        ref_uri, %e,
+                        "worker-driven: orchestrate result ref resolution failed"
+                    ),
+                },
+                Err(e) => warn!(
+                    execution_id,
+                    ref_uri, %e,
+                    "worker-driven: unparseable orchestrate result ref"
+                ),
+            }
+        }
+    }
+
     let Some(result) = decoded else {
         warn!(
             execution_id,
@@ -3072,5 +3184,84 @@ mod tests {
             err.to_string().contains("execution_id"),
             "error should mention the field name: {err}"
         );
+    }
+
+    // --- noetl/ai-meta#113: offloaded OrchestrationResult recovery ---
+
+    #[test]
+    fn find_output_b64_walks_nested_inline_payload() {
+        // Inline (under-budget) drive: `output_b64` nests inside the
+        // call.done result envelope.
+        let payload = serde_json::json!({
+            "command_id": "c1",
+            "result": { "status": "COMPLETED", "context": { "data": {
+                "output_b64": "aGVsbG8=", "flush": { "errors": [] }
+            }}}
+        });
+        assert_eq!(find_output_b64(&payload), Some("aGVsbG8="));
+    }
+
+    #[test]
+    fn find_noetl_ref_finds_durable_ref_when_inline_absent() {
+        // Offloaded (over-budget) drive: no `output_b64`, only the durable
+        // `reference.ref` URI — exactly the noetl/ai-meta#113 shape the worker
+        // emits from `build_call_done_result`'s durable path.
+        let payload = serde_json::json!({
+            "command_id": "c1",
+            "result": {
+                "status": "COMPLETED",
+                "context": { "data": { "_ref": "noetl://execution/9/result/__orchestrate__/1" } },
+                "reference": {
+                    "kind": "result_ref",
+                    "ref": "noetl://execution/9/result/__orchestrate__/2",
+                    "store": "db"
+                }
+            }
+        });
+        assert_eq!(find_output_b64(&payload), None);
+        // Matches the durable `ref` (not the `_ref` navigation hint).
+        assert_eq!(
+            find_noetl_ref(&payload),
+            Some("noetl://execution/9/result/__orchestrate__/2")
+        );
+    }
+
+    #[test]
+    fn find_noetl_ref_ignores_non_noetl_and_shm_only_reference() {
+        // Degraded shm-only path carries an `arrow_ipc` hint with no resolvable
+        // `noetl://` ref — the server can't read another node's shm, so it must
+        // not mistake a non-URI string for a durable ref.
+        let payload = serde_json::json!({
+            "result": { "status": "COMPLETED", "reference": {
+                "kind": "arrow_ipc", "shm_name": "noetl-shm-abc", "byte_length": 42
+            }}
+        });
+        assert_eq!(find_noetl_ref(&payload), None);
+    }
+
+    #[test]
+    fn decode_orchestration_result_round_trips_b64_json() {
+        use base64::Engine;
+        // A minimal OrchestrationResult JSON, base64-wrapped exactly as the
+        // worker wraps the plug-in's output bytes.
+        let or_json = serde_json::json!({
+            "state": "completed",
+            "commands": [],
+            "should_complete": true,
+            "events_to_emit": []
+        });
+        let b64 = base64::engine::general_purpose::STANDARD
+            .encode(serde_json::to_vec(&or_json).unwrap());
+        let decoded = decode_orchestration_result(Some(&b64))
+            .expect("valid base64 + JSON decodes to an OrchestrationResult");
+        assert!(decoded.should_complete);
+        assert!(decoded.commands.is_empty());
+
+        // None / garbage / non-result JSON → None (the error-envelope path).
+        assert!(decode_orchestration_result(None).is_none());
+        assert!(decode_orchestration_result(Some("not base64!!!")).is_none());
+        let not_a_result =
+            base64::engine::general_purpose::STANDARD.encode(b"{\"unexpected\":true}");
+        assert!(decode_orchestration_result(Some(&not_a_result)).is_none());
     }
 }
