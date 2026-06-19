@@ -739,6 +739,65 @@ async fn handle_event_inner(
     }))
 }
 
+/// Resolve an offloaded command context back to its full `{tool_config, args,
+/// render_context}` (noetl/ai-meta#114).
+///
+/// When a `command.issued` context exceeded the budget, `persist_engine_command`
+/// stashed it in `noetl.result_store` and left a tiny
+/// `{ "__context_ref__": "noetl://…" }` marker on the event + command row so the
+/// published event stayed under the NATS `max_payload`.  Both `get_command` and
+/// `claim_command` call this before handing the command to the worker, so the
+/// worker is oblivious to the offload — it always receives the full context.
+///
+/// A within-budget (un-offloaded) context has no marker and is returned
+/// unchanged.  On any resolution failure the marker is returned as-is and a WARN
+/// is logged with `execution_id`; the worker then surfaces a missing-config
+/// error rather than the server silently substituting empty data.
+async fn resolve_command_context_ref(
+    state: &AppState,
+    context: serde_json::Value,
+) -> serde_json::Value {
+    use crate::handlers::execute::COMMAND_CONTEXT_REF_KEY;
+    use crate::services::result_store::{parse_noetl_ref, ResultStoreService};
+
+    let Some(ref_uri) = context
+        .get(COMMAND_CONTEXT_REF_KEY)
+        .and_then(|v| v.as_str())
+    else {
+        return context;
+    };
+
+    let parsed = match parse_noetl_ref(ref_uri) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(ref_uri, %e, "command context reference unparseable; left as-is (noetl/ai-meta#114)");
+            return context;
+        }
+    };
+    let result_store =
+        ResultStoreService::new(state.pools.pool_for(parsed.execution_id).clone(), state.snowflake.clone());
+    match result_store.resolve(&parsed).await {
+        Ok(Some(data)) => {
+            crate::metrics::record_orchestrate_drive("context_ref_resolved");
+            data
+        }
+        Ok(None) => {
+            warn!(
+                execution_id = parsed.execution_id,
+                ref_uri, "command context reference not found in store; left as-is (noetl/ai-meta#114)"
+            );
+            context
+        }
+        Err(e) => {
+            warn!(
+                execution_id = parsed.execution_id,
+                ref_uri, %e, "command context reference resolution failed; left as-is (noetl/ai-meta#114)"
+            );
+            context
+        }
+    }
+}
+
 /// Get command details from command.issued event.
 ///
 /// GET /api/commands/{event_id}
@@ -781,14 +840,20 @@ pub async fn get_command(
     let row = found.map(|(_shard_idx, r)| r);
 
     match row {
-        Some((execution_id, node_name, node_type, context, meta)) => Ok(Json(CommandResponse {
-            execution_id,
-            node_id: node_name.clone(),
-            node_name,
-            action: node_type,
-            context,
-            meta,
-        })),
+        Some((execution_id, node_name, node_type, context, meta)) => {
+            // Resolve an offloaded context back to the full payload before the
+            // worker sees it (noetl/ai-meta#114).  No-op for within-budget
+            // commands.
+            let context = resolve_command_context_ref(&state, context).await;
+            Ok(Json(CommandResponse {
+                execution_id,
+                node_id: node_name.clone(),
+                node_name,
+                action: node_type,
+                context,
+                meta,
+            }))
+        }
         None => Err(AppError::NotFound(format!("command not found: {}", event_id))),
     }
 }
@@ -876,6 +941,10 @@ pub async fn claim_command(
     let context: serde_json::Value = row
         .try_get("context")
         .unwrap_or_else(|_| serde_json::json!({}));
+    // Resolve an offloaded context back to the full payload before the worker
+    // sees it (noetl/ai-meta#114).  No-op for within-budget commands.  Both the
+    // idempotent-reclaim and the fresh-claim return paths below use this value.
+    let context = resolve_command_context_ref(&state, context).await;
     let meta: serde_json::Value = row
         .try_get("meta")
         .unwrap_or_else(|_| serde_json::json!({}));

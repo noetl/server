@@ -165,6 +165,26 @@ pub struct AppConfig {
     /// for the layout.
     #[serde(default)]
     pub shard_count: Option<u32>,
+
+    /// Maximum serialised size (bytes) of a `command.issued` event's `context`
+    /// before it is offloaded to the result store (noetl/ai-meta#114).  When the
+    /// off-server orchestrate drive (`orchestrate_plugin_drive`) builds the next
+    /// step's command with `refs_in_state` **false**, the full resolved upstream
+    /// context is embedded inline in `render_context` — a large-context fixture
+    /// (e.g. `test_output_select`) produced a 1.32MB `command.issued` event that
+    /// exceeds NATS `max_payload` (1MB) under the publish-only gate, so the
+    /// publish never acks and the execution wedges.  When the serialised
+    /// `{tool_config, args, render_context}` exceeds this threshold,
+    /// `persist_engine_command(s)` offloads the whole context to
+    /// `noetl.result_store` and writes a tiny `{ "__context_ref__": "noetl://…" }`
+    /// marker onto the event + command row instead; `get_command` / `claim_command`
+    /// resolve the ref before handing the command to the worker (same
+    /// result-store pattern as the #113 drive-result fix).  Envy maps
+    /// `NOETL_COMMAND_CONTEXT_MAX_BYTES`.  **Default 524288 (512KB)** — comfortably
+    /// under the 1MB NATS ceiling with event/meta overhead, and large enough that
+    /// ordinary commands never offload (their context is a few KB).
+    #[serde(default = "default_command_context_max_bytes")]
+    pub command_context_max_bytes: usize,
 }
 
 fn default_host() -> String {
@@ -189,6 +209,12 @@ fn default_sweep_interval() -> u64 {
 
 fn default_offline_seconds() -> u64 {
     60
+}
+
+fn default_command_context_max_bytes() -> usize {
+    // 512KB — half the NATS 1MB max_payload, leaving headroom for the event's
+    // meta/envelope overhead while never tripping on ordinary (few-KB) commands.
+    512 * 1024
 }
 
 impl AppConfig {
@@ -229,6 +255,7 @@ impl Default for AppConfig {
             server_machine_id: None,
             shard_index: None,
             shard_count: None,
+            command_context_max_bytes: default_command_context_max_bytes(),
         }
     }
 }
@@ -256,5 +283,15 @@ mod tests {
         // noetl/ai-meta#108 (c): the worker-driven orchestrator drive is the
         // default.  Revert is `NOETL_ORCHESTRATE_PLUGIN_DRIVE=false`.
         assert!(AppConfig::default().orchestrate_plugin_drive);
+    }
+
+    #[test]
+    fn test_command_context_max_bytes_default_under_nats_ceiling() {
+        // noetl/ai-meta#114: the offload threshold must sit safely below the
+        // NATS 1MB max_payload so an offloaded `command.issued` event always
+        // fits, with headroom for the meta/envelope overhead.
+        let cfg = AppConfig::default();
+        assert_eq!(cfg.command_context_max_bytes, 512 * 1024);
+        assert!(cfg.command_context_max_bytes < 1024 * 1024);
     }
 }

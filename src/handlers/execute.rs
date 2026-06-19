@@ -646,6 +646,86 @@ async fn inherit_parent_trace(state: &AppState, parent_execution_id: i64) -> Opt
     meta.and_then(|m| m.get("trace").filter(|v| !v.is_null()).cloned())
 }
 
+/// Marker key for an offloaded command context (noetl/ai-meta#114).  When a
+/// `command.issued` event's `{tool_config, args, render_context}` exceeds
+/// [`AppConfig::command_context_max_bytes`](crate::config::AppConfig), the full
+/// context is stashed in `noetl.result_store` and the event + command row carry
+/// only `{ "__context_ref__": "noetl://…" }` so the published event stays under
+/// the NATS `max_payload`.  `get_command` / `claim_command` resolve it back
+/// before the worker sees the command.
+pub(crate) const COMMAND_CONTEXT_REF_KEY: &str = "__context_ref__";
+
+/// Logical `name` segment used for offloaded command contexts in the result
+/// store.  A constant (not the step name) keeps the `noetl://` URI parseable
+/// regardless of step-name characters and unambiguous to spot in the store.
+const COMMAND_CONTEXT_RESULT_NAME: &str = "__command_context__";
+
+/// Offload an over-budget command context to the result store, returning a tiny
+/// `{ "__context_ref__": "noetl://…", "__context_bytes__": N }` marker in its
+/// place (noetl/ai-meta#114).
+///
+/// The off-server orchestrate drive embeds the full resolved upstream context
+/// into the next step's `render_context` when `refs_in_state` is false; for a
+/// large-context fixture this balloons the `command.issued` event past the NATS
+/// `max_payload`, so the publish-only gate can't ack it and the execution
+/// wedges.  This keeps the published event small while the full context lives
+/// durably in `noetl.result_store`, resolved on the read side exactly like the
+/// #113 drive-result offload.
+///
+/// Returns the original `cmd_context` untouched when it is within budget (the
+/// common case — ordinary commands are a few KB), so the hot path is a single
+/// `serde_json::to_vec` length check with no extra DB round-trip.
+async fn maybe_offload_command_context(
+    state: &AppState,
+    execution_id: i64,
+    cmd_context: serde_json::Value,
+) -> AppResult<serde_json::Value> {
+    let max_bytes = state.config.command_context_max_bytes;
+    let bytes = match serde_json::to_vec(&cmd_context) {
+        Ok(v) => v.len(),
+        // If it can't even be serialised, hand it back unchanged — emit_event
+        // will surface the real encode error at the publish boundary.
+        Err(_) => return Ok(cmd_context),
+    };
+    if bytes <= max_bytes {
+        return Ok(cmd_context);
+    }
+
+    let result_store = crate::services::result_store::ResultStoreService::new(
+        state.pools.pool_for(execution_id).clone(),
+        state.snowflake.clone(),
+    );
+    let put = result_store
+        .put(
+            execution_id,
+            &crate::services::result_store::PutResultBody {
+                name: COMMAND_CONTEXT_RESULT_NAME.to_string(),
+                data: cmd_context,
+                scope: "execution".to_string(),
+                source_step: None,
+                store: None,
+                ttl: None,
+                correlation: None,
+                compress: false,
+            },
+        )
+        .await?;
+
+    crate::metrics::record_orchestrate_drive("context_offloaded");
+    debug!(
+        execution_id,
+        bytes,
+        max_bytes,
+        noetl_ref = %put.r#ref,
+        "command context exceeded budget — offloaded to result store (noetl/ai-meta#114)"
+    );
+
+    Ok(serde_json::json!({
+        COMMAND_CONTEXT_REF_KEY: put.r#ref,
+        "__context_bytes__": bytes,
+    }))
+}
+
 /// Persist one engine-generated command + its `command.issued`
 /// event + its NATS notification.
 ///
@@ -700,11 +780,19 @@ pub(crate) async fn persist_engine_command(
         Some(map) => serde_json::to_value(map).unwrap_or_else(|_| serde_json::json!({})),
         None => serde_json::json!({}),
     };
-    let cmd_context = serde_json::json!({
-        "tool_config": command.tool.config,
-        "args": cmd_args,
-        "render_context": render_context,
-    });
+    // Offload an over-budget context to the result store + ref marker so the
+    // published `command.issued` event stays under the NATS max_payload
+    // (noetl/ai-meta#114).  Within-budget contexts pass through unchanged.
+    let cmd_context = maybe_offload_command_context(
+        state,
+        execution_id,
+        serde_json::json!({
+            "tool_config": command.tool.config,
+            "args": cmd_args,
+            "render_context": render_context,
+        }),
+    )
+    .await?;
 
     // Base meta — extended below with iteration_index/_total for
     // iterator commands so `state.apply_event` (Phase D R3b state
@@ -871,11 +959,21 @@ pub(crate) async fn persist_engine_commands_batch(
             Some(map) => serde_json::to_value(map).unwrap_or_else(|_| serde_json::json!({})),
             None => serde_json::json!({}),
         };
-        let cmd_context = serde_json::json!({
-            "tool_config": command.tool.config,
-            "args": cmd_args,
-            "render_context": render_context,
-        });
+        // Offload an over-budget context to the result store + ref marker so the
+        // published `command.issued` event stays under the NATS max_payload
+        // (noetl/ai-meta#114).  This is the hot drive path — the next-step
+        // command a large-context fixture produces is exactly the one that
+        // blows the 1MB ceiling.  Within-budget contexts pass through unchanged.
+        let cmd_context = maybe_offload_command_context(
+            state,
+            execution_id,
+            serde_json::json!({
+                "tool_config": command.tool.config,
+                "args": cmd_args,
+                "render_context": render_context,
+            }),
+        )
+        .await?;
 
         let mut cmd_meta = serde_json::json!({
             "command_id": command_id,
