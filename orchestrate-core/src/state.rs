@@ -55,6 +55,18 @@ impl From<&str> for ExecutionState {
     }
 }
 
+impl ExecutionState {
+    /// True once the execution has reached a terminal state — completed,
+    /// failed, or cancelled.  Past this point no further orchestration must
+    /// be driven (noetl/ai-meta#113 facet 2): a cancel (or any terminal
+    /// event) must stop the worker-driven drive from re-issuing
+    /// `__orchestrate__`, which otherwise re-loops forever (only a server
+    /// restart cleared it before the terminal guard was added).
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
+    }
+}
+
 /// State of a single workflow step.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -448,7 +460,12 @@ impl WorkflowState {
                 self.state = ExecutionState::Failed;
                 self.completed_at = Some(event.timestamp);
             }
-            "playbook.cancelled" => {
+            "playbook.cancelled" | "playbook_cancelled" => {
+                // The ExecutionService cancel chokepoint emits the underscore
+                // form `playbook_cancelled` (services/execution.rs); without
+                // matching it here the cached WorkflowState never transitioned
+                // to Cancelled and the drive kept re-issuing `__orchestrate__`
+                // (noetl/ai-meta#113 facet 2).
                 self.state = ExecutionState::Cancelled;
                 self.completed_at = Some(event.timestamp);
             }
@@ -1222,6 +1239,37 @@ mod tests {
         assert_eq!(ExecutionState::from("RUNNING"), ExecutionState::InProgress);
         assert_eq!(ExecutionState::from("completed"), ExecutionState::Completed);
         assert_eq!(ExecutionState::from("FAILED"), ExecutionState::Failed);
+    }
+
+    #[test]
+    fn test_execution_state_is_terminal() {
+        // noetl/ai-meta#113 facet 2 — the drive guard keys off this.
+        assert!(!ExecutionState::Initial.is_terminal());
+        assert!(!ExecutionState::InProgress.is_terminal());
+        assert!(ExecutionState::Completed.is_terminal());
+        assert!(ExecutionState::Failed.is_terminal());
+        assert!(ExecutionState::Cancelled.is_terminal());
+    }
+
+    #[test]
+    fn test_apply_event_cancels_on_both_event_spellings() {
+        // The cancel chokepoint emits the underscore form `playbook_cancelled`
+        // (services/execution.rs); the dotted `playbook.cancelled` also exists
+        // on legacy paths.  Both must drive the state to Cancelled / terminal so
+        // the off-server drive stops re-issuing `__orchestrate__`
+        // (noetl/ai-meta#113 facet 2).
+        for spelling in ["playbook_cancelled", "playbook.cancelled"] {
+            let mut state = WorkflowState::new(1, 2);
+            state.apply_event(&make_event("playbook_started", None));
+            assert_eq!(state.state, ExecutionState::InProgress);
+            state.apply_event(&make_event(spelling, None));
+            assert_eq!(
+                state.state,
+                ExecutionState::Cancelled,
+                "{spelling} should transition to Cancelled"
+            );
+            assert!(state.state.is_terminal(), "{spelling} state must be terminal");
+        }
     }
 
     #[test]
