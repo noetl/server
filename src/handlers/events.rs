@@ -2137,28 +2137,187 @@ async fn rebuild_state_chain_walk(
     }))
 }
 
+/// Run the shadow parity check inside ONE `REPEATABLE READ` transaction so both
+/// the chain walk and the bounded event scan observe a single consistent MVCC
+/// snapshot of `noetl.event` (RFC #115 Phase 3 parity proof).  This removes the
+/// race against concurrent materialization — under the publish-only gate the
+/// chain head runs ahead of the materialized table and worker/server `event_id`s
+/// interleave, so two un-isolated reads can legitimately see different sets even
+/// for an identical execution.  Inside one snapshot the two builds collect the
+/// SAME events; any remaining difference is a real builder bug (logged by
+/// [`parity_check_states`] with the differing state keys).
+///
+/// Falls through (records nothing) when the chain head is cold or a chain node
+/// isn't present in the snapshot — those are the same conditions the live builder
+/// falls back on, not parity failures.
+async fn run_parity_check(
+    state: &AppState,
+    pool: &crate::db::DbPool,
+    result_store: &crate::services::result_store::ResultStoreService,
+    execution_id: i64,
+    keep_refs: bool,
+) -> AppResult<()> {
+    use sqlx::Row;
+    let Some(head) = state.chain_heads.head(execution_id) else {
+        return Ok(());
+    };
+    let mut conn = pool.acquire().await?;
+    sqlx::query("BEGIN ISOLATION LEVEL REPEATABLE READ")
+        .execute(&mut *conn)
+        .await?;
+
+    // (1) Walk the chain head→root on the snapshot, collecting nodes by PK.
+    let mut walk_events: Vec<crate::db::models::Event> = Vec::new();
+    let mut cursor = Some(head);
+    let mut complete = true;
+    while let Some(eid) = cursor {
+        let row = sqlx::query(&format!(
+            "{ORCH_EVENT_COLS_WITH_PREV} WHERE execution_id = $1 AND event_id = $2"
+        ))
+        .bind(execution_id)
+        .bind(eid)
+        .fetch_optional(&mut *conn)
+        .await?;
+        let Some(row) = row else {
+            complete = false;
+            break;
+        };
+        let prev: Option<i64> = row.try_get("prev_event_id").ok().flatten();
+        let ev = parse_event_rows(vec![row]).into_iter().next().expect("one row");
+        cursor = prev;
+        walk_events.push(ev);
+    }
+
+    // (2) Bounded scan of the same snapshot up to the walk's head.
+    let max_id = walk_events.iter().map(|e| e.event_id).max();
+    let scan_rows = if let Some(max_id) = max_id {
+        sqlx::query(&format!(
+            "{ORCH_EVENT_COLS} WHERE execution_id = $1 AND event_id <= $2 ORDER BY event_id ASC"
+        ))
+        .bind(execution_id)
+        .bind(max_id)
+        .fetch_all(&mut *conn)
+        .await?
+    } else {
+        Vec::new()
+    };
+    // Read-only — end the snapshot.
+    let _ = sqlx::query("COMMIT").execute(&mut *conn).await;
+    drop(conn);
+
+    // Skip non-parity cases: cold/missing chain or no genesis (the live builder
+    // would fall back here too).
+    if !complete || walk_events.is_empty() || !chain_has_genesis(&walk_events) {
+        return Ok(());
+    }
+    let mut scan_events = parse_event_rows(scan_rows);
+    if scan_events.is_empty() {
+        return Ok(());
+    }
+
+    // Build both states off the consistent snapshot, applying in event_id order.
+    walk_events.sort_by_key(|e| e.event_id);
+    hydrate_result_references(&mut walk_events, result_store, keep_refs).await;
+    hydrate_result_references(&mut scan_events, result_store, keep_refs).await;
+    let cw = crate::engine::state::WorkflowState::from_events(
+        &walk_events.iter().map(Into::into).collect::<Vec<_>>(),
+    );
+    let es = crate::engine::state::WorkflowState::from_events(
+        &scan_events.iter().map(Into::into).collect::<Vec<_>>(),
+    );
+    if let (Some(es), Some(cw)) = (es, cw) {
+        parity_check_states(execution_id, &es, &cw);
+    }
+    Ok(())
+}
+
+/// Wall-clock fields on `WorkflowState` / `StepInfo` that are populated from the
+/// event's `created_at` — which `parse_event_rows` resolves to `Utc::now()`
+/// whenever the column can't be decoded (the deployed `noetl.event.created_at` is
+/// `timestamp without time zone`, which doesn't decode into `DateTime<Utc>`).  So
+/// these timestamps **vary across every reconstruction** in BOTH build paths
+/// (`orchestrate-core/src/state.rs` documents this: "the `Utc::now()` loader
+/// fallback … varies across reconstructions").  They are not part of the logical
+/// state that drives decisions, so the parity comparison excludes them — what's
+/// being proven is that the chain-walk and event-scan builds produce the same
+/// *decision-relevant* state, not the same build-time clock reads.
+const NONDETERMINISTIC_STATE_KEYS: &[&str] = &["started_at", "completed_at", "entered_at"];
+
+/// Canonicalize a JSON value for order-insensitive structural comparison: drop
+/// the non-deterministic wall-clock keys ([`NONDETERMINISTIC_STATE_KEYS`]),
+/// recurse into objects, and **sort every array** by its element's canonical
+/// string form.  `WorkflowState` carries `HashSet` fields (`cursor_completed`,
+/// `iteration_command_ids`) that serialize to JSON arrays in arbitrary order, so
+/// a raw `serde_json::Value` array comparison would flag two logically-identical
+/// states as different.  Sorting is sound for this parity check: both builds
+/// apply events in the same `event_id` order, so any genuinely-ordered array is
+/// already element-equal between them (sorting is a no-op); only the set-backed
+/// arrays need reordering.  A real difference (different elements / lengths /
+/// keys) still survives the sort.
+fn canonicalize_state_json(v: &serde_json::Value) -> serde_json::Value {
+    match v {
+        serde_json::Value::Array(a) => {
+            let mut items: Vec<serde_json::Value> = a.iter().map(canonicalize_state_json).collect();
+            items.sort_by_key(|v| v.to_string());
+            serde_json::Value::Array(items)
+        }
+        serde_json::Value::Object(o) => serde_json::Value::Object(
+            o.iter()
+                .filter(|(k, _)| !NONDETERMINISTIC_STATE_KEYS.contains(&k.as_str()))
+                .map(|(k, val)| (k.clone(), canonicalize_state_json(val)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
 /// Shadow parity check (RFC #115 Phase 3): compare an event-scan-built state with
 /// a chain-walk-built state for the same execution.  Equality is **structural**
-/// via `serde_json::Value` (order-insensitive for the state's maps).  Records
-/// `noetl_state_build_parity_total{match|mismatch}` and logs a WARN carrying
-/// `execution_id` on mismatch.  Observation-only — the drive uses the configured
-/// `state_build_mode` result, so a parity bug can never change drive behavior.
+/// via canonicalized `serde_json::Value` (order-insensitive for the state's maps
+/// AND its `HashSet`-backed arrays).  Records
+/// `noetl_state_build_parity_total{match|mismatch}` and, on mismatch, logs a WARN
+/// naming the differing top-level state keys (with `execution_id`).
+/// Observation-only — the drive uses the configured `state_build_mode` result, so
+/// a parity bug can never change drive behavior.
 fn parity_check_states(
     execution_id: i64,
     event_scan: &crate::engine::state::WorkflowState,
     chain_walk: &crate::engine::state::WorkflowState,
 ) {
-    let a = serde_json::to_value(event_scan).ok();
-    let b = serde_json::to_value(chain_walk).ok();
-    if a.is_some() && a == b {
-        crate::metrics::record_state_build_parity("match");
-        debug!(execution_id, "state-build parity OK (chain-walk == event-scan)");
-    } else {
-        crate::metrics::record_state_build_parity("mismatch");
-        warn!(
-            execution_id,
-            "state-build parity MISMATCH: chain-walk state != event-scan state"
-        );
+    let a = serde_json::to_value(event_scan).map(|v| canonicalize_state_json(&v));
+    let b = serde_json::to_value(chain_walk).map(|v| canonicalize_state_json(&v));
+    match (a, b) {
+        (Ok(a), Ok(b)) if a == b => {
+            crate::metrics::record_state_build_parity("match");
+            debug!(execution_id, "state-build parity OK (chain-walk == event-scan)");
+        }
+        (Ok(a), Ok(b)) => {
+            crate::metrics::record_state_build_parity("mismatch");
+            // Name the differing top-level keys so a mismatch is actionable.
+            let diff_keys: Vec<String> = match (&a, &b) {
+                (serde_json::Value::Object(ma), serde_json::Value::Object(mb)) => {
+                    let mut keys: Vec<String> = ma
+                        .keys()
+                        .chain(mb.keys())
+                        .filter(|k| ma.get(*k) != mb.get(*k))
+                        .cloned()
+                        .collect();
+                    keys.sort();
+                    keys.dedup();
+                    keys
+                }
+                _ => vec!["<root>".to_string()],
+            };
+            warn!(
+                execution_id,
+                diff_keys = %diff_keys.join(","),
+                "state-build parity MISMATCH: chain-walk state != event-scan state"
+            );
+        }
+        _ => {
+            crate::metrics::record_state_build_parity("mismatch");
+            warn!(execution_id, "state-build parity: a state failed to serialize");
+        }
     }
 }
 
@@ -2362,26 +2521,24 @@ async fn trigger_orchestrator_inner(
     }
 
     // Parity proof (RFC #115 Phase 3): when `NOETL_STATE_BUILD_PARITY_CHECK` is
-    // on, shadow-build the state BOTH ways and assert they match — observation
-    // only (the drive keeps using whichever mode built `cache.state`).  Costs an
-    // extra event-scan rebuild, so it's a validation switch, off in prod.
+    // on, shadow-build the state BOTH ways from ONE consistent DB snapshot and
+    // assert they match — observation only (the drive keeps using whichever mode
+    // built `cache.state`).  Reading both representations inside a single
+    // `REPEATABLE READ` transaction removes the race against concurrent
+    // materialization (and the cross-machine `event_id` interleave), so a
+    // mismatch is a real builder bug, not a timing artifact.  Validation switch;
+    // off in prod.
     if state.config.state_build_parity_check {
-        let es = rebuild_state(pool, &result_store, execution_id, state.config.refs_in_state)
-            .await
-            .ok();
-        let cw = rebuild_state_chain_walk(
+        if let Err(e) = run_parity_check(
             state,
             pool,
             &result_store,
             execution_id,
-            trigger_event_id,
             state.config.refs_in_state,
         )
         .await
-        .ok()
-        .flatten();
-        if let (Some(es), Some(cw)) = (es, cw) {
-            parity_check_states(execution_id, &es.state, &cw.result.state);
+        {
+            debug!(execution_id, %e, "parity check skipped (read error)");
         }
     }
 
@@ -3181,6 +3338,34 @@ mod tests {
         // falls back to event-scan rather than building a partial state.
         let tail = vec![ev(5, None, "command.completed"), ev(6, Some(5), "command.issued")];
         assert!(!chain_has_genesis(&tail));
+    }
+
+    #[test]
+    fn canonicalize_strips_timestamps_and_sorts_arrays() {
+        // Two logically-identical states that differ only in (a) the order of a
+        // HashSet-backed array and (b) the non-deterministic wall-clock fields
+        // must canonicalize equal — that's what makes the parity check robust to
+        // serialization order + the `Utc::now()` created_at fallback.
+        let a = serde_json::json!({
+            "state": "InProgress",
+            "started_at": "2026-06-19T22:56:40Z",
+            "steps": { "s1": { "status": "done", "completed_at": "2026-06-19T22:56:41Z",
+                               "cursor_completed": ["b", "a", "c"] } }
+        });
+        let b = serde_json::json!({
+            "state": "InProgress",
+            "started_at": "2026-06-19T23:03:43Z",   // different clock read
+            "steps": { "s1": { "status": "done", "completed_at": "2026-06-19T23:03:44Z",
+                               "cursor_completed": ["c", "b", "a"] } } // different set order
+        });
+        assert_eq!(
+            canonicalize_state_json(&a),
+            canonicalize_state_json(&b),
+            "states differing only in set order + wall-clock fields must canonicalize equal"
+        );
+        // A real logical difference still survives canonicalization.
+        let c = serde_json::json!({ "state": "Completed", "steps": {} });
+        assert_ne!(canonicalize_state_json(&a), canonicalize_state_json(&c));
     }
 
     #[test]
