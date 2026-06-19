@@ -188,6 +188,54 @@ pub struct AppConfig {
     /// ordinary commands never offload (their context is a few KB).
     #[serde(default = "default_command_context_max_bytes")]
     pub command_context_max_bytes: usize,
+
+    /// How the orchestrator drive reconstructs `WorkflowState` for an execution
+    /// (RFC noetl/ai-meta#115 Phase 3).  Envy maps `NOETL_STATE_BUILD_MODE`.
+    ///
+    /// - **`event_scan`** (default) — the established path: bounded rebuild from
+    ///   the latest `projection_snapshot` + an `event_id`-range scan of
+    ///   `noetl.event`, or a full `WHERE execution_id = $1` scan when no snapshot
+    ///   exists.  Unchanged prod behavior.
+    /// - **`chain_walk`** — follow the one-level `prev_event_id` chain (Phase 2)
+    ///   from the in-memory chain head back to the genesis event, each hop a
+    ///   `(execution_id, event_id)` **PK lookup** — never a `WHERE execution_id`
+    ///   scan of `noetl.event`.  The collected events are fed to the SAME
+    ///   `WorkflowState::from_events`, so the built state is equivalent to the
+    ///   event-scan build (parity by construction).  When the chain head is cold
+    ///   (server restart / different replica), a walked node isn't yet
+    ///   materialized (materializer lag under the gate), or the walk's root is
+    ///   not a genesis event, the build **falls back to `event_scan`** for that
+    ///   trigger (counted via `noetl_state_build_total{outcome}`) — correctness
+    ///   is never sacrificed.  This is the in-process proof of tenet 3/4 before
+    ///   the off-server builder + cache (Phase 4).
+    ///
+    /// **Default `event_scan`** — prod/default behavior is unchanged; flipping to
+    /// `chain_walk` is opt-in.
+    #[serde(default)]
+    pub state_build_mode: StateBuildMode,
+
+    /// When true, the drive builds `WorkflowState` **both** ways (event-scan AND
+    /// chain-walk) on each cold/rebuild and asserts they are equal, recording a
+    /// mismatch via `noetl_state_build_parity_total{result}` — the drive still
+    /// **uses the configured `state_build_mode` result** for its decision (the
+    /// shadow build is observation-only, so a parity bug can't change behavior).
+    /// Envy maps `NOETL_STATE_BUILD_PARITY_CHECK`.  **Default false** — a
+    /// validation/diagnostic switch, off in prod.
+    #[serde(default)]
+    pub state_build_parity_check: bool,
+}
+
+/// Strategy for reconstructing orchestrator `WorkflowState` — see
+/// [`AppConfig::state_build_mode`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StateBuildMode {
+    /// Bounded snapshot + `event_id`-range / full scan of `noetl.event` (the
+    /// established path).  Default.
+    #[default]
+    EventScan,
+    /// Walk the `prev_event_id` chain head→root by PK lookup (RFC #115 Phase 3).
+    ChainWalk,
 }
 
 fn default_host() -> String {
@@ -261,6 +309,9 @@ impl Default for AppConfig {
             shard_index: None,
             shard_count: None,
             command_context_max_bytes: default_command_context_max_bytes(),
+            // noetl/ai-meta#115 Phase 3: event-scan is the default; chain_walk is opt-in.
+            state_build_mode: StateBuildMode::EventScan,
+            state_build_parity_check: false,
         }
     }
 }
@@ -298,5 +349,24 @@ mod tests {
         let cfg = AppConfig::default();
         assert_eq!(cfg.command_context_max_bytes, 512 * 1024);
         assert!(cfg.command_context_max_bytes < 1024 * 1024);
+    }
+
+    #[test]
+    fn test_state_build_mode_defaults_event_scan() {
+        // noetl/ai-meta#115 Phase 3: prod/default behavior is unchanged — the
+        // chain-walk builder is opt-in via NOETL_STATE_BUILD_MODE=chain_walk.
+        let cfg = AppConfig::default();
+        assert_eq!(cfg.state_build_mode, StateBuildMode::EventScan);
+        assert!(!cfg.state_build_parity_check);
+    }
+
+    #[test]
+    fn test_state_build_mode_deserializes_snake_case() {
+        // Envy parses NOETL_STATE_BUILD_MODE through serde; the variants are
+        // snake_case so `chain_walk` / `event_scan` map cleanly.
+        let cw: StateBuildMode = serde_json::from_str("\"chain_walk\"").unwrap();
+        assert_eq!(cw, StateBuildMode::ChainWalk);
+        let es: StateBuildMode = serde_json::from_str("\"event_scan\"").unwrap();
+        assert_eq!(es, StateBuildMode::EventScan);
     }
 }

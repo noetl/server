@@ -1749,6 +1749,20 @@ const ORCH_EVENT_COLS: &str = r#"
                created_at
         FROM noetl.event "#;
 
+/// Same projection as [`ORCH_EVENT_COLS`] plus the `prev_event_id` chain link —
+/// the column the chain-walk state builder (RFC noetl/ai-meta#115 Phase 3) follows
+/// one level at a time.  Only used by [`fetch_chain_node`], which always pins
+/// `WHERE execution_id = $1 AND event_id = $2` (the `(execution_id, event_id)` PK),
+/// so this never drives a `WHERE execution_id`-only scan.
+const ORCH_EVENT_COLS_WITH_PREV: &str = r#"
+        SELECT event_id, execution_id, catalog_id,
+               parent_event_id, parent_execution_id,
+               event_type, node_id, node_name, node_type, status,
+               context, meta, result, worker_id,
+               NULLIF(meta->>'attempt', '')::int AS attempt,
+               created_at, prev_event_id
+        FROM noetl.event "#;
+
 /// Map rows selected via [`ORCH_EVENT_COLS`] into `Event`s.  `attempt` lives in
 /// `meta` JSONB (no dedicated column), sourced via the `NULLIF(...)::int` alias.
 fn parse_event_rows(rows: Vec<sqlx::postgres::PgRow>) -> Vec<crate::db::models::Event> {
@@ -1934,6 +1948,379 @@ async fn rebuild_state(
     }
 }
 
+// ── Chain-walk state builder (RFC noetl/ai-meta#115 Phase 3) ─────────────────
+//
+// Reconstructs `WorkflowState` by following the one-level `prev_event_id` chain
+// (Phase 2) from the in-memory chain head back to the genesis event, instead of
+// the `event_scan` `rebuild_state` path's `WHERE execution_id = $1 …` scans.
+// Each hop is a `(execution_id, event_id)` PK point-lookup (`fetch_chain_node`);
+// the collected events are sorted by `event_id` and fed to the SAME
+// `WorkflowState::from_events`, so the built state is equivalent to the
+// event-scan build (parity by construction).  The whole thing is gated behind
+// `NOETL_STATE_BUILD_MODE=chain_walk` and falls back to event-scan on any
+// completeness doubt (cold head, missing node under materializer lag, a chain
+// that doesn't reach the genesis), so correctness is never sacrificed.
+
+/// One node fetched during a chain walk: the parsed `Event` plus its
+/// `prev_event_id` link (the next hop backward; `None` at the chain root).
+struct ChainNode {
+    event: crate::db::models::Event,
+    prev_event_id: Option<i64>,
+}
+
+/// Fetch a single chain node by its `(execution_id, event_id)` primary key — the
+/// only query shape the walk issues.  This is a **point lookup on the PK**, never
+/// a `WHERE execution_id`-only scan.  Returns `None` when the row isn't present
+/// (e.g. the event was published but not yet materialized under the publish-only
+/// gate, or a dangling link) so the caller can fall back rather than build a
+/// partial state.
+async fn fetch_chain_node(
+    pool: &crate::db::DbPool,
+    execution_id: i64,
+    event_id: i64,
+) -> AppResult<Option<ChainNode>> {
+    use sqlx::Row;
+    let row = sqlx::query(&format!(
+        "{ORCH_EVENT_COLS_WITH_PREV} WHERE execution_id = $1 AND event_id = $2"
+    ))
+    .bind(execution_id)
+    .bind(event_id)
+    .fetch_optional(pool)
+    .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    // Read the link before the row is consumed by `parse_event_rows`.
+    let prev_event_id: Option<i64> = row.try_get("prev_event_id").ok().flatten();
+    let event = parse_event_rows(vec![row])
+        .into_iter()
+        .next()
+        .expect("one row in, one event out");
+    Ok(Some(ChainNode {
+        event,
+        prev_event_id,
+    }))
+}
+
+/// The genesis (first) event type of an execution — the chain root for a
+/// complete chain.  `playbook_started` is emitted first by `execute` (before any
+/// `command.issued`), and the event-scan `rebuild_state` already keys
+/// `routing_meta` off it, so its presence in the collected set means the walk
+/// reached the true start (not just a post-restart tail).
+fn chain_has_genesis(events: &[crate::db::models::Event]) -> bool {
+    events.iter().any(|e| e.event_type == "playbook_started")
+}
+
+/// A successful chain-walk build: the same [`RebuildResult`] the event-scan path
+/// produces, plus the per-trigger drive inputs the caller would otherwise read
+/// off the event-scan window (`trigger_event_type`, `latest_ts`) and the count of
+/// events the walk collected.
+struct ChainWalkBuild {
+    result: RebuildResult,
+    collected: usize,
+    trigger_event_type: String,
+    latest_ts: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Build `WorkflowState` for `execution_id` by walking the `prev_event_id` chain
+/// head→root (RFC #115 Phase 3).  Returns `None` (caller falls back to
+/// event-scan) when the chain can't be trusted to be complete:
+/// - the chain head is unknown (cold cache / restart / handled on another
+///   replica) — `fallback_cold_head`;
+/// - a walked node isn't present yet (materializer lag under the gate, dangling
+///   link) — `fallback_node_missing`;
+/// - the collected chain doesn't contain the genesis `playbook_started`
+///   (restart-spanning tail) — `fallback_non_genesis`;
+/// - the walk collected nothing — `fallback_empty`.
+///
+/// On success the collected events are sorted by `event_id` (the same order the
+/// event-scan path applies them) and handed to the SAME `from_events`, so the
+/// built state matches the event-scan build for the same execution.
+async fn rebuild_state_chain_walk(
+    state: &AppState,
+    pool: &crate::db::DbPool,
+    result_store: &crate::services::result_store::ResultStoreService,
+    execution_id: i64,
+    trigger_event_id: i64,
+    keep_refs: bool,
+) -> AppResult<Option<ChainWalkBuild>> {
+    // Head from the in-memory watermark — no DB read.  Cold slot → fall back.
+    let Some(head) = state.chain_heads.head(execution_id) else {
+        crate::metrics::record_state_build("chain_walk", "fallback_cold_head");
+        debug!(execution_id, "chain walk: cold head, falling back to event scan");
+        return Ok(None);
+    };
+
+    // Walk backward head→root by PK lookup, collecting nodes.  Bounded so a
+    // corrupt cycle can't spin (real chains are at most a few thousand events).
+    const MAX_WALK: usize = 5_000_000;
+    let mut events: Vec<crate::db::models::Event> = Vec::new();
+    let mut cursor = Some(head);
+    let mut guard = 0usize;
+    while let Some(eid) = cursor {
+        guard += 1;
+        if guard > MAX_WALK {
+            warn!(
+                execution_id,
+                head, "chain walk exceeded bound; falling back to event scan"
+            );
+            crate::metrics::record_state_build("chain_walk", "fallback_node_missing");
+            return Ok(None);
+        }
+        let Some(node) = fetch_chain_node(pool, execution_id, eid).await? else {
+            // Not yet present (materializer lag) or a dangling link: can't build
+            // a complete state — fall back this trigger; the next trigger retries
+            // once the node materializes.
+            crate::metrics::record_state_build("chain_walk", "fallback_node_missing");
+            debug!(
+                execution_id,
+                missing_event_id = eid,
+                "chain walk: node not present (lag/dangling), falling back to event scan"
+            );
+            return Ok(None);
+        };
+        cursor = node.prev_event_id;
+        events.push(node.event);
+    }
+
+    if events.is_empty() {
+        crate::metrics::record_state_build("chain_walk", "fallback_empty");
+        return Ok(None);
+    }
+    // Completeness guard: the walk must have reached the genesis event.  Without
+    // it the in-memory head only covered a post-restart tail and the built state
+    // would miss earlier events.
+    if !chain_has_genesis(&events) {
+        crate::metrics::record_state_build("chain_walk", "fallback_non_genesis");
+        debug!(
+            execution_id,
+            collected = events.len(),
+            "chain walk: root is not the genesis (restart-spanning tail), falling back"
+        );
+        return Ok(None);
+    }
+
+    // Apply in the SAME order the event-scan path uses (`event_id ASC`): the walk
+    // collected head→root (descending), so sort ascending → from_events sees the
+    // identical sequence → identical state.
+    events.sort_by_key(|e| e.event_id);
+    crate::metrics::record_state_build_chain_hops(events.len());
+    hydrate_result_references(&mut events, result_store, keep_refs).await;
+
+    let ws = crate::engine::state::WorkflowState::from_events(
+        &events.iter().map(Into::into).collect::<Vec<_>>(),
+    )
+    .ok_or_else(|| AppError::Validation("chain walk: from_events produced no state".to_string()))?;
+    let last_event_id = events.iter().map(|e| e.event_id).max().unwrap_or(head);
+    let routing_meta = events
+        .iter()
+        .find(|e| e.event_type == "playbook_started")
+        .and_then(|e| e.meta.clone());
+    let trigger_event_type = events
+        .iter()
+        .find(|e| e.event_id == trigger_event_id)
+        .map(|e| e.event_type.clone())
+        .unwrap_or_else(|| "command.completed".to_string());
+    let latest_ts = events.iter().map(|e| e.created_at).max();
+
+    crate::metrics::record_state_build("chain_walk", "ok");
+    Ok(Some(ChainWalkBuild {
+        result: RebuildResult {
+            state: ws,
+            last_event_id,
+            snapshot_version: 0,
+            routing_meta,
+        },
+        collected: events.len(),
+        trigger_event_type,
+        latest_ts,
+    }))
+}
+
+/// Run the shadow parity check inside ONE `REPEATABLE READ` transaction so both
+/// the chain walk and the bounded event scan observe a single consistent MVCC
+/// snapshot of `noetl.event` (RFC #115 Phase 3 parity proof).  This removes the
+/// race against concurrent materialization — under the publish-only gate the
+/// chain head runs ahead of the materialized table and worker/server `event_id`s
+/// interleave, so two un-isolated reads can legitimately see different sets even
+/// for an identical execution.  Inside one snapshot the two builds collect the
+/// SAME events; any remaining difference is a real builder bug (logged by
+/// [`parity_check_states`] with the differing state keys).
+///
+/// Falls through (records nothing) when the chain head is cold or a chain node
+/// isn't present in the snapshot — those are the same conditions the live builder
+/// falls back on, not parity failures.
+async fn run_parity_check(
+    state: &AppState,
+    pool: &crate::db::DbPool,
+    result_store: &crate::services::result_store::ResultStoreService,
+    execution_id: i64,
+    keep_refs: bool,
+) -> AppResult<()> {
+    use sqlx::Row;
+    let Some(head) = state.chain_heads.head(execution_id) else {
+        return Ok(());
+    };
+    let mut conn = pool.acquire().await?;
+    sqlx::query("BEGIN ISOLATION LEVEL REPEATABLE READ")
+        .execute(&mut *conn)
+        .await?;
+
+    // (1) Walk the chain head→root on the snapshot, collecting nodes by PK.
+    let mut walk_events: Vec<crate::db::models::Event> = Vec::new();
+    let mut cursor = Some(head);
+    let mut complete = true;
+    while let Some(eid) = cursor {
+        let row = sqlx::query(&format!(
+            "{ORCH_EVENT_COLS_WITH_PREV} WHERE execution_id = $1 AND event_id = $2"
+        ))
+        .bind(execution_id)
+        .bind(eid)
+        .fetch_optional(&mut *conn)
+        .await?;
+        let Some(row) = row else {
+            complete = false;
+            break;
+        };
+        let prev: Option<i64> = row.try_get("prev_event_id").ok().flatten();
+        let ev = parse_event_rows(vec![row]).into_iter().next().expect("one row");
+        cursor = prev;
+        walk_events.push(ev);
+    }
+
+    // (2) Bounded scan of the same snapshot up to the walk's head.
+    let max_id = walk_events.iter().map(|e| e.event_id).max();
+    let scan_rows = if let Some(max_id) = max_id {
+        sqlx::query(&format!(
+            "{ORCH_EVENT_COLS} WHERE execution_id = $1 AND event_id <= $2 ORDER BY event_id ASC"
+        ))
+        .bind(execution_id)
+        .bind(max_id)
+        .fetch_all(&mut *conn)
+        .await?
+    } else {
+        Vec::new()
+    };
+    // Read-only — end the snapshot.
+    let _ = sqlx::query("COMMIT").execute(&mut *conn).await;
+    drop(conn);
+
+    // Skip non-parity cases: cold/missing chain or no genesis (the live builder
+    // would fall back here too).
+    if !complete || walk_events.is_empty() || !chain_has_genesis(&walk_events) {
+        return Ok(());
+    }
+    let mut scan_events = parse_event_rows(scan_rows);
+    if scan_events.is_empty() {
+        return Ok(());
+    }
+
+    // Build both states off the consistent snapshot, applying in event_id order.
+    walk_events.sort_by_key(|e| e.event_id);
+    hydrate_result_references(&mut walk_events, result_store, keep_refs).await;
+    hydrate_result_references(&mut scan_events, result_store, keep_refs).await;
+    let cw = crate::engine::state::WorkflowState::from_events(
+        &walk_events.iter().map(Into::into).collect::<Vec<_>>(),
+    );
+    let es = crate::engine::state::WorkflowState::from_events(
+        &scan_events.iter().map(Into::into).collect::<Vec<_>>(),
+    );
+    if let (Some(es), Some(cw)) = (es, cw) {
+        parity_check_states(execution_id, &es, &cw);
+    }
+    Ok(())
+}
+
+/// Wall-clock fields on `WorkflowState` / `StepInfo` that are populated from the
+/// event's `created_at` — which `parse_event_rows` resolves to `Utc::now()`
+/// whenever the column can't be decoded (the deployed `noetl.event.created_at` is
+/// `timestamp without time zone`, which doesn't decode into `DateTime<Utc>`).  So
+/// these timestamps **vary across every reconstruction** in BOTH build paths
+/// (`orchestrate-core/src/state.rs` documents this: "the `Utc::now()` loader
+/// fallback … varies across reconstructions").  They are not part of the logical
+/// state that drives decisions, so the parity comparison excludes them — what's
+/// being proven is that the chain-walk and event-scan builds produce the same
+/// *decision-relevant* state, not the same build-time clock reads.
+const NONDETERMINISTIC_STATE_KEYS: &[&str] = &["started_at", "completed_at", "entered_at"];
+
+/// Canonicalize a JSON value for order-insensitive structural comparison: drop
+/// the non-deterministic wall-clock keys ([`NONDETERMINISTIC_STATE_KEYS`]),
+/// recurse into objects, and **sort every array** by its element's canonical
+/// string form.  `WorkflowState` carries `HashSet` fields (`cursor_completed`,
+/// `iteration_command_ids`) that serialize to JSON arrays in arbitrary order, so
+/// a raw `serde_json::Value` array comparison would flag two logically-identical
+/// states as different.  Sorting is sound for this parity check: both builds
+/// apply events in the same `event_id` order, so any genuinely-ordered array is
+/// already element-equal between them (sorting is a no-op); only the set-backed
+/// arrays need reordering.  A real difference (different elements / lengths /
+/// keys) still survives the sort.
+fn canonicalize_state_json(v: &serde_json::Value) -> serde_json::Value {
+    match v {
+        serde_json::Value::Array(a) => {
+            let mut items: Vec<serde_json::Value> = a.iter().map(canonicalize_state_json).collect();
+            items.sort_by_key(|v| v.to_string());
+            serde_json::Value::Array(items)
+        }
+        serde_json::Value::Object(o) => serde_json::Value::Object(
+            o.iter()
+                .filter(|(k, _)| !NONDETERMINISTIC_STATE_KEYS.contains(&k.as_str()))
+                .map(|(k, val)| (k.clone(), canonicalize_state_json(val)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+/// Shadow parity check (RFC #115 Phase 3): compare an event-scan-built state with
+/// a chain-walk-built state for the same execution.  Equality is **structural**
+/// via canonicalized `serde_json::Value` (order-insensitive for the state's maps
+/// AND its `HashSet`-backed arrays).  Records
+/// `noetl_state_build_parity_total{match|mismatch}` and, on mismatch, logs a WARN
+/// naming the differing top-level state keys (with `execution_id`).
+/// Observation-only — the drive uses the configured `state_build_mode` result, so
+/// a parity bug can never change drive behavior.
+fn parity_check_states(
+    execution_id: i64,
+    event_scan: &crate::engine::state::WorkflowState,
+    chain_walk: &crate::engine::state::WorkflowState,
+) {
+    let a = serde_json::to_value(event_scan).map(|v| canonicalize_state_json(&v));
+    let b = serde_json::to_value(chain_walk).map(|v| canonicalize_state_json(&v));
+    match (a, b) {
+        (Ok(a), Ok(b)) if a == b => {
+            crate::metrics::record_state_build_parity("match");
+            debug!(execution_id, "state-build parity OK (chain-walk == event-scan)");
+        }
+        (Ok(a), Ok(b)) => {
+            crate::metrics::record_state_build_parity("mismatch");
+            // Name the differing top-level keys so a mismatch is actionable.
+            let diff_keys: Vec<String> = match (&a, &b) {
+                (serde_json::Value::Object(ma), serde_json::Value::Object(mb)) => {
+                    let mut keys: Vec<String> = ma
+                        .keys()
+                        .chain(mb.keys())
+                        .filter(|k| ma.get(*k) != mb.get(*k))
+                        .cloned()
+                        .collect();
+                    keys.sort();
+                    keys.dedup();
+                    keys
+                }
+                _ => vec!["<root>".to_string()],
+            };
+            warn!(
+                execution_id,
+                diff_keys = %diff_keys.join(","),
+                "state-build parity MISMATCH: chain-walk state != event-scan state"
+            );
+        }
+        _ => {
+            crate::metrics::record_state_build_parity("mismatch");
+            warn!(execution_id, "state-build parity: a state failed to serialize");
+        }
+    }
+}
+
 /// Outcome of advancing one execution's projection snapshot.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SnapshotAdvance {
@@ -2079,6 +2466,92 @@ async fn trigger_orchestrator_inner(
     let cache_slot = state.orch_cache.entry(execution_id);
     let mut cache = cache_slot.lock().await;
 
+    // State-construction outputs shared by both build modes (event-scan and
+    // chain-walk).  Hoisted so the chain-walk branch and the event-scan block
+    // below assign the same locals the downstream drive reads.
+    let mut total: Option<i64> = None;
+    let mut did_rebuild = false;
+    let mut straggler_applied = false;
+    let mut new_events: Vec<crate::db::models::Event> = Vec::new();
+    let mut trigger_event_type = String::new();
+    let mut latest_ts: Option<chrono::DateTime<chrono::Utc>> = None;
+
+    // RFC noetl/ai-meta#115 Phase 3 — chain-walk state build (flagged).  When
+    // `NOETL_STATE_BUILD_MODE=chain_walk`, rebuild `WorkflowState` for this
+    // trigger by walking the `prev_event_id` chain head→root (PK lookups, no
+    // `noetl.event` scan) and skip the event-scan block entirely.  Any
+    // completeness doubt (cold head, missing node under materializer lag, a chain
+    // that doesn't reach the genesis) falls back to event-scan for this trigger —
+    // so correctness is never sacrificed.  The drive logic downstream is
+    // identical; only HOW `cache.state` is built changes.
+    let mut chain_built = false;
+    if matches!(
+        state.config.state_build_mode,
+        crate::config::StateBuildMode::ChainWalk
+    ) {
+        if let Some(cw) = rebuild_state_chain_walk(
+            state,
+            pool,
+            &result_store,
+            execution_id,
+            trigger_event_id,
+            state.config.refs_in_state,
+        )
+        .await?
+        {
+            cache.state = Some(cw.result.state);
+            cache.last_event_id = cw.result.last_event_id;
+            cache.applied_count = cw.collected as i64;
+            cache.snapshot_version = cw.result.snapshot_version;
+            cache.routing_meta = cw.result.routing_meta;
+            cache.last_count_check = Some(std::time::Instant::now());
+            // The full chain rebuild always reflects the latest state, so treat
+            // every chain-walk build like a rebuild: the drive evaluates this
+            // trigger (the drive is idempotent against the current state, gated by
+            // the `orchestrate_in_flight` flag + cursor id-sets).
+            did_rebuild = true;
+            trigger_event_type = cw.trigger_event_type;
+            latest_ts = cw.latest_ts;
+            // total stays None → the projection-snapshot persistence gate below
+            // (`total == Some(applied_count)`) is skipped; chain-walk doesn't
+            // depend on or maintain `projection_snapshot`.
+            chain_built = true;
+        }
+        // else: fell back (metric recorded inside the builder) → run event-scan.
+    }
+
+    // Parity proof (RFC #115 Phase 3): when `NOETL_STATE_BUILD_PARITY_CHECK` is
+    // on, shadow-build the state BOTH ways from ONE consistent DB snapshot and
+    // assert they match — observation only (the drive keeps using whichever mode
+    // built `cache.state`).  Reading both representations inside a single
+    // `REPEATABLE READ` transaction removes the race against concurrent
+    // materialization (and the cross-machine `event_id` interleave), so a
+    // mismatch is a real builder bug, not a timing artifact.  Validation switch;
+    // off in prod.
+    if state.config.state_build_parity_check {
+        if let Err(e) = run_parity_check(
+            state,
+            pool,
+            &result_store,
+            execution_id,
+            state.config.refs_in_state,
+        )
+        .await
+        {
+            debug!(execution_id, %e, "parity check skipped (read error)");
+        }
+    }
+
+    if !chain_built {
+        // Event-scan path: this trigger uses the `noetl.event`-scanning state
+        // construction block.  RFC #115 tenet 3 no-scan proof — with chain_walk
+        // on and no fallback, this counter's delta over a run stays 0.
+        crate::metrics::record_state_build_event_scan();
+    }
+
+    // ===== event-scan state construction (skipped when the chain walk built) ===
+    if !chain_built {
+
     // The consistency `COUNT(*)` over this execution's event partition is
     // O(events) — ≈27ms at 60k events — and only detects a *non-triggering*
     // straggler (an event type that doesn't fire the orchestrator, inserted
@@ -2094,7 +2567,7 @@ async fn trigger_orchestrator_inner(
         || cache
             .last_count_check
             .is_none_or(|t| now.duration_since(t) >= COUNT_THROTTLE);
-    let total: Option<i64> = if do_count {
+    total = if do_count {
         cache.last_count_check = Some(now);
         Some(
             sqlx::query_scalar("SELECT COUNT(*) FROM noetl.event WHERE execution_id = $1")
@@ -2108,7 +2581,7 @@ async fn trigger_orchestrator_inner(
 
     // Warm a cold cache from the latest snapshot + events-since (bounded), or
     // the full (still-small) early log when no snapshot exists yet.
-    let mut did_rebuild = false;
+    did_rebuild = false;
     if cache.state.is_none() {
         let r = rebuild_state(pool, &result_store, execution_id, state.config.refs_in_state).await?;
         cache.state = Some(r.state);
@@ -2126,7 +2599,7 @@ async fn trigger_orchestrator_inner(
     // catches the cursor-relevant stragglers (body completions) with no COUNT
     // and no rebuild.  Idempotent: cursor counters are gated by the
     // `cursor_issued`/`cursor_completed` id-sets.
-    let mut straggler_applied = false;
+    straggler_applied = false;
     if !did_rebuild && trigger_event_id <= cache.last_event_id {
         let mut strag = parse_event_rows(
             sqlx::query(&format!(
@@ -2154,7 +2627,7 @@ async fn trigger_orchestrator_inner(
     }
 
     // Events newer than what's applied.
-    let mut new_events: Vec<crate::db::models::Event> = parse_event_rows(
+    new_events = parse_event_rows(
         sqlx::query(&format!(
             "{ORCH_EVENT_COLS} WHERE execution_id = $1 AND event_id > $2 ORDER BY event_id ASC"
         ))
@@ -2168,12 +2641,12 @@ async fn trigger_orchestrator_inner(
     // Trigger type + drain timestamp.  The trigger event is normally among the
     // new events; after a cold rebuild / straggler apply that already folded it
     // in, fall back to a default type (and a None drain timestamp).
-    let trigger_event_type = new_events
+    trigger_event_type = new_events
         .iter()
         .find(|e| e.event_id == trigger_event_id)
         .map(|e| e.event_type.clone())
         .unwrap_or_else(|| "command.completed".to_string());
-    let latest_ts = new_events.last().map(|e| e.created_at);
+    latest_ts = new_events.last().map(|e| e.created_at);
 
     // Consistency.  With a fresh `total`, applying the new events should account
     // for ALL events; a shortfall means a straggler is below the watermark — and
@@ -2204,6 +2677,8 @@ async fn trigger_orchestrator_inner(
             .map(|e| e.event_id)
             .unwrap_or(cache.last_event_id);
     }
+
+    } // end event-scan state construction (`if !chain_built`)
 
     // Terminal-state guard (noetl/ai-meta#113 facet 2).  A cancel
     // (`playbook_cancelled`) — or any terminal event — transitions the cached
@@ -2825,6 +3300,108 @@ async fn emit_playbook_failed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── RFC #115 Phase 3 — chain-walk state builder ──────────────────────────
+
+    /// Minimal `Event` for the chain-walk ordering tests.
+    fn ev(event_id: i64, prev: Option<i64>, event_type: &str) -> crate::db::models::Event {
+        // `prev` mirrors the chain link a real walk follows; the builder doesn't
+        // store it on `Event` (it's read off the row in `fetch_chain_node`), so
+        // it's only used here to reconstruct the walk order.
+        let _ = prev;
+        crate::db::models::Event {
+            id: event_id,
+            execution_id: 42,
+            catalog_id: 7,
+            event_id,
+            parent_event_id: None,
+            parent_execution_id: None,
+            event_type: event_type.to_string(),
+            node_id: None,
+            node_name: Some("start".to_string()),
+            node_type: None,
+            status: "ok".to_string(),
+            context: None,
+            meta: None,
+            result: None,
+            worker_id: None,
+            attempt: None,
+            created_at: chrono::DateTime::from_timestamp(event_id, 0).unwrap(),
+        }
+    }
+
+    #[test]
+    fn chain_has_genesis_detects_playbook_started() {
+        let with = vec![ev(1, None, "playbook_started"), ev(2, Some(1), "command.issued")];
+        assert!(chain_has_genesis(&with));
+        // A restart-spanning tail (no genesis) must be rejected so the builder
+        // falls back to event-scan rather than building a partial state.
+        let tail = vec![ev(5, None, "command.completed"), ev(6, Some(5), "command.issued")];
+        assert!(!chain_has_genesis(&tail));
+    }
+
+    #[test]
+    fn canonicalize_strips_timestamps_and_sorts_arrays() {
+        // Two logically-identical states that differ only in (a) the order of a
+        // HashSet-backed array and (b) the non-deterministic wall-clock fields
+        // must canonicalize equal — that's what makes the parity check robust to
+        // serialization order + the `Utc::now()` created_at fallback.
+        let a = serde_json::json!({
+            "state": "InProgress",
+            "started_at": "2026-06-19T22:56:40Z",
+            "steps": { "s1": { "status": "done", "completed_at": "2026-06-19T22:56:41Z",
+                               "cursor_completed": ["b", "a", "c"] } }
+        });
+        let b = serde_json::json!({
+            "state": "InProgress",
+            "started_at": "2026-06-19T23:03:43Z",   // different clock read
+            "steps": { "s1": { "status": "done", "completed_at": "2026-06-19T23:03:44Z",
+                               "cursor_completed": ["c", "b", "a"] } } // different set order
+        });
+        assert_eq!(
+            canonicalize_state_json(&a),
+            canonicalize_state_json(&b),
+            "states differing only in set order + wall-clock fields must canonicalize equal"
+        );
+        // A real logical difference still survives canonicalization.
+        let c = serde_json::json!({ "state": "Completed", "steps": {} });
+        assert_ne!(canonicalize_state_json(&a), canonicalize_state_json(&c));
+    }
+
+    #[test]
+    fn chain_walk_collection_matches_event_scan_order() {
+        // Parity by construction: the event-scan path loads events `ORDER BY
+        // event_id ASC`; the chain walk collects them head→root (descending) then
+        // sorts by `event_id` ASC.  Both must hand `from_events` the identical
+        // sequence → identical state.  Here we simulate both orderings and assert
+        // the sorted sequences are equal (the builder calls the SAME from_events).
+        let scan_order = [
+            ev(10, None, "playbook_started"),
+            ev(20, Some(10), "command.issued"),
+            ev(30, Some(20), "command.completed"),
+            ev(40, Some(30), "command.issued"),
+        ];
+        // The walk collects head(40)→root(10): reverse of scan order.
+        let mut walk_collected: Vec<_> = scan_order.iter().rev().cloned().collect();
+        walk_collected.sort_by_key(|e| e.event_id);
+        let scan_ids: Vec<i64> = scan_order.iter().map(|e| e.event_id).collect();
+        let walk_ids: Vec<i64> = walk_collected.iter().map(|e| e.event_id).collect();
+        assert_eq!(
+            scan_ids, walk_ids,
+            "chain-walk sorted order must equal event-scan ORDER BY event_id ASC"
+        );
+
+        // And the states `from_events` produces from each ordering are identical.
+        let scan_state =
+            crate::engine::state::WorkflowState::from_events(&scan_order.iter().map(Into::into).collect::<Vec<_>>());
+        let walk_state =
+            crate::engine::state::WorkflowState::from_events(&walk_collected.iter().map(Into::into).collect::<Vec<_>>());
+        assert_eq!(
+            serde_json::to_value(&scan_state).unwrap(),
+            serde_json::to_value(&walk_state).unwrap(),
+            "chain-walk state must equal event-scan state (parity by construction)"
+        );
+    }
 
     #[test]
     fn with_ref_accessors_injects_locator_keys() {
