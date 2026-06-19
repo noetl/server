@@ -2458,6 +2458,60 @@ async fn apply_worker_orchestration(
         return Ok(0);
     };
 
+    // Cold cache on apply (noetl/ai-meta#104 — off-server-drive × gate
+    // crash-recovery).  The orch_cache only evicts on terminal, so a cold slot
+    // here means the server restarted between dispatching this `__orchestrate__`
+    // command and receiving its `call.done` (the off-server round-trip — NATS →
+    // worker → drive → call.done — widens that window vs the in-process drive).
+    // Dropping the result would strand the execution: no next command is issued,
+    // no further real event fires a trigger, and the reconcile poller only
+    // re-drives executions still in `active_executions()` (empty after restart).
+    // Instead rebuild `WorkflowState` from the durable log — under PUBLISH_ONLY
+    // that log is the materializer's projection of the NATS WAL, the same source
+    // the warm trigger reads — so the drive result applies onto consistent
+    // committed state.  Idempotent: `apply_orchestration_result` issues commands
+    // keyed by deterministic `command_id`, and the cursor counters are gated by
+    // the `cursor_issued`/`cursor_completed` id-sets, so a re-applied result is a
+    // forward no-op rather than a double-issue.
+    if cache.state.is_none() {
+        let pool = state.pools.pool_for(execution_id);
+        let result_store = crate::services::result_store::ResultStoreService::new(
+            pool.clone(),
+            state.snowflake.clone(),
+        );
+        match rebuild_state(pool, &result_store, execution_id, state.config.refs_in_state).await {
+            Ok(r) => {
+                let total: i64 =
+                    sqlx::query_scalar("SELECT COUNT(*) FROM noetl.event WHERE execution_id = $1")
+                        .bind(execution_id)
+                        .fetch_one(pool)
+                        .await
+                        .unwrap_or(0);
+                cache.last_event_id = r.last_event_id;
+                cache.applied_count = total;
+                cache.snapshot_version = r.snapshot_version;
+                cache.routing_meta = r.routing_meta;
+                cache.state = Some(r.state);
+                crate::metrics::record_orchestrate_drive("cold_rebuild");
+                info!(
+                    execution_id,
+                    "worker-driven: cold cache on apply — rebuilt WorkflowState from the durable \
+                     log before applying (crash-recovery, noetl/ai-meta#104)"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    execution_id,
+                    error = %e,
+                    "worker-driven: cold cache on apply and rebuild failed; cannot apply \
+                     orchestrate result this pass (reconcile will retry)"
+                );
+                crate::metrics::record_orchestrate_drive("cold_rebuild_failed");
+                return Ok(0);
+            }
+        }
+    }
+
     let catalog_id = cache.state.as_ref().map(|s| s.catalog_id).unwrap_or(0);
     if catalog_id == 0 {
         warn!(
