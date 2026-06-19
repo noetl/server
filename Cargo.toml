@@ -1,6 +1,6 @@
 [package]
 name = "noetl-server"
-version = "3.29.3"
+version = "3.29.4"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/noetl/noetl"

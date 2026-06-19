@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.29.4](https://github.com/noetl/server/compare/v3.29.3...v3.29.4) (2026-06-19)
+
+### Bug Fixes
+
+* **orchestrate:** recover offloaded drive result + stop drive on cancel ([#113](https://github.com/noetl/server/issues/113)) ([#241](https://github.com/noetl/server/issues/241)) ([215c9a7](https://github.com/noetl/server/commit/215c9a731f32acce9bfee031bf9bd04215cfcbac)), closes [pre-#108](https://github.com/noetl/pre-/issues/108)
+
 ## [3.29.3](https://github.com/noetl/server/compare/v3.29.2...v3.29.3) (2026-06-19)
 
 ### Bug Fixes
