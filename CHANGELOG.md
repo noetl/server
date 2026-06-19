@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.30.0](https://github.com/noetl/server/compare/v3.29.5...v3.30.0) (2026-06-19)
+
+### Features
+
+* **events:** surface _ref/_store on kept refs + default refs_in_state true ([#243](https://github.com/noetl/server/issues/243)) ([dcd1eb1](https://github.com/noetl/server/commit/dcd1eb1ce2d2b564f826b469bb2913d5daaf936f)), closes [noetl/ai-meta#115](https://github.com/noetl/ai-meta/issues/115) [#101](https://github.com/noetl/server/issues/101) [#101](https://github.com/noetl/server/issues/101) [#114](https://github.com/noetl/server/issues/114) [#114](https://github.com/noetl/server/issues/114) [noetl/ai-meta#115](https://github.com/noetl/ai-meta/issues/115) [noetl/ai-meta#101](https://github.com/noetl/ai-meta/issues/101) [noetl/ai-meta#113](https://github.com/noetl/ai-meta/issues/113) [noetl/ai-meta#114](https://github.com/noetl/ai-meta/issues/114)
+
 ## [3.29.5](https://github.com/noetl/server/compare/v3.29.4...v3.29.5) (2026-06-19)
 
 ### Bug Fixes
