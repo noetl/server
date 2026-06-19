@@ -848,6 +848,12 @@ pub(crate) async fn persist_engine_command(
     // ROW below stays a synchronous INSERT — it's the command queue, not the
     // event log (#103 is event-log-scoped), and the worker fetches command
     // config from noetl.command, so it must be present read-your-writes.
+    // The real predecessor event (RFC #115 §4.1) — the chain head before this
+    // command.issued advances it (see persist_engine_commands_batch).
+    let issuing_event = state
+        .chain_heads
+        .head(execution_id)
+        .unwrap_or(parent_event_id);
     let ev = crate::handlers::event_write::EventRow::new(
         event_id,
         execution_id,
@@ -869,6 +875,7 @@ pub(crate) async fn persist_engine_command(
         event_id,
         catalog_id,
         parent_event_id,
+        issuing_event,
         &step.step,
         command.tool.kind.as_str(),
         &cmd_context,
@@ -1025,6 +1032,21 @@ pub(crate) async fn persist_engine_commands_batch(
     // Multi-row `command.issued` EVENTS through the CQRS chokepoint (#103 2d-3):
     // one multi-row INSERT (gate off) or one publish per row (gate on). The
     // noetl.command ROWS below stay synchronous (command queue, not event log).
+    // prev_event_id for the command rows (RFC #115 §4.1) is the **real** event
+    // whose application issued the command — the `step.enter` / unblocking
+    // completion that is the chain head right now, BEFORE the command.issued
+    // batch advances it.  This is exactly the predecessor the watermark stamps
+    // on each command.issued event.  Using it (not `parent_event_id`, which
+    // under the off-server drive is the suppressed `__orchestrate__` trigger)
+    // keeps the command pointer referencing a materialized event.  For a cursor
+    // fan-out the head is the claim/branch event, so every body command points
+    // back at its fan-out origin (§4.4).  Fallback to `parent_event_id` only if
+    // the chain head is somehow unset (no events yet — shouldn't happen after
+    // playbook_started).
+    let issuing_event = state
+        .chain_heads
+        .head(execution_id)
+        .unwrap_or(parent_event_id);
     let event_rows: Vec<crate::handlers::event_write::EventRow> = prepared
         .iter()
         .map(|p| {
@@ -1047,9 +1069,15 @@ pub(crate) async fn persist_engine_commands_batch(
 
     // Multi-row INSERT of all `noetl.command` rows (non-fatal — the event log is
     // the source of truth; mirror the single path's warn-on-failure).
+    // `prev_event_id` (RFC #115 Phase 2, noetl/ai-meta#115 §4.1): the event whose
+    // application issued this command — i.e. the drive trigger (`parent_event_id`).
+    // For a cursor fan-out that trigger is the claim/branch event, so every body
+    // command points back at its fan-out origin (§4.4).  `latest_event_id` keeps
+    // its existing meaning (most-recent lifecycle event); `prev_event_id` is the
+    // immutable issuing link.
     let mut cqb = sqlx::QueryBuilder::new(
         "INSERT INTO noetl.command (command_id, event_id, execution_id, catalog_id, \
-         step_name, tool_kind, status, attempt, context, meta, latest_event_id) ",
+         step_name, tool_kind, status, attempt, context, meta, latest_event_id, prev_event_id) ",
     );
     cqb.push_values(prepared.iter(), |mut b, p| {
         b.push_bind(p.num_command_id)
@@ -1062,7 +1090,8 @@ pub(crate) async fn persist_engine_commands_batch(
             .push_bind(1_i32)
             .push_bind(&p.cmd_context)
             .push_bind(&p.cmd_meta)
-            .push_bind(parent_event_id);
+            .push_bind(parent_event_id)
+            .push_bind(issuing_event);
     });
     if let Err(e) = cqb.build().execute(pool).await {
         tracing::warn!(
@@ -1148,8 +1177,8 @@ pub(crate) async fn dispatch_orchestrate_command(
     let num_command_id = state.snowflake.generate()?;
     sqlx::query(
         "INSERT INTO noetl.command (command_id, event_id, execution_id, catalog_id, \
-         step_name, tool_kind, status, attempt, context, meta, latest_event_id) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+         step_name, tool_kind, status, attempt, context, meta, latest_event_id, prev_event_id) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
     )
     .bind(num_command_id)
     .bind(event_id)
@@ -1161,6 +1190,10 @@ pub(crate) async fn dispatch_orchestrate_command(
     .bind(1_i32)
     .bind(&cmd_context)
     .bind(&cmd_meta)
+    .bind(parent_event_id)
+    // prev_event_id (RFC #115 §4.1): the drive trigger that issued this
+    // meta-command.  The `__orchestrate__` command is suppressed from the event
+    // chain (no command.issued row), but its issuing link is recorded uniformly.
     .bind(parent_event_id)
     .execute(pool)
     .await?;
@@ -1402,6 +1435,7 @@ async fn insert_command_row(
     event_id: i64,
     catalog_id: i64,
     parent_event_id: i64,
+    prev_event_id: i64,
     step_name: &str,
     tool_kind: &str,
     context: &serde_json::Value,
@@ -1421,9 +1455,9 @@ async fn insert_command_row(
         INSERT INTO noetl.command (
             command_id, event_id, execution_id, catalog_id,
             step_name, tool_kind, status, attempt,
-            context, meta, latest_event_id
+            context, meta, latest_event_id, prev_event_id
         ) VALUES (
-            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11
+            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12
         )
         "#,
     )
@@ -1438,6 +1472,10 @@ async fn insert_command_row(
     .bind(context)
     .bind(meta)
     .bind(parent_event_id)
+    // prev_event_id (RFC #115 §4.1): the real predecessor (step.enter /
+    // unblocking completion) that issued this command — the chain head captured
+    // by the caller before the command.issued event advanced it.
+    .bind(prev_event_id)
     .execute(state.pools.pool_for(execution_id))
     .await?;
     Ok(())

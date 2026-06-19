@@ -460,6 +460,12 @@ pub struct EventEnvelope {
     pub execution_id: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_event_id: Option<i64>,
+    /// One-level event-chain link (RFC #115 Phase 2, noetl/ai-meta#115 §4): the
+    /// immediately-previous event in this execution's causal order, stamped by
+    /// the emit chokepoint and published in the stream shape; the materializer
+    /// persists it verbatim.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prev_event_id: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub event_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -535,6 +541,7 @@ pub async fn project_events(pool: &DbPool, events: &[EventEnvelope]) -> AppResul
             execution_id,
             catalog_id,
             parent_event_id,
+            prev_event_id,
             event_type,
             node_id,
             node_name,
@@ -555,6 +562,7 @@ pub async fn project_events(pool: &DbPool, events: &[EventEnvelope]) -> AppResul
             COALESCE(NULLIF(row->>'execution_id', '')::bigint, 0),
             COALESCE(NULLIF(row->>'catalog_id', '')::bigint, 0),
             NULLIF(row->>'parent_event_id', '')::bigint,
+            NULLIF(row->>'prev_event_id', '')::bigint,
             row->>'event_type',
             row->>'node_id',
             row->>'node_name',
@@ -622,6 +630,26 @@ mod tests {
         assert!(none.timestamp.is_none());
         let absent: EventEnvelope = serde_json::from_str(r#"{"event_id":4}"#).unwrap();
         assert!(absent.timestamp.is_none());
+    }
+
+    // RFC #115 §4: the chain link in the published stream shape must
+    // deserialize into the envelope (and survive a re-serialize, since
+    // `project_events` re-encodes the batch before the INSERT … SELECT).
+    #[test]
+    fn envelope_round_trips_prev_event_id() {
+        // Stream shape carries prev_event_id (set on a non-root event).
+        let env: EventEnvelope =
+            serde_json::from_str(r#"{"event_id":12,"prev_event_id":11}"#).unwrap();
+        assert_eq!(env.prev_event_id, Some(11));
+        // Re-serialize (what project_events does) keeps it for the SQL SELECT.
+        let reser = serde_json::to_value(&env).unwrap();
+        assert_eq!(reser["prev_event_id"], 11);
+        // A root event (null / absent) → None, omitted on re-serialize.
+        let root: EventEnvelope =
+            serde_json::from_str(r#"{"event_id":1,"prev_event_id":null}"#).unwrap();
+        assert_eq!(root.prev_event_id, None);
+        let reser_root = serde_json::to_value(&root).unwrap();
+        assert!(reser_root.get("prev_event_id").is_none());
     }
 
     // The full request shape the CQRS materializer POSTs — a batch of envelopes

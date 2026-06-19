@@ -45,6 +45,15 @@ pub struct EventRow {
     pub event_type: String,
     pub status: String,
     pub created_at: DateTime<Utc>,
+    /// One-level event-chain link (RFC #115 Phase 2, noetl/ai-meta#115 §4): the
+    /// immediately-previous event in this execution's causal order.  Normally
+    /// left `None` by the producer site and filled in by [`emit_events`] from
+    /// the per-execution chain head ([`crate::state::ChainHeads`]) so every
+    /// server-emitted row carries a link without each call site threading it.
+    /// A producer that already knows the precise predecessor may set it
+    /// explicitly; [`emit_events`] then respects it.  `None` after stamping
+    /// means this is the execution's root event.
+    pub prev_event_id: Option<i64>,
     pub node_id: Option<String>,
     pub node_name: Option<String>,
     pub node_type: Option<String>,
@@ -74,6 +83,7 @@ impl EventRow {
             event_type: event_type.into(),
             status: status.into(),
             created_at,
+            prev_event_id: None,
             node_id: None,
             node_name: None,
             node_type: None,
@@ -108,6 +118,13 @@ impl EventRow {
     }
     pub fn with_parent_event_id(mut self, id: i64) -> Self {
         self.parent_event_id = Some(id);
+        self
+    }
+    /// Explicitly set the chain link (RFC #115 §4).  Rarely needed — the
+    /// chokepoint fills it from the per-execution head — but available when a
+    /// producer knows the exact predecessor.
+    pub fn with_prev_event_id(mut self, id: Option<i64>) -> Self {
+        self.prev_event_id = id;
         self
     }
     pub fn with_parent_execution_id(mut self, id: Option<i64>) -> Self {
@@ -152,6 +169,7 @@ impl EventRow {
             "node_name": self.node_name,
             "node_type": self.node_type,
             "parent_event_id": self.parent_event_id,
+            "prev_event_id": self.prev_event_id,
             "parent_execution_id": self.parent_execution_id,
             "context": self.context,
             "result": self.result,
@@ -237,6 +255,37 @@ pub async fn emit_events(state: &AppState, pool: &DbPool, rows: &[EventRow]) -> 
         return Ok(());
     }
 
+    // One-level event chain (RFC #115 Phase 2, noetl/ai-meta#115 §4): stamp each
+    // row's `prev_event_id` from the per-execution chain head before it is
+    // written, so the per-execution events form a walkable singly-linked list
+    // (`prev_event_id` → predecessor) without a `noetl.event` scan.  This is the
+    // one server-side chokepoint every server-originated event passes through
+    // (drive events, command.issued, and worker-lifecycle events via
+    // `handle_event`), so stamping here covers the whole chain on both the
+    // gate-off INSERT and gate-on publish paths — the materializer then persists
+    // the link verbatim.  All rows in a batch share one execution (the batch is
+    // built per execution), so a single linkage call covers them in order.
+    let rows: Vec<EventRow> = {
+        let execution_id = rows[0].execution_id;
+        let ids: Vec<i64> = rows.iter().map(|r| r.event_id).collect();
+        let prevs = state.chain_heads.link_batch(execution_id, &ids);
+        rows.iter()
+            .zip(prevs)
+            .map(|(r, prev)| {
+                // Respect an explicit prev a producer already set; otherwise
+                // take the chain-head link.
+                if r.prev_event_id.is_some() {
+                    r.clone()
+                } else {
+                    let mut r = r.clone();
+                    r.prev_event_id = prev;
+                    r
+                }
+            })
+            .collect()
+    };
+    let rows = rows.as_slice();
+
     // All rows in a batch share the same execution + catalog, so one decision
     // covers the batch.
     if should_publish(state, rows[0].catalog_id).await {
@@ -264,7 +313,7 @@ pub async fn emit_events(state: &AppState, pool: &DbPool, rows: &[EventRow]) -> 
 async fn insert_rows(pool: &DbPool, rows: &[EventRow]) -> AppResult<()> {
     let mut qb = sqlx::QueryBuilder::new(
         "INSERT INTO noetl.event (event_id, execution_id, catalog_id, parent_event_id, \
-         parent_execution_id, event_type, node_id, node_name, node_type, status, \
+         prev_event_id, parent_execution_id, event_type, node_id, node_name, node_type, status, \
          context, result, meta, error, worker_id, created_at) ",
     );
     qb.push_values(rows.iter(), |mut b, r| {
@@ -272,6 +321,7 @@ async fn insert_rows(pool: &DbPool, rows: &[EventRow]) -> AppResult<()> {
             .push_bind(r.execution_id)
             .push_bind(r.catalog_id)
             .push_bind(r.parent_event_id)
+            .push_bind(r.prev_event_id)
             .push_bind(r.parent_execution_id)
             .push_bind(&r.event_type)
             .push_bind(&r.node_id)
@@ -341,6 +391,17 @@ mod tests {
         assert!(j["node_type"].is_null());
         assert!(j["parent_event_id"].is_null());
         assert!(j["worker_id"].is_null());
+        // RFC #115 §4: an unset chain link serializes as null (→ NULL / root).
+        assert!(j.get("prev_event_id").is_some(), "must carry prev_event_id key");
+        assert!(j["prev_event_id"].is_null());
+    }
+
+    #[test]
+    fn stream_json_carries_prev_event_id_when_set() {
+        // The chain link must ride the published stream shape so the gate-on
+        // materializer persists it verbatim (RFC #115 §4).
+        let j = sample_row().with_prev_event_id(Some(41)).to_stream_json();
+        assert_eq!(j["prev_event_id"], 41);
     }
 
     #[test]
