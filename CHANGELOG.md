@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.31.0](https://github.com/noetl/server/compare/v3.30.0...v3.31.0) (2026-06-19)
+
+### Features
+
+* **events:** one-level prev_event_id chain links (RFC [#115](https://github.com/noetl/server/issues/115) Phase 2) ([#244](https://github.com/noetl/server/issues/244)) ([29a8d69](https://github.com/noetl/server/commit/29a8d69f77c4fa066270d8729373f9e72aae5da4))
+
 ## [3.30.0](https://github.com/noetl/server/compare/v3.29.5...v3.30.0) (2026-06-19)
 
 ### Features
