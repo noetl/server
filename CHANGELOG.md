@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.33.0](https://github.com/noetl/server/compare/v3.32.0...v3.33.0) (2026-06-20)
+
+### Features
+
+* **config:** NOETL_STATE_BUILDER=offserver|server flag scaffold (RFC [#115](https://github.com/noetl/server/issues/115) Phase 4) ([2ebaac2](https://github.com/noetl/server/commit/2ebaac2741aac02d2cae98d721a55d750a4d0ee0)), closes [noetl/worker#118](https://github.com/noetl/worker/issues/118)
+
 ## [3.32.0](https://github.com/noetl/server/compare/v3.31.0...v3.32.0) (2026-06-19)
 
 ### Features
