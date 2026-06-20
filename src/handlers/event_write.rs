@@ -219,6 +219,24 @@ pub async fn should_publish(state: &AppState, catalog_id: i64) -> bool {
         && !is_system_execution(state, catalog_id).await
 }
 
+/// Is this a terminal execution event?  Both the dotted (`playbook.completed`)
+/// and underscore (`playbook_completed`) spellings exist in the codebase — the
+/// cancel/finalize chokepoint emits the underscore form, the orchestrator emits
+/// the dotted form — so match both.  Mirror of `ExecutionState`'s terminal
+/// detection in `orchestrate-core::state` (`from_str` + `apply_event`).  Used to
+/// stamp the stateless-drive terminal flag at the [`emit_events`] chokepoint.
+fn is_terminal_event_type(event_type: &str) -> bool {
+    matches!(
+        event_type,
+        "playbook.completed"
+            | "playbook_completed"
+            | "playbook.failed"
+            | "playbook_failed"
+            | "playbook.cancelled"
+            | "playbook_cancelled"
+    )
+}
+
 /// Lazily build (once) + return the `noetl_events` publisher.  Returns `None`
 /// only if NATS is absent or the stream can't be ensured — callers then fall
 /// back to the synchronous INSERT.
@@ -267,6 +285,15 @@ pub async fn emit_events(state: &AppState, pool: &DbPool, rows: &[EventRow]) -> 
     // built per execution), so a single linkage call covers them in order.
     let rows: Vec<EventRow> = {
         let execution_id = rows[0].execution_id;
+        // Stateless off-server drive edge (RFC #115 Phase 4 remainder): stamp the
+        // execute-time descriptor's terminal flag when a terminal event passes
+        // through this chokepoint (cancel via `services::execution::cancel`,
+        // finalize, the orchestrator's own `playbook.completed`/`.failed`).  The
+        // stateless drive reads this flag to stop re-dispatching a terminal
+        // execution WITHOUT rebuilding `WorkflowState` to call `is_terminal()`.
+        if rows.iter().any(|r| is_terminal_event_type(&r.event_type)) {
+            state.exec_descriptors.mark_terminal(execution_id);
+        }
         let ids: Vec<i64> = rows.iter().map(|r| r.event_id).collect();
         let prevs = state.chain_heads.link_batch(execution_id, &ids);
         rows.iter()
@@ -356,6 +383,27 @@ mod tests {
         )
         .with_node("step1")
         .with_result(json!({"status": "success"}))
+    }
+
+    #[test]
+    fn terminal_event_types_cover_both_spellings() {
+        // RFC #115 Phase 4 remainder — the stateless drive's terminal flag is
+        // stamped from this predicate.  The cancel/finalize chokepoint emits the
+        // underscore form; the orchestrator emits the dotted form.  Both must be
+        // recognized, and non-terminal types must not stamp.
+        for t in [
+            "playbook.completed",
+            "playbook_completed",
+            "playbook.failed",
+            "playbook_failed",
+            "playbook.cancelled",
+            "playbook_cancelled",
+        ] {
+            assert!(is_terminal_event_type(t), "{t} must be terminal");
+        }
+        for t in ["command.completed", "command.failed", "step.enter", "playbook_started"] {
+            assert!(!is_terminal_event_type(t), "{t} must NOT be terminal");
+        }
     }
 
     #[test]

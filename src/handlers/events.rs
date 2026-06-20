@@ -2420,6 +2420,118 @@ pub fn spawn_orchestrator_reconciler(state: AppState) {
     });
 }
 
+/// Stateless off-server drive dispatch (RFC #115 Phase 4 remainder,
+/// noetl/ai-meta#107 step 2).  Routes a `system/orchestrate` command to the
+/// worker pool WITHOUT the server building `WorkflowState` — the worker
+/// constructs state from the `noetl_events` WAL spine (the wasm `run` /
+/// from_events entry).  The server performs ZERO `noetl.event` reads here:
+///
+/// - `catalog_id` + `routing` come from the execute-time descriptor.
+/// - `expected_head` (the staleness-guard watermark) comes from the in-memory
+///   [`crate::state::ChainHeads`] — the highest event the server has emitted for
+///   this execution — not from a counted/scanned state.
+/// - terminal detection comes from the descriptor's `terminal` flag, stamped at
+///   the emit chokepoint (cancel / finalize / playbook completed|failed).
+/// - the worker resolves `trigger_event_type` off its WAL index from
+///   `trigger_event_id` (no server-side event read to classify the trigger).
+///
+/// No server-built `state` rides the command (the warm path ships none); an
+/// incomplete WAL chain on the worker after its bounded retry is a benign no-op
+/// that the reconcile poller re-drives once the drain catches up — so progress is
+/// guaranteed and no partial state is ever built.  Loading the playbook YAML by
+/// `catalog_id` from `noetl.catalog` is a PK lookup on the cluster catalog table,
+/// NOT a `noetl.event` read.
+async fn dispatch_offserver_stateless_drive(
+    state: &AppState,
+    execution_id: i64,
+    trigger_event_id: i64,
+    desc: &crate::state::ExecDescriptor,
+) -> AppResult<i32> {
+    // Terminal guard — no event read.  A cancel/finalize/completion already
+    // stamped the descriptor; stop re-dispatching and free the in-memory state.
+    if desc.terminal {
+        state.exec_descriptors.evict(execution_id);
+        state.orch_cache.evict(execution_id);
+        state.chain_heads.evict(execution_id);
+        crate::metrics::record_orchestrate_drive("stateless_terminal_skip");
+        debug!(
+            execution_id,
+            "stateless drive: execution terminal (descriptor flag); evicted, no dispatch"
+        );
+        return Ok(0);
+    }
+
+    // Per-execution serialise: reuse the orch_cache slot purely as the in-flight
+    // lock (we never build `cache.state` on this path).  Two near-simultaneous
+    // triggers / the reconcile poller must not double-issue the drive.
+    let cache_slot = state.orch_cache.entry(execution_id);
+    let mut cache = cache_slot.lock().await;
+    if cache.orchestrate_in_flight {
+        crate::metrics::record_orchestrate_drive("skipped_in_flight");
+        debug!(execution_id, "stateless drive: orchestrate already in flight; skip");
+        return Ok(0);
+    }
+
+    let catalog_id = desc.catalog_id;
+    let routing = desc
+        .routing_meta
+        .as_ref()
+        .map(crate::handlers::execute::CommandRouting::from_started_meta)
+        .unwrap_or_default();
+
+    // Dispatch watermark from the in-memory chain head — NO DB read.  The worker
+    // serves the WAL build only once its pool-side index has caught up to this,
+    // so the off-server state is never staler than the server's view.
+    let expected_head = state.chain_heads.head(execution_id).unwrap_or(0);
+
+    // Playbook content — PK lookup on the cluster `noetl.catalog` table (not a
+    // `noetl.event` read).
+    let playbook_yaml: String =
+        sqlx::query_scalar("SELECT content FROM noetl.catalog WHERE catalog_id = $1")
+            .bind(catalog_id)
+            .fetch_one(state.pools.cluster())
+            .await
+            .map_err(|e| {
+                AppError::Internal(format!(
+                    "stateless drive: load playbook for catalog_id {catalog_id}: {e}"
+                ))
+            })?;
+    let playbook = crate::playbook::parser::parse_playbook(&playbook_yaml)?;
+
+    let input = serde_json::json!({
+        "__offserver_build__": true,
+        // No server-built `state` fallback rides the stateless command; the
+        // worker self-sources the spine from the WAL.  The marker tells the
+        // worker that an incomplete chain is a no-op (reconcile re-drives),
+        // not a fall-through to a (now absent) server-built state.
+        "__stateless__": true,
+        "execution_id": execution_id,
+        // The worker resolves `trigger_event_type` off its WAL index from this
+        // id (no server event read to classify the trigger).
+        "trigger_event_id": trigger_event_id,
+        "playbook": &playbook,
+        "expected_head": expected_head,
+    });
+
+    crate::handlers::execute::dispatch_orchestrate_command(
+        state,
+        execution_id,
+        catalog_id,
+        trigger_event_id,
+        input,
+        &playbook,
+        &routing,
+    )
+    .await?;
+    cache.orchestrate_in_flight = true;
+    crate::metrics::record_orchestrate_drive("dispatched_offserver_stateless");
+    debug!(
+        execution_id,
+        expected_head, "stateless drive: dispatched system/orchestrate (no server state build)"
+    );
+    Ok(0)
+}
+
 /// Orchestrator trigger.  `force_count` is set by the background reconcile
 /// poller ([`spawn_orchestrator_reconciler`]): it forces a fresh consistency
 /// `COUNT` (bypassing the throttle) and proceeds to evaluate even when no new
@@ -2439,6 +2551,39 @@ async fn trigger_orchestrator_inner(
         execution_id,
         trigger_event_id, force_count, "trigger_orchestrator: loading events"
     );
+
+    // Stateless off-server drive edge (RFC #115 Phase 4 remainder,
+    // noetl/ai-meta#107 step 2).  Under `NOETL_STATE_BUILDER=offserver` +
+    // worker-driven drive, when we hold a warm execute-time descriptor (catalog_id
+    // + routing seeded at `playbook_started`), route the drive WITHOUT building
+    // `WorkflowState` on the server — state CONSTRUCTION runs on the worker pool
+    // from the WAL spine.  The server reads ZERO `noetl.event` rows on this path:
+    // catalog_id + routing come from the descriptor, the dispatch watermark
+    // (`expected_head`) from the in-memory `ChainHeads`, terminal detection from
+    // the descriptor's emit-stamped flag.  A cold descriptor (server restart) or
+    // the in-process drive falls through to the server-built path below — which
+    // re-seeds the descriptor and ships the built state as the worker's
+    // incomplete-WAL fallback — so correctness never regresses below today.
+    if state.config.orchestrate_plugin_drive
+        && matches!(
+            state.config.state_builder,
+            crate::config::StateBuilder::Offserver
+        )
+    {
+        if let Some(desc) = state.exec_descriptors.get(execution_id) {
+            if desc.catalog_id != 0 {
+                return dispatch_offserver_stateless_drive(
+                    state,
+                    execution_id,
+                    trigger_event_id,
+                    &desc,
+                )
+                .await;
+            }
+        }
+        // Cold/incomplete descriptor → fall through to the server-built path,
+        // which re-seeds the descriptor so subsequent drives go stateless.
+    }
 
     // 1. Incremental state with bounded rebuild (noetl/ai-meta#100, #101 block b).
     //
@@ -2697,6 +2842,7 @@ async fn trigger_orchestrator_inner(
         drop(cache);
         state.orch_cache.evict(execution_id);
         state.chain_heads.evict(execution_id); // RFC #115 §4: drop the chain head too
+        state.exec_descriptors.evict(execution_id); // RFC #115 Phase 4 remainder
         debug!(
             execution_id,
             state = ?st,
@@ -2759,6 +2905,15 @@ async fn trigger_orchestrator_inner(
             "No catalog_id found for execution {execution_id}"
         )));
     }
+
+    // Re-seed the execute-time descriptor from this server-built pass (RFC #115
+    // Phase 4 remainder).  This path runs when the descriptor was cold (a server
+    // restart mid-execution), so seeding catalog_id + the cached routing meta
+    // here lets the NEXT trigger take the stateless branch — the server reads
+    // `noetl.event` only on this recovery pass, then goes scan-free.
+    state
+        .exec_descriptors
+        .seed(execution_id, catalog_id, cache.routing_meta.clone());
 
     // Phase F R4-3: noetl.catalog is a cluster-wide table.
     let playbook_yaml: String =
@@ -2932,6 +3087,7 @@ async fn trigger_orchestrator_inner(
         drop(cache);
         state.orch_cache.evict(execution_id);
         state.chain_heads.evict(execution_id); // RFC #115 §4: drop the chain head too
+        state.exec_descriptors.evict(execution_id); // RFC #115 Phase 4 remainder
     }
 
     Ok(commands_generated)
@@ -3047,6 +3203,23 @@ async fn apply_orchestration_result(
 /// Recursively find the `output_b64` string a wasm plug-in's tool result carries
 /// (the worker base64-wraps the plug-in's output bytes; the exact nesting
 /// depends on the result-envelope shape, so search rather than assume a path).
+/// Find a `true` boolean flag by key anywhere in the value (the worker's
+/// `call.done` result nests its data under tool-result envelopes).  Used to
+/// detect the stateless-drive `__offserver_retry__` no-op marker (RFC #115
+/// Phase 4 remainder).
+fn find_bool_flag(v: &serde_json::Value, key: &str) -> bool {
+    match v {
+        serde_json::Value::Object(m) => {
+            if m.get(key).and_then(|x| x.as_bool()) == Some(true) {
+                return true;
+            }
+            m.values().any(|x| find_bool_flag(x, key))
+        }
+        serde_json::Value::Array(a) => a.iter().any(|x| find_bool_flag(x, key)),
+        _ => false,
+    }
+}
+
 fn find_output_b64(v: &serde_json::Value) -> Option<&str> {
     match v {
         serde_json::Value::Object(m) => {
@@ -3112,6 +3285,21 @@ async fn apply_worker_orchestration(
     let cache_slot = state.orch_cache.entry(execution_id);
     let mut cache = cache_slot.lock().await;
     cache.orchestrate_in_flight = false;
+
+    // Stateless off-server retry (RFC #115 Phase 4 remainder): a stateless drive
+    // whose WAL chain was still incomplete after the worker's bounded retry
+    // returns a benign no-op marker instead of a built result (no server-built
+    // state fallback rides the stateless command).  This is NOT a decode error —
+    // clear in-flight (already done) and let the reconcile poller re-drive once
+    // the pool-side drain catches up.  No state read, no command issued.
+    if find_bool_flag(payload, "__offserver_retry__") {
+        crate::metrics::record_orchestrate_drive("offserver_retry");
+        debug!(
+            execution_id,
+            "stateless drive: worker WAL incomplete; benign no-op, reconcile will re-drive"
+        );
+        return Ok(0);
+    }
 
     // Inline path: the drive result fit the worker's inline budget
     // (`NOETL_EVENT_RESULT_CONTEXT_MAX_BYTES`, default 100KB) and rides the
@@ -3185,73 +3373,114 @@ async fn apply_worker_orchestration(
         return Ok(0);
     };
 
-    // Cold cache on apply (noetl/ai-meta#104 — off-server-drive × gate
-    // crash-recovery).  The orch_cache only evicts on terminal, so a cold slot
-    // here means the server restarted between dispatching this `__orchestrate__`
-    // command and receiving its `call.done` (the off-server round-trip — NATS →
-    // worker → drive → call.done — widens that window vs the in-process drive).
-    // Dropping the result would strand the execution: no next command is issued,
-    // no further real event fires a trigger, and the reconcile poller only
-    // re-drives executions still in `active_executions()` (empty after restart).
-    // Instead rebuild `WorkflowState` from the durable log — under PUBLISH_ONLY
-    // that log is the materializer's projection of the NATS WAL, the same source
-    // the warm trigger reads — so the drive result applies onto consistent
-    // committed state.  Idempotent: `apply_orchestration_result` issues commands
-    // keyed by deterministic `command_id`, and the cursor counters are gated by
-    // the `cursor_issued`/`cursor_completed` id-sets, so a re-applied result is a
-    // forward no-op rather than a double-issue.
-    if cache.state.is_none() {
-        let pool = state.pools.pool_for(execution_id);
-        let result_store = crate::services::result_store::ResultStoreService::new(
-            pool.clone(),
-            state.snowflake.clone(),
-        );
-        match rebuild_state(pool, &result_store, execution_id, state.config.refs_in_state).await {
-            Ok(r) => {
-                let total: i64 =
-                    sqlx::query_scalar("SELECT COUNT(*) FROM noetl.event WHERE execution_id = $1")
-                        .bind(execution_id)
-                        .fetch_one(pool)
-                        .await
-                        .unwrap_or(0);
-                cache.last_event_id = r.last_event_id;
-                cache.applied_count = total;
-                cache.snapshot_version = r.snapshot_version;
-                cache.routing_meta = r.routing_meta;
-                cache.state = Some(r.state);
-                crate::metrics::record_orchestrate_drive("cold_rebuild");
-                info!(
-                    execution_id,
-                    "worker-driven: cold cache on apply — rebuilt WorkflowState from the durable \
-                     log before applying (crash-recovery, noetl/ai-meta#104)"
-                );
+    // Stateless off-server apply (RFC #115 Phase 4 remainder): under
+    // `NOETL_STATE_BUILDER=offserver` with a warm execute-time descriptor, the
+    // worker built + drove the state from the WAL; applying its result needs only
+    // `catalog_id` + `routing` (both from the descriptor) + the playbook —
+    // `apply_orchestration_result` issues `result.commands`, it does not read
+    // `cache.state`.  So skip the cold-rebuild ENTIRELY (no `noetl.event` read on
+    // the apply side of the drive path either).  A cold descriptor falls through
+    // to the crash-recovery rebuild below.
+    let offserver_apply = matches!(
+        state.config.state_builder,
+        crate::config::StateBuilder::Offserver
+    )
+    .then(|| state.exec_descriptors.get(execution_id))
+    .flatten()
+    .filter(|d| d.catalog_id != 0);
+
+    let (catalog_id, routing) = if let Some(desc) = offserver_apply {
+        crate::metrics::record_orchestrate_drive("applied_stateless");
+        (
+            desc.catalog_id,
+            desc.routing_meta
+                .as_ref()
+                .map(crate::handlers::execute::CommandRouting::from_started_meta)
+                .unwrap_or_default(),
+        )
+    } else {
+        // Cold cache on apply (noetl/ai-meta#104 — off-server-drive × gate
+        // crash-recovery).  The orch_cache only evicts on terminal, so a cold slot
+        // here means the server restarted between dispatching this `__orchestrate__`
+        // command and receiving its `call.done` (the off-server round-trip — NATS →
+        // worker → drive → call.done — widens that window vs the in-process drive).
+        // Dropping the result would strand the execution: no next command is issued,
+        // no further real event fires a trigger, and the reconcile poller only
+        // re-drives executions still in `active_executions()` (empty after restart).
+        // Instead rebuild `WorkflowState` from the durable log — under PUBLISH_ONLY
+        // that log is the materializer's projection of the NATS WAL, the same source
+        // the warm trigger reads — so the drive result applies onto consistent
+        // committed state.  Idempotent: `apply_orchestration_result` issues commands
+        // keyed by deterministic `command_id`, and the cursor counters are gated by
+        // the `cursor_issued`/`cursor_completed` id-sets, so a re-applied result is a
+        // forward no-op rather than a double-issue.
+        if cache.state.is_none() {
+            let pool = state.pools.pool_for(execution_id);
+            let result_store = crate::services::result_store::ResultStoreService::new(
+                pool.clone(),
+                state.snowflake.clone(),
+            );
+            match rebuild_state(pool, &result_store, execution_id, state.config.refs_in_state).await
+            {
+                Ok(r) => {
+                    let total: i64 = sqlx::query_scalar(
+                        "SELECT COUNT(*) FROM noetl.event WHERE execution_id = $1",
+                    )
+                    .bind(execution_id)
+                    .fetch_one(pool)
+                    .await
+                    .unwrap_or(0);
+                    cache.last_event_id = r.last_event_id;
+                    cache.applied_count = total;
+                    cache.snapshot_version = r.snapshot_version;
+                    cache.routing_meta = r.routing_meta;
+                    cache.state = Some(r.state);
+                    crate::metrics::record_orchestrate_drive("cold_rebuild");
+                    info!(
+                        execution_id,
+                        "worker-driven: cold cache on apply — rebuilt WorkflowState from the durable \
+                         log before applying (crash-recovery, noetl/ai-meta#104)"
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        execution_id,
+                        error = %e,
+                        "worker-driven: cold cache on apply and rebuild failed; cannot apply \
+                         orchestrate result this pass (reconcile will retry)"
+                    );
+                    crate::metrics::record_orchestrate_drive("cold_rebuild_failed");
+                    return Ok(0);
+                }
             }
-            Err(e) => {
-                warn!(
-                    execution_id,
-                    error = %e,
-                    "worker-driven: cold cache on apply and rebuild failed; cannot apply \
-                     orchestrate result this pass (reconcile will retry)"
-                );
-                crate::metrics::record_orchestrate_drive("cold_rebuild_failed");
-                return Ok(0);
+            // A cold descriptor under offserver → re-seed from this recovery
+            // rebuild so the next trigger goes stateless again.
+            if matches!(
+                state.config.state_builder,
+                crate::config::StateBuilder::Offserver
+            ) {
+                let cid = cache.state.as_ref().map(|s| s.catalog_id).unwrap_or(0);
+                state
+                    .exec_descriptors
+                    .seed(execution_id, cid, cache.routing_meta.clone());
             }
         }
-    }
 
-    let catalog_id = cache.state.as_ref().map(|s| s.catalog_id).unwrap_or(0);
-    if catalog_id == 0 {
-        warn!(
-            execution_id,
-            "worker-driven: cold cache (no catalog_id); cannot apply orchestrate result this pass"
-        );
-        return Ok(0);
-    }
-    let routing = cache
-        .routing_meta
-        .as_ref()
-        .map(crate::handlers::execute::CommandRouting::from_started_meta)
-        .unwrap_or_default();
+        let catalog_id = cache.state.as_ref().map(|s| s.catalog_id).unwrap_or(0);
+        if catalog_id == 0 {
+            warn!(
+                execution_id,
+                "worker-driven: cold cache (no catalog_id); cannot apply orchestrate result this pass"
+            );
+            return Ok(0);
+        }
+        let routing = cache
+            .routing_meta
+            .as_ref()
+            .map(crate::handlers::execute::CommandRouting::from_started_meta)
+            .unwrap_or_default();
+        (catalog_id, routing)
+    };
 
     // Phase F R4-3: noetl.catalog is a cluster-wide table.
     let playbook_yaml: String =
@@ -3276,10 +3505,17 @@ async fn apply_worker_orchestration(
     .await?;
     crate::metrics::record_orchestrate_drive("applied");
 
-    if result.should_complete {
+    // Evict on a terminal outcome.  `should_complete` covers the normal
+    // completion path (the drive emits the terminal event).  `result.state` being
+    // terminal also covers a drive that ran on already-terminal worker-built
+    // state (RFC #115 Phase 4 remainder: a straggler that triggered a drive after
+    // a cancel — the worker's WAL-built state is `Cancelled`, evaluate returns a
+    // no-op with `state: Cancelled`) so the slot is freed and not re-driven.
+    if result.should_complete || result.state.is_terminal() {
         drop(cache);
         state.orch_cache.evict(execution_id);
         state.chain_heads.evict(execution_id); // RFC #115 §4: drop the chain head too
+        state.exec_descriptors.evict(execution_id); // RFC #115 Phase 4 remainder
     }
     Ok(commands_generated)
 }

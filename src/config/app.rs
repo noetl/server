@@ -237,14 +237,16 @@ pub struct AppConfig {
     ///   builder (which walks the `prev_event_id` chain from the `noetl_events`
     ///   **WAL** stream and caches the built spine keyed by the immutable chain
     ///   head — `noetl-worker`'s `state_builder`), so the server stops building
-    ///   state on the hot path.  The server chain-walk + event-scan stay as the
-    ///   fallbacks.
+    ///   state on the hot path.  Phase 4 remainder (noetl/ai-meta#107 step 2):
+    ///   the server edge is now **stateless** on the drive path — with a warm
+    ///   execute-time descriptor (catalog_id + routing seeded at
+    ///   `playbook_started`, terminal stamped at the emit chokepoint, the
+    ///   dispatch watermark read from the in-memory `ChainHeads`) the drive
+    ///   routes the command performing ZERO `noetl.event` reads + ZERO state
+    ///   rebuild; the worker self-sources the spine.  The server chain-walk +
+    ///   event-scan stay as the fallbacks (cold descriptor after a restart).
     ///
-    /// **Default `server`** — prod/default behavior is unchanged.  The
-    /// `offserver` drive-cutover wiring is staged behind this flag (the
-    /// pool-side builder + its WAL shadow loop land first — `noetl-worker`
-    /// `state_builder` + `NOETL_STATE_BUILDER_SHADOW`); flipping this to
-    /// `offserver` before that wiring lands is a no-op on the build path.
+    /// **Default `server`** — prod/default behavior is unchanged.
     #[serde(default)]
     pub state_builder: StateBuilder,
 }

@@ -611,6 +611,17 @@ async fn emit_playbook_started_event(
         }
     }
 
+    // Stateless off-server drive edge (RFC #115 Phase 4 remainder,
+    // noetl/ai-meta#107 step 2): seed the execute-time descriptor with the two
+    // execution-scoped, immutable facts the drive dispatch needs — catalog_id +
+    // the routing meta — so under `NOETL_STATE_BUILDER=offserver` the drive can
+    // route the orchestrate command WITHOUT rebuilding `WorkflowState` (ZERO
+    // `noetl.event` reads on the drive path).  Seeded here, the first place both
+    // are known; read in `events::trigger_orchestrator_inner`'s stateless branch.
+    state
+        .exec_descriptors
+        .seed(execution_id, catalog_id, Some(meta.clone()));
+
     // CQRS write-path chokepoint (#103 2d-3): INSERT (gate off) or publish (on).
     let ev = crate::handlers::event_write::EventRow::new(
         event_id,

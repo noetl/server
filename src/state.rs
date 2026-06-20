@@ -97,6 +97,19 @@ pub struct AppState {
     /// walkable singly-linked list.  See [`ChainHeads`].
     pub chain_heads: Arc<ChainHeads>,
 
+    /// Execute-time descriptors for the stateless off-server drive edge (RFC
+    /// #115 Phase 4 remainder, noetl/ai-meta#107 step 2).  Carries the
+    /// execution-scoped, immutable facts the drive dispatch needs —
+    /// `catalog_id` + `routing_meta` — seeded once when the execution starts, so
+    /// under `NOETL_STATE_BUILDER=offserver` the drive routes the command
+    /// WITHOUT rebuilding `WorkflowState` (ZERO `noetl.event` reads on the drive
+    /// path; state CONSTRUCTION runs on the worker pool from the WAL).  Plus a
+    /// `terminal` flag stamped by the [`crate::handlers::event_write::emit_events`]
+    /// chokepoint when a terminal event (cancel / finalize / playbook
+    /// completed|failed) is written, so the drive stops re-dispatching a terminal
+    /// execution without reading state.  See [`ExecDescriptors`].
+    pub exec_descriptors: Arc<ExecDescriptors>,
+
     /// CQRS write-path publisher (noetl/ai-meta#103 phase 2d-3).  Lazily built
     /// on first use from [`Self::nats`] so the `emit_event` chokepoint can
     /// publish to the `noetl_events` stream when
@@ -197,6 +210,72 @@ impl ChainHeads {
     /// Current head for an execution, if any.  Test/diagnostic helper.
     pub fn head(&self, execution_id: i64) -> Option<i64> {
         self.map.lock().unwrap().get(&execution_id).copied()
+    }
+}
+
+/// Execute-time descriptor for the stateless off-server drive edge (RFC #115
+/// Phase 4 remainder).  See the [`AppState::exec_descriptors`] field doc.
+#[derive(Clone, Debug, Default)]
+pub struct ExecDescriptor {
+    /// The execution's catalog id (immutable for the run).  Sourced from the
+    /// `playbook_started` event at execute-time instead of from a rebuilt
+    /// `WorkflowState`, so the drive needn't scan `noetl.event` for it.
+    pub catalog_id: i64,
+    /// The `playbook_started` event's `meta` (pool segment + W3C trace) — the
+    /// same shape [`crate::handlers::execute::CommandRouting::from_started_meta`]
+    /// reads, cached so follow-up command dispatch needn't reload the first
+    /// event.
+    pub routing_meta: Option<serde_json::Value>,
+    /// Set once a terminal event (cancel / finalize / playbook completed|failed)
+    /// is emitted for this execution.  The stateless drive checks this first and
+    /// stops re-dispatching a terminal execution — replacing the
+    /// `WorkflowState::is_terminal()` guard that needed a rebuilt state.
+    pub terminal: bool,
+}
+
+/// Per-execution execute-time descriptor cache for the stateless off-server
+/// drive edge (RFC #115 Phase 4 remainder, noetl/ai-meta#107 step 2).  In-memory
+/// only and no DB read on the hot path: seeded at execute, read by the drive,
+/// terminal-stamped at the emit chokepoint.  A cold slot (e.g. a server restart
+/// mid-execution) yields `None`, and the drive falls back to the server-built
+/// state path for that trigger — which re-seeds the descriptor — so correctness
+/// never regresses below the server-built drive.
+#[derive(Default)]
+pub struct ExecDescriptors {
+    map: std::sync::Mutex<std::collections::HashMap<i64, ExecDescriptor>>,
+}
+
+impl ExecDescriptors {
+    /// Seed `catalog_id` + `routing_meta` at execute-time (or re-seed from the
+    /// server-built fallback path after a cold-descriptor drive).  Fills the
+    /// load-bearing fields without clobbering a `terminal` flag a concurrent
+    /// cancel may already have stamped.
+    pub fn seed(&self, execution_id: i64, catalog_id: i64, routing_meta: Option<serde_json::Value>) {
+        let mut map = self.map.lock().unwrap();
+        let e = map.entry(execution_id).or_default();
+        if catalog_id != 0 {
+            e.catalog_id = catalog_id;
+        }
+        if routing_meta.is_some() {
+            e.routing_meta = routing_meta;
+        }
+    }
+
+    /// Current descriptor snapshot for an execution, if seeded.
+    pub fn get(&self, execution_id: i64) -> Option<ExecDescriptor> {
+        self.map.lock().unwrap().get(&execution_id).cloned()
+    }
+
+    /// Stamp the terminal flag (emit chokepoint).  Creates the slot if cold so a
+    /// cancel that lands before any drive still records the stop signal.
+    pub fn mark_terminal(&self, execution_id: i64) {
+        self.map.lock().unwrap().entry(execution_id).or_default().terminal = true;
+    }
+
+    /// Drop a terminal execution's descriptor (frees memory).  Called alongside
+    /// [`OrchStateCache::evict`] on the terminal paths.
+    pub fn evict(&self, execution_id: i64) {
+        self.map.lock().unwrap().remove(&execution_id);
     }
 }
 
@@ -325,6 +404,7 @@ impl AppState {
             start_time: std::time::Instant::now(),
             orch_cache: Arc::new(OrchStateCache::default()),
             chain_heads: Arc::new(ChainHeads::default()),
+            exec_descriptors: Arc::new(ExecDescriptors::default()),
             event_stream_publisher: Arc::new(tokio::sync::OnceCell::new()),
         }
     }
@@ -361,7 +441,7 @@ impl AppState {
 
 #[cfg(test)]
 mod tests {
-    use super::ChainHeads;
+    use super::{ChainHeads, ExecDescriptors};
 
     // Note: Full tests require a database connection
     // These are placeholder tests for documentation
@@ -370,6 +450,48 @@ mod tests {
     fn test_uptime() {
         // AppState::new requires a real DB pool, so we can't easily test here
         // This is a documentation placeholder
+    }
+
+    // RFC #115 Phase 4 remainder: the execute-time descriptor carries catalog_id
+    // + routing so the off-server drive routes without rebuilding state.
+    #[test]
+    fn exec_descriptor_seed_get_and_terminal() {
+        let d = ExecDescriptors::default();
+        assert!(d.get(7).is_none(), "cold execution has no descriptor");
+
+        d.seed(7, 42, Some(serde_json::json!({"execution_pool": "default"})));
+        let got = d.get(7).expect("seeded");
+        assert_eq!(got.catalog_id, 42);
+        assert_eq!(got.routing_meta.unwrap()["execution_pool"], "default");
+        assert!(!got.terminal, "freshly seeded is not terminal");
+
+        // A terminal stamp (emit chokepoint) flips the flag without clobbering
+        // the seeded facts.
+        d.mark_terminal(7);
+        let got = d.get(7).expect("still present");
+        assert!(got.terminal, "terminal flag set");
+        assert_eq!(got.catalog_id, 42, "catalog_id preserved across terminal stamp");
+
+        d.evict(7);
+        assert!(d.get(7).is_none(), "evicted");
+    }
+
+    #[test]
+    fn exec_descriptor_seed_preserves_terminal_and_does_not_zero_catalog() {
+        let d = ExecDescriptors::default();
+        // A cancel can stamp terminal before any drive seeded catalog_id.
+        d.mark_terminal(9);
+        // A late seed (e.g. the recovery rebuild) must keep the terminal flag and
+        // must not zero catalog_id when passed 0.
+        d.seed(9, 0, None);
+        let got = d.get(9).expect("present");
+        assert!(got.terminal, "terminal flag survives a seed");
+        assert_eq!(got.catalog_id, 0, "catalog_id stays 0 (nothing real to seed yet)");
+        // A real seed fills catalog_id, still keeping terminal.
+        d.seed(9, 55, Some(serde_json::json!({"x": 1})));
+        let got = d.get(9).expect("present");
+        assert_eq!(got.catalog_id, 55);
+        assert!(got.terminal);
     }
 
     // RFC #115 §4: the per-execution chain head turns a stream of emitted event
