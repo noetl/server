@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.36.0](https://github.com/noetl/server/compare/v3.35.0...v3.36.0) (2026-06-20)
+
+### Features
+
+* **events:** retire the hot-path noetl.event read class (audit-only event read path) — RFC [#115](https://github.com/noetl/server/issues/115) Phase 6 ([01a9979](https://github.com/noetl/server/commit/01a9979436de6bec636300ec020412b3de3bed05))
+
 ## [3.35.0](https://github.com/noetl/server/compare/v3.34.0...v3.35.0) (2026-06-20)
 
 ### Features
