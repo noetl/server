@@ -79,6 +79,15 @@ pub struct AppState {
     /// the [noetl/server wiki sharding-design page](https://github.com/noetl/server/wiki/sharding-design).
     pub shard: Arc<ShardConfig>,
 
+    /// Execution-affinity router (RFC noetl/ai-meta#116).  Routes every trigger
+    /// for an execution (`POST /api/events`) to the single replica that
+    /// [`ShardConfig::owns`] it, so the off-server drive's chain-head read +
+    /// advance are atomic per execution and never fork across replicas.  Inert
+    /// (no forwarding) unless `NOETL_EXECUTION_AFFINITY=true` AND `shard_count >
+    /// 1` AND `NOETL_PEER_URL_TEMPLATE` is set — so single-replica / prod are
+    /// unchanged.  See [`crate::affinity`].
+    pub affinity: Arc<crate::affinity::ExecutionAffinity>,
+
     /// Server start time for uptime calculation
     pub start_time: std::time::Instant,
 
@@ -543,7 +552,20 @@ impl AppState {
         // fail fast on a config bug rather than silently
         // mis-routing requests.
         let shard_count = config.shard_count.unwrap_or(1);
-        let shard_index = config.shard_index.unwrap_or(0);
+        // noetl/ai-meta#116: derive shard_index from the pod's hostname ordinal
+        // (StatefulSet `name-N`) when asked, so one manifest with identical env
+        // gives each pod a distinct shard.  An explicit NOETL_SHARD_INDEX always
+        // wins; a hostname with no trailing ordinal falls back to 0.
+        let shard_index = config.shard_index.unwrap_or_else(|| {
+            if config.shard_index_from_hostname {
+                let hostname = std::env::var("HOSTNAME")
+                    .or_else(|_| std::env::var("COMPUTERNAME"))
+                    .unwrap_or_default();
+                crate::affinity::shard_index_from_hostname(&hostname).unwrap_or(0)
+            } else {
+                0
+            }
+        });
         let shard = ShardConfig::new(shard_index, shard_count).unwrap_or_else(|e| {
             panic!("invalid shard config (NOETL_SHARD_INDEX / NOETL_SHARD_COUNT): {e}")
         });
@@ -557,6 +579,24 @@ impl AppState {
                 "default (no sharding)"
             },
             "Shard configuration initialized"
+        );
+
+        let shard = Arc::new(shard);
+
+        // Execution-affinity router (RFC noetl/ai-meta#116).  Single-owner write
+        // ordering for the off-server drive: every trigger for an execution is
+        // routed to the replica that `owns()` it.  Inert unless the flag is on,
+        // shard_count > 1, and a peer template is set — so prod is unchanged.
+        let affinity = Arc::new(crate::affinity::ExecutionAffinity::new(
+            config.execution_affinity,
+            config.peer_url_template.clone(),
+            shard.clone(),
+        ));
+        tracing::info!(
+            execution_affinity = config.execution_affinity,
+            affinity_active = affinity.active(),
+            peer_url_template = config.peer_url_template.as_deref().unwrap_or("(unset)"),
+            "Execution-affinity router initialized"
         );
 
         // Multi-replica coherence backend (RFC #115 program-scale,
@@ -581,7 +621,8 @@ impl AppState {
             config: Arc::new(config),
             nats,
             snowflake: Arc::new(snowflake),
-            shard: Arc::new(shard),
+            shard,
+            affinity,
             start_time: std::time::Instant::now(),
             orch_cache: Arc::new(OrchStateCache::default()),
             chain_heads: Arc::new(ChainHeads::with_coherence(coherence.clone())),

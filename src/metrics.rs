@@ -400,6 +400,48 @@ pub fn record_replica_coherence(structure: &str, op: &str, outcome: &str) {
         .inc();
 }
 
+// ── Execution affinity (RFC noetl/ai-meta#116) ───────────────────────────────
+
+/// `noetl_execution_affinity_total{outcome}` — every `POST /api/events` routing
+/// decision under `NOETL_EXECUTION_AFFINITY=true`.  The single-owner write-
+/// ordering proof for multi-replica off-server execution.
+///
+/// - `owned_local` — this replica owns the execution; processed locally (the
+///   common case on the owner).
+/// - `forwarded_ok` — a non-owner forwarded the event to the owner and got a
+///   success back.  **The load-bearing proof**: every increment is a trigger that
+///   would otherwise have driven/emitted on the wrong replica (a chain-fork
+///   source) and was instead funnelled to the single owner.
+/// - `forwarded_terminus` — a request the peer already forwarded once landed here
+///   (this replica is the owner); processed locally (loop guard).
+/// - `forward_unavailable` / `forward_http_err` / `forward_decode_err` — the
+///   forward failed; degraded to local processing (no event dropped). Should stay
+///   0 in a healthy cluster.
+pub fn execution_affinity_total() -> &'static IntCounterVec {
+    static M: OnceLock<IntCounterVec> = OnceLock::new();
+    M.get_or_init(|| {
+        let counter = IntCounterVec::new(
+            Opts::new(
+                "noetl_execution_affinity_total",
+                "POST /api/events affinity routing decisions under NOETL_EXECUTION_AFFINITY, by outcome (RFC noetl/ai-meta#116).",
+            ),
+            &["outcome"],
+        )
+        .expect("static counter spec must be valid");
+        registry()
+            .register(Box::new(counter.clone()))
+            .expect("counter registration must succeed");
+        counter
+    })
+}
+
+/// Record one execution-affinity routing decision.
+pub fn record_execution_affinity(outcome: &str) {
+    execution_affinity_total()
+        .with_label_values(&[outcome])
+        .inc();
+}
+
 /// Histogram: wall-clock time spent inside the `POST /api/events` handler.
 pub fn event_ingest_duration_seconds() -> &'static HistogramVec {
     static M: OnceLock<HistogramVec> = OnceLock::new();

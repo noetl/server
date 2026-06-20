@@ -327,6 +327,48 @@ pub struct AppConfig {
     /// multi-replica coherence substrate; opt-in and staged.
     #[serde(default)]
     pub replica_coherence: ReplicaCoherence,
+
+    /// **Execution-affinity routing** (RFC noetl/ai-meta#116, the multi-replica
+    /// half of #115 / #107 step 3).  Envy maps `NOETL_EXECUTION_AFFINITY`.
+    ///
+    /// The KV coherence layer (`replica_coherence=nats_kv`) makes replicas resolve
+    /// the same watermark/descriptor, but the `command.issued` prev read in
+    /// [`crate::handlers::execute`] and the head CAS-advance in
+    /// [`crate::handlers::event_write::emit_events`] are two non-atomic steps —
+    /// concurrent cross-replica emits for one execution fork the chain.  Affinity
+    /// closes the race by routing every trigger (`POST /api/events`, which also
+    /// fires the drive) to the single replica that
+    /// [`crate::sharding::ShardConfig::owns`] the execution; a non-owner forwards
+    /// the request to the owner.  The owner's single-process drive lock + chain
+    /// head then make the read→advance atomic with no distributed lock.
+    ///
+    /// - **false** (default) — no forwarding; prod/default behavior unchanged.
+    /// - **true** — non-owner replicas forward `/api/events` to the owner.  Inert
+    ///   unless `shard_count > 1` AND [`Self::peer_url_template`] is set, so a
+    ///   single replica with the flag on still forwards nothing.
+    #[serde(default)]
+    pub execution_affinity: bool,
+
+    /// **Owner-replica URL template** for execution-affinity forwarding (RFC
+    /// noetl/ai-meta#116).  Envy maps `NOETL_PEER_URL_TEMPLATE`.  The `{shard}`
+    /// token is replaced by the owner's shard index, e.g.
+    /// `http://noetl-server-rust-{shard}.noetl-server-rust-headless:8082` against
+    /// a StatefulSet + headless service.  `None` (default) → affinity is inert
+    /// even when [`Self::execution_affinity`] is true.
+    #[serde(default)]
+    pub peer_url_template: Option<String>,
+
+    /// **Derive [`Self::shard_index`] from the pod's hostname ordinal** (RFC
+    /// noetl/ai-meta#116).  Envy maps `NOETL_SHARD_INDEX_FROM_HOSTNAME`.  When
+    /// true and `NOETL_SHARD_INDEX` is unset, the trailing `-<N>` of the hostname
+    /// (a StatefulSet pod's stable ordinal) becomes the shard index — so one
+    /// StatefulSet manifest with identical env gives each pod a distinct shard.
+    /// An explicit `NOETL_SHARD_INDEX` always wins; a hostname with no trailing
+    /// ordinal (a Deployment pod) falls back to the single-shard default.
+    ///
+    /// **Default false** — prod/default behavior unchanged.
+    #[serde(default)]
+    pub shard_index_from_hostname: bool,
 }
 
 /// How the execution-lifecycle hot path reads `noetl.event` — see
@@ -472,6 +514,12 @@ impl Default for AppConfig {
             // noetl/ai-meta#115 program-scale: in-process maps by default; the
             // NATS-KV multi-replica coherence backing is opt-in (and staged).
             replica_coherence: ReplicaCoherence::Local,
+            // noetl/ai-meta#116: execution-affinity routing off by default; a
+            // non-owner replica forwards /api/events to the owner only when this
+            // is on AND shard_count > 1 AND a peer template is set.
+            execution_affinity: false,
+            peer_url_template: None,
+            shard_index_from_hostname: false,
         }
     }
 }
