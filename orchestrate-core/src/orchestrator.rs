@@ -278,11 +278,18 @@ impl Default for WorkflowOrchestrator {
 }
 
 impl WorkflowOrchestrator {
-    /// Create a new workflow orchestrator.
+    /// Create a new workflow orchestrator (full-context dispatch; default).
     pub fn new() -> Self {
+        Self::with_atomic_item_context(false)
+    }
+
+    /// Create an orchestrator whose command builder narrows each worker-bound
+    /// command context to the minimal working-item slice (RFC noetl/ai-meta#115
+    /// Phase 5 / tenet 6).  `enabled = false` is identical to [`Self::new`].
+    pub fn with_atomic_item_context(enabled: bool) -> Self {
         Self {
             evaluator: ConditionEvaluator::new(),
-            command_builder: CommandBuilder::new(),
+            command_builder: CommandBuilder::with_atomic_item_context(enabled),
             renderer: TemplateRenderer::new(),
         }
     }

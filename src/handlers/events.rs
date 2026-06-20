@@ -3020,6 +3020,11 @@ async fn trigger_orchestrator_inner(
             // state is never staler than the server's view, which prevents a
             // lag-induced re-issue of a fan-in barrier step (RFC #115 Phase 4).
             "expected_head": cache.last_event_id,
+            // RFC #115 Phase 5: carry the atomic-item-context flag so the
+            // off-server drive narrows worker-bound command contexts too.  The
+            // server-built `run_state` fallback reads it directly; the worker
+            // forwards it onto its from_events `OrchestrateInput` (Phase 5b).
+            "atomic_item_context": state.config.atomic_item_context,
         });
         crate::handlers::execute::dispatch_orchestrate_command(
             state,
@@ -3045,7 +3050,10 @@ async fn trigger_orchestrator_inner(
     }
 
     // In-process drive (the `NOETL_ORCHESTRATE_PLUGIN_DRIVE=false` fallback).
-    let orchestrator = WorkflowOrchestrator::new();
+    // RFC noetl/ai-meta#115 Phase 5: narrow each command's worker-bound context
+    // to the minimal working-item slice when the atomic-item-context flag is on.
+    let orchestrator =
+        WorkflowOrchestrator::with_atomic_item_context(state.config.atomic_item_context);
     let ws = cache.state.as_mut().unwrap();
     let result = match orchestrator.evaluate_state(
         ws,

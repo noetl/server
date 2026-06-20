@@ -149,6 +149,38 @@ pub fn record_orchestrate_drive(stage: &str) {
     orchestrate_drive_total().with_label_values(&[stage]).inc();
 }
 
+// ── Atomic-working-item context (RFC noetl/ai-meta#115 Phase 5) ───────────────
+
+/// `noetl_atomic_item_context_total{outcome}` — how the in-process drive sized
+/// each worker-bound command context when the atomic-item-context flag is on.
+/// `outcome` = `narrowed` (a minimal slice replaced the full context) |
+/// `full_fallback` (the step couldn't be statically bounded, so the full
+/// context shipped — conservative). Zero increments while the flag is off.
+pub fn atomic_item_context_total() -> &'static IntCounterVec {
+    static M: OnceLock<IntCounterVec> = OnceLock::new();
+    M.get_or_init(|| {
+        let counter = IntCounterVec::new(
+            Opts::new(
+                "noetl_atomic_item_context_total",
+                "Worker-bound command context sizing under the atomic-item-context flag (RFC #115 Phase 5).",
+            ),
+            &["outcome"],
+        )
+        .expect("static counter spec must be valid");
+        registry()
+            .register(Box::new(counter.clone()))
+            .expect("counter registration must succeed");
+        counter
+    })
+}
+
+/// Record one atomic-item-context sizing decision (`narrowed` | `full_fallback`).
+pub fn record_atomic_item_context(outcome: &str) {
+    atomic_item_context_total()
+        .with_label_values(&[outcome])
+        .inc();
+}
+
 // ── State-build mode (RFC noetl/ai-meta#115 Phase 3) ─────────────────────────
 
 /// `noetl_state_build_total{mode, outcome}` — how the drive built `WorkflowState`

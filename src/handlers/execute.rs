@@ -1318,7 +1318,11 @@ async fn generate_initial_commands(
         .ok_or_else(|| AppError::Validation("Start step 'start' not found".to_string()))?;
 
     // Build command context by merging playbook workload (defaults) with execution payload (overrides)
-    let command_builder = crate::engine::commands::CommandBuilder::new();
+    // RFC noetl/ai-meta#115 Phase 5: narrow the initial command's worker-bound
+    // context to its minimal slice when the atomic-item-context flag is on.
+    let command_builder = crate::engine::commands::CommandBuilder::with_atomic_item_context(
+        state.config.atomic_item_context,
+    );
     let mut context = HashMap::new();
 
     // First, add playbook workload defaults
@@ -1463,6 +1467,18 @@ async fn generate_initial_commands(
         }
 
         return Ok(total as i32);
+    }
+
+    // RFC #115 Phase 5 observability: classify how the start command was sized
+    // (the narrowing itself happens inside build_command).  Zero cost when off.
+    if state.config.atomic_item_context {
+        let narrowed = start_step.r#loop.is_none()
+            && noetl_orchestrate_core::input_binding::analyze(start_step).bounded;
+        crate::metrics::record_atomic_item_context(if narrowed {
+            "narrowed"
+        } else {
+            "full_fallback"
+        });
     }
 
     let command = command_builder.build_command(

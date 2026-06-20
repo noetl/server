@@ -69,6 +69,12 @@ pub struct IteratorMetadata {
 /// Builder for creating commands.
 pub struct CommandBuilder {
     renderer: TemplateRenderer,
+    /// When true, the persisted (worker-bound) command context is narrowed to
+    /// the minimal working-item slice the step statically references — the
+    /// atomic-working-item context contract (RFC noetl/ai-meta#115 Phase 5 /
+    /// tenet 6).  Default false: the full accumulated context ships, exactly as
+    /// before.  Narrowing is conservative — see [`crate::input_binding`].
+    atomic_item_context: bool,
 }
 
 impl Default for CommandBuilder {
@@ -78,10 +84,21 @@ impl Default for CommandBuilder {
 }
 
 impl CommandBuilder {
-    /// Create a new command builder.
+    /// Create a new command builder (full-context dispatch; default behavior).
     pub fn new() -> Self {
         Self {
             renderer: TemplateRenderer::new(),
+            atomic_item_context: false,
+        }
+    }
+
+    /// Create a command builder that narrows each command's worker-bound context
+    /// to the minimal working-item slice (RFC noetl/ai-meta#115 Phase 5).
+    /// `enabled = false` is identical to [`Self::new`].
+    pub fn with_atomic_item_context(enabled: bool) -> Self {
+        Self {
+            renderer: TemplateRenderer::new(),
+            atomic_item_context: enabled,
         }
     }
 
@@ -125,7 +142,23 @@ impl CommandBuilder {
 
         // Build tool command using the shimmed render context so that
         // {{ ctx.foo }} and {{ workload.foo }} templates resolve correctly.
+        // NOTE: server-side rendering always runs against the FULL context — the
+        // narrowing below only trims the *persisted* context the worker receives.
         let tool_command = self.build_tool_from_definition(&step.tool, &render_ctx)?;
+
+        // Atomic-working-item context (RFC noetl/ai-meta#115 Phase 5 / tenet 6):
+        // when enabled, hand the worker only the minimal slice of base-context
+        // keys this step statically references — not the whole accumulated
+        // context.  Scoped to plain (non-loop) steps; loop bodies dispatch via
+        // `build_iteration_command` (their fan-out coordinate handling stays on
+        // the full-context path for now).  `project_context` returns `None` for
+        // any step it can't statically bound, so we fall back to the full
+        // context — narrowing never drops a key the worker might read.
+        let out_context = if self.atomic_item_context && step.r#loop.is_none() {
+            crate::input_binding::project_context(step, context).unwrap_or_else(|| context.clone())
+        } else {
+            context.clone()
+        };
 
         Ok(Command {
             command_id,
@@ -135,7 +168,7 @@ impl CommandBuilder {
             step_name: step.step.clone(),
             tool: tool_command,
             // FLAT context (no ctx/workload self-copies) — the worker re-shims.
-            context: Some(context.clone()),
+            context: Some(out_context),
             metadata: metadata.cloned(),
             iterator: None,
         })

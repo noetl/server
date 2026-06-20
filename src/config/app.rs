@@ -278,6 +278,23 @@ pub struct AppConfig {
     /// to `audit_only` is opt-in and staged.
     #[serde(default)]
     pub event_read_path: EventReadPath,
+
+    /// **Atomic-working-item context** (RFC noetl/ai-meta#115 Phase 5 / tenet 6).
+    /// Envy maps `NOETL_ATOMIC_ITEM_CONTEXT`.
+    ///
+    /// When **true**, each worker-bound command carries only the minimal slice of
+    /// base-context keys the step statically references (its declared `input:` +
+    /// the tool's own templates), instead of the whole accumulated context — the
+    /// worker becomes a true atomic compute block (run tool T on input I).
+    /// Builds on the explicit input-binding surface shipped under #77.  The
+    /// narrowing is conservative: any step that can't be statically bounded
+    /// (whole-context `{{ ctx }}` spread, unparseable fragment) keeps the full
+    /// context, so existing playbooks are unaffected.
+    ///
+    /// **Default false** — full-context dispatch, prod/default behavior
+    /// unchanged.  Flipping to true is opt-in and staged.
+    #[serde(default)]
+    pub atomic_item_context: bool,
 }
 
 /// How the execution-lifecycle hot path reads `noetl.event` — see
@@ -402,6 +419,9 @@ impl Default for AppConfig {
             // noetl/ai-meta#115 Phase 6: hot-path event-scan readers stay on the
             // event table by default; audit_only routes them to the descriptor.
             event_read_path: EventReadPath::EventScan,
+            // noetl/ai-meta#115 Phase 5: full-context dispatch by default; the
+            // atomic-working-item minimal-slice narrowing is opt-in (and staged).
+            atomic_item_context: false,
         }
     }
 }
