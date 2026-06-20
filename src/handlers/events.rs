@@ -468,8 +468,21 @@ pub struct CommandResponse {
 /// of the handler.
 pub async fn handle_event(
     state: State<AppState>,
+    headers: axum::http::HeaderMap,
     request: Json<EventRequest>,
 ) -> Result<Json<EventResponse>, AppError> {
+    // Execution-affinity (RFC noetl/ai-meta#116): single-owner write ordering.
+    // When affinity is active and this replica does not own the execution, the
+    // trigger (and the drive it would fire) is forwarded to the owner so the
+    // off-server chain head's read→advance stays atomic per execution and never
+    // forks across replicas.  Inert / owned executions fall through to local
+    // processing; a failed forward degrades to local (no event dropped).
+    if let crate::affinity::AffinityRoute::Forwarded(resp) =
+        state.0.affinity.route_event(&headers, &request.0).await
+    {
+        return Ok(Json(resp));
+    }
+
     let event_type_for_metrics = request.0.event_type.clone();
     let started_at = std::time::Instant::now();
 
@@ -2439,6 +2452,15 @@ pub fn spawn_orchestrator_reconciler(state: AppState) {
         loop {
             tokio::time::sleep(RECONCILE_INTERVAL).await;
             for execution_id in state.orch_cache.active_executions() {
+                // Execution-affinity (RFC noetl/ai-meta#116): only the owner
+                // replica drives an execution.  Under affinity the orch_cache on a
+                // replica holds only owned executions anyway (events are forwarded
+                // to the owner), but guard explicitly so a transiently-cached
+                // non-owned execution (e.g. one seeded here before forwarding) is
+                // never driven from two replicas' pollers.
+                if state.affinity.active() && !state.affinity.owns(execution_id) {
+                    continue;
+                }
                 // `i64::MAX` as the trigger id keeps the immediate-straggler
                 // shortcut from firing on an already-applied event.
                 match trigger_orchestrator_inner(&state, execution_id, i64::MAX, true).await {

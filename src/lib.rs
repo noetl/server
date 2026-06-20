@@ -45,6 +45,7 @@
 //! }
 //! ```
 
+pub mod affinity;
 pub mod coherence;
 pub mod config;
 pub mod crypto;
