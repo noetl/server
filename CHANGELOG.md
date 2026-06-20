@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.37.0](https://github.com/noetl/server/compare/v3.36.0...v3.37.0) (2026-06-20)
+
+### Features
+
+* **orchestrate:** atomic-working-item context — minimal per-step command slice (RFC [#115](https://github.com/noetl/server/issues/115) Phase 5) ([086e036](https://github.com/noetl/server/commit/086e036fff1310704b66fd8e808794433334738a)), closes [noetl/ai-meta#77](https://github.com/noetl/ai-meta/issues/77) [noetl/ai-meta#107](https://github.com/noetl/ai-meta/issues/107)
+
 ## [3.36.0](https://github.com/noetl/server/compare/v3.35.0...v3.36.0) (2026-06-20)
 
 ### Features
