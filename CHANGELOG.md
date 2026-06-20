@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.34.0](https://github.com/noetl/server/compare/v3.33.0...v3.34.0) (2026-06-20)
+
+### Features
+
+* **events:** route the off-server drive to the pool-side WAL builder (RFC [#115](https://github.com/noetl/server/issues/115) Phase 4 cutover) ([c7e0b62](https://github.com/noetl/server/commit/c7e0b62c8ac46104efe7ab6c2a9656cfc8cc4259))
+
+### Bug Fixes
+
+* **events:** carry expected_head on the off-server drive command (RFC [#115](https://github.com/noetl/server/issues/115) Phase 4 staleness guard) ([1a12498](https://github.com/noetl/server/commit/1a1249832d2449a75c4bd2ccc942839aca0b33bd))
+
 ## [3.33.0](https://github.com/noetl/server/compare/v3.32.0...v3.33.0) (2026-06-20)
 
 ### Features
