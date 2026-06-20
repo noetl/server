@@ -39,6 +39,12 @@ pub struct OrchestrateInput {
     /// The event type that triggered this evaluation (`None` on a cold start).
     #[serde(default)]
     pub trigger_event_type: Option<String>,
+    /// Narrow each worker-bound command context to the minimal working-item
+    /// slice (RFC noetl/ai-meta#115 Phase 5).  `#[serde(default)]` keeps the
+    /// wire shape back-compatible: an older host that omits the field drives
+    /// with full-context dispatch exactly as before.
+    #[serde(default)]
+    pub atomic_item_context: bool,
 }
 
 /// The plug-in's **state** input contract — an already-built `WorkflowState`
@@ -58,6 +64,10 @@ pub struct OrchestrateStateInput {
     pub playbook: Playbook,
     #[serde(default)]
     pub trigger_event_type: Option<String>,
+    /// Narrow each worker-bound command context to the minimal working-item
+    /// slice (RFC noetl/ai-meta#115 Phase 5).  Back-compatible default (false).
+    #[serde(default)]
+    pub atomic_item_context: bool,
 }
 
 /// The error envelope returned when evaluation fails, so the scheduler can tell
@@ -82,7 +92,7 @@ pub fn orchestrate(input: &[u8]) -> Vec<u8> {
 fn orchestrate_inner(input: &[u8]) -> Result<Vec<u8>, String> {
     let parsed: OrchestrateInput =
         serde_json::from_slice(input).map_err(|e| format!("decode OrchestrateInput: {e}"))?;
-    let orchestrator = WorkflowOrchestrator::new();
+    let orchestrator = WorkflowOrchestrator::with_atomic_item_context(parsed.atomic_item_context);
     let result: OrchestrationResult = orchestrator
         .evaluate(
             &parsed.events,
@@ -108,7 +118,7 @@ pub fn orchestrate_state(input: &[u8]) -> Vec<u8> {
 fn orchestrate_state_inner(input: &[u8]) -> Result<Vec<u8>, String> {
     let mut parsed: OrchestrateStateInput =
         serde_json::from_slice(input).map_err(|e| format!("decode OrchestrateStateInput: {e}"))?;
-    let orchestrator = WorkflowOrchestrator::new();
+    let orchestrator = WorkflowOrchestrator::with_atomic_item_context(parsed.atomic_item_context);
     let result: OrchestrationResult = orchestrator
         .evaluate_state(
             &mut parsed.state,
