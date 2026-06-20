@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.39.0](https://github.com/noetl/server/compare/v3.38.0...v3.39.0) (2026-06-20)
+
+### Features
+
+* **affinity:** execution-affinity single-owner write ordering for the off-server drive ([#252](https://github.com/noetl/server/issues/252)) ([4d0f8aa](https://github.com/noetl/server/commit/4d0f8aa6bf94f305a275e56a9ae39922366bbb58)), closes [noetl/ai-meta#116](https://github.com/noetl/ai-meta/issues/116) [#115](https://github.com/noetl/server/issues/115) [#107](https://github.com/noetl/server/issues/107) [noetl/ai-meta#116](https://github.com/noetl/ai-meta/issues/116) [noetl/ai-meta#115](https://github.com/noetl/ai-meta/issues/115) [noetl/ai-meta#107](https://github.com/noetl/ai-meta/issues/107)
+
 ## [3.38.0](https://github.com/noetl/server/compare/v3.37.0...v3.38.0) (2026-06-20)
 
 ### Features
