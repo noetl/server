@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.35.0](https://github.com/noetl/server/compare/v3.34.0...v3.35.0) (2026-06-20)
+
+### Features
+
+* **events:** stateless off-server drive edge — zero state rebuild + zero noetl.event reads under offserver (RFC [#115](https://github.com/noetl/server/issues/115) Phase 4 remainder) ([#248](https://github.com/noetl/server/issues/248)) ([5d72744](https://github.com/noetl/server/commit/5d72744b1e38d72d7ae701c6535a1918fa3851c4)), closes [#247](https://github.com/noetl/server/issues/247) [noetl/ai-meta#107](https://github.com/noetl/ai-meta/issues/107)
+
 ## [3.34.0](https://github.com/noetl/server/compare/v3.33.0...v3.34.0) (2026-06-20)
 
 ### Features
