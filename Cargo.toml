@@ -71,6 +71,10 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 
 # NATS messaging
 async-nats = "0.38"
+# Value type for the JetStream KV puts in `src/coherence.rs` (multi-replica
+# watermark/descriptor coherence, RFC #115 program-scale).  Matches the version
+# async-nats already pulls in transitively.
+bytes = "1"
 
 # Build-fix pin (NOT used directly).  time 0.3.48 (2026-06-12) collides with
 # async-nats 0.38.0's blanket `From<Kind> for Error<Kind>` under rustc 1.91+

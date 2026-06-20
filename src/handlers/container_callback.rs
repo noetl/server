@@ -203,6 +203,7 @@ pub async fn container_callback(
         && state
             .exec_descriptors
             .get(execution_id)
+            .await
             .map(|d| d.catalog_id != 0)
             .unwrap_or(false);
     let row: Option<(i64,)> = if descriptor_warm {
@@ -289,6 +290,7 @@ pub async fn container_callback(
         state
             .exec_descriptors
             .get(execution_id)
+            .await
             .map(|d| d.catalog_id)
             .unwrap_or(0)
     } else if audit_only {
