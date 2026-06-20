@@ -542,7 +542,7 @@ pub(crate) async fn normalize_event_to_row(
         None => state.snowflake.generate()?,
     };
 
-    let catalog_id = get_catalog_id(state, execution_id).await?;
+    let catalog_id = get_catalog_id(state, execution_id, "get_catalog_id_single").await?;
 
     let mut meta = request.meta.clone().unwrap_or_else(|| serde_json::json!({}));
     if let serde_json::Value::Object(ref mut map) = meta {
@@ -1180,7 +1180,7 @@ pub async fn handle_batch_events(
         .parse()
         .map_err(|_| AppError::Validation("Invalid execution_id".to_string()))?;
 
-    let catalog_id = get_catalog_id(&state, execution_id).await?;
+    let catalog_id = get_catalog_id(&state, execution_id, "get_catalog_id_batch").await?;
     // Phase F R4-3: batch writes land on this execution's shard.
     let mut tx = state.pools.pool_for(execution_id).begin().await?;
     let mut event_ids = Vec::with_capacity(request.events.len());
@@ -1476,8 +1476,46 @@ fn build_result_object(request: &EventRequest, status: &str) -> serde_json::Valu
 /// fails + the events are lost).  `noetl.command` is written synchronously even
 /// under the gate (it's the command queue the worker reads), so it always
 /// carries the execution's `catalog_id`.
-async fn get_catalog_id(state: &AppState, execution_id: i64) -> AppResult<Option<i64>> {
+async fn get_catalog_id(state: &AppState, execution_id: i64, site: &str) -> AppResult<Option<i64>> {
+    // RFC #115 Phase 6: under `event_read_path=audit_only`, serve catalog_id from
+    // the in-memory execute-time descriptor (seeded at `playbook_started`, before
+    // the first event emit) — ZERO `noetl.event` read on this per-ingest hot path.
+    // A cold descriptor (server restart mid-execution) falls through to the scan
+    // below (counted `scan`), so correctness never regresses.
     let pool = state.pools.pool_for(execution_id);
+    if matches!(
+        state.config.event_read_path,
+        crate::config::EventReadPath::AuditOnly
+    ) {
+        // Warm descriptor → served, ZERO read.
+        if let Some(desc) = state.exec_descriptors.get(execution_id) {
+            if desc.catalog_id != 0 {
+                crate::metrics::record_event_hotpath_read(site, "served_descriptor");
+                return Ok(Some(desc.catalog_id));
+            }
+        }
+        // Cold descriptor (a post-terminal straggler after the descriptor was
+        // evicted on terminal, or a server restart mid-execution): resolve
+        // catalog_id from `noetl.command` — the **synchronous** command queue
+        // (written for every command regardless of the publish-only gate, the
+        // queue the worker reads) — WITHOUT scanning `noetl.event`.  So
+        // get_catalog_id never reads `noetl.event` under audit_only.  We do NOT
+        // re-seed the descriptor here: re-seeding an already-evicted terminal
+        // execution would re-accumulate exactly the per-execution memory the
+        // terminal eviction frees (the unbounded growth this RFC removes).
+        crate::metrics::record_event_hotpath_read(site, "served_command");
+        let row: Option<(i64,)> = sqlx::query_as::<_, (i64,)>(
+            "SELECT catalog_id FROM noetl.command WHERE execution_id = $1 LIMIT 1",
+        )
+        .bind(execution_id)
+        .fetch_optional(pool)
+        .await?;
+        return Ok(row.map(|(id,)| id));
+    }
+    crate::metrics::record_event_hotpath_read(site, "scan");
+
+    // event_scan (default/prod): unchanged — noetl.event authoritative when
+    // present, noetl.command the fallback under the publish-only gate.
     if let Some((id,)) = sqlx::query_as::<_, (i64,)>(
         "SELECT catalog_id FROM noetl.event WHERE execution_id = $1 LIMIT 1",
     )
@@ -1487,15 +1525,12 @@ async fn get_catalog_id(state: &AppState, execution_id: i64) -> AppResult<Option
     {
         return Ok(Some(id));
     }
-
-    // Fallback: noetl.command (synchronous under PUBLISH_ONLY).
     let row: Option<(i64,)> = sqlx::query_as::<_, (i64,)>(
         "SELECT catalog_id FROM noetl.command WHERE execution_id = $1 LIMIT 1",
     )
     .bind(execution_id)
     .fetch_optional(pool)
     .await?;
-
     Ok(row.map(|(id,)| id))
 }
 

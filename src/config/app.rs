@@ -249,6 +249,50 @@ pub struct AppConfig {
     /// **Default `server`** — prod/default behavior is unchanged.
     #[serde(default)]
     pub state_builder: StateBuilder,
+
+    /// **How the execution-lifecycle hot path reads `noetl.event`** (RFC
+    /// noetl/ai-meta#115 Phase 6).  Envy maps `NOETL_EVENT_READ_PATH`.
+    ///
+    /// Phase 4 already removed the *drive*'s state-rebuild scan under
+    /// `state_builder=offserver`.  This flag retires the **remaining**
+    /// execution-scan readers of `noetl.event` on the hot path — the
+    /// `WHERE execution_id = $1` replay class that runs *outside* the drive:
+    /// the per-ingest `get_catalog_id` (`normalize_event_to_row`), the
+    /// child-execution `inherit_parent_trace`, the subscription dedup-audit
+    /// catalog lookup, and the container-callback existence + catalog reads.
+    ///
+    /// - **`event_scan`** (default) — those readers scan `noetl.event` exactly
+    ///   as today.  Unchanged prod behavior.
+    /// - **`audit_only`** — each reader is served from the in-memory
+    ///   execute-time [`crate::state::ExecDescriptor`] (catalog_id + routing,
+    ///   seeded at `playbook_started`).  A warm descriptor → ZERO `noetl.event`
+    ///   read; a cold descriptor (server restart mid-execution) **falls back**
+    ///   to the scan for that read (counted via
+    ///   `noetl_event_hotpath_reads_total{outcome="scan"}`) — correctness is
+    ///   never sacrificed.  `noetl.event` becomes **audit-only**: still written
+    ///   by the materializer (#103) and read by operator/status/replay APIs,
+    ///   never scanned by the execution lifecycle.  Pairs with
+    ///   `state_builder=offserver` to reach the end-to-end never-scan invariant.
+    ///
+    /// **Default `event_scan`** — prod/default behavior is unchanged; flipping
+    /// to `audit_only` is opt-in and staged.
+    #[serde(default)]
+    pub event_read_path: EventReadPath,
+}
+
+/// How the execution-lifecycle hot path reads `noetl.event` — see
+/// [`AppConfig::event_read_path`] (RFC noetl/ai-meta#115 Phase 6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EventReadPath {
+    /// Hot-path readers scan `noetl.event` (`WHERE execution_id = $1`) exactly
+    /// as today.  Default — prod behavior.
+    #[default]
+    EventScan,
+    /// Hot-path readers are served from the in-memory execute-time descriptor;
+    /// `noetl.event` becomes audit-only (RFC #115 Phase 6).  Cold-descriptor
+    /// reads fall back to the scan.
+    AuditOnly,
 }
 
 /// Where orchestrator `WorkflowState` is constructed — see
@@ -355,6 +399,9 @@ impl Default for AppConfig {
             // noetl/ai-meta#115 Phase 4: server-side build is the default; the
             // off-server builder cutover is opt-in (and staged).
             state_builder: StateBuilder::Server,
+            // noetl/ai-meta#115 Phase 6: hot-path event-scan readers stay on the
+            // event table by default; audit_only routes them to the descriptor.
+            event_read_path: EventReadPath::EventScan,
         }
     }
 }
@@ -429,5 +476,24 @@ mod tests {
         assert_eq!(off, StateBuilder::Offserver);
         let srv: StateBuilder = serde_json::from_str("\"server\"").unwrap();
         assert_eq!(srv, StateBuilder::Server);
+    }
+
+    #[test]
+    fn test_event_read_path_defaults_event_scan() {
+        // noetl/ai-meta#115 Phase 6: prod/default behavior is unchanged — the
+        // hot-path event readers keep scanning noetl.event; audit_only (route to
+        // the descriptor, noetl.event becomes audit-only) is opt-in via
+        // NOETL_EVENT_READ_PATH=audit_only.
+        let cfg = AppConfig::default();
+        assert_eq!(cfg.event_read_path, EventReadPath::EventScan);
+    }
+
+    #[test]
+    fn test_event_read_path_deserializes_snake_case() {
+        // Envy parses NOETL_EVENT_READ_PATH through serde; variants are snake_case.
+        let ao: EventReadPath = serde_json::from_str("\"audit_only\"").unwrap();
+        assert_eq!(ao, EventReadPath::AuditOnly);
+        let es: EventReadPath = serde_json::from_str("\"event_scan\"").unwrap();
+        assert_eq!(es, EventReadPath::EventScan);
     }
 }

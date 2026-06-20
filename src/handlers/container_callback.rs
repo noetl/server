@@ -190,12 +190,39 @@ pub async fn container_callback(
 
     // -- Stale check: is there ANY event for this execution_id?
     let pool = state.pools.pool_for(execution_id);
-    let row: Option<(i64,)> = sqlx::query_as(
-        "SELECT 1::bigint FROM noetl.event WHERE execution_id = $1 LIMIT 1",
-    )
-    .bind(execution_id)
-    .fetch_optional(pool)
-    .await?;
+    // RFC #115 Phase 6: under `event_read_path=audit_only`, a warm execute-time
+    // descriptor proves the execution exists — ZERO `noetl.event` read.  A cold
+    // descriptor (server restart, or a genuinely stale callback for an execution
+    // this server never saw) falls through to the scan (counted `scan`), which
+    // preserves the stale-detection correctness.
+    let audit_only = matches!(
+        state.config.event_read_path,
+        crate::config::EventReadPath::AuditOnly
+    );
+    let descriptor_warm = audit_only
+        && state
+            .exec_descriptors
+            .get(execution_id)
+            .map(|d| d.catalog_id != 0)
+            .unwrap_or(false);
+    let row: Option<(i64,)> = if descriptor_warm {
+        crate::metrics::record_event_hotpath_read("container_callback_exists", "served_descriptor");
+        Some((1,))
+    } else if audit_only {
+        // Cold descriptor under audit_only: prove existence from `noetl.command`
+        // (the synchronous queue) — ZERO `noetl.event` read.
+        crate::metrics::record_event_hotpath_read("container_callback_exists", "served_command");
+        sqlx::query_as("SELECT 1::bigint FROM noetl.command WHERE execution_id = $1 LIMIT 1")
+            .bind(execution_id)
+            .fetch_optional(pool)
+            .await?
+    } else {
+        crate::metrics::record_event_hotpath_read("container_callback_exists", "scan");
+        sqlx::query_as("SELECT 1::bigint FROM noetl.event WHERE execution_id = $1 LIMIT 1")
+            .bind(execution_id)
+            .fetch_optional(pool)
+            .await?
+    };
 
     if row.is_none() {
         tracing::info!(
@@ -255,16 +282,40 @@ pub async fn container_callback(
 
     // catalog_id is required by the schema; resolve from the
     // execution's existing events (the start event carries it).
-    let catalog_id: i64 = sqlx::query_as::<_, (i64,)>(
-        "SELECT catalog_id FROM noetl.event WHERE execution_id = $1 \
-         AND event_type IN ('playbook.initialized', 'playbook_started') \
-         LIMIT 1",
-    )
-    .bind(execution_id)
-    .fetch_optional(pool)
-    .await?
-    .map(|(c,)| c)
-    .unwrap_or(0);
+    // RFC #115 Phase 6: under `event_read_path=audit_only` a warm descriptor
+    // carries catalog_id — ZERO `noetl.event` read; cold falls through to scan.
+    let catalog_id: i64 = if descriptor_warm {
+        crate::metrics::record_event_hotpath_read("container_callback_catalog", "served_descriptor");
+        state
+            .exec_descriptors
+            .get(execution_id)
+            .map(|d| d.catalog_id)
+            .unwrap_or(0)
+    } else if audit_only {
+        // Cold descriptor under audit_only: catalog_id from `noetl.command` — the
+        // synchronous queue — ZERO `noetl.event` read.
+        crate::metrics::record_event_hotpath_read("container_callback_catalog", "served_command");
+        sqlx::query_as::<_, (i64,)>(
+            "SELECT catalog_id FROM noetl.command WHERE execution_id = $1 LIMIT 1",
+        )
+        .bind(execution_id)
+        .fetch_optional(pool)
+        .await?
+        .map(|(c,)| c)
+        .unwrap_or(0)
+    } else {
+        crate::metrics::record_event_hotpath_read("container_callback_catalog", "scan");
+        sqlx::query_as::<_, (i64,)>(
+            "SELECT catalog_id FROM noetl.event WHERE execution_id = $1 \
+             AND event_type IN ('playbook.initialized', 'playbook_started') \
+             LIMIT 1",
+        )
+        .bind(execution_id)
+        .fetch_optional(pool)
+        .await?
+        .map(|(c,)| c)
+        .unwrap_or(0)
+    };
 
     // Persist the resume `call.done` using the deployed `noetl.event`
     // column set (matches handlers::events).  The previous path went
