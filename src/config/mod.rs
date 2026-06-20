@@ -6,5 +6,5 @@
 mod app;
 pub mod database;
 
-pub use app::{AppConfig, StateBuildMode};
+pub use app::{AppConfig, StateBuildMode, StateBuilder};
 pub use database::{DatabaseConfig, ShardConnection, ShardConnectionError, ShardingConfig};

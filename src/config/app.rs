@@ -223,6 +223,44 @@ pub struct AppConfig {
     /// validation/diagnostic switch, off in prod.
     #[serde(default)]
     pub state_build_parity_check: bool,
+
+    /// **Where** orchestrator `WorkflowState` is constructed (RFC
+    /// noetl/ai-meta#115 Phase 4).  Envy maps `NOETL_STATE_BUILDER`.
+    ///
+    /// - **`server`** (default) — the server builds `WorkflowState` in-process
+    ///   (via [`Self::state_build_mode`]: `event_scan` or the Phase-3
+    ///   `chain_walk`) and, under the off-server *drive* (#108), hands the
+    ///   already-built state to the worker plug-in's `run_state` entry.  Prod
+    ///   behavior; unchanged.
+    /// - **`offserver`** — state CONSTRUCTION moves to the system worker pool:
+    ///   the drive obtains its `WorkflowState` from the pool-side off-server
+    ///   builder (which walks the `prev_event_id` chain from the `noetl_events`
+    ///   **WAL** stream and caches the built spine keyed by the immutable chain
+    ///   head — `noetl-worker`'s `state_builder`), so the server stops building
+    ///   state on the hot path.  The server chain-walk + event-scan stay as the
+    ///   fallbacks.
+    ///
+    /// **Default `server`** — prod/default behavior is unchanged.  The
+    /// `offserver` drive-cutover wiring is staged behind this flag (the
+    /// pool-side builder + its WAL shadow loop land first — `noetl-worker`
+    /// `state_builder` + `NOETL_STATE_BUILDER_SHADOW`); flipping this to
+    /// `offserver` before that wiring lands is a no-op on the build path.
+    #[serde(default)]
+    pub state_builder: StateBuilder,
+}
+
+/// Where orchestrator `WorkflowState` is constructed — see
+/// [`AppConfig::state_builder`] (RFC noetl/ai-meta#115 Phase 4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StateBuilder {
+    /// The server builds `WorkflowState` in-process (event-scan or chain-walk).
+    /// Default — prod behavior.
+    #[default]
+    Server,
+    /// State construction runs off-server on the system worker pool, reading the
+    /// `noetl_events` WAL with a pool-side cache (RFC #115 Phase 4).
+    Offserver,
 }
 
 /// Strategy for reconstructing orchestrator `WorkflowState` — see
@@ -312,6 +350,9 @@ impl Default for AppConfig {
             // noetl/ai-meta#115 Phase 3: event-scan is the default; chain_walk is opt-in.
             state_build_mode: StateBuildMode::EventScan,
             state_build_parity_check: false,
+            // noetl/ai-meta#115 Phase 4: server-side build is the default; the
+            // off-server builder cutover is opt-in (and staged).
+            state_builder: StateBuilder::Server,
         }
     }
 }
@@ -368,5 +409,23 @@ mod tests {
         assert_eq!(cw, StateBuildMode::ChainWalk);
         let es: StateBuildMode = serde_json::from_str("\"event_scan\"").unwrap();
         assert_eq!(es, StateBuildMode::EventScan);
+    }
+
+    #[test]
+    fn test_state_builder_defaults_server() {
+        // noetl/ai-meta#115 Phase 4: prod/default behavior is unchanged — state
+        // construction stays on the server; the off-server builder is opt-in via
+        // NOETL_STATE_BUILDER=offserver (and the cutover wiring is staged).
+        let cfg = AppConfig::default();
+        assert_eq!(cfg.state_builder, StateBuilder::Server);
+    }
+
+    #[test]
+    fn test_state_builder_deserializes_snake_case() {
+        // Envy parses NOETL_STATE_BUILDER through serde; variants are snake_case.
+        let off: StateBuilder = serde_json::from_str("\"offserver\"").unwrap();
+        assert_eq!(off, StateBuilder::Offserver);
+        let srv: StateBuilder = serde_json::from_str("\"server\"").unwrap();
+        assert_eq!(srv, StateBuilder::Server);
     }
 }
