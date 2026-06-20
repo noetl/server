@@ -1377,7 +1377,7 @@ dependencies = [
 
 [[package]]
 name = "noetl-server"
-version = "3.39.0"
+version = "3.39.1"
 dependencies = [
  "aes-gcm",
  "anyhow",

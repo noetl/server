@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.39.1](https://github.com/noetl/server/compare/v3.39.0...v3.39.1) (2026-06-20)
+
+### Bug Fixes
+
+* **event-write:** exactly-one-terminal-per-execution guard ([#118](https://github.com/noetl/server/issues/118)) ([#253](https://github.com/noetl/server/issues/253)) ([43721f6](https://github.com/noetl/server/commit/43721f68bb8cb6b021be6d805a8c535e6f41830c)), closes [#116](https://github.com/noetl/server/issues/116)
+
 ## [3.39.0](https://github.com/noetl/server/compare/v3.38.0...v3.39.0) (2026-06-20)
 
 ### Features
