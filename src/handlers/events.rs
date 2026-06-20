@@ -2824,6 +2824,12 @@ async fn trigger_orchestrator_inner(
             "trigger_event_type": trigger_event_type,
             "__offserver_build__": offserver,
             "execution_id": execution_id,
+            // The server's dispatch watermark (the highest event applied to the
+            // server-built state).  The worker's WAL build serves only once its
+            // pool-side index has caught up to this head — so the off-server
+            // state is never staler than the server's view, which prevents a
+            // lag-induced re-issue of a fan-in barrier step (RFC #115 Phase 4).
+            "expected_head": cache.last_event_id,
         });
         crate::handlers::execute::dispatch_orchestrate_command(
             state,
