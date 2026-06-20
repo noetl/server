@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.38.0](https://github.com/noetl/server/compare/v3.37.0...v3.38.0) (2026-06-20)
+
+### Features
+
+* **coherence:** NATS-KV multi-replica coherence for ChainHeads + ExecDescriptor ([f09cb76](https://github.com/noetl/server/commit/f09cb761cf6d7609b590889c4e56ade7ce9c87de)), closes [noetl/ai-meta#115](https://github.com/noetl/ai-meta/issues/115) [noetl/ai-meta#107](https://github.com/noetl/ai-meta/issues/107) [noetl/ai-meta#115](https://github.com/noetl/ai-meta/issues/115) [noetl/ai-meta#107](https://github.com/noetl/ai-meta/issues/107)
+
 ## [3.37.0](https://github.com/noetl/server/compare/v3.36.0...v3.37.0) (2026-06-20)
 
 ### Features
