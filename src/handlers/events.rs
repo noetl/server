@@ -2802,11 +2802,28 @@ async fn trigger_orchestrator_inner(
             .as_ref()
             .map(crate::handlers::execute::CommandRouting::from_started_meta)
             .unwrap_or_default();
+        // Off-server drive cutover (RFC #115 Phase 4): under
+        // `NOETL_STATE_BUILDER=offserver` the drive obtains its `WorkflowState`
+        // from the pool-side WAL builder (the worker walks the `prev_event_id`
+        // chain off the `noetl_events` WAL and feeds the spine to the wasm `run`
+        // / from_events entry — state CONSTRUCTION runs off the server).  We mark
+        // the command `__offserver_build__` + carry `execution_id` so the worker
+        // self-sources the spine; the server-built `state` rides along as the
+        // **fallback** the worker uses only when its WAL chain is incomplete
+        // (lag / cold) — so progress + correctness never regress below the
+        // server-built `run_state` path.  Default `server` → the state is the
+        // sole drive input exactly as today.
+        let offserver = matches!(
+            state.config.state_builder,
+            crate::config::StateBuilder::Offserver
+        );
         let input = serde_json::json!({
             "state": cache.state.as_ref().expect("state present after rebuild"),
             "latest_ts": latest_ts,
             "playbook": &playbook,
             "trigger_event_type": trigger_event_type,
+            "__offserver_build__": offserver,
+            "execution_id": execution_id,
         });
         crate::handlers::execute::dispatch_orchestrate_command(
             state,
@@ -2819,7 +2836,15 @@ async fn trigger_orchestrator_inner(
         )
         .await?;
         cache.orchestrate_in_flight = true;
-        debug!(execution_id, "worker-driven: dispatched system/orchestrate to the pool");
+        crate::metrics::record_orchestrate_drive(if offserver {
+            "dispatched_offserver"
+        } else {
+            "dispatched"
+        });
+        debug!(
+            execution_id,
+            offserver, "worker-driven: dispatched system/orchestrate to the pool"
+        );
         return Ok(0);
     }
 
