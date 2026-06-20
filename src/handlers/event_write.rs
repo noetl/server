@@ -285,18 +285,48 @@ pub async fn emit_events(state: &AppState, pool: &DbPool, rows: &[EventRow]) -> 
     // built per execution), so a single linkage call covers them in order.
     let rows: Vec<EventRow> = {
         let execution_id = rows[0].execution_id;
-        // Stateless off-server drive edge (RFC #115 Phase 4 remainder): stamp the
-        // execute-time descriptor's terminal flag when a terminal event passes
-        // through this chokepoint (cancel via `services::execution::cancel`,
-        // finalize, the orchestrator's own `playbook.completed`/`.failed`).  The
-        // stateless drive reads this flag to stop re-dispatching a terminal
-        // execution WITHOUT rebuilding `WorkflowState` to call `is_terminal()`.
-        if rows.iter().any(|r| is_terminal_event_type(&r.event_type)) {
+        let terminal_in_batch = rows.iter().any(|r| is_terminal_event_type(&r.event_type));
+        // Idempotent terminal (noetl/ai-meta#118): enforce exactly one terminal
+        // event per execution.  A DUPLICATE finalize (a straggler/duplicate drive
+        // under off-server + PUBLISH_ONLY materializer-lag on a single replica)
+        // must be suppressed *before* it reaches the chain linker — otherwise it
+        // arrives after the first terminal evicted the chain head, links to a
+        // `None` head (`prev_event_id = NULL`), and forks the per-execution chain
+        // into a second root (the off-server spine walk then can't reach it → a
+        // benign `event_scan` fallback).  `mark()` returns true for the FIRST
+        // terminal (write it) and false for any later one (drop it).  Multi-replica
+        // execution-affinity (noetl/ai-meta#116) already serialises finalize to the
+        // owner, so this is the single-replica safety net.  Terminal events are
+        // emitted one-at-a-time today, so a suppressed-terminal batch drops to
+        // empty (handled below); filtering rather than early-returning keeps a
+        // hypothetical mixed batch correct.
+        let drop_terminal = terminal_in_batch && !state.finalized_guard.mark(execution_id);
+        if drop_terminal {
+            crate::metrics::record_terminal_dedup("suppressed");
+            tracing::debug!(
+                execution_id,
+                "emit: suppressed duplicate terminal event (execution already finalized; \
+                 noetl/ai-meta#118)"
+            );
+        } else if terminal_in_batch {
+            // Stateless off-server drive edge (RFC #115 Phase 4 remainder): stamp
+            // the execute-time descriptor's terminal flag when the FIRST terminal
+            // event passes through this chokepoint (cancel via
+            // `services::execution::cancel`, finalize, the orchestrator's own
+            // `playbook.completed`/`.failed`).  The stateless drive reads this flag
+            // to stop re-dispatching a terminal execution WITHOUT rebuilding
+            // `WorkflowState` to call `is_terminal()`.
             state.exec_descriptors.mark_terminal(execution_id).await;
         }
-        let ids: Vec<i64> = rows.iter().map(|r| r.event_id).collect();
+        // A suppressed duplicate terminal must not advance the chain head, so drop
+        // it before `link_batch` consumes the batch's ids.
+        let kept: Vec<&EventRow> = rows
+            .iter()
+            .filter(|r| !(drop_terminal && is_terminal_event_type(&r.event_type)))
+            .collect();
+        let ids: Vec<i64> = kept.iter().map(|r| r.event_id).collect();
         let prevs = state.chain_heads.link_batch(execution_id, &ids).await;
-        rows.iter()
+        kept.into_iter()
             .zip(prevs)
             .map(|(r, prev)| {
                 // Respect an explicit prev a producer already set; otherwise
@@ -311,6 +341,10 @@ pub async fn emit_events(state: &AppState, pool: &DbPool, rows: &[EventRow]) -> 
             })
             .collect()
     };
+    // The whole batch was a suppressed duplicate terminal → nothing to write.
+    if rows.is_empty() {
+        return Ok(());
+    }
     let rows = rows.as_slice();
 
     // All rows in a batch share the same execution + catalog, so one decision

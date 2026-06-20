@@ -149,6 +149,39 @@ pub fn record_orchestrate_drive(stage: &str) {
     orchestrate_drive_total().with_label_values(&[stage]).inc();
 }
 
+// ── Terminal-event dedup (noetl/ai-meta#118) ─────────────────────────────────
+
+/// `noetl_terminal_dedup_total{outcome}` — the event-write chokepoint's
+/// exactly-one-terminal-per-execution guard.  `outcome` = `suppressed` (a
+/// DUPLICATE terminal event — a straggler/duplicate finalize under off-server +
+/// PUBLISH_ONLY materializer-lag on a single replica — was dropped before it
+/// could reach the chain linker and orphan as a NULL-`prev_event_id` second
+/// chain root).  Zero increments on a healthy run; any non-zero count is the
+/// race being caught instead of forking the chain.  See
+/// [`crate::state::FinalizedGuard`].
+pub fn terminal_dedup_total() -> &'static IntCounterVec {
+    static M: OnceLock<IntCounterVec> = OnceLock::new();
+    M.get_or_init(|| {
+        let counter = IntCounterVec::new(
+            Opts::new(
+                "noetl_terminal_dedup_total",
+                "Duplicate terminal events suppressed at the event-write chokepoint (noetl/ai-meta#118).",
+            ),
+            &["outcome"],
+        )
+        .expect("static counter spec must be valid");
+        registry()
+            .register(Box::new(counter.clone()))
+            .expect("counter registration must succeed");
+        counter
+    })
+}
+
+/// Record one terminal-event dedup decision (`outcome` = `suppressed`).
+pub fn record_terminal_dedup(outcome: &str) {
+    terminal_dedup_total().with_label_values(&[outcome]).inc();
+}
+
 // ── Atomic-working-item context (RFC noetl/ai-meta#115 Phase 5) ───────────────
 
 /// `noetl_atomic_item_context_total{outcome}` — how the in-process drive sized

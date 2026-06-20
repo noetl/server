@@ -119,6 +119,13 @@ pub struct AppState {
     /// execution without reading state.  See [`ExecDescriptors`].
     pub exec_descriptors: Arc<ExecDescriptors>,
 
+    /// Recently-finalized executions, so the [`crate::handlers::event_write`]
+    /// chokepoint enforces exactly one terminal event per execution and a
+    /// duplicate finalize can't orphan the chain with a NULL-`prev_event_id`
+    /// second root (noetl/ai-meta#118).  Bounded + in-memory; see
+    /// [`FinalizedGuard`].
+    pub finalized_guard: Arc<FinalizedGuard>,
+
     /// CQRS write-path publisher (noetl/ai-meta#103 phase 2d-3).  Lazily built
     /// on first use from [`Self::nats`] so the `emit_event` chokepoint can
     /// publish to the `noetl_events` stream when
@@ -453,6 +460,92 @@ impl ExecDescriptors {
     }
 }
 
+/// Bounded set of execution ids that have already emitted a terminal event
+/// (`playbook.completed` / `playbook_failed` / `playbook_cancelled`), so the
+/// event-write chokepoint can keep the **exactly-one-terminal-per-execution**
+/// invariant under the duplicate-finalize race (noetl/ai-meta#118).
+///
+/// The race: under `NOETL_STATE_BUILDER=offserver` + `PUBLISH_ONLY` on a
+/// **single replica**, a high-concurrency fan-out can drive the same execution
+/// to terminal twice — the first drive emits the terminal event (chain-linked to
+/// the head) and then evicts the chain head + descriptor; a straggler/late
+/// trigger then falls through to the server-built path, rebuilds from the
+/// materialized WAL that *hasn't caught up* (so the rebuilt state isn't terminal
+/// yet — the materializer-lag window), drives again, and emits a SECOND terminal
+/// event.  That second event reaches [`ChainHeads::link_batch`] after the head
+/// was evicted → `prev_event_id = NULL` → a second chain root (the orphan), and
+/// the off-server spine walk then can't reach it → a benign `event_scan`
+/// fallback.  Multi-replica execution-affinity (noetl/ai-meta#116) already
+/// serialises every finalize to the owning replica, so it never forks — this
+/// guard is the single-replica equivalent: the first terminal wins, any later
+/// terminal for the same execution is suppressed at the chokepoint *before* it
+/// touches the chain.
+///
+/// In-memory + **bounded** (FIFO eviction past `capacity`) so it never
+/// reintroduces the unbounded per-execution growth RFC #115 Phase 6 removed: the
+/// only window that matters is the straggler + materializer-lag horizon
+/// (seconds), so a few thousand recent ids is ample.  Process-local, like the
+/// sibling [`OrchStateCache`] / [`ExecDescriptors`] in-memory maps — multi-replica
+/// correctness comes from affinity, not from sharing this set.  A server restart
+/// drops the set, but a post-restart straggler is then caught by the
+/// server-built terminal guard (the rebuilt state is terminal once the WAL has
+/// materialized), so correctness never regresses below today.
+pub struct FinalizedGuard {
+    inner: std::sync::Mutex<FinalizedInner>,
+    capacity: usize,
+}
+
+struct FinalizedInner {
+    set: std::collections::HashSet<i64>,
+    queue: std::collections::VecDeque<i64>,
+}
+
+impl Default for FinalizedGuard {
+    fn default() -> Self {
+        // 8192 recent finalized executions — far past the straggler /
+        // materializer-lag horizon, trivially small in memory (≈64 KiB of i64s).
+        Self::new(8192)
+    }
+}
+
+impl FinalizedGuard {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            inner: std::sync::Mutex::new(FinalizedInner {
+                set: std::collections::HashSet::new(),
+                queue: std::collections::VecDeque::new(),
+            }),
+            capacity,
+        }
+    }
+
+    /// Record `execution_id` as finalized.  Returns `true` when it was **newly**
+    /// inserted — i.e. this is the FIRST terminal event for the execution and the
+    /// caller should write it.  Returns `false` when the execution was already
+    /// finalized — a DUPLICATE terminal the caller must suppress so it can't
+    /// orphan the chain.  FIFO-evicts the oldest id once `capacity` is exceeded.
+    pub fn mark(&self, execution_id: i64) -> bool {
+        let mut g = self.inner.lock().unwrap();
+        if !g.set.insert(execution_id) {
+            return false;
+        }
+        g.queue.push_back(execution_id);
+        while g.queue.len() > self.capacity {
+            if let Some(old) = g.queue.pop_front() {
+                g.set.remove(&old);
+            }
+        }
+        true
+    }
+
+    /// True if a terminal event has already been recorded for `execution_id`
+    /// (within the bounded window).  Test/observability helper; the write path
+    /// uses [`Self::mark`] for the atomic check-and-record.
+    pub fn contains(&self, execution_id: i64) -> bool {
+        self.inner.lock().unwrap().set.contains(&execution_id)
+    }
+}
+
 /// Per-execution orchestrator state cache.  The outer `std::Mutex` guards a
 /// short get-or-insert; the inner per-execution `tokio::Mutex` is held across
 /// the orchestrator's DB round-trips so a single execution's triggers serialise
@@ -627,6 +720,7 @@ impl AppState {
             orch_cache: Arc::new(OrchStateCache::default()),
             chain_heads: Arc::new(ChainHeads::with_coherence(coherence.clone())),
             exec_descriptors: Arc::new(ExecDescriptors::with_coherence(coherence)),
+            finalized_guard: Arc::new(FinalizedGuard::default()),
             event_stream_publisher: Arc::new(tokio::sync::OnceCell::new()),
         }
     }
@@ -663,7 +757,7 @@ impl AppState {
 
 #[cfg(test)]
 mod tests {
-    use super::{ChainHeads, ExecDescriptors};
+    use super::{ChainHeads, ExecDescriptors, FinalizedGuard};
 
     // Note: Full tests require a database connection
     // These are placeholder tests for documentation
@@ -672,6 +766,42 @@ mod tests {
     fn test_uptime() {
         // AppState::new requires a real DB pool, so we can't easily test here
         // This is a documentation placeholder
+    }
+
+    // noetl/ai-meta#118: exactly-one-terminal-per-execution.  The chokepoint
+    // calls `mark()` for every terminal event; the FIRST returns true (write it),
+    // any later one returns false (suppress the duplicate before it can orphan
+    // the chain).
+    #[test]
+    fn finalized_guard_first_terminal_wins_duplicate_suppressed() {
+        let g = FinalizedGuard::new(8);
+        assert!(!g.contains(7), "cold execution is not finalized");
+        assert!(g.mark(7), "first terminal for an execution is newly inserted");
+        assert!(g.contains(7), "now recorded as finalized");
+        // Every subsequent terminal for the SAME execution is a duplicate.
+        assert!(!g.mark(7), "second terminal is a suppressed duplicate");
+        assert!(!g.mark(7), "third terminal is still a suppressed duplicate");
+        // A different execution is independent.
+        assert!(g.mark(8), "a different execution's first terminal still wins");
+        assert!(!g.mark(8));
+    }
+
+    #[test]
+    fn finalized_guard_is_bounded_fifo() {
+        // Capacity 2: inserting a third id evicts the oldest, so its terminal
+        // would be (correctly) treated as fresh again — acceptable because the
+        // window only needs to span the seconds-long straggler horizon, far
+        // inside any real capacity.  This asserts the bound holds (no unbounded
+        // growth) rather than infinite memory.
+        let g = FinalizedGuard::new(2);
+        assert!(g.mark(1));
+        assert!(g.mark(2));
+        assert!(g.mark(3)); // evicts id 1 (oldest)
+        assert!(!g.contains(1), "oldest id evicted past capacity");
+        assert!(g.contains(2));
+        assert!(g.contains(3));
+        // id 1 fell out of the window, so it is seen as fresh again.
+        assert!(g.mark(1), "evicted id is fresh again (bounded window)");
     }
 
     // RFC #115 Phase 4 remainder: the execute-time descriptor carries catalog_id
