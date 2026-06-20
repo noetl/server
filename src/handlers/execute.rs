@@ -472,14 +472,47 @@ async fn emit_deduplicated_event(
     // from the subscription scope's lifecycle events (its execution_id ==
     // scope).  Best-effort: if it can't be resolved, skip the audit rather
     // than turning a correct dedup into an error.
-    let catalog_id: Option<i64> = sqlx::query_scalar(
-        "SELECT catalog_id FROM noetl.event WHERE execution_id = $1 ORDER BY event_id ASC LIMIT 1",
-    )
-    .bind(scope)
-    .fetch_optional(state.pools.pool_for(scope))
-    .await
-    .ok()
-    .flatten();
+    // RFC #115 Phase 6: under `event_read_path=audit_only`, serve the scope's
+    // catalog_id from the in-memory execute-time descriptor — ZERO `noetl.event`
+    // read.  Cold descriptor falls through to the scan (counted `scan`).
+    let catalog_id: Option<i64> = if matches!(
+        state.config.event_read_path,
+        crate::config::EventReadPath::AuditOnly
+    ) && state
+        .exec_descriptors
+        .get(scope)
+        .map(|d| d.catalog_id)
+        .filter(|c| *c != 0)
+        .is_some()
+    {
+        crate::metrics::record_event_hotpath_read("dedup_audit_catalog", "served_descriptor");
+        state.exec_descriptors.get(scope).map(|d| d.catalog_id)
+    } else if matches!(
+        state.config.event_read_path,
+        crate::config::EventReadPath::AuditOnly
+    ) {
+        // Cold descriptor under audit_only: catalog_id from `noetl.command` — the
+        // synchronous queue — ZERO `noetl.event` read.
+        crate::metrics::record_event_hotpath_read("dedup_audit_catalog", "served_command");
+        sqlx::query_scalar(
+            "SELECT catalog_id FROM noetl.command WHERE execution_id = $1 LIMIT 1",
+        )
+        .bind(scope)
+        .fetch_optional(state.pools.pool_for(scope))
+        .await
+        .ok()
+        .flatten()
+    } else {
+        crate::metrics::record_event_hotpath_read("dedup_audit_catalog", "scan");
+        sqlx::query_scalar(
+            "SELECT catalog_id FROM noetl.event WHERE execution_id = $1 ORDER BY event_id ASC LIMIT 1",
+        )
+        .bind(scope)
+        .fetch_optional(state.pools.pool_for(scope))
+        .await
+        .ok()
+        .flatten()
+    };
     let Some(catalog_id) = catalog_id else {
         tracing::debug!(subscription_id = scope, "dedup audit: no catalog_id for scope; skipping audit event");
         return;
@@ -645,6 +678,35 @@ async fn emit_playbook_started_event(
 /// `playbook_started` event so a child run joins the same distributed trace.
 /// Best-effort: a missing parent / missing trace simply yields `None`.
 async fn inherit_parent_trace(state: &AppState, parent_execution_id: i64) -> Option<serde_json::Value> {
+    // RFC #115 Phase 6: under `event_read_path=audit_only`, read the parent's
+    // trace off its in-memory execute-time descriptor (its `routing_meta` is the
+    // `playbook_started` meta this query reads) — ZERO `noetl.event` read.  A cold
+    // parent descriptor falls through to the scan (counted `scan`).
+    if matches!(
+        state.config.event_read_path,
+        crate::config::EventReadPath::AuditOnly
+    ) {
+        if let Some(desc) = state.exec_descriptors.get(parent_execution_id) {
+            if desc.catalog_id != 0 {
+                crate::metrics::record_event_hotpath_read("inherit_parent_trace", "served_descriptor");
+                return desc
+                    .routing_meta
+                    .as_ref()
+                    .and_then(|m| m.get("trace"))
+                    .filter(|v| !v.is_null())
+                    .cloned();
+            }
+        }
+        // Cold parent descriptor under audit_only: the W3C trace lives only in the
+        // parent's `playbook_started` meta (no `noetl.command` source).  Trace
+        // inheritance is best-effort observability — return None (the child opens
+        // a fresh trace segment) rather than scan `noetl.event`, keeping the
+        // never-scan invariant.  Only the parent-restart path is affected.
+        crate::metrics::record_event_hotpath_read("inherit_parent_trace", "served_none_cold");
+        return None;
+    }
+    crate::metrics::record_event_hotpath_read("inherit_parent_trace", "scan");
+
     let meta: Option<serde_json::Value> = sqlx::query_scalar(
         "SELECT meta FROM noetl.event WHERE execution_id = $1 AND event_type = 'playbook_started' \
          ORDER BY event_id ASC LIMIT 1",

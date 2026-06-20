@@ -182,6 +182,53 @@ pub fn record_state_build(mode: &str, outcome: &str) {
     state_build_total().with_label_values(&[mode, outcome]).inc();
 }
 
+// ── Hot-path event reads (RFC noetl/ai-meta#115 Phase 6) ─────────────────────
+
+/// `noetl_event_hotpath_reads_total{site, outcome}` — every execution-lifecycle
+/// hot-path reader of `noetl.event` that the Phase-6 `event_read_path=audit_only`
+/// flag retires (the `WHERE execution_id = $1` replay class *outside* the drive:
+/// `get_catalog_id`, `inherit_parent_trace`, the subscription dedup-audit catalog
+/// lookup, the container-callback existence + catalog reads).
+///
+/// - `site` = `get_catalog_id` | `inherit_parent_trace` | `dedup_audit_catalog`
+///   | `container_callback_exists` | `container_callback_catalog`.
+/// - `outcome` = `served_descriptor` (served from the in-memory execute-time
+///   descriptor — **no `noetl.event` read**) | `scan` (fell back to the
+///   `WHERE execution_id` scan — cold descriptor, or `event_read_path=event_scan`).
+///
+/// The never-scan invariant proof (RFC §7): under `event_read_path=audit_only`
+/// + `state_builder=offserver`, across a full execution lifecycle the
+/// `{outcome="scan"}` series stays **flat** (Δ0) while the lifecycle still
+/// completes — every hot-path event read was served from a read model, and
+/// `noetl.event` was scanned by nobody on the hot path.  Pairs with the
+/// drive-path `noetl_state_build_event_scans_total` (which proves the drive's
+/// own zero-scan) for the end-to-end guarantee.
+pub fn event_hotpath_reads_total() -> &'static IntCounterVec {
+    static M: OnceLock<IntCounterVec> = OnceLock::new();
+    M.get_or_init(|| {
+        let counter = IntCounterVec::new(
+            Opts::new(
+                "noetl_event_hotpath_reads_total",
+                "Execution-lifecycle hot-path reads of noetl.event, by site and outcome (RFC #115 Phase 6).",
+            ),
+            &["site", "outcome"],
+        )
+        .expect("static counter spec must be valid");
+        registry()
+            .register(Box::new(counter.clone()))
+            .expect("counter registration must succeed");
+        counter
+    })
+}
+
+/// Record one hot-path event read (`site` = the reader; `outcome` =
+/// `served_descriptor` | `scan`).
+pub fn record_event_hotpath_read(site: &str, outcome: &str) {
+    event_hotpath_reads_total()
+        .with_label_values(&[site, outcome])
+        .inc();
+}
+
 /// `noetl_state_build_event_scans_total` — incremented once each time the drive
 /// path enters the **event-scan** state-construction block (the block that issues
 /// `WHERE execution_id = $1 …` scans of `noetl.event`: the consistency `COUNT`,
