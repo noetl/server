@@ -345,6 +345,61 @@ pub fn record_state_build_parity(result: &str) {
     state_build_parity_total().with_label_values(&[result]).inc();
 }
 
+// ── Replica coherence (RFC noetl/ai-meta#115 program-scale / #107) ───────────
+
+/// `noetl_replica_coherence_total{structure, op, outcome}` — every access to the
+/// per-execution drive watermark ([`crate::state::ChainHeads`]) or descriptor
+/// ([`crate::state::ExecDescriptor`]) under `NOETL_REPLICA_COHERENCE=nats_kv`,
+/// labelled by which read model served it.  The proof series for multi-replica
+/// coherence:
+///
+/// - `structure` = `chain_head` | `descriptor`.
+/// - `op` = `link_batch` | `head` | `get` | `seed` | `mark_terminal` | `evict`.
+/// - `outcome`:
+///   - `kv_ok` — a KV write (head CAS / descriptor merge / evict) succeeded.
+///   - `kv_remote_hit` — a `descriptor get` (or `head`) **missed the local
+///     in-process map but hit the KV bucket** — i.e. another replica seeded it
+///     and this replica resolved it coherently.  **This is the load-bearing
+///     proof counter**: every increment is a server-built cold-fallback (an event
+///     read) that the KV backing avoided when the trigger landed on a different
+///     replica than the one that seeded the execution.
+///   - `kv_local_hit` — both the local map and KV had it (the common
+///     single-replica / same-replica case).
+///   - `kv_miss` — KV authoritatively had no entry (genuinely cold: never-seeded
+///     or evicted everywhere) → the caller takes the server-built fallback.
+///   - `kv_unavailable` — KV unreachable / disabled / a CAS exhausted its
+///     retries → degraded to the in-process map (behaves as `local`).
+///
+/// Under `nats_kv` with 2+ replicas and triggers landing across them, a coherent
+/// run shows `kv_remote_hit > 0` (cross-replica resolves happened) while the
+/// drive's `noetl_state_build_event_scans_total` and the hot-path
+/// `noetl_event_hotpath_reads_total{outcome="scan"}` stay flat — coherence
+/// without a single recovery scan attributable to the replica split.
+pub fn replica_coherence_total() -> &'static IntCounterVec {
+    static M: OnceLock<IntCounterVec> = OnceLock::new();
+    M.get_or_init(|| {
+        let counter = IntCounterVec::new(
+            Opts::new(
+                "noetl_replica_coherence_total",
+                "Per-execution drive watermark/descriptor accesses under NOETL_REPLICA_COHERENCE=nats_kv, by structure/op/outcome (RFC #115 program-scale).",
+            ),
+            &["structure", "op", "outcome"],
+        )
+        .expect("static counter spec must be valid");
+        registry()
+            .register(Box::new(counter.clone()))
+            .expect("counter registration must succeed");
+        counter
+    })
+}
+
+/// Record one replica-coherence access (`structure`/`op`/`outcome`).
+pub fn record_replica_coherence(structure: &str, op: &str, outcome: &str) {
+    replica_coherence_total()
+        .with_label_values(&[structure, op, outcome])
+        .inc();
+}
+
 /// Histogram: wall-clock time spent inside the `POST /api/events` handler.
 pub fn event_ingest_duration_seconds() -> &'static HistogramVec {
     static M: OnceLock<HistogramVec> = OnceLock::new();

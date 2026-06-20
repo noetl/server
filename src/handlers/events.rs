@@ -1488,7 +1488,7 @@ async fn get_catalog_id(state: &AppState, execution_id: i64, site: &str) -> AppR
         crate::config::EventReadPath::AuditOnly
     ) {
         // Warm descriptor → served, ZERO read.
-        if let Some(desc) = state.exec_descriptors.get(execution_id) {
+        if let Some(desc) = state.exec_descriptors.get(execution_id).await {
             if desc.catalog_id != 0 {
                 crate::metrics::record_event_hotpath_read(site, "served_descriptor");
                 return Ok(Some(desc.catalog_id));
@@ -2080,7 +2080,7 @@ async fn rebuild_state_chain_walk(
     keep_refs: bool,
 ) -> AppResult<Option<ChainWalkBuild>> {
     // Head from the in-memory watermark — no DB read.  Cold slot → fall back.
-    let Some(head) = state.chain_heads.head(execution_id) else {
+    let Some(head) = state.chain_heads.head(execution_id).await else {
         crate::metrics::record_state_build("chain_walk", "fallback_cold_head");
         debug!(execution_id, "chain walk: cold head, falling back to event scan");
         return Ok(None);
@@ -2193,7 +2193,7 @@ async fn run_parity_check(
     keep_refs: bool,
 ) -> AppResult<()> {
     use sqlx::Row;
-    let Some(head) = state.chain_heads.head(execution_id) else {
+    let Some(head) = state.chain_heads.head(execution_id).await else {
         return Ok(());
     };
     let mut conn = pool.acquire().await?;
@@ -2485,9 +2485,9 @@ async fn dispatch_offserver_stateless_drive(
     // Terminal guard — no event read.  A cancel/finalize/completion already
     // stamped the descriptor; stop re-dispatching and free the in-memory state.
     if desc.terminal {
-        state.exec_descriptors.evict(execution_id);
+        state.exec_descriptors.evict(execution_id).await;
         state.orch_cache.evict(execution_id);
-        state.chain_heads.evict(execution_id);
+        state.chain_heads.evict(execution_id).await;
         crate::metrics::record_orchestrate_drive("stateless_terminal_skip");
         debug!(
             execution_id,
@@ -2517,7 +2517,7 @@ async fn dispatch_offserver_stateless_drive(
     // Dispatch watermark from the in-memory chain head — NO DB read.  The worker
     // serves the WAL build only once its pool-side index has caught up to this,
     // so the off-server state is never staler than the server's view.
-    let expected_head = state.chain_heads.head(execution_id).unwrap_or(0);
+    let expected_head = state.chain_heads.head(execution_id).await.unwrap_or(0);
 
     // Playbook content — PK lookup on the cluster `noetl.catalog` table (not a
     // `noetl.event` read).
@@ -2605,7 +2605,7 @@ async fn trigger_orchestrator_inner(
             crate::config::StateBuilder::Offserver
         )
     {
-        if let Some(desc) = state.exec_descriptors.get(execution_id) {
+        if let Some(desc) = state.exec_descriptors.get(execution_id).await {
             if desc.catalog_id != 0 {
                 return dispatch_offserver_stateless_drive(
                     state,
@@ -2876,8 +2876,8 @@ async fn trigger_orchestrator_inner(
         let st = cache.state.as_ref().map(|ws| ws.state);
         drop(cache);
         state.orch_cache.evict(execution_id);
-        state.chain_heads.evict(execution_id); // RFC #115 §4: drop the chain head too
-        state.exec_descriptors.evict(execution_id); // RFC #115 Phase 4 remainder
+        state.chain_heads.evict(execution_id).await; // RFC #115 §4: drop the chain head too
+        state.exec_descriptors.evict(execution_id).await; // RFC #115 Phase 4 remainder
         debug!(
             execution_id,
             state = ?st,
@@ -2948,7 +2948,8 @@ async fn trigger_orchestrator_inner(
     // `noetl.event` only on this recovery pass, then goes scan-free.
     state
         .exec_descriptors
-        .seed(execution_id, catalog_id, cache.routing_meta.clone());
+        .seed(execution_id, catalog_id, cache.routing_meta.clone())
+        .await;
 
     // Phase F R4-3: noetl.catalog is a cluster-wide table.
     let playbook_yaml: String =
@@ -3129,8 +3130,8 @@ async fn trigger_orchestrator_inner(
     if result.should_complete {
         drop(cache);
         state.orch_cache.evict(execution_id);
-        state.chain_heads.evict(execution_id); // RFC #115 §4: drop the chain head too
-        state.exec_descriptors.evict(execution_id); // RFC #115 Phase 4 remainder
+        state.chain_heads.evict(execution_id).await; // RFC #115 §4: drop the chain head too
+        state.exec_descriptors.evict(execution_id).await; // RFC #115 Phase 4 remainder
     }
 
     Ok(commands_generated)
@@ -3424,13 +3425,18 @@ async fn apply_worker_orchestration(
     // `cache.state`.  So skip the cold-rebuild ENTIRELY (no `noetl.event` read on
     // the apply side of the drive path either).  A cold descriptor falls through
     // to the crash-recovery rebuild below.
-    let offserver_apply = matches!(
+    let offserver_apply = if matches!(
         state.config.state_builder,
         crate::config::StateBuilder::Offserver
-    )
-    .then(|| state.exec_descriptors.get(execution_id))
-    .flatten()
-    .filter(|d| d.catalog_id != 0);
+    ) {
+        state
+            .exec_descriptors
+            .get(execution_id)
+            .await
+            .filter(|d| d.catalog_id != 0)
+    } else {
+        None
+    };
 
     let (catalog_id, routing) = if let Some(desc) = offserver_apply {
         crate::metrics::record_orchestrate_drive("applied_stateless");
@@ -3505,7 +3511,8 @@ async fn apply_worker_orchestration(
                 let cid = cache.state.as_ref().map(|s| s.catalog_id).unwrap_or(0);
                 state
                     .exec_descriptors
-                    .seed(execution_id, cid, cache.routing_meta.clone());
+                    .seed(execution_id, cid, cache.routing_meta.clone())
+                    .await;
             }
         }
 
@@ -3557,8 +3564,8 @@ async fn apply_worker_orchestration(
     if result.should_complete || result.state.is_terminal() {
         drop(cache);
         state.orch_cache.evict(execution_id);
-        state.chain_heads.evict(execution_id); // RFC #115 §4: drop the chain head too
-        state.exec_descriptors.evict(execution_id); // RFC #115 Phase 4 remainder
+        state.chain_heads.evict(execution_id).await; // RFC #115 §4: drop the chain head too
+        state.exec_descriptors.evict(execution_id).await; // RFC #115 Phase 4 remainder
     }
     Ok(commands_generated)
 }

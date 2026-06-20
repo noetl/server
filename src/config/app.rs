@@ -295,6 +295,38 @@ pub struct AppConfig {
     /// unchanged.  Flipping to true is opt-in and staged.
     #[serde(default)]
     pub atomic_item_context: bool,
+
+    /// **Where the per-execution drive watermark + descriptor live** (RFC
+    /// noetl/ai-meta#115 program-scale / noetl/ai-meta#107).  Envy maps
+    /// `NOETL_REPLICA_COHERENCE`.
+    ///
+    /// The off-server drive edge keys two execution-scoped facts off in-memory
+    /// `AppState` maps: the [`crate::state::ChainHeads`] watermark (the
+    /// `prev_event_id` the emit chokepoint stamps) and the
+    /// [`crate::state::ExecDescriptor`] (catalog_id + routing + terminal).  Both
+    /// carry a **single-replica locality assumption** — they are seeded on the
+    /// replica that handled `playbook_started` and read on whichever replica a
+    /// later trigger lands on.  With one replica that is always the same process;
+    /// with 2+ a trigger that lands on a different replica finds a cold slot and
+    /// falls back to the server-built (event-reading) path — correct, but not
+    /// scan-free and not coherent.
+    ///
+    /// - **`local`** (default) — the maps are pure in-process state, exactly as
+    ///   today.  Prod/default behavior; unchanged.  Correct for single-replica.
+    /// - **`nats_kv`** — the maps are backed by two JetStream **KV buckets**
+    ///   (`noetl_chain_heads`, `noetl_exec_descriptors`) so any replica resolves
+    ///   the same watermark/descriptor.  The head advance is a **compare-and-swap**
+    ///   so a single per-execution chain is preserved even when two replicas emit
+    ///   concurrently; the descriptor is a CAS read-modify-write so seed +
+    ///   terminal merge.  The in-process maps become a write-through cache /
+    ///   degraded-mode fallback (KV unreachable → behaves as `local`).  Requires a
+    ///   connected NATS (the gate-on publish path already does); with no NATS it
+    ///   transparently degrades to `local`.
+    ///
+    /// **Default `local`** — prod/default behavior is unchanged.  `nats_kv` is the
+    /// multi-replica coherence substrate; opt-in and staged.
+    #[serde(default)]
+    pub replica_coherence: ReplicaCoherence,
 }
 
 /// How the execution-lifecycle hot path reads `noetl.event` — see
@@ -324,6 +356,21 @@ pub enum StateBuilder {
     /// State construction runs off-server on the system worker pool, reading the
     /// `noetl_events` WAL with a pool-side cache (RFC #115 Phase 4).
     Offserver,
+}
+
+/// Where the per-execution drive watermark + descriptor live — see
+/// [`AppConfig::replica_coherence`] (RFC noetl/ai-meta#115 program-scale).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplicaCoherence {
+    /// `ChainHeads` + `ExecDescriptor` are pure in-process `AppState` maps.
+    /// Default — prod behavior; correct for a single replica.
+    #[default]
+    Local,
+    /// The maps are backed by JetStream KV buckets so 2+ replicas resolve the
+    /// same watermark/descriptor (CAS on the head advance + descriptor merge);
+    /// the in-process maps become a write-through cache (RFC #115 program-scale).
+    NatsKv,
 }
 
 /// Strategy for reconstructing orchestrator `WorkflowState` — see
@@ -422,6 +469,9 @@ impl Default for AppConfig {
             // noetl/ai-meta#115 Phase 5: full-context dispatch by default; the
             // atomic-working-item minimal-slice narrowing is opt-in (and staged).
             atomic_item_context: false,
+            // noetl/ai-meta#115 program-scale: in-process maps by default; the
+            // NATS-KV multi-replica coherence backing is opt-in (and staged).
+            replica_coherence: ReplicaCoherence::Local,
         }
     }
 }

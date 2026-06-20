@@ -173,49 +173,135 @@ pub struct ExecOrchState {
 /// validates.  Restart-spanning repair is a Phase 3 builder concern (it
 /// re-walks from a durable head); nothing reads `prev_event_id` yet, so a chain
 /// restart here is additive metadata, never a regression.
-#[derive(Default)]
 pub struct ChainHeads {
     map: std::sync::Mutex<std::collections::HashMap<i64, i64>>,
+    /// Multi-replica coherence backend (RFC #115 program-scale).  `local`
+    /// (default) → disabled, the `map` is the whole story (today's behavior).
+    /// `nats_kv` → the head is CAS-advanced in a shared KV bucket so 2+ replicas
+    /// agree, and `map` becomes a write-through cache / degraded-mode fallback.
+    coherence: Arc<crate::coherence::CoherenceKv>,
+}
+
+impl Default for ChainHeads {
+    fn default() -> Self {
+        Self {
+            map: std::sync::Mutex::new(std::collections::HashMap::new()),
+            coherence: Arc::new(crate::coherence::CoherenceKv::default()),
+        }
+    }
 }
 
 impl ChainHeads {
+    /// Build with a shared coherence backend (used by [`AppState::new`]).
+    pub fn with_coherence(coherence: Arc<crate::coherence::CoherenceKv>) -> Self {
+        Self {
+            map: std::sync::Mutex::new(std::collections::HashMap::new()),
+            coherence,
+        }
+    }
+
     /// Stamp the chain link for a batch of event ids emitted (in order) for one
     /// execution, advancing the head as it goes.  Returns, for each id, the
-    /// `prev_event_id` it should carry (`None` for a chain root).  One short
-    /// `std::Mutex` critical section, no `await` held — safe to call from any
-    /// chokepoint path without lock-ordering hazards against
-    /// [`OrchStateCache`]'s per-execution `tokio::Mutex`.
+    /// `prev_event_id` it should carry (`None` for a chain root).
+    ///
+    /// Under `local` this is one short `std::Mutex` critical section (no `await`
+    /// held).  Under `nats_kv` the head before the batch is obtained by a KV
+    /// **compare-and-swap** so concurrent emits on different replicas serialise
+    /// into a single per-execution chain; the `std::Mutex` is never held across
+    /// the KV `await`.
     ///
     /// An empty `event_ids` is a no-op returning an empty vec.
-    pub fn link_batch(&self, execution_id: i64, event_ids: &[i64]) -> Vec<Option<i64>> {
+    pub async fn link_batch(&self, execution_id: i64, event_ids: &[i64]) -> Vec<Option<i64>> {
+        if event_ids.is_empty() {
+            return Vec::new();
+        }
+        let new_head = *event_ids.last().expect("non-empty checked above");
+        if self.coherence.enabled() {
+            if let crate::coherence::KvRead::Hit(prev_head) =
+                self.coherence.advance_head(execution_id, new_head).await
+            {
+                // Write-through the local cache (best-effort; KV is the truth).
+                self.map.lock().unwrap().insert(execution_id, new_head);
+                crate::metrics::record_replica_coherence("chain_head", "link_batch", "kv_ok");
+                return Self::prevs_from(prev_head, event_ids);
+            }
+            crate::metrics::record_replica_coherence("chain_head", "link_batch", "kv_unavailable");
+            // Fall through to the in-process map (degraded mode == local).
+        }
         let mut map = self.map.lock().unwrap();
-        let mut head = map.get(&execution_id).copied();
+        let head = map.get(&execution_id).copied();
+        let prevs = Self::prevs_from(head, event_ids);
+        map.insert(execution_id, new_head);
+        prevs
+    }
+
+    /// Given the head *before* a batch + the batch's ids (in order), the
+    /// `prev_event_id` each id carries: the first points at the prior head, each
+    /// subsequent at its predecessor in the batch.
+    fn prevs_from(prev_head: Option<i64>, event_ids: &[i64]) -> Vec<Option<i64>> {
+        let mut head = prev_head;
         let mut prevs = Vec::with_capacity(event_ids.len());
         for &eid in event_ids {
             prevs.push(head);
             head = Some(eid);
         }
-        if let Some(h) = head {
-            map.insert(execution_id, h);
-        }
         prevs
     }
 
-    /// Drop a terminal execution's head (frees memory).  Called alongside
-    /// [`OrchStateCache::evict`] on the terminal-event paths.
-    pub fn evict(&self, execution_id: i64) {
+    /// Drop a terminal execution's head (frees memory + the KV entry).  Called
+    /// alongside [`OrchStateCache::evict`] on the terminal-event paths.
+    pub async fn evict(&self, execution_id: i64) {
         self.map.lock().unwrap().remove(&execution_id);
+        if self.coherence.enabled() {
+            self.coherence.evict_head(execution_id).await;
+        }
     }
 
-    /// Current head for an execution, if any.  Test/diagnostic helper.
-    pub fn head(&self, execution_id: i64) -> Option<i64> {
+    /// Current head for an execution, if any.  Under `nats_kv` the coherent KV
+    /// value is authoritative (any replica resolves the same head); a KV miss is
+    /// a genuine cold slot, KV-unavailable degrades to the in-process map.
+    pub async fn head(&self, execution_id: i64) -> Option<i64> {
+        if self.coherence.enabled() {
+            match self.coherence.get_head(execution_id).await {
+                crate::coherence::KvRead::Hit(v) => {
+                    let local_had = self
+                        .map
+                        .lock()
+                        .unwrap()
+                        .insert(execution_id, v)
+                        .is_some();
+                    crate::metrics::record_replica_coherence(
+                        "chain_head",
+                        "head",
+                        if local_had { "kv_local_hit" } else { "kv_remote_hit" },
+                    );
+                    return Some(v);
+                }
+                crate::coherence::KvRead::Miss => {
+                    crate::metrics::record_replica_coherence("chain_head", "head", "kv_miss");
+                    return None;
+                }
+                crate::coherence::KvRead::Unavailable => {
+                    crate::metrics::record_replica_coherence(
+                        "chain_head",
+                        "head",
+                        "kv_unavailable",
+                    );
+                    // Fall through to local.
+                }
+            }
+        }
         self.map.lock().unwrap().get(&execution_id).copied()
     }
 }
 
 /// Execute-time descriptor for the stateless off-server drive edge (RFC #115
 /// Phase 4 remainder).  See the [`AppState::exec_descriptors`] field doc.
-#[derive(Clone, Debug, Default)]
+///
+/// `Serialize`/`Deserialize` so the multi-replica coherence backend
+/// ([`crate::coherence::CoherenceKv`]) can store it in a JetStream KV bucket
+/// under `NOETL_REPLICA_COHERENCE=nats_kv`.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct ExecDescriptor {
     /// The execution's catalog id (immutable for the run).  Sourced from the
     /// `playbook_started` event at execute-time instead of from a rebuilt
@@ -240,42 +326,121 @@ pub struct ExecDescriptor {
 /// mid-execution) yields `None`, and the drive falls back to the server-built
 /// state path for that trigger — which re-seeds the descriptor — so correctness
 /// never regresses below the server-built drive.
-#[derive(Default)]
 pub struct ExecDescriptors {
     map: std::sync::Mutex<std::collections::HashMap<i64, ExecDescriptor>>,
+    /// Multi-replica coherence backend (RFC #115 program-scale).  `local`
+    /// (default) → disabled (today's behavior).  `nats_kv` → the descriptor is a
+    /// shared KV entry so a trigger landing on a replica that didn't seed the
+    /// execution resolves it (and the terminal flag) coherently instead of
+    /// taking a server-built cold fallback.
+    coherence: Arc<crate::coherence::CoherenceKv>,
+}
+
+impl Default for ExecDescriptors {
+    fn default() -> Self {
+        Self {
+            map: std::sync::Mutex::new(std::collections::HashMap::new()),
+            coherence: Arc::new(crate::coherence::CoherenceKv::default()),
+        }
+    }
 }
 
 impl ExecDescriptors {
-    /// Seed `catalog_id` + `routing_meta` at execute-time (or re-seed from the
-    /// server-built fallback path after a cold-descriptor drive).  Fills the
-    /// load-bearing fields without clobbering a `terminal` flag a concurrent
-    /// cancel may already have stamped.
-    pub fn seed(&self, execution_id: i64, catalog_id: i64, routing_meta: Option<serde_json::Value>) {
-        let mut map = self.map.lock().unwrap();
-        let e = map.entry(execution_id).or_default();
-        if catalog_id != 0 {
-            e.catalog_id = catalog_id;
-        }
-        if routing_meta.is_some() {
-            e.routing_meta = routing_meta;
+    /// Build with a shared coherence backend (used by [`AppState::new`]).
+    pub fn with_coherence(coherence: Arc<crate::coherence::CoherenceKv>) -> Self {
+        Self {
+            map: std::sync::Mutex::new(std::collections::HashMap::new()),
+            coherence,
         }
     }
 
-    /// Current descriptor snapshot for an execution, if seeded.
-    pub fn get(&self, execution_id: i64) -> Option<ExecDescriptor> {
-        self.map.lock().unwrap().get(&execution_id).cloned()
+    /// Seed `catalog_id` + `routing_meta` at execute-time (or re-seed from the
+    /// server-built fallback path after a cold-descriptor drive).  Fills the
+    /// load-bearing fields without clobbering a `terminal` flag a concurrent
+    /// cancel may already have stamped.  Under `nats_kv` the merge also rides a
+    /// KV CAS so a seed + a terminal-stamp from different replicas converge.
+    pub async fn seed(
+        &self,
+        execution_id: i64,
+        catalog_id: i64,
+        routing_meta: Option<serde_json::Value>,
+    ) {
+        {
+            let mut map = self.map.lock().unwrap();
+            let e = map.entry(execution_id).or_default();
+            if catalog_id != 0 {
+                e.catalog_id = catalog_id;
+            }
+            if routing_meta.is_some() {
+                e.routing_meta = routing_meta.clone();
+            }
+        }
+        if self.coherence.enabled() {
+            self.coherence
+                .seed_descriptor(execution_id, catalog_id, routing_meta)
+                .await;
+            crate::metrics::record_replica_coherence("descriptor", "seed", "kv_ok");
+        }
+    }
+
+    /// Current descriptor snapshot for an execution, if seeded.  Under `nats_kv`
+    /// the coherent KV value is authoritative: a KV hit that the local map
+    /// missed is a **cross-replica resolve** (`kv_remote_hit`) — the descriptor
+    /// another replica seeded, found without a server-built cold fallback.  A KV
+    /// miss is a genuine cold slot (never-seeded or evicted everywhere); KV
+    /// unavailable degrades to the in-process map.
+    pub async fn get(&self, execution_id: i64) -> Option<ExecDescriptor> {
+        let local = self.map.lock().unwrap().get(&execution_id).cloned();
+        if self.coherence.enabled() {
+            match self.coherence.get_descriptor(execution_id).await {
+                crate::coherence::KvRead::Hit(desc) => {
+                    crate::metrics::record_replica_coherence(
+                        "descriptor",
+                        "get",
+                        if local.is_some() { "kv_local_hit" } else { "kv_remote_hit" },
+                    );
+                    self.map.lock().unwrap().insert(execution_id, desc.clone());
+                    return Some(desc);
+                }
+                crate::coherence::KvRead::Miss => {
+                    crate::metrics::record_replica_coherence("descriptor", "get", "kv_miss");
+                    return None;
+                }
+                crate::coherence::KvRead::Unavailable => {
+                    crate::metrics::record_replica_coherence(
+                        "descriptor",
+                        "get",
+                        "kv_unavailable",
+                    );
+                    return local;
+                }
+            }
+        }
+        local
     }
 
     /// Stamp the terminal flag (emit chokepoint).  Creates the slot if cold so a
     /// cancel that lands before any drive still records the stop signal.
-    pub fn mark_terminal(&self, execution_id: i64) {
-        self.map.lock().unwrap().entry(execution_id).or_default().terminal = true;
+    pub async fn mark_terminal(&self, execution_id: i64) {
+        self.map
+            .lock()
+            .unwrap()
+            .entry(execution_id)
+            .or_default()
+            .terminal = true;
+        if self.coherence.enabled() {
+            self.coherence.mark_terminal_descriptor(execution_id).await;
+            crate::metrics::record_replica_coherence("descriptor", "mark_terminal", "kv_ok");
+        }
     }
 
-    /// Drop a terminal execution's descriptor (frees memory).  Called alongside
-    /// [`OrchStateCache::evict`] on the terminal paths.
-    pub fn evict(&self, execution_id: i64) {
+    /// Drop a terminal execution's descriptor (frees memory + the KV entry).
+    /// Called alongside [`OrchStateCache::evict`] on the terminal paths.
+    pub async fn evict(&self, execution_id: i64) {
         self.map.lock().unwrap().remove(&execution_id);
+        if self.coherence.enabled() {
+            self.coherence.evict_descriptor(execution_id).await;
+        }
     }
 }
 
@@ -394,17 +559,33 @@ impl AppState {
             "Shard configuration initialized"
         );
 
+        // Multi-replica coherence backend (RFC #115 program-scale,
+        // noetl/ai-meta#107).  `local` (default) → disabled, so `ChainHeads` +
+        // `ExecDescriptors` are the in-process maps (prod-unchanged).  `nats_kv`
+        // → both are backed by shared JetStream KV buckets so 2+ replicas resolve
+        // the same watermark/descriptor.  One backend shared by both structures.
+        let nats = nats.map(Arc::new);
+        let coherence = Arc::new(crate::coherence::CoherenceKv::new(
+            nats.clone(),
+            config.replica_coherence,
+        ));
+        tracing::info!(
+            replica_coherence = ?config.replica_coherence,
+            coherence_enabled = coherence.enabled(),
+            "Replica coherence backend initialized"
+        );
+
         Self {
             db,
             pools,
             config: Arc::new(config),
-            nats: nats.map(Arc::new),
+            nats,
             snowflake: Arc::new(snowflake),
             shard: Arc::new(shard),
             start_time: std::time::Instant::now(),
             orch_cache: Arc::new(OrchStateCache::default()),
-            chain_heads: Arc::new(ChainHeads::default()),
-            exec_descriptors: Arc::new(ExecDescriptors::default()),
+            chain_heads: Arc::new(ChainHeads::with_coherence(coherence.clone())),
+            exec_descriptors: Arc::new(ExecDescriptors::with_coherence(coherence)),
             event_stream_publisher: Arc::new(tokio::sync::OnceCell::new()),
         }
     }
@@ -454,93 +635,97 @@ mod tests {
 
     // RFC #115 Phase 4 remainder: the execute-time descriptor carries catalog_id
     // + routing so the off-server drive routes without rebuilding state.
-    #[test]
-    fn exec_descriptor_seed_get_and_terminal() {
+    // `ChainHeads::default()` / `ExecDescriptors::default()` are
+    // coherence-disabled (local), so these tests assert the in-process
+    // behavior — the prod/default path the `nats_kv` backing must stay
+    // bit-compatible with.
+    #[tokio::test]
+    async fn exec_descriptor_seed_get_and_terminal() {
         let d = ExecDescriptors::default();
-        assert!(d.get(7).is_none(), "cold execution has no descriptor");
+        assert!(d.get(7).await.is_none(), "cold execution has no descriptor");
 
-        d.seed(7, 42, Some(serde_json::json!({"execution_pool": "default"})));
-        let got = d.get(7).expect("seeded");
+        d.seed(7, 42, Some(serde_json::json!({"execution_pool": "default"}))).await;
+        let got = d.get(7).await.expect("seeded");
         assert_eq!(got.catalog_id, 42);
         assert_eq!(got.routing_meta.unwrap()["execution_pool"], "default");
         assert!(!got.terminal, "freshly seeded is not terminal");
 
         // A terminal stamp (emit chokepoint) flips the flag without clobbering
         // the seeded facts.
-        d.mark_terminal(7);
-        let got = d.get(7).expect("still present");
+        d.mark_terminal(7).await;
+        let got = d.get(7).await.expect("still present");
         assert!(got.terminal, "terminal flag set");
         assert_eq!(got.catalog_id, 42, "catalog_id preserved across terminal stamp");
 
-        d.evict(7);
-        assert!(d.get(7).is_none(), "evicted");
+        d.evict(7).await;
+        assert!(d.get(7).await.is_none(), "evicted");
     }
 
-    #[test]
-    fn exec_descriptor_seed_preserves_terminal_and_does_not_zero_catalog() {
+    #[tokio::test]
+    async fn exec_descriptor_seed_preserves_terminal_and_does_not_zero_catalog() {
         let d = ExecDescriptors::default();
         // A cancel can stamp terminal before any drive seeded catalog_id.
-        d.mark_terminal(9);
+        d.mark_terminal(9).await;
         // A late seed (e.g. the recovery rebuild) must keep the terminal flag and
         // must not zero catalog_id when passed 0.
-        d.seed(9, 0, None);
-        let got = d.get(9).expect("present");
+        d.seed(9, 0, None).await;
+        let got = d.get(9).await.expect("present");
         assert!(got.terminal, "terminal flag survives a seed");
         assert_eq!(got.catalog_id, 0, "catalog_id stays 0 (nothing real to seed yet)");
         // A real seed fills catalog_id, still keeping terminal.
-        d.seed(9, 55, Some(serde_json::json!({"x": 1})));
-        let got = d.get(9).expect("present");
+        d.seed(9, 55, Some(serde_json::json!({"x": 1}))).await;
+        let got = d.get(9).await.expect("present");
         assert_eq!(got.catalog_id, 55);
         assert!(got.terminal);
     }
 
     // RFC #115 §4: the per-execution chain head turns a stream of emitted event
     // ids into a walkable singly-linked list.
-    #[test]
-    fn chain_head_links_first_event_is_root() {
+    #[tokio::test]
+    async fn chain_head_links_first_event_is_root() {
         let heads = ChainHeads::default();
         // First batch: the execution's first event has no predecessor (root).
-        let prevs = heads.link_batch(7, &[100]);
+        let prevs = heads.link_batch(7, &[100]).await;
         assert_eq!(prevs, vec![None], "execution's first event is a chain root");
-        assert_eq!(heads.head(7), Some(100));
+        assert_eq!(heads.head(7).await, Some(100));
     }
 
-    #[test]
-    fn chain_head_links_batch_in_order() {
+    #[tokio::test]
+    async fn chain_head_links_batch_in_order() {
         let heads = ChainHeads::default();
         // A multi-row batch (e.g. a cursor fan-out's N command.issued events)
         // links each row to the previous one in order; the first to the head.
-        let prevs = heads.link_batch(7, &[10, 11, 12]);
+        let prevs = heads.link_batch(7, &[10, 11, 12]).await;
         assert_eq!(prevs, vec![None, Some(10), Some(11)]);
-        assert_eq!(heads.head(7), Some(12), "head advances to the last id");
+        assert_eq!(heads.head(7).await, Some(12), "head advances to the last id");
         // A following batch continues the chain from the advanced head.
-        let prevs = heads.link_batch(7, &[20, 21]);
+        let prevs = heads.link_batch(7, &[20, 21]).await;
         assert_eq!(prevs, vec![Some(12), Some(20)]);
-        assert_eq!(heads.head(7), Some(21));
+        assert_eq!(heads.head(7).await, Some(21));
     }
 
-    #[test]
-    fn chain_head_is_per_execution() {
+    #[tokio::test]
+    async fn chain_head_is_per_execution() {
         let heads = ChainHeads::default();
-        heads.link_batch(1, &[10, 11]);
-        heads.link_batch(2, &[90]);
+        heads.link_batch(1, &[10, 11]).await;
+        heads.link_batch(2, &[90]).await;
         // Distinct executions never share a head.
-        assert_eq!(heads.head(1), Some(11));
-        assert_eq!(heads.head(2), Some(90));
-        let p1 = heads.link_batch(1, &[12]);
-        let p2 = heads.link_batch(2, &[91]);
+        assert_eq!(heads.head(1).await, Some(11));
+        assert_eq!(heads.head(2).await, Some(90));
+        let p1 = heads.link_batch(1, &[12]).await;
+        let p2 = heads.link_batch(2, &[91]).await;
         assert_eq!(p1, vec![Some(11)]);
         assert_eq!(p2, vec![Some(90)]);
     }
 
-    #[test]
-    fn chain_head_walk_reconstructs_full_sequence_no_gaps() {
+    #[tokio::test]
+    async fn chain_head_walk_reconstructs_full_sequence_no_gaps() {
         // Property the kind validation asserts in SQL: walking prev_event_id
         // from the head reconstructs the full per-execution sequence with no
         // gaps.  Model it over the in-memory linker.
         let heads = ChainHeads::default();
         let ids = [5_i64, 6, 7, 8, 9];
-        let prevs = heads.link_batch(42, &ids);
+        let prevs = heads.link_batch(42, &ids).await;
         // Build the prev map the chain would persist.
         let mut prev_of = std::collections::HashMap::new();
         for (id, prev) in ids.iter().zip(&prevs) {
@@ -548,7 +733,7 @@ mod tests {
         }
         // Walk backward from the head.
         let mut walked = Vec::new();
-        let mut cur = heads.head(42);
+        let mut cur = heads.head(42).await;
         while let Some(id) = cur {
             walked.push(id);
             cur = prev_of.get(&id).copied().flatten();
@@ -557,22 +742,22 @@ mod tests {
         assert_eq!(walked, ids, "pointer walk == full emit sequence, no gaps");
     }
 
-    #[test]
-    fn chain_head_evict_drops_state() {
+    #[tokio::test]
+    async fn chain_head_evict_drops_state() {
         let heads = ChainHeads::default();
-        heads.link_batch(7, &[10]);
-        assert_eq!(heads.head(7), Some(10));
-        heads.evict(7);
-        assert_eq!(heads.head(7), None, "evicted execution starts a fresh chain");
+        heads.link_batch(7, &[10]).await;
+        assert_eq!(heads.head(7).await, Some(10));
+        heads.evict(7).await;
+        assert_eq!(heads.head(7).await, None, "evicted execution starts a fresh chain");
         // After eviction the next event is treated as a root again.
-        let prevs = heads.link_batch(7, &[20]);
+        let prevs = heads.link_batch(7, &[20]).await;
         assert_eq!(prevs, vec![None]);
     }
 
-    #[test]
-    fn chain_head_empty_batch_is_noop() {
+    #[tokio::test]
+    async fn chain_head_empty_batch_is_noop() {
         let heads = ChainHeads::default();
-        assert_eq!(heads.link_batch(7, &[]), Vec::<Option<i64>>::new());
-        assert_eq!(heads.head(7), None);
+        assert_eq!(heads.link_batch(7, &[]).await, Vec::<Option<i64>>::new());
+        assert_eq!(heads.head(7).await, None);
     }
 }

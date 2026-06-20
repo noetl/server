@@ -292,10 +292,10 @@ pub async fn emit_events(state: &AppState, pool: &DbPool, rows: &[EventRow]) -> 
         // stateless drive reads this flag to stop re-dispatching a terminal
         // execution WITHOUT rebuilding `WorkflowState` to call `is_terminal()`.
         if rows.iter().any(|r| is_terminal_event_type(&r.event_type)) {
-            state.exec_descriptors.mark_terminal(execution_id);
+            state.exec_descriptors.mark_terminal(execution_id).await;
         }
         let ids: Vec<i64> = rows.iter().map(|r| r.event_id).collect();
-        let prevs = state.chain_heads.link_batch(execution_id, &ids);
+        let prevs = state.chain_heads.link_batch(execution_id, &ids).await;
         rows.iter()
             .zip(prevs)
             .map(|(r, prev)| {

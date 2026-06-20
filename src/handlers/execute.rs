@@ -475,22 +475,25 @@ async fn emit_deduplicated_event(
     // RFC #115 Phase 6: under `event_read_path=audit_only`, serve the scope's
     // catalog_id from the in-memory execute-time descriptor — ZERO `noetl.event`
     // read.  Cold descriptor falls through to the scan (counted `scan`).
-    let catalog_id: Option<i64> = if matches!(
+    let audit_only = matches!(
         state.config.event_read_path,
         crate::config::EventReadPath::AuditOnly
-    ) && state
-        .exec_descriptors
-        .get(scope)
-        .map(|d| d.catalog_id)
-        .filter(|c| *c != 0)
-        .is_some()
-    {
+    );
+    // Read the (possibly KV-coherent) descriptor once.
+    let desc_catalog: Option<i64> = if audit_only {
+        state
+            .exec_descriptors
+            .get(scope)
+            .await
+            .map(|d| d.catalog_id)
+            .filter(|c| *c != 0)
+    } else {
+        None
+    };
+    let catalog_id: Option<i64> = if let Some(cid) = desc_catalog {
         crate::metrics::record_event_hotpath_read("dedup_audit_catalog", "served_descriptor");
-        state.exec_descriptors.get(scope).map(|d| d.catalog_id)
-    } else if matches!(
-        state.config.event_read_path,
-        crate::config::EventReadPath::AuditOnly
-    ) {
+        Some(cid)
+    } else if audit_only {
         // Cold descriptor under audit_only: catalog_id from `noetl.command` — the
         // synchronous queue — ZERO `noetl.event` read.
         crate::metrics::record_event_hotpath_read("dedup_audit_catalog", "served_command");
@@ -653,7 +656,8 @@ async fn emit_playbook_started_event(
     // are known; read in `events::trigger_orchestrator_inner`'s stateless branch.
     state
         .exec_descriptors
-        .seed(execution_id, catalog_id, Some(meta.clone()));
+        .seed(execution_id, catalog_id, Some(meta.clone()))
+        .await;
 
     // CQRS write-path chokepoint (#103 2d-3): INSERT (gate off) or publish (on).
     let ev = crate::handlers::event_write::EventRow::new(
@@ -686,7 +690,7 @@ async fn inherit_parent_trace(state: &AppState, parent_execution_id: i64) -> Opt
         state.config.event_read_path,
         crate::config::EventReadPath::AuditOnly
     ) {
-        if let Some(desc) = state.exec_descriptors.get(parent_execution_id) {
+        if let Some(desc) = state.exec_descriptors.get(parent_execution_id).await {
             if desc.catalog_id != 0 {
                 crate::metrics::record_event_hotpath_read("inherit_parent_trace", "served_descriptor");
                 return desc
@@ -926,6 +930,7 @@ pub(crate) async fn persist_engine_command(
     let issuing_event = state
         .chain_heads
         .head(execution_id)
+        .await
         .unwrap_or(parent_event_id);
     let ev = crate::handlers::event_write::EventRow::new(
         event_id,
@@ -1119,6 +1124,7 @@ pub(crate) async fn persist_engine_commands_batch(
     let issuing_event = state
         .chain_heads
         .head(execution_id)
+        .await
         .unwrap_or(parent_event_id);
     let event_rows: Vec<crate::handlers::event_write::EventRow> = prepared
         .iter()
