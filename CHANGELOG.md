@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.39.2](https://github.com/noetl/server/compare/v3.39.1...v3.39.2) (2026-06-21)
+
+### Bug Fixes
+
+* **orchestrate-core:** don't block reduce barrier on severed open-loop predecessors ([#120](https://github.com/noetl/server/issues/120)) ([#254](https://github.com/noetl/server/issues/254)) ([fbb855f](https://github.com/noetl/server/commit/fbb855f26391d546b76d0671e5c24a5ec3b02147)), closes [server#142](https://github.com/noetl/server/issues/142)
+
 ## [3.39.1](https://github.com/noetl/server/compare/v3.39.0...v3.39.1) (2026-06-20)
 
 ### Bug Fixes
