@@ -211,6 +211,52 @@ fn forward_reachable<'a>(
     seen
 }
 
+/// The set of steps that can still execute on the *current* path:
+/// every step forward-reachable from one of `seeds`, plus the seeds
+/// themselves.  `seeds` are the steps that are live right now — the
+/// in-flight (entered / not-yet-terminal) steps and the step whose
+/// completion is driving this dispatch pass.  Cycle-safe (a visited
+/// set bounds the walk).
+///
+/// noetl/ai-meta#120: the reduce barrier uses this to decide whether
+/// a statically-declared upstream is a *real* pending dependency.  An
+/// upstream that is not done, not skipped, not in-flight, and not
+/// reachable from any live seed can never run on the taken path — it
+/// is the source of a severed open / asymmetric loop back-edge (e.g.
+/// `pft_flow_test`'s `load_next_facility -> setup_facility_work` where
+/// the per-facility loop is bypassed).  Counting it as a barrier
+/// dependency deadlocks dispatch forever (`commands=0`).  The static
+/// `build_incoming_arcs` back-edge filter cannot distinguish this case
+/// because, with the return path absent, the target does NOT
+/// forward-reach the upstream, so the arc looks exactly like a genuine
+/// fan-in — only runtime state tells them apart.
+fn live_reachable<'a>(
+    seeds: &[&'a str],
+    steps: &'a HashMap<&'a str, &'a Step>,
+) -> HashSet<&'a str> {
+    let mut seen: HashSet<&'a str> = HashSet::new();
+    let mut stack: Vec<&'a str> = Vec::new();
+    for seed in seeds {
+        if let Some((k, _)) = steps.get_key_value(*seed) {
+            if seen.insert(*k) {
+                stack.push(*k);
+            }
+        }
+    }
+    while let Some(node) = stack.pop() {
+        if let Some(step) = steps.get(node) {
+            for t in collect_arc_targets(step) {
+                if let Some((k, _)) = steps.get_key_value(t.as_str()) {
+                    if seen.insert(*k) {
+                        stack.push(*k);
+                    }
+                }
+            }
+        }
+    }
+    seen
+}
+
 /// Collect every target step-name referenced by a step's `next`
 /// router, across all four `NextSpec` variants.  Helper for
 /// [`build_incoming_arcs`].
@@ -1313,11 +1359,41 @@ impl WorkflowOrchestrator {
                                 .filter(|e| e.event_type == "step.skipped")
                                 .filter_map(|e| e.node_name.as_deref())
                                 .collect();
+                            // #120: an upstream only blocks the barrier
+                            // if it can still run on the taken path.
+                            // Seed the live frontier with the in-flight
+                            // (entered, not-yet-terminal) steps, the
+                            // step driving this pass (`step_name`, whose
+                            // forward wave we're now expanding), and the
+                            // steps entered earlier in this same pass
+                            // (their `step.enter` is queued but not yet
+                            // applied to `state`).  An upstream that is
+                            // neither done, skipped, in-flight, nor
+                            // reachable from that frontier is a severed
+                            // open / asymmetric loop predecessor — it
+                            // never runs, so counting it would deadlock
+                            // dispatch forever (`commands=0`).  Genuine
+                            // fan-in (a live parallel branch still
+                            // running or reachable from one) and closed
+                            // loops are unaffected.
+                            let mut live_seeds: Vec<&str> = state.running_steps();
+                            live_seeds.push(step_name.as_str());
+                            for ev in events_to_emit
+                                .iter()
+                                .filter(|e| e.event_type == "step.enter")
+                            {
+                                if let Some(n) = ev.node_name.as_deref() {
+                                    live_seeds.push(n);
+                                }
+                            }
+                            let live = live_reachable(&live_seeds, steps);
                             let pending: Vec<&str> = upstreams
                                 .iter()
                                 .copied()
                                 .filter(|up| {
-                                    !state.is_step_done(up) && !in_pass_skipped.contains(up)
+                                    !state.is_step_done(up)
+                                        && !in_pass_skipped.contains(up)
+                                        && live.contains(up)
                                 })
                                 .collect();
                             if !pending.is_empty() {
@@ -3787,6 +3863,104 @@ workflow:
         assert!(
             !fetch_upstreams.contains("check_pagination"),
             "the loop back-edge check_pagination -> fetch_page must not gate the barrier",
+        );
+    }
+
+    #[test]
+    fn test_open_loop_back_edge_does_not_block_dispatch() {
+        // noetl/ai-meta#120 regression: an OPEN / asymmetric loop join.
+        //
+        //   start -> setup_facility_work -> process_batches -> end
+        //   load_next_facility -> setup_facility_work   (back-edge)
+        //
+        // `setup_facility_work` is the target of TWO static arcs:
+        // `start` (taken) and `load_next_facility` (the per-facility
+        // cursor loop's back-edge).  Unlike the CLOSED pagination loop
+        // above, the forward return path is ABSENT — `setup_facility_work`
+        // does NOT forward-reach `load_next_facility` (the loop is
+        // bypassed by the action-batch refactor).  So the static
+        // `build_incoming_arcs` back-edge filter cannot strip it: the arc
+        // looks exactly like a genuine fan-in (`incoming_arcs.len() == 2`).
+        //
+        // The runtime barrier must NOT treat `load_next_facility` as a
+        // pending dependency, because it never runs on the taken path —
+        // it is not done, not skipped, not in-flight, and not reachable
+        // from any live step (`start` does not forward-reach it).  Pre-fix
+        // the barrier deferred forever -> `commands=0`.  This asserts
+        // `setup_facility_work` IS dispatched after `start` completes.
+        let orchestrator = WorkflowOrchestrator::new();
+
+        let start = make_step("start", Some("setup_facility_work"));
+        let setup = make_step("setup_facility_work", Some("process_batches"));
+        let process = make_step("process_batches", Some("end"));
+        // The severed back-edge source: declares `next -> setup` but is
+        // never entered on the taken path (no inbound forward arc).
+        let load_next_facility = make_step("load_next_facility", Some("setup_facility_work"));
+        let end = make_step("end", None);
+        let workflow = vec![start, setup, process, load_next_facility, end];
+
+        // Sanity: statically, setup has TWO upstreams — the back-edge is
+        // NOT stripped because setup cannot forward-reach load_next_facility.
+        {
+            let steps: HashMap<&str, &Step> =
+                workflow.iter().map(|s| (s.step.as_str(), s)).collect();
+            let incoming = build_incoming_arcs(&steps);
+            let setup_upstreams = incoming
+                .get("setup_facility_work")
+                .expect("setup should have an upstream set");
+            assert_eq!(
+                setup_upstreams.len(),
+                2,
+                "open back-edge cannot be stripped statically; got {:?}",
+                setup_upstreams,
+            );
+            assert!(setup_upstreams.contains("start"));
+            assert!(setup_upstreams.contains("load_next_facility"));
+        }
+
+        let playbook = Playbook {
+            api_version: "noetl.io/v2".to_string(),
+            kind: "Playbook".to_string(),
+            metadata: Metadata {
+                name: "open_loop_test".to_string(),
+                path: Some("test/open_loop".to_string()),
+                description: None,
+                labels: None,
+                extra: HashMap::new(),
+            },
+            workload: None,
+            vars: None,
+            keychain: None,
+            workbook: None,
+            workflow,
+        };
+
+        let events = vec![
+            {
+                let mut e = make_event("playbook_started", None);
+                e.context = Some(serde_json::json!({
+                    "workload": {},
+                    "path": "test/open_loop",
+                    "version": "1"
+                }));
+                e
+            },
+            make_event("step.enter", Some("start")),
+            // start completes; load_next_facility never entered.
+            make_event("command.completed", Some("start")),
+        ];
+
+        let result = orchestrator
+            .evaluate(&events, &playbook, Some("command.completed"))
+            .unwrap();
+
+        let dispatched: Vec<String> =
+            result.commands.iter().map(|c| c.step_name.clone()).collect();
+        assert!(
+            dispatched.contains(&"setup_facility_work".to_string()),
+            "setup_facility_work must dispatch despite the open back-edge from \
+             load_next_facility (which never runs); got commands: {:?}",
+            dispatched,
         );
     }
 
