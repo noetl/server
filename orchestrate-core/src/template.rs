@@ -205,6 +205,88 @@ impl TemplateRenderer {
         }
     }
 
+    /// Render a nested structure like [`render_value`], but DEFER (return
+    /// verbatim) any string template that references a variable path which is
+    /// unresolved in `context`.  Used for distributed `task_sequence`
+    /// sub-task configs (noetl/ai-meta#124): the server builds the command
+    /// against the *step-entry* context, but a later sub-task's `url` /
+    /// `params` may reference `{{ iter.* }}` / sibling-result values produced
+    /// only at worker runtime by a prior sub-task's `set:` block.  Rendering
+    /// those now (under `Chainable`) silently collapses them to empty before
+    /// the worker's per-sub-task binding runs.  Deferring the whole template
+    /// string lets the worker's task_sequence re-render it against the richer
+    /// running context (which is a superset of the build-time context — it
+    /// carries the same flattened workload / step-result keys plus prior
+    /// sub-tasks' `set:` writes and sibling results).  Fully-resolvable
+    /// templates still render now, so non-sequence and already-resolvable
+    /// fields are byte-identical to [`render_value`].
+    pub fn render_value_deferring_unresolved(
+        &self,
+        value: &serde_json::Value,
+        context: &HashMap<String, serde_json::Value>,
+    ) -> CoreResult<serde_json::Value> {
+        match value {
+            serde_json::Value::String(s) => {
+                if self.template_has_unresolved_path(s, context) {
+                    Ok(serde_json::Value::String(s.clone()))
+                } else {
+                    self.render_to_value(s, context)
+                }
+            }
+            serde_json::Value::Object(map) => {
+                let mut result = serde_json::Map::new();
+                for (k, v) in map {
+                    // Keys are rarely templated; defer an unresolved key too.
+                    let rendered_key = if self.template_has_unresolved_path(k, context) {
+                        k.clone()
+                    } else {
+                        self.render(k, context)?
+                    };
+                    result.insert(
+                        rendered_key,
+                        self.render_value_deferring_unresolved(v, context)?,
+                    );
+                }
+                Ok(serde_json::Value::Object(result))
+            }
+            serde_json::Value::Array(arr) => {
+                let result: Result<Vec<_>, _> = arr
+                    .iter()
+                    .map(|v| self.render_value_deferring_unresolved(v, context))
+                    .collect();
+                Ok(serde_json::Value::Array(result?))
+            }
+            _ => Ok(value.clone()),
+        }
+    }
+
+    /// True when `s` contains template syntax that references at least one
+    /// variable path absent from `context` — meaning a downstream renderer
+    /// (the worker's task_sequence) must resolve it instead of collapsing it
+    /// to empty here.  Uses minijinja's `undeclared_variables(true)` to get
+    /// the nested dotted paths the template references (same mechanism as
+    /// [`crate::input_binding`]).  A fragment that won't parse as a standalone
+    /// template is deferred conservatively.
+    fn template_has_unresolved_path(
+        &self,
+        s: &str,
+        context: &HashMap<String, serde_json::Value>,
+    ) -> bool {
+        if !contains_template_syntax(s) {
+            return false;
+        }
+        let tmpl = match self.env.template_from_str(s) {
+            Ok(t) => t,
+            Err(_) => return true,
+        };
+        for path in tmpl.undeclared_variables(true) {
+            if !path_resolves(context, &path) {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Evaluate a condition expression.
     pub fn evaluate_condition(
         &self,
@@ -242,6 +324,36 @@ impl TemplateRenderer {
 /// Check if a string contains Jinja2 template syntax.
 fn contains_template_syntax(s: &str) -> bool {
     (s.contains("{{") && s.contains("}}")) || (s.contains("{%") && s.contains("%}"))
+}
+
+/// True when the dotted `path` resolves to a present key in `context`.
+/// `iter.data_type` resolves only when the `iter` map actually carries a
+/// `data_type` key — so a sub-task that references a value a prior sub-task
+/// will `set:` at runtime reads as unresolved here (and is deferred to the
+/// worker).  Descending into a non-object (array index, scalar) stops the
+/// walk and treats the reference as resolvable up to that point — the worker
+/// resolves the remainder identically.  A present-but-null value counts as
+/// resolved (null is a legitimate build-time value, not a missing one).
+fn path_resolves(context: &HashMap<String, serde_json::Value>, path: &str) -> bool {
+    let mut segs = path.split('.');
+    let root = match segs.next() {
+        Some(r) if !r.is_empty() => r,
+        _ => return false,
+    };
+    let mut cur = match context.get(root) {
+        Some(v) => v,
+        None => return false,
+    };
+    for seg in segs {
+        match cur {
+            serde_json::Value::Object(m) => match m.get(seg) {
+                Some(v) => cur = v,
+                None => return false,
+            },
+            _ => return true,
+        }
+    }
+    true
 }
 
 /// Convert a JSON HashMap to a minijinja Value.

@@ -527,8 +527,16 @@ fn render_pipeline_config(
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect();
 
-            let rendered =
-                renderer.render_value(&serde_json::Value::Object(filtered), context)?;
+            // noetl/ai-meta#124: render the non-deferred fields, but DEFER
+            // (preserve verbatim) any template that references a value
+            // unresolved at command-build time — e.g. `url`/`params` that
+            // reference `{{ iter.* }}` or a sibling sub-task's result, which a
+            // PRIOR sub-task's `set:` block only produces at worker runtime.
+            // Rendering those now (Chainable) collapses them to empty before
+            // task_sequence's per-sub-task binding runs; the worker re-renders
+            // the deferred templates against the running context.
+            let rendered = renderer
+                .render_value_deferring_unresolved(&serde_json::Value::Object(filtered), context)?;
             let mut rendered_spec = match rendered {
                 serde_json::Value::Object(m) => m,
                 other => {
@@ -806,6 +814,90 @@ mod tests {
         assert_eq!(command.step_name, "pipeline_step");
         assert_eq!(command.tool.kind, "task_sequence");
         assert!(command.tool.config.is_some());
+    }
+
+    /// noetl/ai-meta#124: in a distributed `task_sequence`, a later sub-task's
+    /// templates that reference a value a PRIOR sub-task produces at runtime —
+    /// a forward `set:`, a policy-rule `set:`, or a sibling result — must be
+    /// preserved VERBATIM by the server's command build so the worker's
+    /// task_sequence renders them per-sub-task against the running context.
+    /// Before the fix they were rendered against the step-entry context at
+    /// build time and collapsed to empty (Chainable undefined), so
+    /// `fetch_batch`'s `{{ iter.data_type }}` URL segment vanished → 404 → 0
+    /// rows.  Resolvable fields (`{{ api_url }}`) still render now.
+    #[test]
+    fn test_pipeline_defers_forward_policy_and_sibling_bindings() {
+        let renderer = TemplateRenderer::new();
+
+        // Step-entry context: `api_url` is resolvable now; `iter` exists as the
+        // loop namespace but carries NO `fwd_dt`/`pol_dt` yet (a prior sub-task
+        // `set:`s them at runtime), and the sibling label `t1` is absent.
+        let mut context = HashMap::new();
+        context.insert("api_url".to_string(), serde_json::json!("http://api.test"));
+        context.insert("iter".to_string(), serde_json::json!({ "slot": 1 }));
+
+        let config = serde_json::json!([
+            {
+                "t1": {
+                    "kind": "postgres",
+                    "command": "SELECT 1",
+                    "set": { "iter.fwd_dt": "{{ output.data.dt }}" },
+                    "spec": { "policy": { "rules": [
+                        { "else": { "then": { "do": "continue",
+                            "set": { "iter.pol_dt": "{{ output.data.dt }}" } } } }
+                    ] } }
+                }
+            },
+            {
+                "t2": {
+                    "kind": "http",
+                    "method": "GET",
+                    "url": "{{ api_url }}/v1/{{ iter.fwd_dt }}",
+                    "params": {
+                        "fwd": "{{ iter.fwd_dt }}",
+                        "pol": "{{ iter.pol_dt }}",
+                        "sib": "{{ t1.dt }}",
+                        "sibd": "{{ t1.data.dt }}",
+                        "resolvable": "{{ api_url }}"
+                    }
+                }
+            }
+        ]);
+
+        let out = render_pipeline_config(&renderer, &config, &context).unwrap();
+        let arr = out.as_array().unwrap();
+
+        // t1 keeps `set` + `spec` verbatim (runtime-only, restored as-is).
+        let t1 = &arr[0]["t1"];
+        assert_eq!(
+            t1["set"]["iter.fwd_dt"],
+            serde_json::json!("{{ output.data.dt }}")
+        );
+        assert!(t1["spec"]["policy"]["rules"].is_array());
+
+        let t2 = &arr[1]["t2"];
+
+        // The mixed url references an unresolved path → the WHOLE string is
+        // deferred verbatim so the worker resolves both `api_url` and the
+        // runtime ref.  (Pre-resolving `api_url` server-side buys nothing.)
+        assert_eq!(
+            t2["url"],
+            serde_json::json!("{{ api_url }}/v1/{{ iter.fwd_dt }}"),
+            "mixed url with a runtime ref must defer verbatim"
+        );
+
+        // FWD / POL / SIB / SIBD all preserved verbatim (non-empty for the
+        // worker to render); the resolvable-only field renders now.
+        let p = &t2["params"];
+        assert_eq!(p["fwd"], serde_json::json!("{{ iter.fwd_dt }}"));
+        assert_eq!(p["pol"], serde_json::json!("{{ iter.pol_dt }}"));
+        assert_eq!(p["sib"], serde_json::json!("{{ t1.dt }}"));
+        assert_eq!(p["sibd"], serde_json::json!("{{ t1.data.dt }}"));
+        assert_eq!(
+            p["resolvable"],
+            serde_json::json!("http://api.test"),
+            "a fully-resolvable field must still render at build time"
+        );
     }
 
     // ---- ctx / workload namespace shim tests (noetl/ai-meta#74) ----
