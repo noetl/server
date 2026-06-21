@@ -2666,7 +2666,22 @@ async fn trigger_orchestrator_inner(
         )
     {
         if let Some(desc) = state.exec_descriptors.get(execution_id).await {
-            if desc.catalog_id != 0 {
+            // The stateless off-server drive builds `WorkflowState` from the
+            // `noetl_events` WAL spine on the worker.  ONLY events that PUBLISH
+            // reach that stream — and `should_publish` is false for system-pool
+            // executions (`system/...`), whose events are INSERTed straight to
+            // `noetl.event` and never enter the WAL (they drain the stream, so
+            // they can't depend on it).  Routing a system execution to the
+            // stateless drive means the worker's WAL build can NEVER complete →
+            // it returns the `__offserver_retry__` no-op forever and the
+            // reconciler re-drives in a loop (noetl/ai-meta#121: the wedged
+            // `system/scheduled_cleanup` execs).  Gate the stateless drive on
+            // `should_publish(catalog_id)` so system executions fall through to
+            // the server-built path below — which reads `noetl.event` (where the
+            // system events DO live) and ships the built state to the worker.
+            if desc.catalog_id != 0
+                && crate::handlers::event_write::should_publish(state, desc.catalog_id).await
+            {
                 return dispatch_offserver_stateless_drive(
                     state,
                     execution_id,
@@ -2676,8 +2691,10 @@ async fn trigger_orchestrator_inner(
                 .await;
             }
         }
-        // Cold/incomplete descriptor → fall through to the server-built path,
-        // which re-seeds the descriptor so subsequent drives go stateless.
+        // Cold/incomplete descriptor, or a system execution whose events never
+        // reach the WAL → fall through to the server-built path, which re-seeds
+        // the descriptor and (for system execs) ships the built state so the
+        // worker drives off `run_state` instead of an unservable WAL spine.
     }
 
     // 1. Incremental state with bounded rebuild (noetl/ai-meta#100, #101 block b).
@@ -3064,10 +3081,16 @@ async fn trigger_orchestrator_inner(
         // (lag / cold) — so progress + correctness never regress below the
         // server-built `run_state` path.  Default `server` → the state is the
         // sole drive input exactly as today.
+        // Off-server WAL build applies only to executions whose events PUBLISH to
+        // `noetl_events` — system executions (`should_publish` false) INSERT their
+        // events and never enter the WAL (noetl/ai-meta#121), so the worker would
+        // burn its retry window on an unservable WAL spine before falling back to
+        // `run_state`.  Drive those purely server-built (`offserver=false` → the
+        // worker uses the shipped `state` via `run_state` directly, no WAL probe).
         let offserver = matches!(
             state.config.state_builder,
             crate::config::StateBuilder::Offserver
-        );
+        ) && crate::handlers::event_write::should_publish(state, catalog_id).await;
         let input = serde_json::json!({
             "state": cache.state.as_ref().expect("state present after rebuild"),
             "latest_ts": latest_ts,

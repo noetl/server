@@ -202,11 +202,19 @@ async fn is_system_execution(state: &AppState, catalog_id: i64) -> bool {
             .await
             .ok()
             .flatten();
-    let is_sys = path.as_deref().map(|p| p.starts_with("system/")).unwrap_or(false);
+    let is_sys = path.as_deref().map(is_system_path).unwrap_or(false);
     if let Ok(mut m) = SYSTEM_CATALOG.write() {
         m.insert(catalog_id, is_sys);
     }
     is_sys
+}
+
+/// A catalog path identifies a **system-pool** playbook iff it lives under the
+/// `system/` namespace.  Pulled out of [`is_system_execution`] so the predicate
+/// — the thing the off-server-drive gate in `events.rs` ultimately turns on
+/// (noetl/ai-meta#121) — is unit-testable without a live catalog row.
+fn is_system_path(path: &str) -> bool {
+    path.starts_with("system/")
 }
 
 /// True when this execution's events should be PUBLISHED rather than INSERTed:
@@ -437,6 +445,27 @@ mod tests {
         }
         for t in ["command.completed", "command.failed", "step.enter", "playbook_started"] {
             assert!(!is_terminal_event_type(t), "{t} must NOT be terminal");
+        }
+    }
+
+    #[test]
+    fn system_path_detection_gates_the_offserver_drive() {
+        // noetl/ai-meta#121 — `should_publish` is false for `system/*` execs, so
+        // the off-server WAL drive in events.rs is gated off for them and they
+        // fall through to the server-built path.  `is_system_path` is the leaf
+        // predicate that whole chain turns on.  System paths drain the stream and
+        // INSERT their events (never published to `noetl_events`), so they must
+        // be detected; user paths publish and stay on the off-server path.
+        for p in ["system/scheduled_cleanup", "system/event_materializer", "system/projector"] {
+            assert!(is_system_path(p), "{p} must be detected as a system path");
+        }
+        for p in [
+            "weather/forecast",
+            "user/system_report", // `system` not at the path root
+            "systems/monitor",    // prefix is `system/`, not `system`
+            "",
+        ] {
+            assert!(!is_system_path(p), "{p} must NOT be detected as a system path");
         }
     }
 
