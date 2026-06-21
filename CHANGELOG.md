@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.39.3](https://github.com/noetl/server/compare/v3.39.2...v3.39.3) (2026-06-21)
+
+### Bug Fixes
+
+* **orchestrate-core:** defer task_sequence sub-task templates with unresolved bindings ([#124](https://github.com/noetl/server/issues/124)) ([#255](https://github.com/noetl/server/issues/255)) ([d53e095](https://github.com/noetl/server/commit/d53e095c245f9329b528c6998fac1bb953b2acd8))
+
 ## [3.39.2](https://github.com/noetl/server/compare/v3.39.1...v3.39.2) (2026-06-21)
 
 ### Bug Fixes
