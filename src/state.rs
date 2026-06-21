@@ -931,4 +931,89 @@ mod tests {
         assert_eq!(heads.link_batch(7, &[]).await, Vec::<Option<i64>>::new());
         assert_eq!(heads.head(7).await, None);
     }
+
+    /// Walk `prev_event_id` backward from `head`, returning the reconstructed
+    /// sequence (root-first).  Returns `None` if the walk hits a non-genesis
+    /// event whose `prev` is `NULL` — exactly the off-server `chain_walk_from`
+    /// →`build_spine_to` `Incomplete` condition (the WAL-chain-incomplete loop).
+    /// `genesis` is the lowest id (`playbook_started`) whose `NULL` prev is the
+    /// legitimate chain root.
+    fn walk_chain(
+        head: Option<i64>,
+        prev_of: &std::collections::HashMap<i64, Option<i64>>,
+        genesis: i64,
+    ) -> Option<Vec<i64>> {
+        let mut walked = Vec::new();
+        let mut cur = head;
+        while let Some(id) = cur {
+            walked.push(id);
+            match prev_of.get(&id).copied().flatten() {
+                Some(prev) => cur = Some(prev),
+                None if id == genesis => cur = None, // reached the real root
+                None => return None,                // orphaned non-genesis head
+            }
+        }
+        walked.reverse();
+        Some(walked)
+    }
+
+    /// noetl/ai-meta#121: a `command.claimed` written through a path that
+    /// bypasses the chain-link chokepoint (the gate-off in-tx claim INSERT)
+    /// gets `prev_event_id = NULL` AND never advances the head, so the next
+    /// event (`command.started`) links back to `command.issued`, skipping the
+    /// orphaned claim.  The off-server spine walk from the orphan head then
+    /// can't reach genesis → `Incomplete` → re-drive loop.  This test models
+    /// the orphan (the bug) and the linked sequence (the fix), asserting the
+    /// pointer walk only completes once the claim is linked.
+    #[tokio::test]
+    async fn chain_head_claim_orphan_vs_linked() {
+        // Snowflake-ish ascending ids for one execution.
+        let (started, issued, claimed, cmd_started) = (100_i64, 101, 102, 103);
+
+        // --- BUG: command.claimed bypasses link_batch (raw in-tx INSERT). ---
+        // The chokepoint links playbook_started, command.issued, then (skipping
+        // the claim) command.started off the un-advanced head (= command.issued).
+        let buggy = ChainHeads::default();
+        let mut prev_of = std::collections::HashMap::new();
+        for (id, prev) in [started, issued]
+            .iter()
+            .zip(buggy.link_batch(7, &[started, issued]).await)
+        {
+            prev_of.insert(*id, prev);
+        }
+        // The claim is written WITHOUT the chokepoint: NULL prev, head untouched.
+        prev_of.insert(claimed, None);
+        // command.started links off the still-at-`issued` head, skipping claimed.
+        for (id, prev) in [cmd_started]
+            .iter()
+            .zip(buggy.link_batch(7, &[cmd_started]).await)
+        {
+            prev_of.insert(*id, prev);
+        }
+        assert_eq!(prev_of[&cmd_started], Some(issued), "started skips claimed");
+        assert_eq!(prev_of[&claimed], None, "claimed is an orphan (NULL prev)");
+        // If the orphan ever becomes the head, the off-server walk can't complete.
+        assert_eq!(
+            walk_chain(Some(claimed), &prev_of, started),
+            None,
+            "orphan claim head → WAL chain incomplete (the re-drive loop)"
+        );
+
+        // --- FIX: command.claimed flows through link_batch like every event. ---
+        let fixed = ChainHeads::default();
+        let mut prev_of = std::collections::HashMap::new();
+        let seq = [started, issued, claimed, cmd_started];
+        for (id, prev) in seq.iter().zip(fixed.link_batch(7, &seq).await) {
+            prev_of.insert(*id, prev);
+        }
+        assert_eq!(prev_of[&claimed], Some(issued), "claim links to command.issued");
+        assert_eq!(prev_of[&cmd_started], Some(claimed), "started links to claim");
+        assert_eq!(fixed.head(7).await, Some(cmd_started));
+        // The off-server spine walk now reconstructs the full sequence — complete.
+        assert_eq!(
+            walk_chain(fixed.head(7).await, &prev_of, started),
+            Some(seq.to_vec()),
+            "linked claim → off-server chain-walk completes (no re-drive loop)"
+        );
+    }
 }
