@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.39.6](https://github.com/noetl/server/compare/v3.39.5...v3.39.6) (2026-06-22)
+
+### Bug Fixes
+
+* **orchestrate:** surface a non-iterable loop in: as a terminal failure ([#123](https://github.com/noetl/server/issues/123)) ([#258](https://github.com/noetl/server/issues/258)) ([275b914](https://github.com/noetl/server/commit/275b914d5bf1fe42625f2d74ed7cd42ad565f634))
+
 ## [3.39.5](https://github.com/noetl/server/compare/v3.39.4...v3.39.5) (2026-06-22)
 
 ### Bug Fixes
