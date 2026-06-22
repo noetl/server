@@ -73,11 +73,7 @@ noetl-events = "0.1"
 # not land on the control plane.  noetl-tools re-exports the same types as
 # `noetl_tools::locator`, so the worker stamp path is unchanged; the server and
 # worker still share ONE implementation.
-#
-# TEMPORARY (noetl/ai-meta#104 Phase A): git dep on the extraction branch until
-# `noetl-locator 0.1.0` is published to crates.io (by the noetl/tools release CI
-# after noetl/tools#NN merges).  BEFORE MERGE, swap to `noetl-locator = "0.1.0"`.
-noetl-locator = { git = "https://github.com/noetl/tools.git", branch = "feat/104-phase-a-noetl-locator" }
+noetl-locator = "0.1.0"
 
 # Database
 sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres", "chrono", "uuid", "json"] }

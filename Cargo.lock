@@ -1371,7 +1371,8 @@ dependencies = [
 [[package]]
 name = "noetl-locator"
 version = "0.1.0"
-source = "git+https://github.com/noetl/tools.git?branch=feat%2F104-phase-a-noetl-locator#2377fe57cc6f77b555d749efbddd1757980384f0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b1e5442663cd67add8e6c39776a3eacc4375eb4d7755ef6546a131c9edb677ec"
 
 [[package]]
 name = "noetl-orchestrate-core"
