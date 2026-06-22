@@ -294,6 +294,43 @@ pub fn record_event_hotpath_read(site: &str, outcome: &str) {
         .inc();
 }
 
+/// `noetl_result_uri_accept_total{outcome}` — canonical result-URI shadow
+/// acceptance (RFC noetl/ai-meta#104 Phase A). Incremented once per event whose
+/// `result` carries a `reference.uri`, when `NOETL_RESULT_URI_ACCEPT=true`.
+/// `outcome` is one of:
+/// - `canonical` — parsed as the canonical logical Resource Locator.
+/// - `legacy` — parsed as the legacy execution ref (accepted for back-compat).
+/// - `malformed` — failed to parse; logged + counted, event NOT failed.
+///
+/// Flag-off this counter never moves (the accept hook is skipped); flag-on its
+/// delta over a run is the proof the server is accepting the worker-stamped URI
+/// without resolving by it yet (that is Phase C).
+pub fn result_uri_accept_total() -> &'static IntCounterVec {
+    static M: OnceLock<IntCounterVec> = OnceLock::new();
+    M.get_or_init(|| {
+        let counter = IntCounterVec::new(
+            Opts::new(
+                "noetl_result_uri_accept_total",
+                "Canonical result-URI shadow acceptances by outcome (RFC #104 Phase A).",
+            ),
+            &["outcome"],
+        )
+        .expect("static counter spec must be valid");
+        registry()
+            .register(Box::new(counter.clone()))
+            .expect("counter registration must succeed");
+        counter
+    })
+}
+
+/// Record one canonical result-URI acceptance outcome (`canonical` | `legacy` |
+/// `malformed`).
+pub fn record_result_uri_accept(outcome: &str) {
+    result_uri_accept_total()
+        .with_label_values(&[outcome])
+        .inc();
+}
+
 /// `noetl_state_build_event_scans_total` — incremented once each time the drive
 /// path enters the **event-scan** state-construction block (the block that issues
 /// `WHERE execution_id = $1 …` scans of `noetl.event`: the consistency `COUNT`,

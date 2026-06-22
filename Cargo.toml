@@ -65,6 +65,16 @@ serde_yaml = "0.9"
 # a wire-compat test that proves the shared subset round-trips.
 noetl-events = "0.1"
 
+# Shared Resource Locator (noetl/ai-meta#104 Phase A): the server parses the
+# canonical logical result URI (`noetl://<tenant>/<project>/results/<eid>/<step>/
+# <frame>/<row>/<attempt>`) the worker stamps on over-budget references.  This is
+# the LEAN, dependency-free `noetl-locator` crate (pure `std`) — NOT the full
+# `noetl-tools` registry, whose graph (duckdb/kube/arrow-flight/tonic/rhai) must
+# not land on the control plane.  noetl-tools re-exports the same types as
+# `noetl_tools::locator`, so the worker stamp path is unchanged; the server and
+# worker still share ONE implementation.
+noetl-locator = "0.1.0"
+
 # Database
 sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres", "chrono", "uuid", "json"] }
 
