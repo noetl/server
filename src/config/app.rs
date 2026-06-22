@@ -306,7 +306,7 @@ pub struct AppConfig {
     /// keys off the legacy server-minted `reference.ref`
     /// (`noetl://execution/<eid>/result/<name>/<id>`).  Phase A is the first
     /// consumption step: the server **accepts and validates** the canonical URI
-    /// (via `noetl_tools::locator`) without yet resolving by it (that is Phase C)
+    /// (via `noetl_locator`) without yet resolving by it (that is Phase C)
     /// and without yet writing the Feather tier (Phase B).
     ///
     /// - **false** (default) — the accept hook is skipped entirely; the canonical

@@ -3423,7 +3423,7 @@ fn find_reference_uri(v: &serde_json::Value) -> Option<&str> {
 /// Shadow-accept the canonical result URI (RFC noetl/ai-meta#104 Phase A).
 ///
 /// When the built `result` carries a `reference.uri`, parse + validate it via
-/// the shared [`noetl_tools::locator`] (accepting **both** the canonical
+/// the shared [`noetl_locator`] (accepting **both** the canonical
 /// logical Resource Locator and the legacy execution ref) and record the
 /// outcome on `noetl_result_uri_accept_total{outcome}`.  A malformed URI is
 /// logged (WARN, with `execution_id`) + counted `malformed` but **never fails

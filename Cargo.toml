@@ -67,13 +67,17 @@ noetl-events = "0.1"
 
 # Shared Resource Locator (noetl/ai-meta#104 Phase A): the server parses the
 # canonical logical result URI (`noetl://<tenant>/<project>/results/<eid>/<step>/
-# <frame>/<row>/<attempt>`) the worker stamps on over-budget references via
-# `noetl_tools::locator`, so the two-layer derivable naming has a single
-# implementation across worker + server (instead of the divergent
-# string-formatting they use today).  `default-features = false` drops the
-# optional source backends (pubsub/kafka/gcs/s3) the locator does not need — the
-# `locator` module is pure `std`.
-noetl-tools = { version = "3.14.2", default-features = false }
+# <frame>/<row>/<attempt>`) the worker stamps on over-budget references.  This is
+# the LEAN, dependency-free `noetl-locator` crate (pure `std`) — NOT the full
+# `noetl-tools` registry, whose graph (duckdb/kube/arrow-flight/tonic/rhai) must
+# not land on the control plane.  noetl-tools re-exports the same types as
+# `noetl_tools::locator`, so the worker stamp path is unchanged; the server and
+# worker still share ONE implementation.
+#
+# TEMPORARY (noetl/ai-meta#104 Phase A): git dep on the extraction branch until
+# `noetl-locator 0.1.0` is published to crates.io (by the noetl/tools release CI
+# after noetl/tools#NN merges).  BEFORE MERGE, swap to `noetl-locator = "0.1.0"`.
+noetl-locator = { git = "https://github.com/noetl/tools.git", branch = "feat/104-phase-a-noetl-locator" }
 
 # Database
 sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres", "chrono", "uuid", "json"] }

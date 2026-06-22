@@ -166,7 +166,7 @@ pub fn parse_noetl_ref(s: &str) -> Result<NoetlRef, String> {
 /// (`reference.uri`) additively on over-budget references (noetl/ai-meta#104
 /// R02b), while the server still mints + resolves the **legacy** execution ref
 /// (`reference.ref`).  Phase A teaches the server to *accept* both via the
-/// shared [`noetl_tools::locator`] implementation so later phases can migrate
+/// shared [`noetl_locator`] implementation so later phases can migrate
 /// consumption without a flag-day rename.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResultRef {
@@ -176,8 +176,8 @@ pub enum ResultRef {
     Legacy(NoetlRef),
     /// Canonical `noetl://<tenant>/<project>/results/<eid>/<step>/<frame>/<row>/<attempt>`
     /// — the stable, location-independent logical name from
-    /// [`noetl_tools::locator::ResourceLocator`].
-    Canonical(noetl_tools::locator::ResourceLocator),
+    /// [`noetl_locator::ResourceLocator`].
+    Canonical(noetl_locator::ResourceLocator),
 }
 
 impl ResultRef {
@@ -195,7 +195,7 @@ impl ResultRef {
 /// (noetl/ai-meta#104 Phase A).
 ///
 /// Routes on the first path segment: `execution/...` is the legacy shape
-/// (detected via [`noetl_tools::locator::is_legacy_execution_ref`]) and keeps
+/// (detected via [`noetl_locator::is_legacy_execution_ref`]) and keeps
 /// the server's own richer legacy parse (which extracts the numeric
 /// `result_id` the resolve path needs — the locator's legacy parse is a
 /// structural check only).  Anything else is parsed as the canonical
@@ -205,7 +205,7 @@ impl ResultRef {
 /// caller can log + count without panicking — Phase A never fails an event on
 /// a bad reference.
 pub fn parse_result_ref(uri: &str) -> Result<ResultRef, String> {
-    use noetl_tools::locator::{is_legacy_execution_ref, ResourceLocator};
+    use noetl_locator::{is_legacy_execution_ref, ResourceLocator};
 
     if is_legacy_execution_ref(uri) {
         return parse_noetl_ref(uri).map(ResultRef::Legacy);
