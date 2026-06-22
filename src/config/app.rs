@@ -296,6 +296,36 @@ pub struct AppConfig {
     #[serde(default)]
     pub atomic_item_context: bool,
 
+    /// **Shadow-accept the canonical result URI** (RFC noetl/ai-meta#104
+    /// Phase A).  Envy maps `NOETL_RESULT_URI_ACCEPT`.
+    ///
+    /// The worker already stamps the stable logical Resource Locator
+    /// (`reference.uri = noetl://<tenant>/<project>/results/<eid>/<step>/<frame>/
+    /// <row>/<attempt>`) additively on over-budget references (noetl/ai-meta#104
+    /// R02b), but **nothing on the server consumes it** — the resolve path still
+    /// keys off the legacy server-minted `reference.ref`
+    /// (`noetl://execution/<eid>/result/<name>/<id>`).  Phase A is the first
+    /// consumption step: the server **accepts and validates** the canonical URI
+    /// (via `noetl_tools::locator`) without yet resolving by it (that is Phase C)
+    /// and without yet writing the Feather tier (Phase B).
+    ///
+    /// - **false** (default) — the accept hook is skipped entirely; the canonical
+    ///   `reference.uri` is ignored exactly as today.  No-op; prod/default
+    ///   behavior is byte-identical.
+    /// - **true** — when an event's `result` carries a `reference.uri`, the hook
+    ///   parses it (accepting both the canonical logical URI and the legacy
+    ///   execution ref for back-compat) and records the outcome on
+    ///   `noetl_result_uri_accept_total{outcome}`.  A **malformed** URI is logged
+    ///   (WARN, with `execution_id`) + counted but **never fails the event** —
+    ///   Phase A must not introduce a new failure path.  The URI is already
+    ///   persisted in the `reference` JSON (the worker stamped it); the hook adds
+    ///   acceptance + validation, not storage.
+    ///
+    /// **Default false** — opt-in shadow accept, reversible, kind-validated
+    /// before any rollout.
+    #[serde(default)]
+    pub result_uri_accept: bool,
+
     /// **Where the per-execution drive watermark + descriptor live** (RFC
     /// noetl/ai-meta#115 program-scale / noetl/ai-meta#107).  Envy maps
     /// `NOETL_REPLICA_COHERENCE`.
@@ -511,6 +541,9 @@ impl Default for AppConfig {
             // noetl/ai-meta#115 Phase 5: full-context dispatch by default; the
             // atomic-working-item minimal-slice narrowing is opt-in (and staged).
             atomic_item_context: false,
+            // noetl/ai-meta#104 Phase A: the canonical result URI is ignored by
+            // default; shadow-accept (parse + validate + record) is opt-in.
+            result_uri_accept: false,
             // noetl/ai-meta#115 program-scale: in-process maps by default; the
             // NATS-KV multi-replica coherence backing is opt-in (and staged).
             replica_coherence: ReplicaCoherence::Local,

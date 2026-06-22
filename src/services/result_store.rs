@@ -77,7 +77,7 @@ pub struct ResultPutResponse {
 }
 
 /// Parsed components of a `noetl://execution/<eid>/result/<name>/<id>` URI.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NoetlRef {
     pub execution_id: i64,
     pub name: String,
@@ -154,6 +154,65 @@ pub fn parse_noetl_ref(s: &str) -> Result<NoetlRef, String> {
         name,
         result_id,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Canonical-or-legacy result reference (noetl/ai-meta#104 Phase A)
+// ---------------------------------------------------------------------------
+
+/// A `noetl://` result reference in either shape the platform now produces.
+///
+/// The worker stamps the **canonical** logical Resource Locator
+/// (`reference.uri`) additively on over-budget references (noetl/ai-meta#104
+/// R02b), while the server still mints + resolves the **legacy** execution ref
+/// (`reference.ref`).  Phase A teaches the server to *accept* both via the
+/// shared [`noetl_tools::locator`] implementation so later phases can migrate
+/// consumption without a flag-day rename.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResultRef {
+    /// Legacy `noetl://execution/<eid>/result/<name>/<id>` — what the server
+    /// mints today and what the resolve path keys off (`result_id` is the
+    /// `noetl.result_store` row id).
+    Legacy(NoetlRef),
+    /// Canonical `noetl://<tenant>/<project>/results/<eid>/<step>/<frame>/<row>/<attempt>`
+    /// — the stable, location-independent logical name from
+    /// [`noetl_tools::locator::ResourceLocator`].
+    Canonical(noetl_tools::locator::ResourceLocator),
+}
+
+impl ResultRef {
+    /// The shape label recorded on `noetl_result_uri_accept_total{outcome}`.
+    pub fn shape(&self) -> &'static str {
+        match self {
+            ResultRef::Legacy(_) => "legacy",
+            ResultRef::Canonical(_) => "canonical",
+        }
+    }
+}
+
+/// Parse a `noetl://` result reference, **accepting both** the legacy
+/// execution-scoped shape and the canonical logical Resource Locator
+/// (noetl/ai-meta#104 Phase A).
+///
+/// Routes on the first path segment: `execution/...` is the legacy shape
+/// (detected via [`noetl_tools::locator::is_legacy_execution_ref`]) and keeps
+/// the server's own richer legacy parse (which extracts the numeric
+/// `result_id` the resolve path needs — the locator's legacy parse is a
+/// structural check only).  Anything else is parsed as the canonical
+/// `<tenant>/<project>/<kind>/<logical_path>` locator.
+///
+/// Returns a human-readable error string on a structural mismatch so the
+/// caller can log + count without panicking — Phase A never fails an event on
+/// a bad reference.
+pub fn parse_result_ref(uri: &str) -> Result<ResultRef, String> {
+    use noetl_tools::locator::{is_legacy_execution_ref, ResourceLocator};
+
+    if is_legacy_execution_ref(uri) {
+        return parse_noetl_ref(uri).map(ResultRef::Legacy);
+    }
+    ResourceLocator::parse(uri)
+        .map(ResultRef::Canonical)
+        .map_err(|e| e.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -306,6 +365,60 @@ mod tests {
     #[test]
     fn rejects_wrong_third_segment() {
         assert!(parse_noetl_ref("noetl://execution/1/artifact/step/2").is_err());
+    }
+
+    // --- parse_result_ref: accepts BOTH shapes (noetl/ai-meta#104 Phase A) ---
+
+    #[test]
+    fn result_ref_accepts_legacy_shape() {
+        let r = parse_result_ref("noetl://execution/123/result/my_step/456")
+            .expect("legacy ref must parse");
+        assert_eq!(r.shape(), "legacy");
+        match r {
+            ResultRef::Legacy(l) => {
+                assert_eq!(l.execution_id, 123);
+                assert_eq!(l.name, "my_step");
+                assert_eq!(l.result_id, 456);
+            }
+            other => panic!("expected Legacy, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn result_ref_accepts_canonical_logical_uri() {
+        // The exact shape the worker stamps as `reference.uri` (frame 2, row 4
+        // cursor body result) — see repos/worker/src/executor/command.rs.
+        let uri = "noetl://default/default/results/325/load_next_facility/2/4/1";
+        let r = parse_result_ref(uri).expect("canonical URI must parse");
+        assert_eq!(r.shape(), "canonical");
+        match r {
+            ResultRef::Canonical(loc) => {
+                assert_eq!(loc.tenant, "default");
+                assert_eq!(loc.project, "default");
+                assert_eq!(loc.kind, "results");
+                assert_eq!(loc.logical_path, "325/load_next_facility/2/4/1");
+            }
+            other => panic!("expected Canonical, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn result_ref_canonical_with_tenant_project() {
+        let r = parse_result_ref("noetl://t_acme/p_gen/results/1/start/0/0/1")
+            .expect("tenant/project canonical URI must parse");
+        assert_eq!(r.shape(), "canonical");
+    }
+
+    #[test]
+    fn result_ref_rejects_malformed() {
+        // Wrong scheme, too-few segments, and empty segments are all errors —
+        // the caller logs + counts `malformed` and leaves the event untouched.
+        assert!(parse_result_ref("https://t/p/results/1/s/0/0/1").is_err());
+        assert!(parse_result_ref("noetl://t/p/results").is_err());
+        assert!(parse_result_ref("noetl://t//results/x").is_err());
+        // A legacy-looking ref with a non-numeric id still routes to the legacy
+        // parser and fails there (not silently accepted as canonical).
+        assert!(parse_result_ref("noetl://execution/abc/result/step/1").is_err());
     }
 
     // --- URI construction round-trip (no DB) ---

@@ -65,6 +65,16 @@ serde_yaml = "0.9"
 # a wire-compat test that proves the shared subset round-trips.
 noetl-events = "0.1"
 
+# Shared Resource Locator (noetl/ai-meta#104 Phase A): the server parses the
+# canonical logical result URI (`noetl://<tenant>/<project>/results/<eid>/<step>/
+# <frame>/<row>/<attempt>`) the worker stamps on over-budget references via
+# `noetl_tools::locator`, so the two-layer derivable naming has a single
+# implementation across worker + server (instead of the divergent
+# string-formatting they use today).  `default-features = false` drops the
+# optional source backends (pubsub/kafka/gcs/s3) the locator does not need — the
+# `locator` module is pure `std`.
+noetl-tools = { version = "3.14.2", default-features = false }
+
 # Database
 sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres", "chrono", "uuid", "json"] }
 

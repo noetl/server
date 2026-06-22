@@ -547,6 +547,19 @@ pub(crate) async fn normalize_event_to_row(
     // `chk_event_result_shape` constraint) + credential scrub.
     let result = sanitize_sensitive_data(&build_result_object(request, &status));
 
+    // noetl/ai-meta#104 Phase A: shadow-accept the canonical result URI the
+    // worker stamps on over-budget references (`reference.uri`).  Default-off;
+    // flag-on parses + validates + records acceptance WITHOUT changing
+    // resolution (Phase C) or writing the Feather tier (Phase B).  Sits on the
+    // shared normalization chokepoint so the synchronous ingest and the CQRS
+    // materializer accept identically — under `NOETL_EVENT_INGEST_PUBLISH_ONLY`
+    // both passes run, so the accept counter advances on the publish AND the
+    // materialize of the same event (a shadow counter; the duplication is
+    // harmless and expected under the gate).
+    if state.config.result_uri_accept {
+        accept_canonical_result_uri(&result, execution_id);
+    }
+
     // Producer-stamped event_id, else a server-side snowflake.
     let event_id: i64 = match request.event_id.as_deref() {
         Some(raw) => raw
@@ -3383,6 +3396,60 @@ fn find_noetl_ref(v: &serde_json::Value) -> Option<&str> {
     }
 }
 
+/// Find the first canonical result URI (`noetl://…`) carried by a `uri` field
+/// anywhere in the value.  The worker stamps it on the `reference` block of an
+/// over-budget `call.done` result, additively alongside the legacy `ref`
+/// (noetl/ai-meta#104 R02b — the stable logical Resource Locator
+/// `noetl://<tenant>/<project>/results/<eid>/<step>/<frame>/<row>/<attempt>`).
+/// Symmetric to [`find_noetl_ref`] but matches the `"uri"` key (the canonical
+/// logical locator) rather than `"ref"` (the legacy durable store key); the
+/// `reference` block can sit at `result.reference` or
+/// `result.context.result.reference`, so the search recurses.
+fn find_reference_uri(v: &serde_json::Value) -> Option<&str> {
+    match v {
+        serde_json::Value::Object(m) => {
+            if let Some(serde_json::Value::String(s)) = m.get("uri") {
+                if s.starts_with("noetl://") {
+                    return Some(s);
+                }
+            }
+            m.values().find_map(find_reference_uri)
+        }
+        serde_json::Value::Array(a) => a.iter().find_map(find_reference_uri),
+        _ => None,
+    }
+}
+
+/// Shadow-accept the canonical result URI (RFC noetl/ai-meta#104 Phase A).
+///
+/// When the built `result` carries a `reference.uri`, parse + validate it via
+/// the shared [`noetl_tools::locator`] (accepting **both** the canonical
+/// logical Resource Locator and the legacy execution ref) and record the
+/// outcome on `noetl_result_uri_accept_total{outcome}`.  A malformed URI is
+/// logged (WARN, with `execution_id`) + counted `malformed` but **never fails
+/// the event** — Phase A adds acceptance, not a failure path, and does not yet
+/// resolve by the URI (Phase C) or write the Feather tier (Phase B).
+///
+/// The caller gates this on `NOETL_RESULT_URI_ACCEPT`; it is a no-op when no
+/// `reference.uri` is present.
+fn accept_canonical_result_uri(result: &serde_json::Value, execution_id: i64) {
+    let Some(uri) = find_reference_uri(result) else {
+        return;
+    };
+    match crate::services::result_store::parse_result_ref(uri) {
+        Ok(parsed) => crate::metrics::record_result_uri_accept(parsed.shape()),
+        Err(e) => {
+            crate::metrics::record_result_uri_accept("malformed");
+            warn!(
+                execution_id,
+                result_uri = uri,
+                error = %e,
+                "canonical result URI malformed; accepted as-is, not resolved (noetl/ai-meta#104 Phase A)"
+            );
+        }
+    }
+}
+
 /// Decode a base64-wrapped `OrchestrationResult` (the worker base64-wraps the
 /// `system/orchestrate` plug-in's output bytes).  Returns `None` on a missing
 /// input, a base64 error, or a JSON error (an error envelope rather than a
@@ -3757,6 +3824,94 @@ async fn emit_playbook_failed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── RFC #104 Phase A — shadow-accept the canonical result URI ────────────
+
+    /// The over-budget `call.done` envelope the worker emits: the canonical
+    /// `reference.uri` sits nested under `context.result.reference`, alongside
+    /// the legacy `ref`.
+    #[test]
+    fn find_reference_uri_locates_nested_worker_shape() {
+        let result = serde_json::json!({
+            "status": "completed",
+            "context": {
+                "result": {
+                    "reference": {
+                        "ref": "noetl://execution/325/result/load_next_facility/9001",
+                        "uri": "noetl://default/default/results/325/load_next_facility/2/4/1",
+                        "extracted": { "rows": 4 }
+                    },
+                    "context": { "data": { "_ref": "noetl://execution/325/result/load_next_facility/9001" } }
+                }
+            }
+        });
+        assert_eq!(
+            find_reference_uri(&result),
+            Some("noetl://default/default/results/325/load_next_facility/2/4/1")
+        );
+    }
+
+    /// Top-level (un-wrapped tool result) carries the reference at
+    /// `result.reference`.
+    #[test]
+    fn find_reference_uri_locates_top_level_shape() {
+        let result = serde_json::json!({
+            "status": "completed",
+            "reference": { "uri": "noetl://t_acme/p_gen/results/1/start/0/0/1" }
+        });
+        assert_eq!(
+            find_reference_uri(&result),
+            Some("noetl://t_acme/p_gen/results/1/start/0/0/1")
+        );
+    }
+
+    /// An inline result (no reference) yields nothing — the hook is a no-op.
+    #[test]
+    fn find_reference_uri_absent_on_inline_result() {
+        let result = serde_json::json!({
+            "status": "completed",
+            "context": { "data": { "rows": [1, 2, 3] } }
+        });
+        assert_eq!(find_reference_uri(&result), None);
+        // A non-`noetl://` `uri` (e.g. an http response field) is ignored.
+        let other = serde_json::json!({ "context": { "data": { "uri": "https://example.com/x" } } });
+        assert_eq!(find_reference_uri(&other), None);
+    }
+
+    /// The accept hook classifies a canonical URI and advances the metric.
+    #[test]
+    fn accept_canonical_result_uri_records_canonical() {
+        let before = crate::metrics::result_uri_accept_total()
+            .with_label_values(&["canonical"])
+            .get();
+        let result = serde_json::json!({
+            "status": "completed",
+            "reference": { "uri": "noetl://default/default/results/7/start/0/0/1" }
+        });
+        accept_canonical_result_uri(&result, 7);
+        let after = crate::metrics::result_uri_accept_total()
+            .with_label_values(&["canonical"])
+            .get();
+        assert_eq!(after, before + 1, "canonical accept must increment the counter");
+    }
+
+    /// A malformed `reference.uri` is counted `malformed` and does NOT panic /
+    /// fail — Phase A introduces no new failure path.
+    #[test]
+    fn accept_canonical_result_uri_records_malformed_without_failing() {
+        let before = crate::metrics::result_uri_accept_total()
+            .with_label_values(&["malformed"])
+            .get();
+        let result = serde_json::json!({
+            "status": "completed",
+            "reference": { "uri": "noetl://t/p/results" } // too few segments
+        });
+        accept_canonical_result_uri(&result, 9);
+        let after = crate::metrics::result_uri_accept_total()
+            .with_label_values(&["malformed"])
+            .get();
+        assert_eq!(after, before + 1, "malformed accept must increment the counter");
+    }
 
     // ── RFC #115 Phase 3 — chain-walk state builder ──────────────────────────
 
