@@ -58,6 +58,17 @@ pub const PROJECTOR_CONSUMER: &str = "noetl_projector";
 /// has its own ack cursor.
 pub const MATERIALIZER_CONSUMER: &str = "noetl_materializer";
 
+/// Durable pull consumer the **result materializer** drains
+/// (noetl/ai-meta#104 Phase B).  A *separate* consumer from
+/// [`MATERIALIZER_CONSUMER`] by design: the result materializer writes the
+/// over-budget Feather/JSON result tier to object store, whose I/O latency must
+/// never back-pressure the `noetl.event` audit fold the lag alert guards.  Each
+/// drains the same stream with its own ack cursor.  Ensured unconditionally
+/// (like the projector/materializer consumers) so the cursor exists from the
+/// stream's birth; an idle consumer (Phase B flag default-off on the worker)
+/// just sits at the stream tail and costs nothing under `limits` retention.
+pub const RESULT_MATERIALIZER_CONSUMER: &str = "noetl_result_materializer";
+
 /// Publishes full events onto the `noetl_events` JetStream stream.
 #[derive(Clone)]
 pub struct EventStreamPublisher {
@@ -82,6 +93,10 @@ impl EventStreamPublisher {
         // projector (→ projection_snapshot) and the materializer (→ noetl.event).
         Self::ensure_consumer(&js, PROJECTOR_CONSUMER).await?;
         Self::ensure_consumer(&js, MATERIALIZER_CONSUMER).await?;
+        // The result materializer (noetl/ai-meta#104 Phase B) is a sibling
+        // drainer on its own cursor — ensured here so its consumer exists even
+        // when no worker drains it yet (flag default-off).
+        Self::ensure_consumer(&js, RESULT_MATERIALIZER_CONSUMER).await?;
         Ok(Self { js })
     }
 
