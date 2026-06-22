@@ -1,5 +1,5 @@
-//! Object-store endpoints (noetl/ai-meta#105 Round 5) — the server-mediated
-//! backend for a plug-in's `noetl.object_put` capability (the Feather tier).
+//! Object-store endpoints (noetl/ai-meta#105 Round 5; backend selector added in
+//! [noetl/ai-meta#104](https://github.com/noetl/ai-meta/issues/104) Phase C).
 //!
 //! - `PUT /api/internal/objects/{*key}` — write an object (raw body) at the §7
 //!   physical key; the server computes the SHA-256 digest and stores it.
@@ -9,6 +9,10 @@
 //! (`noetl/env=…/region=…/cell=…/shard=…/…/results/<step>/<frame>/<row>/<attempt>.feather`)
 //! resolves. Under `/api/internal/*`, the service-account-gated family —
 //! workers reach NoETL-owned data only through the server API.
+//!
+//! The bytes land in whichever [`ObjectBackend`] the server resolved at startup
+//! (`NOETL_OBJECT_STORE_BACKEND`): Postgres `BYTEA` (Phase B default) or a GCS
+//! bucket (Phase C). The HTTP contract is identical across backends.
 
 use axum::{
     body::Bytes,
@@ -20,8 +24,17 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::db::{queries::object_store, DbPool};
+use crate::db::DbPool;
 use crate::error::AppResult;
+use crate::services::object_backend::ObjectBackend;
+
+/// Injected object-store deps: the Postgres pool (for the Postgres backend) plus
+/// the resolved backend selector.
+#[derive(Clone)]
+pub struct ObjectStoreDeps {
+    pub pool: DbPool,
+    pub backend: ObjectBackend,
+}
 
 #[derive(Debug, Deserialize)]
 pub struct PutQuery {
@@ -38,7 +51,7 @@ pub struct PutResponse {
 
 /// `PUT /api/internal/objects/{*key}` — store the raw body at `key`.
 pub async fn put(
-    State(pool): State<DbPool>,
+    State(deps): State<ObjectStoreDeps>,
     Path(key): Path<String>,
     Query(q): Query<PutQuery>,
     body: Bytes,
@@ -47,8 +60,13 @@ pub async fn put(
     let media_type = q
         .media_type
         .unwrap_or_else(|| "application/octet-stream".to_string());
-    object_store::put(&pool, &key, &digest, &media_type, &body).await?;
-    tracing::debug!(object_key = %key, digest = %digest, bytes = body.len(), "stored object");
+    let outcome = deps
+        .backend
+        .put(&deps.pool, &key, &digest, &media_type, &body)
+        .await;
+    crate::metrics::record_object_store_op(deps.backend.label(), "put", outcome.is_ok());
+    outcome?;
+    tracing::debug!(object_key = %key, digest = %digest, bytes = body.len(), backend = deps.backend.label(), "stored object");
     Ok(Json(PutResponse {
         key,
         digest,
@@ -58,11 +76,10 @@ pub async fn put(
 
 /// `GET /api/internal/objects/{*key}` — serve the object bytes, content-typed by
 /// its media type with the digest as an ETag.
-pub async fn get(
-    State(pool): State<DbPool>,
-    Path(key): Path<String>,
-) -> AppResult<Response> {
-    let Some(row) = object_store::get(&pool, &key).await? else {
+pub async fn get(State(deps): State<ObjectStoreDeps>, Path(key): Path<String>) -> AppResult<Response> {
+    let fetched = deps.backend.get(&deps.pool, &key).await;
+    crate::metrics::record_object_store_op(deps.backend.label(), "get", fetched.is_ok());
+    let Some(row) = fetched? else {
         return Ok((StatusCode::NOT_FOUND, format!("object {key} not found")).into_response());
     };
     Ok((
