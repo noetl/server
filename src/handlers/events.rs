@@ -3396,6 +3396,30 @@ fn decode_orchestration_result(
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
 }
 
+/// Decode a base64-wrapped orchestrate-drive ERROR envelope (`{"error": "..."}`)
+/// — the `system/orchestrate` plug-in emits this (instead of an
+/// `OrchestrationResult`) when the off-server drive's `evaluate_state` returns
+/// `Err`: a deterministic, every-retry failure such as an invalid step-body
+/// template, an unknown `next` step, or a loop `in:` expression that does not
+/// evaluate to an iterable (noetl/ai-meta#123).  Returns the error message so
+/// the caller can terminate the execution as FAILED rather than treating the
+/// envelope as an undecodable result and silently no-op'ing — which strands the
+/// run in RUNNING forever (the observability regression #123 fixes).
+///
+/// A *transient* decode miss (missing `output_b64` from a race, truncated
+/// base64) parses as neither an `OrchestrationResult` nor this envelope, so it
+/// stays on the benign `decode_error` re-drive path — only a structured error
+/// envelope is treated as terminal.
+fn decode_orchestrate_error(b64: Option<&str>) -> Option<String> {
+    use base64::Engine;
+    let bytes = b64.and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())?;
+    let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    match v.get("error") {
+        Some(serde_json::Value::String(s)) if !s.is_empty() => Some(s.clone()),
+        _ => None,
+    }
+}
+
 /// Apply the `OrchestrationResult` a worker computed for the worker-driven drive
 /// (noetl/ai-meta#108 slice 3): decode it from the `system/orchestrate`
 /// completion, then emit events + issue commands via `apply_orchestration_result`
@@ -3491,6 +3515,39 @@ async fn apply_worker_orchestration(
     }
 
     let Some(result) = decoded else {
+        // noetl/ai-meta#123: distinguish a deterministic DRIVE ERROR from a
+        // transient decode miss.  When the off-server drive's `evaluate_state`
+        // returns `Err` (invalid template, unknown `next` step, or a loop `in:`
+        // that does not evaluate to an iterable), the `system/orchestrate`
+        // plug-in returns a structured `{"error": "..."}` envelope rather than an
+        // `OrchestrationResult`.  Treating that as an undecodable result and
+        // returning Ok(0) wedges the execution in RUNNING forever (commands=0, no
+        // terminal event) — the exact silent-wedge regression #123 fixes.  The
+        // in-process drive already terminates such failures as `playbook.failed`
+        // (the `evaluate_state` Err arm in `trigger_orchestrator_inner`); the
+        // off-server drive must do the same so a malformed playbook fails loudly.
+        if let Some(err_msg) = decode_orchestrate_error(find_output_b64(payload)) {
+            // catalog_id for the terminal event: prefer the warm execute-time
+            // descriptor (off-server apply path), else 0 — the event still
+            // resolves the run to FAILED and surfaces the message to the client.
+            let catalog_id = state
+                .exec_descriptors
+                .get(execution_id)
+                .await
+                .map(|d| d.catalog_id)
+                .filter(|c| *c != 0)
+                .unwrap_or(0);
+            let msg = format!("Orchestrator drive failed (off-server): {err_msg}");
+            warn!(
+                execution_id,
+                error = %msg,
+                "worker-driven: drive returned a deterministic error envelope — \
+                 terminating execution as FAILED"
+            );
+            crate::metrics::record_orchestrate_drive("drive_error");
+            emit_playbook_failed(state, execution_id, catalog_id, trigger_event_id, &msg).await?;
+            return Ok(0);
+        }
         warn!(
             execution_id,
             "worker-driven: could not decode OrchestrationResult from orchestrate completion \
@@ -4381,5 +4438,40 @@ mod tests {
         let not_a_result =
             base64::engine::general_purpose::STANDARD.encode(b"{\"unexpected\":true}");
         assert!(decode_orchestration_result(Some(&not_a_result)).is_none());
+    }
+
+    #[test]
+    fn decode_orchestrate_error_extracts_drive_error_envelope() {
+        // noetl/ai-meta#123: the off-server drive returns `{"error": "..."}` when
+        // `evaluate_state` fails (e.g. a non-iterable loop `in:`).  The server
+        // must recognise it so it can terminate the run as FAILED instead of
+        // silently no-op'ing on an undecodable result.
+        use base64::Engine;
+        let envelope = serde_json::json!({
+            "error": "evaluate_state: Validation error: loop step 'process': \
+                      Loop expression '{{ workload.batch_slots }}' did not evaluate to an \
+                      iterable (got null)"
+        });
+        let b64 = base64::engine::general_purpose::STANDARD
+            .encode(serde_json::to_vec(&envelope).unwrap());
+        let msg = decode_orchestrate_error(Some(&b64)).expect("envelope decodes to its message");
+        assert!(msg.contains("did not evaluate to an iterable"), "{msg}");
+        assert!(msg.contains("process"), "{msg}");
+
+        // A real OrchestrationResult is NOT an error envelope → None (stays on the
+        // success path, never mis-classified as a failure).
+        let or_json = serde_json::json!({
+            "state": "completed", "commands": [], "should_complete": true, "events_to_emit": []
+        });
+        let or_b64 = base64::engine::general_purpose::STANDARD
+            .encode(serde_json::to_vec(&or_json).unwrap());
+        assert!(decode_orchestrate_error(Some(&or_b64)).is_none());
+
+        // Transient decode misses (None / bad base64 / empty error) stay on the
+        // benign re-drive path, NOT the terminal-fail path.
+        assert!(decode_orchestrate_error(None).is_none());
+        assert!(decode_orchestrate_error(Some("not base64!!!")).is_none());
+        let empty_err = base64::engine::general_purpose::STANDARD.encode(b"{\"error\":\"\"}");
+        assert!(decode_orchestrate_error(Some(&empty_err)).is_none());
     }
 }

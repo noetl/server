@@ -360,10 +360,27 @@ impl ConditionEvaluator {
                 let n = n.as_u64().unwrap_or(0) as usize;
                 Ok((0..n).map(|i| serde_json::json!(i)).collect())
             }
-            _ => Err(CoreError::Validation(format!(
-                "Loop expression did not evaluate to an iterable: {}",
-                loop_expr
-            ))),
+            other => {
+                // noetl/ai-meta#123: a loop `in:` that renders to a
+                // non-iterable (null / boolean / undefined-from-a-missing
+                // workload key, e.g. `loop: { in: '{{ workload.batch_slots }}' }`
+                // with `batch_slots` absent) MUST surface a deterministic
+                // validation error so the execution fails loudly — rather than
+                // silently producing zero iterations (commands=0) and wedging in
+                // RUNNING forever.  This restores the v3.4.2 behavior.  Note an
+                // *empty* iterable (`[]` / `{}`) is NOT this case — it matches the
+                // `Array` / `Object` arms above and legitimately short-circuits
+                // the loop to its `next`.
+                let kind = match &other {
+                    serde_json::Value::Null => "null",
+                    serde_json::Value::Bool(_) => "boolean",
+                    _ => "non-iterable value",
+                };
+                Err(CoreError::Validation(format!(
+                    "Loop expression '{}' did not evaluate to an iterable (got {})",
+                    loop_expr, kind
+                )))
+            }
         }
     }
 }

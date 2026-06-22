@@ -65,6 +65,23 @@ fn output_namespace(state: &WorkflowState, step_name: &str) -> Option<serde_json
     Some(out)
 }
 
+/// noetl/ai-meta#123: prepend the offending loop step name to an
+/// `evaluate_loop` error so the surfaced `playbook.failed` names *which*
+/// step's `in:` failed — without nesting a second `Validation error:`
+/// prefix (which `CoreError`'s `Display` would add if the whole error were
+/// re-wrapped).  The inner message (e.g. `Loop expression '…' did not
+/// evaluate to an iterable (got null)`) is preserved verbatim.
+fn prefix_loop_step_error(step_name: &str, e: CoreError) -> CoreError {
+    match e {
+        CoreError::Validation(msg) => {
+            CoreError::Validation(format!("loop step '{step_name}': {msg}"))
+        }
+        CoreError::Template(msg) => {
+            CoreError::Template(format!("loop step '{step_name}': {msg}"))
+        }
+    }
+}
+
 /// Add `ctx` and `workload` namespace shims to a flat variable
 /// context.  Mirrors the same pattern in `CommandBuilder::build_command`
 /// (commands.rs:108-115) so that `{{ ctx.foo }}` and `{{ workload.foo }}`
@@ -825,7 +842,11 @@ impl WorkflowOrchestrator {
 
                 let next_idx = completed as usize;
                 let shimmed = with_ctx_shims(context);
-                let items = self.evaluator.evaluate_loop(loop_cfg.in_expr.as_deref().unwrap_or(""), &shimmed)?;
+                // noetl/ai-meta#123: name the loop step in any surfaced error.
+                let items = self
+                    .evaluator
+                    .evaluate_loop(loop_cfg.in_expr.as_deref().unwrap_or(""), &shimmed)
+                    .map_err(|e| prefix_loop_step_error(step_name, e))?;
                 if next_idx >= items.len() {
                     continue;
                 } // safety guard
@@ -1685,9 +1706,14 @@ impl WorkflowOrchestrator {
                         }
 
                         let shimmed_loop = with_ctx_shims(&current_ctx);
+                        // noetl/ai-meta#123: prepend the offending step name so the
+                        // surfaced `playbook.failed` names *which* loop step's `in:`
+                        // failed (a non-iterable here returns Err, which the caller
+                        // turns into a terminal FAILED — not a silent commands=0).
                         let items = self
                             .evaluator
-                            .evaluate_loop(loop_cfg.in_expr.as_deref().unwrap_or(""), &shimmed_loop)?;
+                            .evaluate_loop(loop_cfg.in_expr.as_deref().unwrap_or(""), &shimmed_loop)
+                            .map_err(|e| prefix_loop_step_error(&current_step_name, e))?;
                         let total: usize = items.len();
 
                         if total == 0 {
@@ -3077,6 +3103,80 @@ workflow:
             .collect();
         assert!(types.contains(&"step.enter"));
         assert!(types.contains(&"step.exit"));
+    }
+
+    #[test]
+    fn test_step_loop_non_iterable_in_fails_loudly() {
+        // noetl/ai-meta#123: a loop whose `in:` renders to a NON-iterable
+        // (here `{{ workload.batch_slots }}` with `batch_slots` absent →
+        // undefined → renders empty → null) must return a deterministic Err
+        // naming the step + expression — NOT silently produce zero iterations
+        // (commands=0) and leave the execution wedged in RUNNING.  The server
+        // boundary turns this Err into a terminal `playbook.failed`.
+        //
+        // Contrast with `test_step_loop_empty_collection_short_circuits`: an
+        // *empty* iterable (`[]`) is legitimate and short-circuits to `next`;
+        // a *non-iterable* expression is the bug this guards against.
+        let orchestrator = WorkflowOrchestrator::new();
+
+        let start = make_step("start", Some("process"));
+        let mut process = make_step("process", Some("end"));
+        process.r#loop = Some(crate::playbook::Loop {
+            in_expr: Some("{{ workload.batch_slots }}".to_string()),
+            cursor: None,
+            iterator: "slot".to_string(),
+            spec: None,
+        });
+        let end = make_step("end", None);
+
+        let events = vec![
+            {
+                let mut e = make_event("playbook_started", None);
+                // `workload` present but WITHOUT `batch_slots` — the repro shape.
+                e.context = Some(serde_json::json!({
+                    "workload": { "other_key": 1 },
+                    "path": "test",
+                    "version": "1"
+                }));
+                e
+            },
+            make_event("command.completed", Some("start")),
+        ];
+
+        let playbook = Playbook {
+            api_version: "noetl.io/v2".to_string(),
+            kind: "Playbook".to_string(),
+            metadata: Metadata {
+                name: "loop_non_iterable".to_string(),
+                path: Some("test/loop_non_iterable".to_string()),
+                description: None,
+                labels: None,
+                extra: HashMap::new(),
+            },
+            workload: None,
+            vars: None,
+            keychain: None,
+            workbook: None,
+            workflow: vec![start, process, end],
+        };
+
+        let result = orchestrator.evaluate(&events, &playbook, Some("command.completed"));
+        let err = result.expect_err(
+            "a non-iterable loop `in:` must return Err, not Ok(commands=0) — the silent wedge",
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("did not evaluate to an iterable"),
+            "error should explain the non-iterable loop, got: {msg}"
+        );
+        assert!(
+            msg.contains("process"),
+            "error should name the offending loop step, got: {msg}"
+        );
+        assert!(
+            msg.contains("workload.batch_slots"),
+            "error should carry the rendered expression, got: {msg}"
+        );
     }
 
     /// Helper: build a step with a Router-style `next` that has
