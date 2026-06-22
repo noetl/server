@@ -1363,9 +1363,9 @@ dependencies = [
 
 [[package]]
 name = "noetl-locator"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b1e5442663cd67add8e6c39776a3eacc4375eb4d7755ef6546a131c9edb677ec"
+checksum = "fcdc9657471e917de19608a327a65eafb0d4bef5df5271c991c85982a5ccdf07"
 
 [[package]]
 name = "noetl-orchestrate-core"
@@ -1383,7 +1383,7 @@ dependencies = [
 
 [[package]]
 name = "noetl-server"
-version = "3.40.0"
+version = "3.41.0"
 dependencies = [
  "aes-gcm",
  "anyhow",

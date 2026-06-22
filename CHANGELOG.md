@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.41.0](https://github.com/noetl/server/compare/v3.40.0...v3.41.0) (2026-06-22)
+
+### Features
+
+* **events:** ensure sibling noetl_result_materializer consumer ([#104](https://github.com/noetl/server/issues/104) Phase B) ([48ad318](https://github.com/noetl/server/commit/48ad318d636d7ec77d1120a2967103a4fdd70f00)), closes [noetl/worker#127](https://github.com/noetl/worker/issues/127)
+
 ## [3.40.0](https://github.com/noetl/server/compare/v3.39.6...v3.40.0) (2026-06-22)
 
 ### Features
