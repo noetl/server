@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.39.4](https://github.com/noetl/server/compare/v3.39.3...v3.39.4) (2026-06-22)
+
+### Bug Fixes
+
+* **events:** link command.claimed through ChainHeads on the gate-off claim path ([#121](https://github.com/noetl/server/issues/121)) ([#256](https://github.com/noetl/server/issues/256)) ([28b17cb](https://github.com/noetl/server/commit/28b17cb46372c99166c50a34cb6c8786e40e2a8c))
+
 ## [3.39.3](https://github.com/noetl/server/compare/v3.39.2...v3.39.3) (2026-06-21)
 
 ### Bug Fixes
