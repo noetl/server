@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.40.0](https://github.com/noetl/server/compare/v3.39.6...v3.40.0) (2026-06-22)
+
+### Features
+
+* **events:** accept the canonical result URI ([#104](https://github.com/noetl/server/issues/104) Phase A of N) ([82f77de](https://github.com/noetl/server/commit/82f77de5e0e371192f50c03896a53b44aafd2169))
+
 ## [3.39.6](https://github.com/noetl/server/compare/v3.39.5...v3.39.6) (2026-06-22)
 
 ### Bug Fixes
