@@ -56,11 +56,35 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Publish crate
+      # Publish the workspace member `noetl-orchestrate-core` FIRST — noetl-server
+      # depends on it (path + version), so `cargo publish` of the root crate needs
+      # it resolvable from crates.io (noetl/ai-meta#108; mirrors how noetl-tools
+      # publishes noetl-directives, noetl/ai-meta#92).  Idempotent: skip if this
+      # version is already published (a re-run, or a release that didn't bump the
+      # member — the core moves far less often than the server).
+      - name: Publish noetl-orchestrate-core (if changed)
         if: ${{ env.CRATES_IO_TOKEN != '' }}
         env:
           CARGO_REGISTRY_TOKEN: ${{ env.CRATES_IO_TOKEN }}
-        run: cargo publish
+        run: |
+          set -euo pipefail
+          VER="$(grep -E '^version = ' orchestrate-core/Cargo.toml | head -1 | cut -d'"' -f2)"
+          if cargo search noetl-orchestrate-core 2>/dev/null | grep -q "noetl-orchestrate-core = \"${VER}\""; then
+            echo "noetl-orchestrate-core ${VER} already on crates.io; skipping."
+          else
+            OUTPUT="$(cargo publish -p noetl-orchestrate-core 2>&1)" || {
+              echo "$OUTPUT"
+              echo "$OUTPUT" | grep -q "already exists" && echo "already published; continuing." || exit 1
+            }
+            echo "$OUTPUT"
+            # Give the sparse index a moment so the root crate's publish resolves it.
+            sleep 20
+          fi
+      - name: Publish noetl-server crate
+        if: ${{ env.CRATES_IO_TOKEN != '' }}
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ env.CRATES_IO_TOKEN }}
+        run: cargo publish -p noetl-server
       - name: Skip publish (no token)
         if: ${{ env.CRATES_IO_TOKEN == '' }}
         run: echo "CRATES_IO_TOKEN is not set; skipping crate publish."
