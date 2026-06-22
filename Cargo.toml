@@ -21,7 +21,13 @@ exclude = ["plugins/orchestrate"]
 
 [dependencies]
 # Pure orchestrator drive core (one source → native + wasm32; noetl/ai-meta#108).
-noetl-orchestrate-core = { path = "orchestrate-core" }
+# Carries an explicit `version` alongside the `path` so `cargo publish` of
+# noetl-server resolves the dep from crates.io — a bare path dep has no version
+# and fails publish ("all dependencies must have a version requirement
+# specified when publishing").  The release workflow publishes
+# noetl-orchestrate-core first; mirrors noetl-tools/noetl-directives
+# (noetl/ai-meta#92).
+noetl-orchestrate-core = { version = "0.1.0", path = "orchestrate-core" }
 # Async runtime
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time", "sync"] }
 
