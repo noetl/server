@@ -1127,14 +1127,42 @@ pub async fn claim_command(
                 .with_worker_id(Some(request.worker_id.clone())),
             );
         } else {
+            // One-level event chain (RFC #115 Phase 2): stamp `prev_event_id`
+            // from the per-execution chain head + advance the head, EXACTLY as
+            // the `event_write::emit_events` chokepoint does for every other
+            // server-originated event.  This gate-off branch writes the
+            // `command.claimed` row in-tx (atomic with the claim), so it never
+            // passed through that chokepoint — leaving `prev_event_id = NULL`
+            // AND the chain head un-advanced.  The orphan that produced
+            // (noetl/ai-meta#121): the next worker event (`command.started`)
+            // linked back to `command.issued`, skipping the unlinked
+            // `command.claimed`, so the off-server `chain_walk_from` hit a
+            // NULL-prev non-genesis head, reported the spine `Incomplete`, and
+            // the server reconciler re-drove the execution in a loop.  Linking
+            // here keeps the chain `command.issued → command.claimed →
+            // command.started …` walkable so the off-server builder completes.
+            // `link_batch` advances the head before the INSERT — the same
+            // advance-then-write ordering `emit_events` already uses; a (rare)
+            // commit failure leaves an advanced head re-derived on restart, no
+            // worse than the chokepoint path.  Gate-on (publish) links via the
+            // post-commit `emit_event` above, so this is only reached gate-off.
+            let prev_event_id = state
+                .chain_heads
+                .link_batch(execution_id, &[claim_event_id])
+                .await
+                .into_iter()
+                .next()
+                .flatten();
             sqlx::query(
                 r#"
                 INSERT INTO noetl.event (
                     event_id, execution_id, catalog_id, event_type,
-                    node_id, node_name, status, result, meta, worker_id, created_at
+                    node_id, node_name, status, result, meta, worker_id,
+                    prev_event_id, created_at
                 ) VALUES (
                     $1, $2, $3, $4,
-                    $5, $6, $7, $8, $9, $10, $11
+                    $5, $6, $7, $8, $9, $10,
+                    $11, $12
                 )
                 "#,
             )
@@ -1148,6 +1176,7 @@ pub async fn claim_command(
             .bind(claim_result)
             .bind(claim_meta)
             .bind(&request.worker_id)
+            .bind(prev_event_id)
             .bind(chrono::Utc::now())
             .execute(&mut *tx)
             .await?;
@@ -1287,11 +1316,19 @@ pub async fn handle_batch_events(
         )
         .await?;
     } else {
+        // Same one-level chain stamping the `event_write::emit_events`
+        // chokepoint performs (noetl/ai-meta#121): this gate-off batch INSERT
+        // bypasses it, so link each row's `prev_event_id` from the
+        // per-execution chain head + advance the head here, in batch order, so
+        // the gate-off chain stays walkable for the off-server builder.  Rows in
+        // a batch share one execution.
+        let ids: Vec<i64> = rows.iter().map(|r| r.event_id).collect();
+        let prevs = state.chain_heads.link_batch(execution_id, &ids).await;
         let mut qb = sqlx::QueryBuilder::new(
             "INSERT INTO noetl.event (event_id, execution_id, catalog_id, event_type, \
-             node_id, node_name, status, result, meta, worker_id, created_at) ",
+             node_id, node_name, status, result, meta, worker_id, prev_event_id, created_at) ",
         );
-        qb.push_values(rows.iter(), |mut b, r| {
+        qb.push_values(rows.iter().zip(prevs.iter()), |mut b, (r, prev)| {
             b.push_bind(r.event_id)
                 .push_bind(execution_id)
                 .push_bind(catalog_id)
@@ -1302,6 +1339,7 @@ pub async fn handle_batch_events(
                 .push_bind(&r.result_obj)
                 .push_bind(&r.meta_obj)
                 .push_bind(&request.worker_id)
+                .push_bind(*prev)
                 .push_bind(now);
         });
         qb.build().execute(&mut *tx).await?;
