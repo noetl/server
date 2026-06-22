@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.39.5](https://github.com/noetl/server/compare/v3.39.4...v3.39.5) (2026-06-22)
+
+### Bug Fixes
+
+* **drive:** don't route system executions to the off-server WAL drive ([#121](https://github.com/noetl/server/issues/121)) ([#257](https://github.com/noetl/server/issues/257)) ([54ac277](https://github.com/noetl/server/commit/54ac2773402721f61d411796c6deaaa6a854bf58))
+
 ## [3.39.4](https://github.com/noetl/server/compare/v3.39.3...v3.39.4) (2026-06-22)
 
 ### Bug Fixes
