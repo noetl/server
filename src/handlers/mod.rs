@@ -21,6 +21,7 @@ pub mod plugins;
 pub mod objects;
 pub mod replay;
 pub mod result_store;
+pub mod result_tier;
 pub mod runtime;
 pub mod secret_audit;
 pub mod sharding;
