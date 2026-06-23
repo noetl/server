@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.42.0](https://github.com/noetl/server/compare/v3.41.0...v3.42.0) (2026-06-23)
+
+### Features
+
+* **result:** GCS object backend + cell registry resolve-by-URN read side ([#104](https://github.com/noetl/server/issues/104) Phase C) ([082a955](https://github.com/noetl/server/commit/082a955a46dbd5d61d6f6c84b1b78a091a2a8223))
+
 ## [3.41.0](https://github.com/noetl/server/compare/v3.40.0...v3.41.0) (2026-06-22)
 
 ### Features
