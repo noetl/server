@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.45.0](https://github.com/noetl/server/compare/v3.44.0...v3.45.0) (2026-06-23)
+
+### Features
+
+* **object:** Workload Identity / ADC auth for the GCS result-tier backend ([#104](https://github.com/noetl/server/issues/104)) ([#265](https://github.com/noetl/server/issues/265)) ([fad5d8a](https://github.com/noetl/server/commit/fad5d8a8724f317c2ccf3c8f1ed23304c5d20ec3))
+
 ## [3.44.0](https://github.com/noetl/server/compare/v3.43.0...v3.44.0) (2026-06-23)
 
 ### Features
