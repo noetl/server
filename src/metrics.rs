@@ -214,6 +214,42 @@ pub fn record_atomic_item_context(outcome: &str) {
         .inc();
 }
 
+// ── Object-store GCS auth (noetl/ai-meta#104 result tier) ────────────────────
+
+/// `noetl_object_store_gcs_auth_total{mode, outcome}` — GCS backend bearer-token
+/// acquisitions for the result tier (noetl/ai-meta#104). `mode` = `adc`
+/// (Workload Identity / Application Default Credentials, the prod path) | `static`
+/// (explicit `NOETL_OBJECT_STORE_GCS_TOKEN`). `outcome` = `acquired` (token
+/// resolved — for `adc` this is served from gcp_auth's internal cache or a fresh
+/// mint, transparently) | `error` (provider init or token fetch failed). The
+/// no-auth emulator path (`mode = none`) makes no external token call, so it
+/// never increments here.
+pub fn object_store_gcs_auth_total() -> &'static IntCounterVec {
+    static M: OnceLock<IntCounterVec> = OnceLock::new();
+    M.get_or_init(|| {
+        let counter = IntCounterVec::new(
+            Opts::new(
+                "noetl_object_store_gcs_auth_total",
+                "GCS result-tier bearer-token acquisitions, by mode and outcome (noetl/ai-meta#104).",
+            ),
+            &["mode", "outcome"],
+        )
+        .expect("static counter spec must be valid");
+        registry()
+            .register(Box::new(counter.clone()))
+            .expect("counter registration must succeed");
+        counter
+    })
+}
+
+/// Record one GCS bearer-token acquisition (`mode` = `adc` | `static`;
+/// `outcome` = `acquired` | `error`).
+pub fn record_object_store_gcs_auth(mode: &str, outcome: &str) {
+    object_store_gcs_auth_total()
+        .with_label_values(&[mode, outcome])
+        .inc();
+}
+
 // ── State-build mode (RFC noetl/ai-meta#115 Phase 3) ─────────────────────────
 
 /// `noetl_state_build_total{mode, outcome}` — how the drive built `WorkflowState`
