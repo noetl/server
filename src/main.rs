@@ -339,6 +339,7 @@ fn build_router(
         .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
         .with_state(handlers::result_store::ResultStoreDeps {
             service: result_store_service,
+            mint_authoritative: state.config.result_mint_authoritative,
         });
 
     // Variable routes (transient table)

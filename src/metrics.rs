@@ -331,6 +331,39 @@ pub fn record_result_uri_accept(outcome: &str) {
         .inc();
 }
 
+/// `noetl_result_store_dual_write_total` — over-budget results written to
+/// `noetl.result_store` as the **transitional fallback leg** while the Phase D
+/// minting flip is on (`NOETL_RESULT_MINT_AUTHORITATIVE=true`,
+/// RFC noetl/ai-meta#104 Phase D).
+///
+/// Under the flip the worker treats the URN → Feather/GCS tier as authoritative
+/// and resolves from it first; the server keeps minting + storing `result_store`
+/// so the cutover is reversible (flag-off → `result_store`-authoritative again).
+/// Each such write increments this counter, making the dual-write window
+/// observable. Flag-off it never moves (the dual-write is just the ordinary,
+/// only store). The actual retirement of `result_store` (stopping this write) is
+/// the OQ5-gated operational decision — not Phase D.
+pub fn result_store_dual_write_total() -> &'static prometheus::IntCounter {
+    static M: OnceLock<prometheus::IntCounter> = OnceLock::new();
+    M.get_or_init(|| {
+        let counter = prometheus::IntCounter::new(
+            "noetl_result_store_dual_write_total",
+            "result_store writes that are the dual-write fallback leg under the Phase D minting flip (RFC #104 Phase D).",
+        )
+        .expect("static counter spec must be valid");
+        registry()
+            .register(Box::new(counter.clone()))
+            .expect("counter registration must succeed");
+        counter
+    })
+}
+
+/// Record one `result_store` dual-write (the reversible fallback leg under the
+/// Phase D minting flip).
+pub fn record_result_store_dual_write() {
+    result_store_dual_write_total().inc();
+}
+
 /// `noetl_state_build_event_scans_total` — incremented once each time the drive
 /// path enters the **event-scan** state-construction block (the block that issues
 /// `WHERE execution_id = $1 …` scans of `noetl.event`: the consistency `COUNT`,

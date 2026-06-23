@@ -31,6 +31,11 @@ use crate::services::result_store::{parse_noetl_ref, PutResultBody, ResultStoreS
 #[derive(Clone)]
 pub struct ResultStoreDeps {
     pub service: ResultStoreService,
+    /// Phase D minting flip (noetl/ai-meta#104 Phase D): when true the worker
+    /// treats the URN tier as authoritative, so each `result_store` write here is
+    /// the reversible **dual-write fallback leg** — counted on
+    /// `noetl_result_store_dual_write_total`. Off → ordinary authoritative write.
+    pub mint_authoritative: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -74,6 +79,17 @@ pub async fn put_result(
                 "result_store.put: stored",
             );
             crate::metrics::record_result_store_put(elapsed, resp.bytes as usize, "ok");
+            // Phase D (#104): under the minting flip the URN tier is
+            // authoritative and this write is the reversible dual-write fallback
+            // leg — count it so the dual-write window is observable.
+            if deps.mint_authoritative {
+                crate::metrics::record_result_store_dual_write();
+                tracing::debug!(
+                    execution_id,
+                    name = %body.name,
+                    "result_store dual-write (Phase D fallback leg; tier authoritative)",
+                );
+            }
             Ok((StatusCode::OK, Json(resp)))
         }
         Err(e) => {
