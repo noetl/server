@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.43.0](https://github.com/noetl/server/compare/v3.42.0...v3.43.0) (2026-06-23)
+
+### Features
+
+* **result:** mint-authoritative flag + result_store dual-write counter ([#104](https://github.com/noetl/server/issues/104) Phase D) ([eaf0082](https://github.com/noetl/server/commit/eaf00824303beb4bb85dffdcaee8d499e8058c93))
+
 ## [3.42.0](https://github.com/noetl/server/compare/v3.41.0...v3.42.0) (2026-06-23)
 
 ### Features
