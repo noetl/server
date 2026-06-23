@@ -1442,6 +1442,39 @@ pub fn record_cell_registry_request() {
     cell_registry_requests_total().inc();
 }
 
+/// `noetl_result_tier_gc_total{outcome}` — result-tier GC sweep outcomes (RFC
+/// #104 Phase F). `outcome` is `no_op` (gate off), `scanned`, `deleted`,
+/// `skipped_live`, `skipped_grace`, `skipped_unparseable`, or `error`. The
+/// `skipped_live` series is the proof the sweep never reclaims a live-referenced
+/// object; `deleted` advances only when a provably-dead object is removed.
+pub fn result_tier_gc_total() -> &'static IntCounterVec {
+    static M: OnceLock<IntCounterVec> = OnceLock::new();
+    M.get_or_init(|| {
+        let counter = IntCounterVec::new(
+            Opts::new(
+                "noetl_result_tier_gc_total",
+                "Result-tier GC sweep outcomes by outcome (RFC #104 Phase F).",
+            ),
+            &["outcome"],
+        )
+        .expect("static counter spec must be valid");
+        registry()
+            .register(Box::new(counter.clone()))
+            .expect("counter registration must succeed");
+        counter
+    })
+}
+
+/// Record `n` result-tier GC outcomes of a kind (a sweep records one delta per
+/// outcome class, so the counter sums cleanly across sweeps).
+pub fn record_result_tier_gc(outcome: &str, n: u64) {
+    if n > 0 {
+        result_tier_gc_total()
+            .with_label_values(&[outcome])
+            .inc_by(n);
+    }
+}
+
 /// Secrets-Wallet Phase 7c: histogram of token auto-renewal wall-clock
 /// latency.  Buckets `[0.05, 0.1, 0.25, 0.5, 1, 2, 5]` — span the range
 /// where auth round-trips actually live.  Observed regardless of

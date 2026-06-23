@@ -98,3 +98,42 @@ pub async fn get(pool: &DbPool, object_key: &str) -> AppResult<Option<ObjectRow>
         bytes: r.get::<Vec<u8>, _>("bytes"),
     }))
 }
+
+/// List object keys under `prefix` (most-recently-written first), capped at
+/// `limit`. Backs the result-tier GC sweep ([noetl/ai-meta#104](https://github.com/noetl/ai-meta/issues/104)
+/// Phase F) for the Postgres backend.
+pub async fn list_keys(pool: &DbPool, prefix: &str, limit: i64) -> AppResult<Vec<String>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT object_key
+        FROM noetl.object_store
+        WHERE object_key LIKE $1 || '%'
+        ORDER BY created_at DESC
+        LIMIT $2
+        "#,
+    )
+    .bind(prefix)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| r.get::<String, _>("object_key"))
+        .collect())
+}
+
+/// Delete the object at `object_key`. Returns `true` if a row was removed
+/// (idempotent — a missing key is `false`, not an error). Backs the result-tier
+/// GC sweep ([noetl/ai-meta#104](https://github.com/noetl/ai-meta/issues/104) Phase F).
+pub async fn delete(pool: &DbPool, object_key: &str) -> AppResult<bool> {
+    let result = sqlx::query(
+        r#"
+        DELETE FROM noetl.object_store
+        WHERE object_key = $1
+        "#,
+    )
+    .bind(object_key)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}

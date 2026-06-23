@@ -16,6 +16,7 @@ pub mod keychain_refresh;
 pub mod orch_snapshot;
 pub mod replay;
 pub mod result_store;
+pub mod result_tier_gc;
 pub mod runtime;
 pub mod secret_audit;
 pub mod ui_schema;

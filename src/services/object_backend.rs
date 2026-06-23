@@ -128,6 +128,28 @@ impl ObjectBackend {
             ObjectBackend::Gcs(g) => g.get(key).await,
         }
     }
+
+    /// List object keys under `prefix`, capped at `limit`. Backs the result-tier
+    /// GC sweep ([noetl/ai-meta#104](https://github.com/noetl/ai-meta/issues/104)
+    /// Phase F). The ordering is best-effort per backend (Postgres → newest
+    /// first; GCS → lexicographic, the JSON-API default); the GC sweep does not
+    /// depend on order, only on coverage up to `limit`.
+    pub async fn list(&self, pool: &DbPool, prefix: &str, limit: usize) -> AppResult<Vec<String>> {
+        match self {
+            ObjectBackend::Postgres => object_store::list_keys(pool, prefix, limit as i64).await,
+            ObjectBackend::Gcs(g) => g.list(prefix, limit).await,
+        }
+    }
+
+    /// Delete the object at `key`. Idempotent: a missing key is `Ok(false)`, not
+    /// an error. Backs the result-tier GC sweep
+    /// ([noetl/ai-meta#104](https://github.com/noetl/ai-meta/issues/104) Phase F).
+    pub async fn delete(&self, pool: &DbPool, key: &str) -> AppResult<bool> {
+        match self {
+            ObjectBackend::Postgres => object_store::delete(pool, key).await,
+            ObjectBackend::Gcs(g) => g.delete(key).await,
+        }
+    }
 }
 
 impl GcsBackend {
@@ -209,6 +231,108 @@ impl GcsBackend {
             bytes,
         }))
     }
+
+    /// List object names under `prefix` via the GCS JSON API
+    /// (`GET …/o?prefix=…&maxResults=…`), following `nextPageToken` until `limit`
+    /// keys are collected or the listing is exhausted. The `prefix` rides as a
+    /// query param (the client URL-encodes it). Works against real GCS and the
+    /// fake-gcs-server emulator alike.
+    async fn list(&self, prefix: &str, limit: usize) -> AppResult<Vec<String>> {
+        let url = format!("{}/storage/v1/b/{}/o", self.endpoint, self.bucket);
+        let mut keys: Vec<String> = Vec::new();
+        let mut page_token: Option<String> = None;
+        // Bound the page walk so a pathological listing can't loop forever.
+        for _ in 0..1000 {
+            let remaining = limit.saturating_sub(keys.len());
+            if remaining == 0 {
+                break;
+            }
+            let max_results = remaining.min(1000).to_string();
+            let mut query: Vec<(&str, &str)> = vec![("prefix", prefix), ("maxResults", &max_results)];
+            if let Some(tok) = page_token.as_deref() {
+                query.push(("pageToken", tok));
+            }
+            let mut req = self.client.get(&url).query(&query);
+            if !self.token.is_empty() {
+                req = req.bearer_auth(&self.token);
+            }
+            let resp = req
+                .send()
+                .await
+                .map_err(|e| AppError::Internal(format!("gcs object list {prefix}: {e}")))?;
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                return Err(AppError::Internal(format!(
+                    "gcs object list {prefix}: HTTP {} {}",
+                    status.as_u16(),
+                    body
+                )));
+            }
+            let page: GcsListPage = resp
+                .json()
+                .await
+                .map_err(|e| AppError::Internal(format!("gcs object list {prefix} decode: {e}")))?;
+            for item in page.items {
+                keys.push(item.name);
+                if keys.len() >= limit {
+                    break;
+                }
+            }
+            match page.next_page_token {
+                Some(tok) if keys.len() < limit => page_token = Some(tok),
+                _ => break,
+            }
+        }
+        Ok(keys)
+    }
+
+    /// Delete the object at `key` via the GCS JSON API
+    /// (`DELETE …/o/<percent-encoded-key>`). Idempotent: a 404 (already gone) is
+    /// `Ok(false)`; a 2xx is `Ok(true)`; other non-2xx errors.
+    async fn delete(&self, key: &str) -> AppResult<bool> {
+        let url = format!(
+            "{}/storage/v1/b/{}/o/{}",
+            self.endpoint,
+            self.bucket,
+            percent_encode_segment(key)
+        );
+        let mut req = self.client.delete(&url);
+        if !self.token.is_empty() {
+            req = req.bearer_auth(&self.token);
+        }
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| AppError::Internal(format!("gcs object delete {key}: {e}")))?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(false);
+        }
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(AppError::Internal(format!(
+                "gcs object delete {key}: HTTP {} {}",
+                status.as_u16(),
+                body
+            )));
+        }
+        Ok(true)
+    }
+}
+
+/// One page of a GCS JSON-API object listing (`…/o` response).
+#[derive(serde::Deserialize)]
+struct GcsListPage {
+    #[serde(default)]
+    items: Vec<GcsListItem>,
+    #[serde(rename = "nextPageToken", default)]
+    next_page_token: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct GcsListItem {
+    name: String,
 }
 
 /// Percent-encode one path segment per RFC 3986 (encode everything but the

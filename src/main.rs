@@ -466,6 +466,21 @@ fn build_router(
             registry: cell_registry,
         });
 
+    // Result-tier GC (noetl/ai-meta#104 Phase F) — the conservative, dry-run-first
+    // sweeper that reclaims only provably-dead tier objects (execution aged out of
+    // the event log; never a live-referenced object). Gated `NOETL_RESULT_TIER_GC`
+    // (default off → no-op). Carries the pool (liveness query) + the object backend
+    // (list + delete) in state.
+    let result_tier_routes = Router::new()
+        .route(
+            "/api/internal/result-tier/gc",
+            post(handlers::result_tier::gc),
+        )
+        .with_state(handlers::result_tier::ResultTierDeps {
+            pool: db_pool.clone(),
+            backend: object_backend.clone(),
+        });
+
     // Gateway push-ingress config endpoint (noetl/ai-meta#90 Phase 3).  The
     // gateway calls GET /api/internal/ingress/{listener} (service-account
     // gated) to resolve a push subscription's verify scheme + Wallet-resolved
@@ -534,6 +549,7 @@ fn build_router(
         .merge(internal_routes)
         .merge(object_store_routes)
         .merge(cell_routes)
+        .merge(result_tier_routes)
         .merge(ingress_routes)
         .merge(system_routes)
         .merge(dashboard_routes)
