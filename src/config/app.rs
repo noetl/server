@@ -326,6 +326,30 @@ pub struct AppConfig {
     #[serde(default)]
     pub result_uri_accept: bool,
 
+    /// **Phase D minting flip** (noetl/ai-meta#104 Phase D).  Envy maps
+    /// `NOETL_RESULT_MINT_AUTHORITATIVE`.
+    ///
+    /// The flip makes the URN → Feather/GCS result tier the **authoritative**
+    /// result store, with `noetl.result_store` demoted to the transitional
+    /// **dual-write fallback** for reversibility.  The authoritative tier write
+    /// and the tier-primary consume path are worker-side (the slim control plane
+    /// does not encode Feather); the server's role under the flag is the
+    /// **dual-write window**: it continues minting + storing `result_store` as
+    /// the reversible fallback leg, and records each such write on
+    /// `noetl_result_store_dual_write_total` so the window is observable.
+    ///
+    /// - **false** (default) — `result_store` is the authoritative store exactly
+    ///   as in Phase A–C; the dual-write counter never moves.  No-op; byte-
+    ///   identical prod/default behavior.
+    /// - **true** — the worker treats the tier as authoritative; the server keeps
+    ///   writing `result_store` (the fallback leg) and counts it.  The actual
+    ///   *retirement* of `result_store` (stop the dual-write) is the OQ5-gated
+    ///   operational decision — **not** Phase D — so flag-off rolls back cleanly.
+    ///
+    /// **Default false** — opt-in, reversible, kind-validated before any rollout.
+    #[serde(default)]
+    pub result_mint_authoritative: bool,
+
     /// **Where the per-execution drive watermark + descriptor live** (RFC
     /// noetl/ai-meta#115 program-scale / noetl/ai-meta#107).  Envy maps
     /// `NOETL_REPLICA_COHERENCE`.
@@ -544,6 +568,9 @@ impl Default for AppConfig {
             // noetl/ai-meta#104 Phase A: the canonical result URI is ignored by
             // default; shadow-accept (parse + validate + record) is opt-in.
             result_uri_accept: false,
+            // noetl/ai-meta#104 Phase D: the minting flip is off by default; the
+            // tier-authoritative + dual-write-fallback behavior is opt-in.
+            result_mint_authoritative: false,
             // noetl/ai-meta#115 program-scale: in-process maps by default; the
             // NATS-KV multi-replica coherence backing is opt-in (and staged).
             replica_coherence: ReplicaCoherence::Local,
@@ -567,6 +594,13 @@ mod tests {
         assert_eq!(config.host, "0.0.0.0");
         assert_eq!(config.port, 8082);
         assert!(!config.debug);
+    }
+
+    #[test]
+    fn test_result_mint_authoritative_defaults_off() {
+        // Phase D (#104): the minting flip is opt-in; default-off must be a true
+        // no-op (no dual-write counting, no behavior change).
+        assert!(!AppConfig::default().result_mint_authoritative);
     }
 
     #[test]
