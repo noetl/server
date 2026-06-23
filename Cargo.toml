@@ -85,6 +85,15 @@ thiserror = "2.0"
 # HTTP client
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
+# GCS result-tier auth (noetl/ai-meta#104).  Mints + auto-refreshes a short-lived
+# OAuth token from Workload Identity / Application Default Credentials for the
+# `gcs` object backend in prod (the bucket enforces public-access-prevention, so
+# a WI-bound KSA token is required).  Same crate + version the worker/tools tree
+# already uses (noetl-tools `gcp_auth = "0.12"`), so the control plane reuses a
+# vetted, rustls-based provider rather than adding a new dependency.  No effect on
+# the Postgres default backend or the no-auth fake-gcs emulator path.
+gcp_auth = "0.12"
+
 # NATS messaging
 async-nats = "0.38"
 # Value type for the JetStream KV puts in `src/coherence.rs` (multi-replica

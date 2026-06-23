@@ -25,16 +25,42 @@
 //!
 //! ## Auth
 //!
-//! The kind/emulator path needs no credential (fake-gcs-server is open). Real-GCS
-//! auth (GKE workload identity / a bearer token) is a prod-rollout concern wired
-//! in a later phase; the emulator path proves the read/write contract on kind.
-//! When `NOETL_OBJECT_STORE_GCS_TOKEN` is set it is sent as a bearer token, so a
-//! token-bearing deployment works without a code change.
+//! The GCS backend resolves one of three auth modes at startup
+//! ([noetl/ai-meta#104](https://github.com/noetl/ai-meta/issues/104)). The mode
+//! is chosen by `NOETL_OBJECT_STORE_GCS_AUTH` (default `auto`):
+//!
+//! | Mode | When (`auto`) | Behavior |
+//! | :-- | :-- | :-- |
+//! | `none` | endpoint is **not** a `googleapis.com` host (the fake-gcs-server emulator on kind) | No `Authorization` header. The emulator is open; kind validation runs unchanged. |
+//! | `static` | `NOETL_OBJECT_STORE_GCS_TOKEN` is set | The configured token rides as a bearer (explicit override — e.g. a short-lived token injected by a sidecar). |
+//! | `adc` | real GCS (`storage.googleapis.com`) with no static token | Mints + **auto-refreshes** a short-lived OAuth token from Workload Identity / Application Default Credentials, scope `devstorage.read_write`. The prod path: the bucket enforces public-access-prevention and the server runs under a WI-bound KSA. |
+//!
+//! `auto` resolution order: a non-empty `NOETL_OBJECT_STORE_GCS_TOKEN` wins
+//! (`static`); else a real-GCS endpoint selects `adc`; else (custom/emulator
+//! endpoint) `none`. Set `NOETL_OBJECT_STORE_GCS_AUTH` to `none` / `static` /
+//! `adc` to force a mode (e.g. `adc` against a non-default private-google
+//! endpoint).
+//!
+//! The ADC token is held by [`gcp_auth`]'s `TokenProvider`, which caches the
+//! token and refreshes it before expiry — the backend asks for a token per
+//! request but does **not** mint per request. The provider is initialized lazily
+//! on first GCS I/O so startup stays free of a credential round-trip.
+//!
+//! [`gcp_auth`]: https://docs.rs/gcp_auth
+
+use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
+use tokio::sync::RwLock;
 
 use crate::db::{queries::object_store, queries::object_store::ObjectRow, DbPool};
 use crate::error::{AppError, AppResult};
+use crate::metrics;
+
+/// OAuth scope for read/write access to GCS objects (the result tier `PUT`s and
+/// `GET`s object bytes). Narrower than `cloud-platform` — the server only needs
+/// object read/write on its one results bucket.
+const GCS_RW_SCOPE: &[&str] = &["https://www.googleapis.com/auth/devstorage.read_write"];
 
 /// The resolved object-store backend (built once at startup from env).
 #[derive(Clone)]
@@ -54,8 +80,156 @@ pub struct GcsBackend {
     endpoint: String,
     /// Target bucket.
     bucket: String,
-    /// Optional bearer token (empty for the open emulator).
-    token: String,
+    /// Resolved auth mode (no-auth emulator | static token | ADC/WI).
+    auth: GcsAuth,
+}
+
+/// How the GCS backend authenticates each request.
+#[derive(Clone)]
+enum GcsAuth {
+    /// No credential — the open fake-gcs-server emulator on kind.
+    None,
+    /// Explicit static bearer token (`NOETL_OBJECT_STORE_GCS_TOKEN`).
+    Static(String),
+    /// Workload Identity / Application Default Credentials — mints + refreshes a
+    /// short-lived OAuth token via [`gcp_auth`]. The prod path.
+    Adc(AdcAuth),
+}
+
+/// Lazily-initialized ADC token source. The [`gcp_auth`] provider is created on
+/// first use and caches + auto-refreshes the token internally, so this holds it
+/// behind a shared `RwLock` (cloning the backend shares one provider + one
+/// cache). Mirrors the worker/tools `GcpAuth` wrapper.
+#[derive(Clone)]
+struct AdcAuth {
+    provider: Arc<RwLock<Option<Arc<dyn gcp_auth::TokenProvider>>>>,
+}
+
+impl AdcAuth {
+    fn new() -> Self {
+        Self {
+            provider: Arc::new(RwLock::new(None)),
+        }
+    }
+
+    /// Resolve a bearer token for the GCS read/write scope. The provider serves
+    /// from its internal cache when the token is still fresh and refreshes it
+    /// transparently before expiry — so this is safe (and intended) to call per
+    /// request without minting per request.
+    async fn token(&self) -> AppResult<String> {
+        // Fast path: provider already initialized.
+        {
+            let guard = self.provider.read().await;
+            if let Some(provider) = guard.as_ref() {
+                return Self::fetch(provider).await;
+            }
+        }
+        // Initialize once. Two callers racing here both call `gcp_auth::provider()`
+        // and the last write wins; both refer to the same ADC source, so the
+        // observable result is identical and the cost is one extra init at most.
+        let provider = gcp_auth::provider().await.map_err(|e| {
+            metrics::record_object_store_gcs_auth("adc", "error");
+            AppError::Internal(format!("gcs adc provider init: {e}"))
+        })?;
+        {
+            let mut guard = self.provider.write().await;
+            *guard = Some(provider);
+        }
+        let guard = self.provider.read().await;
+        let provider = guard
+            .as_ref()
+            .ok_or_else(|| AppError::Internal("gcs adc provider missing after init".to_string()))?;
+        Self::fetch(provider).await
+    }
+
+    async fn fetch(provider: &Arc<dyn gcp_auth::TokenProvider>) -> AppResult<String> {
+        match provider.token(GCS_RW_SCOPE).await {
+            Ok(tok) => {
+                metrics::record_object_store_gcs_auth("adc", "acquired");
+                Ok(tok.as_str().to_string())
+            }
+            Err(e) => {
+                metrics::record_object_store_gcs_auth("adc", "error");
+                Err(AppError::Internal(format!("gcs adc token: {e}")))
+            }
+        }
+    }
+}
+
+impl GcsAuth {
+    /// Resolve the auth mode from env, given the already-resolved endpoint.
+    ///
+    /// `NOETL_OBJECT_STORE_GCS_AUTH` (`auto` default) selects the mode; in `auto`
+    /// a non-empty static token wins, else a real-GCS endpoint → `adc`, else
+    /// (custom/emulator endpoint) → `none`.
+    fn from_env(endpoint: &str) -> Self {
+        let token = std::env::var("NOETL_OBJECT_STORE_GCS_TOKEN").unwrap_or_default();
+        let mode = std::env::var("NOETL_OBJECT_STORE_GCS_AUTH")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        match mode.as_str() {
+            "none" => GcsAuth::None,
+            "static" => {
+                if token.trim().is_empty() {
+                    tracing::warn!(
+                        "NOETL_OBJECT_STORE_GCS_AUTH=static but NOETL_OBJECT_STORE_GCS_TOKEN is \
+                         empty; GCS requests will be sent without a bearer token"
+                    );
+                    GcsAuth::None
+                } else {
+                    GcsAuth::Static(token)
+                }
+            }
+            "adc" => GcsAuth::Adc(AdcAuth::new()),
+            // "auto" (default) or any unrecognized value.
+            _ => {
+                if !token.trim().is_empty() {
+                    GcsAuth::Static(token)
+                } else if is_real_gcs(endpoint) {
+                    GcsAuth::Adc(AdcAuth::new())
+                } else {
+                    GcsAuth::None
+                }
+            }
+        }
+    }
+
+    /// Stable label for logs/tests.
+    fn label(&self) -> &'static str {
+        match self {
+            GcsAuth::None => "none",
+            GcsAuth::Static(_) => "static",
+            GcsAuth::Adc(_) => "adc",
+        }
+    }
+
+    /// The bearer token to attach to a request, or `None` for the no-auth path.
+    async fn bearer_token(&self) -> AppResult<Option<String>> {
+        match self {
+            GcsAuth::None => Ok(None),
+            GcsAuth::Static(t) if t.is_empty() => Ok(None),
+            GcsAuth::Static(t) => Ok(Some(t.clone())),
+            GcsAuth::Adc(a) => Ok(Some(a.token().await?)),
+        }
+    }
+}
+
+/// True when `endpoint` points at real Google Cloud Storage (any
+/// `*.googleapis.com` host), i.e. the prod path that needs a credential. A custom
+/// endpoint (the kind fake-gcs-server) is treated as the open emulator.
+fn is_real_gcs(endpoint: &str) -> bool {
+    let host = endpoint
+        .split("://")
+        .nth(1)
+        .unwrap_or(endpoint)
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .split(':')
+        .next()
+        .unwrap_or("");
+    host == "googleapis.com" || host.ends_with(".googleapis.com")
 }
 
 impl ObjectBackend {
@@ -85,13 +259,18 @@ impl ObjectBackend {
                     .unwrap_or_else(|_| "https://storage.googleapis.com".to_string())
                     .trim_end_matches('/')
                     .to_string();
-                let token = std::env::var("NOETL_OBJECT_STORE_GCS_TOKEN").unwrap_or_default();
-                tracing::info!(endpoint = %endpoint, bucket = %bucket, "object store backend: GCS (#104 Phase C)");
+                let auth = GcsAuth::from_env(&endpoint);
+                tracing::info!(
+                    endpoint = %endpoint,
+                    bucket = %bucket,
+                    auth = %auth.label(),
+                    "object store backend: GCS (#104 Phase C)"
+                );
                 ObjectBackend::Gcs(GcsBackend {
                     client: reqwest::Client::new(),
                     endpoint,
                     bucket,
-                    token,
+                    auth,
                 })
             }
             _ => ObjectBackend::Postgres,
@@ -164,8 +343,8 @@ impl GcsBackend {
             .query(&[("uploadType", "media"), ("name", key)])
             .header(reqwest::header::CONTENT_TYPE, media_type)
             .body(bytes.to_vec());
-        if !self.token.is_empty() {
-            req = req.bearer_auth(&self.token);
+        if let Some(token) = self.auth.bearer_token().await? {
+            req = req.bearer_auth(token);
         }
         let resp = req
             .send()
@@ -194,8 +373,8 @@ impl GcsBackend {
             percent_encode_segment(key)
         );
         let mut req = self.client.get(&url).query(&[("alt", "media")]);
-        if !self.token.is_empty() {
-            req = req.bearer_auth(&self.token);
+        if let Some(token) = self.auth.bearer_token().await? {
+            req = req.bearer_auth(token);
         }
         let resp = req
             .send()
@@ -253,8 +432,8 @@ impl GcsBackend {
                 query.push(("pageToken", tok));
             }
             let mut req = self.client.get(&url).query(&query);
-            if !self.token.is_empty() {
-                req = req.bearer_auth(&self.token);
+            if let Some(token) = self.auth.bearer_token().await? {
+                req = req.bearer_auth(token);
             }
             let resp = req
                 .send()
@@ -298,8 +477,8 @@ impl GcsBackend {
             percent_encode_segment(key)
         );
         let mut req = self.client.delete(&url);
-        if !self.token.is_empty() {
-            req = req.bearer_auth(&self.token);
+        if let Some(token) = self.auth.bearer_token().await? {
+            req = req.bearer_auth(token);
         }
         let resp = req
             .send()
@@ -358,18 +537,33 @@ fn percent_encode_segment(s: &str) -> String {
 mod tests {
     use super::*;
 
+    const ENV_KEYS: &[&str] = &[
+        "NOETL_OBJECT_STORE_BACKEND",
+        "NOETL_OBJECT_STORE_GCS_BUCKET",
+        "NOETL_OBJECT_STORE_GCS_ENDPOINT",
+        "NOETL_OBJECT_STORE_GCS_TOKEN",
+        "NOETL_OBJECT_STORE_GCS_AUTH",
+    ];
+
+    fn clear_env() {
+        for k in ENV_KEYS {
+            std::env::remove_var(k);
+        }
+    }
+
+    fn gcs_auth_label() -> &'static str {
+        match ObjectBackend::from_env() {
+            ObjectBackend::Gcs(g) => g.auth.label(),
+            _ => panic!("expected gcs backend"),
+        }
+    }
+
     // One sequential test: mutating process env from several parallel tests
     // races (the runner shares one process), so all `from_env` assertions live
     // in a single body that fully controls + resets env.
     #[test]
     fn from_env_backend_selection() {
-        for k in [
-            "NOETL_OBJECT_STORE_BACKEND",
-            "NOETL_OBJECT_STORE_GCS_BUCKET",
-            "NOETL_OBJECT_STORE_GCS_ENDPOINT",
-        ] {
-            std::env::remove_var(k);
-        }
+        clear_env();
 
         // Default → Postgres (prod/default behavior).
         assert_eq!(ObjectBackend::from_env().label(), "postgres");
@@ -389,13 +583,90 @@ mod tests {
             _ => panic!("expected gcs"),
         }
 
-        for k in [
-            "NOETL_OBJECT_STORE_BACKEND",
-            "NOETL_OBJECT_STORE_GCS_BUCKET",
-            "NOETL_OBJECT_STORE_GCS_ENDPOINT",
-        ] {
-            std::env::remove_var(k);
-        }
+        // ── Auth-mode selection (same sequential body to avoid env races) ──
+        // emulator endpoint → none, static token → static, real-GCS → adc,
+        // plus the explicit override knob.
+        std::env::set_var("NOETL_OBJECT_STORE_BACKEND", "gcs");
+        std::env::set_var("NOETL_OBJECT_STORE_GCS_BUCKET", "noetl-results");
+
+        // auto + custom (emulator) endpoint, no token → none (kind path).
+        std::env::set_var("NOETL_OBJECT_STORE_GCS_ENDPOINT", "http://fake-gcs:4443");
+        assert_eq!(gcs_auth_label(), "none");
+
+        // auto + static token set → static (explicit override wins).
+        std::env::set_var("NOETL_OBJECT_STORE_GCS_TOKEN", "ya29.test-token");
+        assert_eq!(gcs_auth_label(), "static");
+        std::env::remove_var("NOETL_OBJECT_STORE_GCS_TOKEN");
+
+        // auto + real-GCS endpoint (default), no token → adc (prod path).
+        std::env::remove_var("NOETL_OBJECT_STORE_GCS_ENDPOINT");
+        assert_eq!(gcs_auth_label(), "adc");
+
+        // Override: force adc against a non-default endpoint.
+        std::env::set_var("NOETL_OBJECT_STORE_GCS_ENDPOINT", "http://fake-gcs:4443");
+        std::env::set_var("NOETL_OBJECT_STORE_GCS_AUTH", "adc");
+        assert_eq!(gcs_auth_label(), "adc");
+
+        // Override: force none even with a token set.
+        std::env::set_var("NOETL_OBJECT_STORE_GCS_TOKEN", "ya29.test-token");
+        std::env::set_var("NOETL_OBJECT_STORE_GCS_AUTH", "none");
+        assert_eq!(gcs_auth_label(), "none");
+
+        // Override: static with an empty token degrades to none (with WARN).
+        std::env::remove_var("NOETL_OBJECT_STORE_GCS_TOKEN");
+        std::env::set_var("NOETL_OBJECT_STORE_GCS_AUTH", "static");
+        assert_eq!(gcs_auth_label(), "none");
+
+        clear_env();
+    }
+
+    #[test]
+    fn is_real_gcs_detection() {
+        assert!(is_real_gcs("https://storage.googleapis.com"));
+        assert!(is_real_gcs("https://storage.googleapis.com/"));
+        assert!(is_real_gcs("https://us-central1-storage.googleapis.com"));
+        assert!(!is_real_gcs("http://fake-gcs:4443"));
+        assert!(!is_real_gcs("http://fake-gcs-server:4443/storage"));
+        assert!(!is_real_gcs("http://localhost:4443"));
+        // A look-alike host must not be treated as real GCS.
+        assert!(!is_real_gcs("https://googleapis.com.evil.example"));
+    }
+
+    // The static/no-auth bearer-token resolution (the paths kind exercises) is
+    // unchanged in shape: none → no header, static → the token, empty static →
+    // no header. ADC needs a live metadata server, so it is covered by the
+    // selection test + verified live at prod enablement.
+    #[tokio::test]
+    async fn bearer_token_static_and_none_paths() {
+        assert_eq!(GcsAuth::None.bearer_token().await.unwrap(), None);
+        assert_eq!(
+            GcsAuth::Static("ya29.tok".to_string())
+                .bearer_token()
+                .await
+                .unwrap(),
+            Some("ya29.tok".to_string())
+        );
+        assert_eq!(
+            GcsAuth::Static(String::new()).bearer_token().await.unwrap(),
+            None
+        );
+    }
+
+    // The ADC source is lazy (no provider until first use) and cloning the
+    // backend shares ONE provider + ONE token cache — so refresh is process-wide,
+    // not per-request. Proven structurally without a network round-trip.
+    #[tokio::test]
+    async fn adc_provider_is_lazy_and_shared() {
+        let a = AdcAuth::new();
+        assert!(
+            a.provider.read().await.is_none(),
+            "provider must not initialize until first token request"
+        );
+        let b = a.clone();
+        assert!(
+            Arc::ptr_eq(&a.provider, &b.provider),
+            "clones must share one provider/cache so refresh is shared"
+        );
     }
 
     #[test]
