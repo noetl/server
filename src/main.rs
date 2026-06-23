@@ -61,6 +61,14 @@ fn build_router(
         .allow_methods(Any)
         .allow_headers(Any);
 
+    // Object-store backend + cell endpoint registry (RFC noetl/ai-meta#104
+    // Phase C).  Both are env-driven (default off → Postgres object backend,
+    // single-cell seed), built once here and cloned into their route state.
+    let object_backend =
+        noetl_server::services::object_backend::ObjectBackend::from_env();
+    let cell_registry =
+        noetl_server::services::cell_registry::CellRegistry::from_env(&object_backend);
+
     // Health check routes (no auth required)
     let mut health_routes = Router::new()
         .route("/health", get(handlers::health_check))
@@ -432,14 +440,30 @@ fn build_router(
             "/api/internal/plugins/{*path}",
             post(handlers::plugins::register).get(handlers::plugins::fetch),
         )
-        // Object store (noetl/ai-meta#105 Round 5) — server-mediated backend for
-        // a plug-in's `noetl.object_put` capability (the Feather tier), keyed by
-        // the §7 physical object key.
+        .with_state(db_pool.clone());
+
+    // Object store (noetl/ai-meta#105 Round 5; backend selector noetl/ai-meta#104
+    // Phase C) — server-mediated backend for a plug-in's `noetl.object_put`
+    // capability (the Feather tier), keyed by the §7 physical object key. Its own
+    // group because it carries the resolved `ObjectBackend` (Postgres | GCS) in
+    // state alongside the pool.
+    let object_store_routes = Router::new()
         .route(
             "/api/internal/objects/{*key}",
             put(handlers::objects::put).get(handlers::objects::get),
         )
-        .with_state(db_pool.clone());
+        .with_state(handlers::objects::ObjectStoreDeps {
+            pool: db_pool.clone(),
+            backend: object_backend.clone(),
+        });
+
+    // Cell endpoint registry (noetl/ai-meta#104 Phase C) — the read-side cell map
+    // the resolve-by-URN path consults. Single-cell seed today; fail-safe miss.
+    let cell_routes = Router::new()
+        .route("/api/internal/cells", get(handlers::cells::list_cells))
+        .with_state(handlers::cells::CellRegistryDeps {
+            registry: cell_registry,
+        });
 
     // Gateway push-ingress config endpoint (noetl/ai-meta#90 Phase 3).  The
     // gateway calls GET /api/internal/ingress/{listener} (service-account
@@ -507,6 +531,8 @@ fn build_router(
         .merge(sharding_routes)
         .merge(database_routes)
         .merge(internal_routes)
+        .merge(object_store_routes)
+        .merge(cell_routes)
         .merge(ingress_routes)
         .merge(system_routes)
         .merge(dashboard_routes)

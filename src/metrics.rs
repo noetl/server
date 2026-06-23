@@ -1356,6 +1356,59 @@ pub fn record_result_store_resolve(duration_seconds: f64, status: &str) {
         .observe(duration_seconds);
 }
 
+/// `noetl_object_store_ops_total{backend,op,outcome}` — object-store backend I/O
+/// (RFC #104 Phase C). `backend` is `postgres`/`gcs`, `op` is `put`/`get`,
+/// `outcome` is `ok`/`error`. The GCS-backend deltas are the proof the Feather
+/// tier read/write goes through GCS under the flag.
+pub fn object_store_ops_total() -> &'static IntCounterVec {
+    static M: OnceLock<IntCounterVec> = OnceLock::new();
+    M.get_or_init(|| {
+        let counter = IntCounterVec::new(
+            Opts::new(
+                "noetl_object_store_ops_total",
+                "Object-store backend operations by backend, op, and outcome (RFC #104 Phase C).",
+            ),
+            &["backend", "op", "outcome"],
+        )
+        .expect("static counter spec must be valid");
+        registry()
+            .register(Box::new(counter.clone()))
+            .expect("counter registration must succeed");
+        counter
+    })
+}
+
+/// Record one object-store backend operation outcome.
+pub fn record_object_store_op(backend: &str, op: &str, ok: bool) {
+    object_store_ops_total()
+        .with_label_values(&[backend, op, if ok { "ok" } else { "error" }])
+        .inc();
+}
+
+/// `noetl_cell_registry_requests_total` — `GET /api/internal/cells` hits (RFC
+/// #104 Phase C). The resolve-by-URN read path consults the registry once per
+/// process (cached), so this is low-volume; its delta proves the read side is
+/// wired to the server-served registry rather than local env.
+pub fn cell_registry_requests_total() -> &'static prometheus::IntCounter {
+    static M: OnceLock<prometheus::IntCounter> = OnceLock::new();
+    M.get_or_init(|| {
+        let counter = prometheus::IntCounter::new(
+            "noetl_cell_registry_requests_total",
+            "GET /api/internal/cells requests served (RFC #104 Phase C cell endpoint registry).",
+        )
+        .expect("static counter spec must be valid");
+        registry()
+            .register(Box::new(counter.clone()))
+            .expect("counter registration must succeed");
+        counter
+    })
+}
+
+/// Record one cell-registry request.
+pub fn record_cell_registry_request() {
+    cell_registry_requests_total().inc();
+}
+
 /// Secrets-Wallet Phase 7c: histogram of token auto-renewal wall-clock
 /// latency.  Buckets `[0.05, 0.1, 0.25, 0.5, 1, 2, 5]` — span the range
 /// where auth round-trips actually live.  Observed regardless of
