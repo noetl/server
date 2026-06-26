@@ -19,6 +19,7 @@ pub mod internal;
 pub mod keychain;
 pub mod plugins;
 pub mod objects;
+pub mod registry;
 pub mod replay;
 pub mod result_store;
 pub mod result_tier;

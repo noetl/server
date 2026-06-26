@@ -1454,6 +1454,37 @@ pub fn record_object_store_op(backend: &str, op: &str, ok: bool) {
         .inc();
 }
 
+/// `noetl_registry_ops_total{op,outcome}` — model/dataset/eval/release registry
+/// operations (RFC #146 platform foundation G3). `op` is
+/// `register`/`list`/`resolve`; `outcome` is `ok`/`error`. The deltas prove the
+/// SLM MLOps stages' registry writes + resolves go through the server API
+/// (data-access-boundary.md). Gated behind `NOETL_REGISTRY_ENABLED`, so this
+/// counter is flat on default deployments.
+pub fn registry_ops_total() -> &'static IntCounterVec {
+    static M: OnceLock<IntCounterVec> = OnceLock::new();
+    M.get_or_init(|| {
+        let counter = IntCounterVec::new(
+            Opts::new(
+                "noetl_registry_ops_total",
+                "Registry operations by op and outcome (RFC #146 G3).",
+            ),
+            &["op", "outcome"],
+        )
+        .expect("static counter spec must be valid");
+        registry()
+            .register(Box::new(counter.clone()))
+            .expect("counter registration must succeed");
+        counter
+    })
+}
+
+/// Record one registry operation outcome.
+pub fn record_registry_op(op: &str, ok: bool) {
+    registry_ops_total()
+        .with_label_values(&[op, if ok { "ok" } else { "error" }])
+        .inc();
+}
+
 /// `noetl_cell_registry_requests_total` — `GET /api/internal/cells` hits (RFC
 /// #104 Phase C). The resolve-by-URN read path consults the registry once per
 /// process (cached), so this is low-volume; its delta proves the read side is

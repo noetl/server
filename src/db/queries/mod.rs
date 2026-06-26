@@ -9,6 +9,7 @@ pub mod event_chain;
 pub mod keychain;
 pub mod plugin_module;
 pub mod object_store;
+pub mod registry;
 pub mod result_store;
 pub mod secret_audit;
 pub mod subscription_dedup;
