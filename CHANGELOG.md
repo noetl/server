@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.46.0](https://github.com/noetl/server/compare/v3.45.0...v3.46.0) (2026-06-26)
+
+### Features
+
+* **registry:** versioned model/dataset/eval registry on [#104](https://github.com/noetl/server/issues/104) object tier (G3) ([#266](https://github.com/noetl/server/issues/266)) ([7fae4d7](https://github.com/noetl/server/commit/7fae4d7eb10920a214c012e3425edefad4728146))
+
 ## [3.45.0](https://github.com/noetl/server/compare/v3.44.0...v3.45.0) (2026-06-23)
 
 ### Features
