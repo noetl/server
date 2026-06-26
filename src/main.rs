@@ -458,6 +458,39 @@ fn build_router(
             backend: object_backend.clone(),
         });
 
+    // Model/dataset/eval/release registry (noetl/ai-meta#146 G3) — the typed,
+    // versioned catalog index the SLM MLOps stages write to, built on the #104
+    // object backend. Its own group (carries the RegistryService, which holds the
+    // snowflake generator + object backend). Mounted only under
+    // NOETL_REGISTRY_ENABLED so default deployments carry no new route.
+    let registry_routes = if noetl_server::registry_enabled() {
+        let registry_service = noetl_server::services::RegistryService::new(
+            db_pool.clone(),
+            state.snowflake.clone(),
+            object_backend.clone(),
+        );
+        Some(
+            Router::new()
+                .route(
+                    "/api/internal/registry/register",
+                    post(handlers::registry::register),
+                )
+                .route(
+                    "/api/internal/registry/list",
+                    get(handlers::registry::list),
+                )
+                .route(
+                    "/api/internal/registry/resolve",
+                    get(handlers::registry::resolve),
+                )
+                .with_state(handlers::registry::RegistryDeps {
+                    service: registry_service,
+                }),
+        )
+    } else {
+        None
+    };
+
     // Cell endpoint registry (noetl/ai-meta#104 Phase C) — the read-side cell map
     // the resolve-by-URN path consults. Single-cell seed today; fail-safe miss.
     let cell_routes = Router::new()
@@ -526,7 +559,7 @@ fn build_router(
         .with_state(db_pool);
 
     // Combine all routes
-    Router::new()
+    let mut app = Router::new()
         .merge(health_routes)
         .merge(catalog_routes)
         .merge(credential_routes)
@@ -552,9 +585,15 @@ fn build_router(
         .merge(result_tier_routes)
         .merge(ingress_routes)
         .merge(system_routes)
-        .merge(dashboard_routes)
-        .layer(TraceLayer::new_for_http())
-        .layer(cors)
+        .merge(dashboard_routes);
+
+    // Flag-gated registry group (noetl/ai-meta#146 G3) — merged only when
+    // NOETL_REGISTRY_ENABLED is set.
+    if let Some(registry_routes) = registry_routes {
+        app = app.merge(registry_routes);
+    }
+
+    app.layer(TraceLayer::new_for_http()).layer(cors)
 }
 
 /// Connect to NATS if configured.
@@ -827,6 +866,15 @@ async fn main() -> anyhow::Result<()> {
     // Object store (noetl/ai-meta#105 Round 5) — durable Feather tier backing a
     // plug-in's `noetl.object_put`. Same idempotent startup-DDL pattern.
     noetl_server::db::queries::object_store::ensure_table(&db_pool).await?;
+    // Model/dataset/eval/release registry (noetl/ai-meta#146 G3) — the typed,
+    // versioned catalog index the SLM MLOps stages write to, built on the #104
+    // object backend.  Additive + flag-gated: the table is created (and the
+    // `/api/internal/registry/*` routes mounted) only when
+    // NOETL_REGISTRY_ENABLED is set, so default deployments see no new schema.
+    if noetl_server::registry_enabled() {
+        noetl_server::db::queries::registry::ensure_table(&db_pool).await?;
+        tracing::info!("registry (#146 G3) enabled: noetl.registry ready");
+    }
     // Opt-in subscription dedup window (noetl/ai-meta#90 Phase 7, RFC §10
     // OQ1) — same idempotent startup-DDL pattern.  The table is server-owned
     // (only /api/execute writes it) and bounded by age; dedup is opt-in per

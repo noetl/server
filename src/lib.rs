@@ -69,3 +69,19 @@ pub mod template;
 
 pub use error::{AppError, AppResult};
 pub use result_ext::ResultExt;
+
+/// Whether the model/dataset/eval/release registry (noetl/ai-meta#146 G3) is
+/// enabled. Default off: a truthy `NOETL_REGISTRY_ENABLED`
+/// (`1`/`true`/`yes`/`on`, case-insensitive) creates the `noetl.registry` table
+/// at startup and mounts the `/api/internal/registry/*` routes. Off → no schema
+/// change, no routes (the additive default-off contract).
+pub fn registry_enabled() -> bool {
+    matches!(
+        std::env::var("NOETL_REGISTRY_ENABLED")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
