@@ -340,6 +340,7 @@ fn build_router(
         .with_state(handlers::result_store::ResultStoreDeps {
             service: result_store_service,
             mint_authoritative: state.config.result_mint_authoritative,
+            dual_write: state.config.result_store_dual_write,
         });
 
     // Variable routes (transient table)

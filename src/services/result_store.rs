@@ -232,19 +232,17 @@ impl ResultStoreService {
         Self { pool, snowflake }
     }
 
-    /// Store one result and return the minted `ResultPutResponse`.
+    /// Mint the `noetl.result_store` row + its `ResultPutResponse` from a
+    /// request body, **without** touching the DB.
     ///
-    /// Steps:
-    /// 1. Serialise `data` → JSON bytes; measure + SHA-256.
-    /// 2. Mint a snowflake `result_id`.
-    /// 3. Build the `noetl://` URI.
-    /// 4. INSERT into `noetl.result_store`.
-    /// 5. Return the response.
-    pub async fn put(
+    /// Shared by [`put`](Self::put) (which then INSERTs the row) and
+    /// [`mint_ref_only`](Self::mint_ref_only) (which drops it).  Steps 1–3 of the
+    /// store contract: serialise → measure + SHA-256 → mint snowflake → build URI.
+    fn prepare(
         &self,
         execution_id: i64,
         body: &PutResultBody,
-    ) -> AppResult<ResultPutResponse> {
+    ) -> AppResult<(ResultStoreRow, ResultPutResponse)> {
         // Serialise to measure bytes + compute hash.
         let serialised = serde_json::to_vec(&body.data)
             .map_err(|e| AppError::Internal(format!("result_store.put: serialise: {e}")))?;
@@ -277,16 +275,54 @@ impl ResultStoreService {
             expires_at: None,
         };
 
-        queries::insert(&self.pool, &row).await?;
-
-        Ok(ResultPutResponse {
+        let response = ResultPutResponse {
             r#ref: noetl_ref,
             store: "db".to_string(),
             scope: body.scope.clone(),
             bytes: bytes as u64,
             sha256: Some(sha256_hex),
             expires_at: None,
-        })
+        };
+
+        Ok((row, response))
+    }
+
+    /// Store one result and return the minted `ResultPutResponse`.
+    ///
+    /// Steps:
+    /// 1. Serialise `data` → JSON bytes; measure + SHA-256.
+    /// 2. Mint a snowflake `result_id`.
+    /// 3. Build the `noetl://` URI.
+    /// 4. INSERT into `noetl.result_store`.
+    /// 5. Return the response.
+    pub async fn put(
+        &self,
+        execution_id: i64,
+        body: &PutResultBody,
+    ) -> AppResult<ResultPutResponse> {
+        let (row, response) = self.prepare(execution_id, body)?;
+        queries::insert(&self.pool, &row).await?;
+        Ok(response)
+    }
+
+    /// Mint the `ResultPutResponse` **without** writing the `noetl.result_store`
+    /// row — the dual-write-retired path (noetl/ai-meta#104 OQ5,
+    /// `NOETL_RESULT_STORE_DUAL_WRITE=false`).
+    ///
+    /// Returns a byte-identical response to [`put`](Self::put) (same minted ref,
+    /// same `bytes`/`sha256`/`scope`/`store`), so the worker's `reference` block is
+    /// unchanged — but no row is persisted.  The #104 result tier is the
+    /// authoritative byte source under the minting flip, so resolution still
+    /// serves from the tier; this only stops the dead-weight store write.  Existing
+    /// rows are untouched (frozen), so flipping the flag back re-arms the
+    /// dual-write one step away.
+    pub fn mint_ref_only(
+        &self,
+        execution_id: i64,
+        body: &PutResultBody,
+    ) -> AppResult<ResultPutResponse> {
+        let (_row, response) = self.prepare(execution_id, body)?;
+        Ok(response)
     }
 
     /// Resolve a parsed `NoetlRef` back to the stored `data` JSON.
@@ -315,6 +351,52 @@ impl ResultStoreService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- mint_ref_only (dual-write retirement, #104 OQ5) ---
+
+    /// `mint_ref_only` is the `NOETL_RESULT_STORE_DUAL_WRITE=false` path: it must
+    /// mint a byte-identical `ResultPutResponse` **without** touching the DB. We
+    /// prove that by handing it a lazy pool pointed at an unreachable address —
+    /// if it ever connected, the call would error; it doesn't.
+    #[tokio::test]
+    async fn mint_ref_only_builds_ref_without_db_write() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://invalid:invalid@127.0.0.1:1/none")
+            .expect("lazy pool construction must not connect");
+        let snowflake = Arc::new(SnowflakeGenerator::new(1).expect("machine id 1 is valid"));
+        let svc = ResultStoreService::new(pool, snowflake);
+
+        let body = PutResultBody {
+            name: "my_step".to_string(),
+            data: serde_json::json!({ "columns": ["id"], "rows": [[1], [2], [3]] }),
+            scope: "execution".to_string(),
+            source_step: Some("my_step".to_string()),
+            store: None,
+            ttl: None,
+            correlation: None,
+            compress: false,
+        };
+
+        let resp = svc
+            .mint_ref_only(42, &body)
+            .expect("mint_ref_only must succeed without the DB");
+
+        // Byte-identical response shape to `put` (sans the row): minted ref on the
+        // canonical coordinates, store label, real byte count + sha256.
+        assert!(
+            resp.r#ref.starts_with("noetl://execution/42/result/my_step/"),
+            "ref tail: {}",
+            resp.r#ref
+        );
+        assert_eq!(resp.store, "db");
+        assert_eq!(resp.scope, "execution");
+        assert!(resp.bytes > 0, "byte count must be measured");
+        assert!(resp.sha256.is_some(), "sha256 must be computed");
+        // The ref parses back cleanly (the worker's reference block stays valid).
+        let parsed = parse_noetl_ref(&resp.r#ref).expect("minted ref must parse");
+        assert_eq!(parsed.execution_id, 42);
+        assert_eq!(parsed.name, "my_step");
+    }
 
     // --- parse_noetl_ref ---
 
