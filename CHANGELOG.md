@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.47.0](https://github.com/noetl/server/compare/v3.46.0...v3.47.0) (2026-06-28)
+
+### Features
+
+* **result-store:** gate the result_store dual-write for OQ5 retirement ([#104](https://github.com/noetl/server/issues/104)) ([#267](https://github.com/noetl/server/issues/267)) ([31ab342](https://github.com/noetl/server/commit/31ab342a53189ce663b8c86246ee363c37286f8f)), closes [#114](https://github.com/noetl/server/issues/114)
+
 ## [3.46.0](https://github.com/noetl/server/compare/v3.45.0...v3.46.0) (2026-06-26)
 
 ### Features
