@@ -36,6 +36,12 @@ pub struct ResultStoreDeps {
     /// the reversible **dual-write fallback leg** — counted on
     /// `noetl_result_store_dual_write_total`. Off → ordinary authoritative write.
     pub mint_authoritative: bool,
+    /// `result_store` dual-write switch (noetl/ai-meta#104 OQ5 retirement,
+    /// `NOETL_RESULT_STORE_DUAL_WRITE`). **true** (default) → the handler INSERTs
+    /// the `noetl.result_store` row as before. **false** → the handler skips the
+    /// INSERT (the #104 result tier is authoritative) but still returns a
+    /// byte-identical ref; counted on `noetl_result_store_dual_write_skipped_total`.
+    pub dual_write: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -65,29 +71,52 @@ pub async fn put_result(
     let _g = span.enter();
 
     let t0 = std::time::Instant::now();
-    let result = deps.service.put(execution_id, &body).await;
+    // #104 OQ5 retirement: when the dual-write is retired
+    // (`NOETL_RESULT_STORE_DUAL_WRITE=false`) the handler mints a byte-identical
+    // ref but skips the `noetl.result_store` INSERT — the #104 result tier is the
+    // authoritative byte source, so resolution still serves from the tier. Default
+    // (flag on) → ordinary INSERT, behavior-neutral.
+    let result = if deps.dual_write {
+        deps.service.put(execution_id, &body).await
+    } else {
+        deps.service.mint_ref_only(execution_id, &body)
+    };
     let elapsed = t0.elapsed().as_secs_f64();
 
     match result {
         Ok(resp) => {
-            tracing::info!(
-                execution_id,
-                name = %body.name,
-                bytes = resp.bytes,
-                result_ref = %resp.r#ref,
-                duration_seconds = elapsed,
-                "result_store.put: stored",
-            );
-            crate::metrics::record_result_store_put(elapsed, resp.bytes as usize, "ok");
-            // Phase D (#104): under the minting flip the URN tier is
-            // authoritative and this write is the reversible dual-write fallback
-            // leg — count it so the dual-write window is observable.
-            if deps.mint_authoritative {
-                crate::metrics::record_result_store_dual_write();
+            if deps.dual_write {
+                tracing::info!(
+                    execution_id,
+                    name = %body.name,
+                    bytes = resp.bytes,
+                    result_ref = %resp.r#ref,
+                    duration_seconds = elapsed,
+                    "result_store.put: stored",
+                );
+                crate::metrics::record_result_store_put(elapsed, resp.bytes as usize, "ok");
+                // Phase D (#104): under the minting flip the URN tier is
+                // authoritative and this write is the reversible dual-write
+                // fallback leg — count it so the dual-write window is observable.
+                if deps.mint_authoritative {
+                    crate::metrics::record_result_store_dual_write();
+                    tracing::debug!(
+                        execution_id,
+                        name = %body.name,
+                        "result_store dual-write (Phase D fallback leg; tier authoritative)",
+                    );
+                }
+            } else {
+                // Dual-write retired: no row written, ref still minted so the
+                // worker's `reference` block is byte-identical. Count the skip so
+                // "0 new writes" is observable against a flat put_total.
+                crate::metrics::record_result_store_dual_write_skipped();
                 tracing::debug!(
                     execution_id,
                     name = %body.name,
-                    "result_store dual-write (Phase D fallback leg; tier authoritative)",
+                    result_ref = %resp.r#ref,
+                    duration_seconds = elapsed,
+                    "result_store.put: skipped (dual-write retired; #104 tier authoritative)",
                 );
             }
             Ok((StatusCode::OK, Json(resp)))

@@ -350,6 +350,33 @@ pub struct AppConfig {
     #[serde(default)]
     pub result_mint_authoritative: bool,
 
+    /// **`result_store` dual-write switch** (noetl/ai-meta#104 OQ5 retirement).
+    /// Envy maps `NOETL_RESULT_STORE_DUAL_WRITE`.
+    ///
+    /// Under the Phase D minting flip the URN → Feather/GCS result tier is the
+    /// authoritative byte source and `noetl.result_store` is only the reversible
+    /// **dual-write fallback leg**.  Once the OQ5 soak proved tier resolution
+    /// never falls back to the store (`result_resolve_total{outcome=~"fallback_.*"}`
+    /// held at 0), the store write is dead weight.  This flag retires it:
+    ///
+    /// - **true** (default) — the `PUT /api/result/{eid}` handler mints + INSERTs
+    ///   the `noetl.result_store` row exactly as before.  Byte-identical to
+    ///   prod/default behavior; the retirement is a no-op until explicitly flipped.
+    /// - **false** — the handler still mints + returns a byte-identical
+    ///   `ResultPutResponse` (so the worker's `reference` block is unchanged), but
+    ///   **skips the `noetl.result_store` INSERT**.  Counted on
+    ///   `noetl_result_store_dual_write_skipped_total`.  The #104 result-tier write
+    ///   path (producer-stage / materializer / object store) is untouched, and
+    ///   resolution still serves from the tier.
+    ///
+    /// Existing `result_store` rows are never deleted — the flag only stops *new*
+    /// writes, so flipping it back to **true** re-arms the dual-write one step away.
+    ///
+    /// **Default true** — behavior-neutral; the only behavioral change is the
+    /// explicit operational flip after the OQ5 soak passes.
+    #[serde(default = "default_true")]
+    pub result_store_dual_write: bool,
+
     /// **Where the per-execution drive watermark + descriptor live** (RFC
     /// noetl/ai-meta#115 program-scale / noetl/ai-meta#107).  Envy maps
     /// `NOETL_REPLICA_COHERENCE`.
@@ -571,6 +598,9 @@ impl Default for AppConfig {
             // noetl/ai-meta#104 Phase D: the minting flip is off by default; the
             // tier-authoritative + dual-write-fallback behavior is opt-in.
             result_mint_authoritative: false,
+            // noetl/ai-meta#104 OQ5 retirement: the result_store dual-write stays
+            // ON by default — behavior-neutral until the explicit operational flip.
+            result_store_dual_write: true,
             // noetl/ai-meta#115 program-scale: in-process maps by default; the
             // NATS-KV multi-replica coherence backing is opt-in (and staged).
             replica_coherence: ReplicaCoherence::Local,
@@ -601,6 +631,14 @@ mod tests {
         // Phase D (#104): the minting flip is opt-in; default-off must be a true
         // no-op (no dual-write counting, no behavior change).
         assert!(!AppConfig::default().result_mint_authoritative);
+    }
+
+    #[test]
+    fn test_result_store_dual_write_defaults_on() {
+        // #104 OQ5 retirement: the dual-write to noetl.result_store stays ON by
+        // default so the gated build is behavior-neutral; only the explicit
+        // operational flip (NOETL_RESULT_STORE_DUAL_WRITE=false) retires it.
+        assert!(AppConfig::default().result_store_dual_write);
     }
 
     #[test]

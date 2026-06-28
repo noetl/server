@@ -400,6 +400,37 @@ pub fn record_result_store_dual_write() {
     result_store_dual_write_total().inc();
 }
 
+/// `noetl_result_store_dual_write_skipped_total` — `PUT /api/result/{eid}`
+/// requests whose `noetl.result_store` INSERT was **skipped** because the
+/// dual-write was retired (`NOETL_RESULT_STORE_DUAL_WRITE=false`, RFC
+/// noetl/ai-meta#104 OQ5 retirement).
+///
+/// The handler still mints + returns a byte-identical `ResultPutResponse` (the
+/// worker's `reference` block is unchanged); only the DB row is not written. This
+/// counter climbing while `noetl_result_store_put_total{status="ok"}` stays flat
+/// is the on-prod signal that the store write is retired — resolution continues
+/// to serve from the #104 result tier. Flag-on it never moves.
+pub fn result_store_dual_write_skipped_total() -> &'static prometheus::IntCounter {
+    static M: OnceLock<prometheus::IntCounter> = OnceLock::new();
+    M.get_or_init(|| {
+        let counter = prometheus::IntCounter::new(
+            "noetl_result_store_dual_write_skipped_total",
+            "result_store INSERTs skipped because the dual-write was retired (NOETL_RESULT_STORE_DUAL_WRITE=false, RFC #104 OQ5).",
+        )
+        .expect("static counter spec must be valid");
+        registry()
+            .register(Box::new(counter.clone()))
+            .expect("counter registration must succeed");
+        counter
+    })
+}
+
+/// Record one skipped `result_store` write (the retired dual-write under
+/// `NOETL_RESULT_STORE_DUAL_WRITE=false`).
+pub fn record_result_store_dual_write_skipped() {
+    result_store_dual_write_skipped_total().inc();
+}
+
 /// `noetl_state_build_event_scans_total` — incremented once each time the drive
 /// path enters the **event-scan** state-construction block (the block that issues
 /// `WHERE execution_id = $1 …` scans of `noetl.event`: the consistency `COUNT`,
