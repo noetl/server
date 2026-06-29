@@ -106,6 +106,15 @@ pub struct AppState {
     /// walkable singly-linked list.  See [`ChainHeads`].
     pub chain_heads: Arc<ChainHeads>,
 
+    /// Per-execution event-tail ring for the off-server drive tail-attach
+    /// accelerator (noetl/ai-meta#156).  Populated at the `noetl_events` publish
+    /// chokepoint with the payloads the server just published, drained at
+    /// off-server drive dispatch so the worker advances its WAL index without
+    /// waiting on the global-stream drain.  Only touched when
+    /// `config.offserver_attach_tail` is on; otherwise it stays empty.  See
+    /// [`ChainTails`].
+    pub chain_tails: Arc<ChainTails>,
+
     /// Execute-time descriptors for the stateless off-server drive edge (RFC
     /// #115 Phase 4 remainder, noetl/ai-meta#107 step 2).  Carries the
     /// execution-scoped, immutable facts the drive dispatch needs —
@@ -308,6 +317,80 @@ impl ChainHeads {
             }
         }
         self.map.lock().unwrap().get(&execution_id).copied()
+    }
+}
+
+/// Per-execution **event tail** ring for the off-server drive tail-attach
+/// accelerator (noetl/ai-meta#156).  In-memory only, populated by the server at
+/// the `noetl_events` publish chokepoint ([`crate::handlers::event_write::emit_events`])
+/// and drained at off-server drive dispatch ([`crate::handlers::events`]).
+///
+/// ## Why this exists
+///
+/// The off-server drive's per-hop latency is today coupled to **global**
+/// `noetl_events` WAL volume, not to one execution's work: the worker serves a
+/// hop only once the pool-side WAL drain (one ephemeral `DeliverAll` consumer
+/// racing the entire stream under one mutex) has independently pulled + indexed
+/// this hop's `expected_head`.  Under load the drain lags past the worker's ~1s
+/// drive-retry budget and the hop drops to the server's 8s reconcile tick — the
+/// per-hop variance #156 pins.
+///
+/// The server is the **producer** of every event the worker needs, and stamps
+/// the same `to_stream_json()` payload it publishes to `noetl_events`.  Keeping
+/// the most-recent `cap` of those payloads per execution lets the dispatch carry
+/// the new tail to the worker directly, so the worker advances its WAL index
+/// without waiting on the drain.  The ring is the only new state; it never reads
+/// the DB and holds at most `cap` events per non-terminal execution.
+///
+/// ## Bounded + best-effort
+///
+/// The ring evicts oldest-first at `cap` and is dropped wholesale on a terminal
+/// event (alongside [`ChainHeads::evict`]).  It is an **accelerator, not a source
+/// of truth**: the worker's WAL index + drain remain authoritative.  If the
+/// attached tail is insufficient to complete the chain to genesis (a gap, or a
+/// post-restart cold worker index whose genesis predates the ring), the worker's
+/// build is `Incomplete` and falls through to exactly today's retry/drain/
+/// reconcile path — so correctness is preserved, worst case equals today.
+#[derive(Default)]
+pub struct ChainTails {
+    map: std::sync::Mutex<std::collections::HashMap<i64, std::collections::VecDeque<serde_json::Value>>>,
+}
+
+impl ChainTails {
+    /// Append the just-published `noetl_events` payloads for one execution,
+    /// evicting oldest-first so the ring never exceeds `cap`.  `cap == 0` is a
+    /// no-op (the accelerator stays disabled regardless of the flag).  Called from
+    /// the publish branch of the event-write chokepoint, in emit order.
+    pub fn push(&self, execution_id: i64, payloads: &[serde_json::Value], cap: usize) {
+        if cap == 0 || payloads.is_empty() {
+            return;
+        }
+        let mut map = self.map.lock().unwrap();
+        let ring = map.entry(execution_id).or_default();
+        for p in payloads {
+            ring.push_back(p.clone());
+        }
+        while ring.len() > cap {
+            ring.pop_front();
+        }
+    }
+
+    /// Snapshot the current tail for an execution (oldest→newest), or an empty
+    /// vec when nothing is buffered.  Cloned out under the lock so the caller can
+    /// attach it to the dispatch without holding the mutex across an `await`.
+    pub fn snapshot(&self, execution_id: i64) -> Vec<serde_json::Value> {
+        self.map
+            .lock()
+            .unwrap()
+            .get(&execution_id)
+            .map(|ring| ring.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Drop a terminal execution's ring — frees memory.  Called alongside
+    /// [`ChainHeads::evict`] on the terminal-event paths.
+    pub fn evict(&self, execution_id: i64) {
+        self.map.lock().unwrap().remove(&execution_id);
     }
 }
 
@@ -719,6 +802,7 @@ impl AppState {
             start_time: std::time::Instant::now(),
             orch_cache: Arc::new(OrchStateCache::default()),
             chain_heads: Arc::new(ChainHeads::with_coherence(coherence.clone())),
+            chain_tails: Arc::new(ChainTails::default()),
             exec_descriptors: Arc::new(ExecDescriptors::with_coherence(coherence)),
             finalized_guard: Arc::new(FinalizedGuard::default()),
             event_stream_publisher: Arc::new(tokio::sync::OnceCell::new()),
@@ -757,7 +841,7 @@ impl AppState {
 
 #[cfg(test)]
 mod tests {
-    use super::{ChainHeads, ExecDescriptors, FinalizedGuard};
+    use super::{ChainHeads, ChainTails, ExecDescriptors, FinalizedGuard};
 
     // Note: Full tests require a database connection
     // These are placeholder tests for documentation
@@ -766,6 +850,44 @@ mod tests {
     fn test_uptime() {
         // AppState::new requires a real DB pool, so we can't easily test here
         // This is a documentation placeholder
+    }
+
+    // noetl/ai-meta#156: the per-execution event-tail ring is a bounded,
+    // oldest-first FIFO, snapshot-able, evicted on terminal.
+    #[test]
+    fn chain_tails_ring_is_bounded_fifo() {
+        let tails = ChainTails::default();
+        let ev = |id: i64| serde_json::json!({ "event_id": id });
+
+        // cap == 0 → disabled, nothing buffered regardless of the flag.
+        tails.push(1, &[ev(10)], 0);
+        assert!(tails.snapshot(1).is_empty(), "cap 0 must buffer nothing");
+
+        // Append within cap → snapshot is oldest→newest.
+        tails.push(1, &[ev(10), ev(11)], 3);
+        tails.push(1, &[ev(12)], 3);
+        let ids: Vec<i64> = tails
+            .snapshot(1)
+            .iter()
+            .map(|v| v["event_id"].as_i64().unwrap())
+            .collect();
+        assert_eq!(ids, vec![10, 11, 12]);
+
+        // Exceeding cap evicts oldest-first.
+        tails.push(1, &[ev(13), ev(14)], 3);
+        let ids: Vec<i64> = tails
+            .snapshot(1)
+            .iter()
+            .map(|v| v["event_id"].as_i64().unwrap())
+            .collect();
+        assert_eq!(ids, vec![12, 13, 14], "ring keeps the newest `cap` events");
+
+        // Per-execution isolation.
+        assert!(tails.snapshot(2).is_empty());
+
+        // Terminal eviction frees the ring.
+        tails.evict(1);
+        assert!(tails.snapshot(1).is_empty());
     }
 
     // noetl/ai-meta#118: exactly-one-terminal-per-execution.  The chokepoint

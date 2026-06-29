@@ -2561,6 +2561,7 @@ async fn dispatch_offserver_stateless_drive(
         state.exec_descriptors.evict(execution_id).await;
         state.orch_cache.evict(execution_id);
         state.chain_heads.evict(execution_id).await;
+        state.chain_tails.evict(execution_id); // noetl/ai-meta#156: drop the tail ring too
         crate::metrics::record_orchestrate_drive("stateless_terminal_skip");
         debug!(
             execution_id,
@@ -2606,6 +2607,19 @@ async fn dispatch_offserver_stateless_drive(
             })?;
     let playbook = crate::playbook::parser::parse_playbook(&playbook_yaml)?;
 
+    // noetl/ai-meta#156: attach the per-execution event tail the server just
+    // published so the worker advances its WAL index to `expected_head`
+    // immediately — drain-independent — instead of parking on the global-stream
+    // drain to catch up (the source of the per-hop variance).  Empty when the
+    // accelerator is off or the ring holds nothing (cold dispatch) → the worker
+    // falls back to today's drain-served path, so worst case equals today.
+    let tail_events = if state.config.offserver_attach_tail {
+        state.chain_tails.snapshot(execution_id)
+    } else {
+        Vec::new()
+    };
+    crate::metrics::record_offserver_tail_attached(tail_events.len());
+
     let input = serde_json::json!({
         "__offserver_build__": true,
         // No server-built `state` fallback rides the stateless command; the
@@ -2619,6 +2633,10 @@ async fn dispatch_offserver_stateless_drive(
         "trigger_event_id": trigger_event_id,
         "playbook": &playbook,
         "expected_head": expected_head,
+        // noetl/ai-meta#156: the recently-published events for this execution
+        // (oldest→newest).  The worker applies them to its WAL index before
+        // building, so a warm-index hop serves on the first build attempt.
+        "tail_events": tail_events,
     });
 
     crate::handlers::execute::dispatch_orchestrate_command(
@@ -2967,6 +2985,7 @@ async fn trigger_orchestrator_inner(
         drop(cache);
         state.orch_cache.evict(execution_id);
         state.chain_heads.evict(execution_id).await; // RFC #115 §4: drop the chain head too
+        state.chain_tails.evict(execution_id); // noetl/ai-meta#156: drop the tail ring too
         state.exec_descriptors.evict(execution_id).await; // RFC #115 Phase 4 remainder
         debug!(
             execution_id,
@@ -3104,6 +3123,18 @@ async fn trigger_orchestrator_inner(
             state.config.state_builder,
             crate::config::StateBuilder::Offserver
         ) && crate::handlers::event_write::should_publish(state, catalog_id).await;
+        // noetl/ai-meta#156: same tail-attach accelerator as the stateless edge —
+        // only meaningful on the off-server path (`offserver` true), where the
+        // worker self-sources the spine.  Empty when the flag is off or nothing is
+        // buffered; the server-built `state` here is the fallback regardless.
+        let tail_events = if offserver && state.config.offserver_attach_tail {
+            state.chain_tails.snapshot(execution_id)
+        } else {
+            Vec::new()
+        };
+        if offserver {
+            crate::metrics::record_offserver_tail_attached(tail_events.len());
+        }
         let input = serde_json::json!({
             "state": cache.state.as_ref().expect("state present after rebuild"),
             "latest_ts": latest_ts,
@@ -3111,6 +3142,9 @@ async fn trigger_orchestrator_inner(
             "trigger_event_type": trigger_event_type,
             "__offserver_build__": offserver,
             "execution_id": execution_id,
+            // noetl/ai-meta#156: recently-published tail for this execution; the
+            // worker applies it to its WAL index before building.
+            "tail_events": tail_events,
             // The server's dispatch watermark (the highest event applied to the
             // server-built state).  The worker's WAL build serves only once its
             // pool-side index has caught up to this head — so the off-server
@@ -3227,6 +3261,7 @@ async fn trigger_orchestrator_inner(
         drop(cache);
         state.orch_cache.evict(execution_id);
         state.chain_heads.evict(execution_id).await; // RFC #115 §4: drop the chain head too
+        state.chain_tails.evict(execution_id); // noetl/ai-meta#156: drop the tail ring too
         state.exec_descriptors.evict(execution_id).await; // RFC #115 Phase 4 remainder
     }
 
@@ -3772,6 +3807,7 @@ async fn apply_worker_orchestration(
         drop(cache);
         state.orch_cache.evict(execution_id);
         state.chain_heads.evict(execution_id).await; // RFC #115 §4: drop the chain head too
+        state.chain_tails.evict(execution_id); // noetl/ai-meta#156: drop the tail ring too
         state.exec_descriptors.evict(execution_id).await; // RFC #115 Phase 4 remainder
     }
     Ok(commands_generated)
