@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.48.0](https://github.com/noetl/server/compare/v3.47.0...v3.48.0) (2026-06-29)
+
+### Features
+
+* **offserver:** attach per-execution event tail to drive dispatch ([#156](https://github.com/noetl/server/issues/156)) ([#268](https://github.com/noetl/server/issues/268)) ([7df9686](https://github.com/noetl/server/commit/7df96867339076c7af3cd8a4e47cea9c1f1dd80a))
+
 ## [3.47.0](https://github.com/noetl/server/compare/v3.46.0...v3.47.0) (2026-06-28)
 
 ### Features
