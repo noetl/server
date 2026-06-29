@@ -332,6 +332,34 @@ pub struct AppConfig {
     #[serde(default = "default_offserver_tail_cap")]
     pub offserver_tail_cap: usize,
 
+    /// **Scope the tail-attach accelerator to specific playbooks** (by path /
+    /// name prefix).  Envy maps `NOETL_OFFSERVER_TAIL_PLAYBOOK_PREFIXES`
+    /// (comma-separated).
+    ///
+    /// The global flag-on form of [`Self::offserver_attach_tail`] regressed the
+    /// **auth/login** path: that drive runs behind the gateway's hard ~15s
+    /// callback timeout, and flag-on the multi-hop auth chain hit a per-hop stall
+    /// that pushed it past the deadline → login outage (noetl/ai-meta#156 RESTORE,
+    /// 2026-06-29).  The planner has no equivalent hard client deadline, so the
+    /// same accelerator is pure win there.
+    ///
+    /// This list scopes *which* executions receive the attached tail:
+    /// - **empty** (default) — the accelerator applies to **all** off-server
+    ///   executions exactly as before; backward-compatible with the original
+    ///   global flag.  Do not use this form in prod until the auth-path
+    ///   regression is root-caused.
+    /// - **non-empty** — an execution receives `tail_events` only when its
+    ///   playbook `metadata.path` (or, as a fallback, `metadata.name`) starts
+    ///   with one of these prefixes.  Every other execution — including
+    ///   `api_integration/auth0/*` — gets an empty tail, i.e. exactly today's
+    ///   drain-served path (flag-off-equivalent), so login is safe **by
+    ///   construction** regardless of why the auth shape regressed.
+    ///
+    /// Prod value (planner + its MCP children, never auth):
+    /// `muno/playbooks/itinerary-planner,automation/agents/mcp/`.
+    #[serde(default)]
+    pub offserver_tail_playbook_prefixes: Vec<String>,
+
     /// **Shadow-accept the canonical result URI** (RFC noetl/ai-meta#104
     /// Phase A).  Envy maps `NOETL_RESULT_URI_ACCEPT`.
     ///
@@ -595,6 +623,32 @@ impl AppConfig {
     pub fn bind_address(&self) -> String {
         format!("{}:{}", self.host, self.port)
     }
+
+    /// Whether the off-server tail-attach accelerator (noetl/ai-meta#156) applies
+    /// to the execution whose playbook has this `path` / `name`.
+    ///
+    /// - Master flag off → never (no-op, as today).
+    /// - Master flag on, empty prefix list → applies to all (the original global
+    ///   behavior).
+    /// - Master flag on, non-empty prefix list → applies only when `path` (or, as
+    ///   a fallback, `name`) starts with one of the configured prefixes.
+    ///
+    /// Auth/session playbooks (`api_integration/auth0/*`) are kept off the prod
+    /// allowlist, so they always get an empty tail (today's drain-served path) and
+    /// the 15s-gateway-timeout regression cannot recur for login.
+    pub fn tail_attach_applies(&self, playbook_path: &str, playbook_name: &str) -> bool {
+        if !self.offserver_attach_tail {
+            return false;
+        }
+        if self.offserver_tail_playbook_prefixes.is_empty() {
+            return true;
+        }
+        self.offserver_tail_playbook_prefixes.iter().any(|prefix| {
+            let prefix = prefix.trim();
+            !prefix.is_empty()
+                && (playbook_path.starts_with(prefix) || playbook_name.starts_with(prefix))
+        })
+    }
 }
 
 impl Default for AppConfig {
@@ -641,6 +695,11 @@ impl Default for AppConfig {
             // `tail_events`, prod/default behavior + memory cost are unchanged.
             offserver_attach_tail: false,
             offserver_tail_cap: default_offserver_tail_cap(),
+            // noetl/ai-meta#156: empty prefix list → the accelerator (when on)
+            // applies to all off-server executions, as the original global flag
+            // did.  Prod scopes it to the planner (+ MCP children) so the auth
+            // path keeps today's drain-served behavior.
+            offserver_tail_playbook_prefixes: Vec::new(),
             // noetl/ai-meta#104 Phase A: the canonical result URI is ignored by
             // default; shadow-accept (parse + validate + record) is opt-in.
             result_uri_accept: false,
@@ -697,6 +756,36 @@ mod tests {
         let cfg = AppConfig::default();
         assert!(!cfg.offserver_attach_tail);
         assert_eq!(cfg.offserver_tail_cap, 64);
+        assert!(cfg.offserver_tail_playbook_prefixes.is_empty());
+    }
+
+    #[test]
+    fn test_tail_attach_scoping() {
+        // Master flag off → never, regardless of prefixes.
+        let mut cfg = AppConfig::default();
+        assert!(!cfg.tail_attach_applies("muno/playbooks/itinerary-planner", "muno_itinerary_planner"));
+
+        // Flag on, empty allowlist → applies to all (original global behavior).
+        cfg.offserver_attach_tail = true;
+        assert!(cfg.tail_attach_applies("api_integration/auth0/auth0_login", "auth0_login"));
+
+        // Flag on, scoped allowlist → planner (+ MCP children) in, auth out.
+        cfg.offserver_tail_playbook_prefixes = vec![
+            "muno/playbooks/itinerary-planner".to_string(),
+            "automation/agents/mcp/".to_string(),
+        ];
+        assert!(cfg.tail_attach_applies("muno/playbooks/itinerary-planner", "muno_itinerary_planner"));
+        assert!(cfg.tail_attach_applies("automation/agents/mcp/duffel", "duffel_mcp"));
+        // The auth/login + session-validate drives — the parked regression — stay off.
+        assert!(!cfg.tail_attach_applies("api_integration/auth0/auth0_login", "auth0_login"));
+        assert!(!cfg.tail_attach_applies(
+            "api_integration/auth0/auth0_validate_session",
+            "auth0_validate_session"
+        ));
+        // Match by name as a fallback when path is absent.
+        cfg.offserver_tail_playbook_prefixes = vec!["muno_itinerary_planner".to_string()];
+        assert!(cfg.tail_attach_applies("", "muno_itinerary_planner"));
+        assert!(!cfg.tail_attach_applies("", "auth0_login"));
     }
 
     #[test]
