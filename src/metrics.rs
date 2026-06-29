@@ -149,6 +149,67 @@ pub fn record_orchestrate_drive(stage: &str) {
     orchestrate_drive_total().with_label_values(&[stage]).inc();
 }
 
+// ── Off-server tail-attach accelerator (noetl/ai-meta#156) ───────────────────
+
+/// `noetl_offserver_tail_attached_total{outcome}` — off-server drive dispatches
+/// by whether the server attached a non-empty per-execution event tail
+/// ([`crate::state::ChainTails`]).  `outcome` = `attached` (the dispatch carried
+/// `tail_events` so the worker can advance its WAL index drain-independently) or
+/// `empty` (the ring held nothing for this execution — a cold dispatch falling
+/// back to today's drain-served path).  Zero increments when the accelerator is
+/// off (`NOETL_OFFSERVER_ATTACH_TAIL=false`).
+pub fn offserver_tail_attached_total() -> &'static IntCounterVec {
+    static M: OnceLock<IntCounterVec> = OnceLock::new();
+    M.get_or_init(|| {
+        let counter = IntCounterVec::new(
+            Opts::new(
+                "noetl_offserver_tail_attached_total",
+                "Off-server drive dispatches by tail-attach outcome (noetl/ai-meta#156).",
+            ),
+            &["outcome"],
+        )
+        .expect("static counter spec must be valid");
+        registry()
+            .register(Box::new(counter.clone()))
+            .expect("counter registration must succeed");
+        counter
+    })
+}
+
+/// `noetl_offserver_tail_size` — distribution of the number of events the server
+/// attaches to an off-server drive dispatch (noetl/ai-meta#156).  Observed only
+/// when a non-empty tail is attached; the magnitude shows the tail stays O(few
+/// events) rather than O(global-stream).
+pub fn offserver_tail_size() -> &'static Histogram {
+    static M: OnceLock<Histogram> = OnceLock::new();
+    M.get_or_init(|| {
+        let h = Histogram::with_opts(
+            HistogramOpts::new(
+                "noetl_offserver_tail_size",
+                "Events attached to an off-server drive dispatch (noetl/ai-meta#156).",
+            )
+            .buckets(vec![1.0, 2.0, 3.0, 5.0, 8.0, 16.0, 32.0, 64.0]),
+        )
+        .expect("static histogram spec must be valid");
+        registry()
+            .register(Box::new(h.clone()))
+            .expect("histogram registration must succeed");
+        h
+    })
+}
+
+/// Record one off-server drive dispatch's tail-attach outcome.  `n` is the number
+/// of events attached (0 → the `empty` outcome; the size histogram is observed
+/// only for a non-empty tail).
+pub fn record_offserver_tail_attached(n: usize) {
+    if n == 0 {
+        offserver_tail_attached_total().with_label_values(&["empty"]).inc();
+    } else {
+        offserver_tail_attached_total().with_label_values(&["attached"]).inc();
+        offserver_tail_size().observe(n as f64);
+    }
+}
+
 // ── Terminal-event dedup (noetl/ai-meta#118) ─────────────────────────────────
 
 /// `noetl_terminal_dedup_total{outcome}` — the event-write chokepoint's

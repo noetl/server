@@ -296,6 +296,42 @@ pub struct AppConfig {
     #[serde(default)]
     pub atomic_item_context: bool,
 
+    /// **Attach the per-execution event tail to the off-server drive dispatch**
+    /// (noetl/ai-meta#156).  Envy maps `NOETL_OFFSERVER_ATTACH_TAIL`.
+    ///
+    /// The off-server drive's per-hop cost is today coupled to **global**
+    /// `noetl_events` WAL volume, not to this execution's work: the worker's
+    /// `build_offserver_input` serves only once the pool-side WAL drain — one
+    /// ephemeral `DeliverAll` consumer racing the whole stream under one mutex —
+    /// has independently pulled + indexed this hop's `expected_head`.  Under load
+    /// the drain lags past the worker's 1s drive-retry budget and the hop drops to
+    /// the server's 8s reconcile tick → the ~8–13s per-hop variance #156 pins.
+    ///
+    /// When **true**, the server (the producer of these events) keeps a small
+    /// bounded per-execution ring of the `noetl_events` payloads it just published
+    /// ([`crate::state::ChainTails`]) and attaches them to the
+    /// `__offserver_build__` dispatch as `tail_events`.  The worker applies that
+    /// tail into its WAL index **before** building, so a warm-index hop serves on
+    /// the first build attempt — drain-independent — collapsing the per-hop cost
+    /// to O(tail) ≈ constant and removing the reconcile cliff.  The drain stays
+    /// the cold-rebuild / crash-recovery backstop: an insufficient tail (a gap, or
+    /// a post-restart cold index whose genesis predates the ring) leaves the build
+    /// `Incomplete` and falls through to exactly today's retry/drain/reconcile
+    /// path — so correctness is preserved, worst case equals today.
+    ///
+    /// **Default false** — the ring is never populated and `tail_events` is never
+    /// attached, so prod/default behavior (and memory cost) is byte-identical.
+    #[serde(default)]
+    pub offserver_attach_tail: bool,
+
+    /// Cap on the per-execution [`crate::state::ChainTails`] ring size, in events
+    /// (noetl/ai-meta#156).  Envy maps `NOETL_OFFSERVER_TAIL_CAP`.  Only consulted
+    /// when [`Self::offserver_attach_tail`] is on.  Sized to cover the tail between
+    /// consecutive hops plus a wide safety margin (a planner turn is ~10 hops of a
+    /// few events each); the ring evicts oldest-first and is dropped on terminal.
+    #[serde(default = "default_offserver_tail_cap")]
+    pub offserver_tail_cap: usize,
+
     /// **Shadow-accept the canonical result URI** (RFC noetl/ai-meta#104
     /// Phase A).  Envy maps `NOETL_RESULT_URI_ACCEPT`.
     ///
@@ -539,6 +575,14 @@ fn default_command_context_max_bytes() -> usize {
     512 * 1024
 }
 
+fn default_offserver_tail_cap() -> usize {
+    // 64 events — far more than the 1–3 event tail between consecutive hops, so a
+    // worker index that fell a few hops behind still completes from the attached
+    // ring alone.  ~64 × few-KB × concurrent executions worst-case is a few tens
+    // of MB; in practice most executions hold far fewer than the cap.
+    64
+}
+
 impl AppConfig {
     /// Load configuration from environment variables.
     ///
@@ -592,6 +636,11 @@ impl Default for AppConfig {
             // noetl/ai-meta#115 Phase 5: full-context dispatch by default; the
             // atomic-working-item minimal-slice narrowing is opt-in (and staged).
             atomic_item_context: false,
+            // noetl/ai-meta#156: the off-server tail-attach accelerator is off by
+            // default — the ring is never populated, no dispatch carries
+            // `tail_events`, prod/default behavior + memory cost are unchanged.
+            offserver_attach_tail: false,
+            offserver_tail_cap: default_offserver_tail_cap(),
             // noetl/ai-meta#104 Phase A: the canonical result URI is ignored by
             // default; shadow-accept (parse + validate + record) is opt-in.
             result_uri_accept: false,
@@ -639,6 +688,15 @@ mod tests {
         // default so the gated build is behavior-neutral; only the explicit
         // operational flip (NOETL_RESULT_STORE_DUAL_WRITE=false) retires it.
         assert!(AppConfig::default().result_store_dual_write);
+    }
+
+    #[test]
+    fn test_offserver_attach_tail_defaults_off() {
+        // noetl/ai-meta#156: the tail-attach accelerator is opt-in; default-off
+        // must be a true no-op (ring never populated, no `tail_events` dispatched).
+        let cfg = AppConfig::default();
+        assert!(!cfg.offserver_attach_tail);
+        assert_eq!(cfg.offserver_tail_cap, 64);
     }
 
     #[test]

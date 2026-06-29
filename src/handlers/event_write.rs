@@ -359,8 +359,17 @@ pub async fn emit_events(state: &AppState, pool: &DbPool, rows: &[EventRow]) -> 
     // covers the batch.
     if should_publish(state, rows[0].catalog_id).await {
         if let Some(pubr) = publisher(state).await {
+            // noetl/ai-meta#156: when the tail-attach accelerator is on, keep the
+            // `to_stream_json()` payloads we publish in the per-execution ring so
+            // the off-server drive dispatch can carry the new tail to the worker
+            // directly — letting it advance its WAL index without waiting on the
+            // global-stream drain.  This is the SAME bytes we publish (the chain
+            // link is already stamped above), so the attached tail is byte-identical
+            // to what the worker would have drained off `noetl_events`.
+            let mut tail_payloads: Vec<serde_json::Value> = Vec::new();
             for row in rows {
-                let bytes = serde_json::to_vec(&row.to_stream_json()).map_err(|e| {
+                let stream_json = row.to_stream_json();
+                let bytes = serde_json::to_vec(&stream_json).map_err(|e| {
                     crate::error::AppError::Internal(format!("event publish encode: {e}"))
                 })?;
                 pubr.publish_event(row.event_id, &row.event_type, &bytes)
@@ -369,6 +378,16 @@ pub async fn emit_events(state: &AppState, pool: &DbPool, rows: &[EventRow]) -> 
                         crate::error::AppError::Internal(format!("event publish: {e}"))
                     })?;
                 crate::metrics::record_event_published(&row.event_type);
+                if state.config.offserver_attach_tail {
+                    tail_payloads.push(stream_json);
+                }
+            }
+            if state.config.offserver_attach_tail && !tail_payloads.is_empty() {
+                state.chain_tails.push(
+                    rows[0].execution_id,
+                    &tail_payloads,
+                    state.config.offserver_tail_cap,
+                );
             }
             return Ok(());
         }
