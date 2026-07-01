@@ -2,6 +2,7 @@
 //!
 //! This module contains all route handlers organized by domain.
 
+pub mod auth;
 pub mod catalog;
 pub mod cells;
 pub mod container_callback;

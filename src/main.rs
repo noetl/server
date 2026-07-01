@@ -115,6 +115,21 @@ fn build_router(
         )
         .with_state(credential_service.clone());
 
+    // Synchronous auth fast-path routes (noetl/ai-meta#167).  These run the
+    // exact `auth0_validate_session` / `auth0_login` logic **in-process** —
+    // resolving the `pg_auth` credential and hitting the auth Postgres directly
+    // — instead of dispatching a multi-hop off-server drive that the gateway's
+    // hard ~15s auth deadline could outrun under load (the recurring lockout).
+    // Inert unless the gateway opts in with `NOETL_AUTH_SYNC=true`, so the
+    // routes are a purely additive, reversible surface.
+    let auth_routes = Router::new()
+        .route(
+            "/api/auth/session/validate",
+            post(handlers::auth::validate_session),
+        )
+        .route("/api/auth/login", post(handlers::auth::login))
+        .with_state(credential_service.clone());
+
     // Sealed-credential endpoint (Secrets Wallet Phase 5b, noetl/ai-meta#61).
     // Returns a SealedEnvelope (X25519-sealed credential JSON) addressed to
     // the worker named via `?worker_id=<name>`.  Defense-in-depth on top of
@@ -564,6 +579,7 @@ fn build_router(
         .merge(health_routes)
         .merge(catalog_routes)
         .merge(credential_routes)
+        .merge(auth_routes)
         .merge(sealed_credential_routes)
         .merge(cross_region_routes)
         .merge(wallet_rotate_routes)
