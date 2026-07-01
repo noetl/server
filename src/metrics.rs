@@ -974,6 +974,37 @@ pub fn record_credential_seal(status: &str) {
         .inc();
 }
 
+/// Counter: synchronous auth fast-path calls (noetl/ai-meta#167 structural
+/// cure).  Bucketed by `operation` (`validate` / `login`) and `outcome`
+/// (`valid` / `invalid` / `authenticated` / `error`).  This is the drive-immune
+/// in-process path the gateway takes under `NOETL_AUTH_SYNC=true`; the counter
+/// makes it visible whether prod auth traffic is served synchronously (fast) or
+/// still falling to the off-server drive (the recurring-lockout path).
+pub fn auth_sync_total() -> &'static IntCounterVec {
+    static M: OnceLock<IntCounterVec> = OnceLock::new();
+    M.get_or_init(|| {
+        let counter = IntCounterVec::new(
+            Opts::new(
+                "noetl_auth_sync_total",
+                "Synchronous in-process auth calls by operation (validate/login) and outcome.",
+            ),
+            &["operation", "outcome"],
+        )
+        .expect("static counter spec must be valid");
+        registry()
+            .register(Box::new(counter.clone()))
+            .expect("counter registration must succeed");
+        counter
+    })
+}
+
+/// Increment [`auth_sync_total`] by 1 for the given operation + outcome.
+pub fn record_auth_sync(operation: &str, outcome: &str) {
+    auth_sync_total()
+        .with_label_values(&[operation, outcome])
+        .inc();
+}
+
 /// Secrets-Wallet Phase 6a: per-resolve counter for keychain entries
 /// against external secret providers.
 ///
