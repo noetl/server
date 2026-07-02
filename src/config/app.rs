@@ -514,6 +514,81 @@ pub struct AppConfig {
     /// **Default false** — prod/default behavior unchanged.
     #[serde(default)]
     pub shard_index_from_hostname: bool,
+
+    /// **Orphaned-command guardrail sweep** (noetl/ai-meta zombie-exec fix;
+    /// refs #154 / #161 / #163).  Envy maps `NOETL_ORPHAN_SWEEP_ENABLED`.
+    ///
+    /// When a worker pod is rolled or killed mid-execution, the step command it
+    /// had claimed (`command.claimed` carries the dead pod's `worker_id`) never
+    /// gets a `command.completed` / `command.failed` — the worker is gone.  The
+    /// orchestrate reconciler ([`crate::handlers::events::spawn_orchestrator_reconciler`])
+    /// then re-drives `__orchestrate__` every 8s forever: the step is
+    /// outstanding, 0 new commands fan out, and the execution is wedged RUNNING
+    /// permanently — loading the system-pool drive and the noetl.event /
+    /// noetl.command reconcile queries (the "zombie" re-drive loop; prod incident
+    /// exec 330319143314137088 re-drove 111×/15min).
+    ///
+    /// When **true**, a background sweep
+    /// ([`crate::handlers::orphan_sweep::spawn_orphan_command_sweep`]) periodically
+    /// finds RUNNING executions whose latest outstanding `command.claimed` is
+    /// owned by a `worker_id` NOT in the live set (no `noetl.runtime` row with a
+    /// heartbeat within [`Self::orphan_worker_ttl_secs`]) and older than
+    /// [`Self::orphan_sweep_grace_secs`], then terminates each **append-only**
+    /// with a `playbook.failed` event (via the emit_event chokepoint — #103
+    /// sole-writer + idempotent-terminal #118 preserved).  It NEVER touches an
+    /// execution whose outstanding command is held by a live worker, never
+    /// re-executes a side-effecting step, and is rate-limited to
+    /// [`Self::orphan_sweep_max_per_tick`] terminations per tick.  Server-side
+    /// only — off the hot worker claim path.
+    ///
+    /// **Default false** — the sweep task still spawns but returns immediately
+    /// each tick, so prod/default behavior is byte-identical.  Instant rollback =
+    /// flip back to false.
+    #[serde(default)]
+    pub orphan_sweep_enabled: bool,
+
+    /// Seconds between orphaned-command sweep ticks.  Envy maps
+    /// `NOETL_ORPHAN_SWEEP_INTERVAL_SECS`.  Only consulted when
+    /// [`Self::orphan_sweep_enabled`] is on.  Default 60.
+    #[serde(default = "default_orphan_sweep_interval_secs")]
+    pub orphan_sweep_interval_secs: u64,
+
+    /// How long an outstanding `command.claimed` must be un-finished before it is
+    /// eligible for orphan termination, in seconds.  Envy maps
+    /// `NOETL_ORPHAN_SWEEP_GRACE_SECS`.  Kept comfortably above the reconcile
+    /// interval (8s) and the runtime offline threshold so a live worker mid-step
+    /// or a briefly-partitioned worker is never mistaken for dead.  Default 180.
+    #[serde(default = "default_orphan_sweep_grace_secs")]
+    pub orphan_sweep_grace_secs: u64,
+
+    /// A worker is considered LIVE iff a `noetl.runtime` row exists for its
+    /// `worker_id` with a heartbeat within this many seconds.  Envy maps
+    /// `NOETL_ORPHAN_WORKER_TTL_SECS`.  Set above the worker heartbeat interval
+    /// (15s) and the `runtime_offline_seconds` threshold so a crashed worker that
+    /// left a stale `noetl.runtime` row (no graceful deregister) still reads as
+    /// dead.  Default 90 (6 missed 15s beats).
+    #[serde(default = "default_orphan_worker_ttl_secs")]
+    pub orphan_worker_ttl_secs: u64,
+
+    /// Cap on executions terminated per sweep tick (rate limit).  Envy maps
+    /// `NOETL_ORPHAN_SWEEP_MAX_PER_TICK`.  A tick that hits the cap logs the
+    /// remaining backlog (no silent truncation) and clears it over subsequent
+    /// ticks.  Default 20.
+    #[serde(default = "default_orphan_sweep_max_per_tick")]
+    pub orphan_sweep_max_per_tick: usize,
+
+    /// Per-shard `LIMIT` on the candidate scan, and the lookback window bound
+    /// (`orphan_sweep_lookback_secs`) that keeps the query cheap.  Envy maps
+    /// `NOETL_ORPHAN_SWEEP_SCAN_LIMIT`.  Default 500.
+    #[serde(default = "default_orphan_sweep_scan_limit")]
+    pub orphan_sweep_scan_limit: i64,
+
+    /// Only claims newer than this many seconds are scanned — a zombie is
+    /// normally caught within a grace-period of the worker roll, so a wide bound
+    /// (default 48h) catches recent zombies while keeping the scan bounded.  Envy
+    /// maps `NOETL_ORPHAN_SWEEP_LOOKBACK_SECS`.
+    #[serde(default = "default_orphan_sweep_lookback_secs")]
+    pub orphan_sweep_lookback_secs: u64,
 }
 
 /// How the execution-lifecycle hot path reads `noetl.event` — see
@@ -601,6 +676,33 @@ fn default_command_context_max_bytes() -> usize {
     // 512KB — half the NATS 1MB max_payload, leaving headroom for the event's
     // meta/envelope overhead while never tripping on ordinary (few-KB) commands.
     512 * 1024
+}
+
+fn default_orphan_sweep_interval_secs() -> u64 {
+    60
+}
+
+fn default_orphan_sweep_grace_secs() -> u64 {
+    180
+}
+
+fn default_orphan_worker_ttl_secs() -> u64 {
+    90
+}
+
+fn default_orphan_sweep_max_per_tick() -> usize {
+    20
+}
+
+fn default_orphan_sweep_scan_limit() -> i64 {
+    500
+}
+
+fn default_orphan_sweep_lookback_secs() -> u64 {
+    // 48h — a zombie is normally swept within a grace-period of the worker roll,
+    // so this only bounds the candidate scan; wide enough to catch anything a
+    // couple of days old, narrow enough to keep the query off the full log.
+    48 * 60 * 60
 }
 
 fn default_offserver_tail_cap() -> usize {
@@ -718,6 +820,16 @@ impl Default for AppConfig {
             execution_affinity: false,
             peer_url_template: None,
             shard_index_from_hostname: false,
+            // Zombie-exec guardrail (refs #154/#161/#163): the sweep spawns but
+            // is inert by default — a rolled/crashed worker's orphaned command is
+            // only terminated once ops flips this on.  Instant rollback = false.
+            orphan_sweep_enabled: false,
+            orphan_sweep_interval_secs: default_orphan_sweep_interval_secs(),
+            orphan_sweep_grace_secs: default_orphan_sweep_grace_secs(),
+            orphan_worker_ttl_secs: default_orphan_worker_ttl_secs(),
+            orphan_sweep_max_per_tick: default_orphan_sweep_max_per_tick(),
+            orphan_sweep_scan_limit: default_orphan_sweep_scan_limit(),
+            orphan_sweep_lookback_secs: default_orphan_sweep_lookback_secs(),
         }
     }
 }

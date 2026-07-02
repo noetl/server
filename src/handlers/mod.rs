@@ -20,6 +20,7 @@ pub mod internal;
 pub mod keychain;
 pub mod plugins;
 pub mod objects;
+pub mod orphan_sweep;
 pub mod registry;
 pub mod replay;
 pub mod result_store;
