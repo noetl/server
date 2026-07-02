@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.50.0](https://github.com/noetl/server/compare/v3.49.0...v3.50.0) (2026-07-02)
+
+### Features
+
+* **orphan-sweep:** terminate dead-worker-orphaned RUNNING executions (guardrail) ([ab10a7b](https://github.com/noetl/server/commit/ab10a7bae7a4b765fe35a453c60430064dddc04e)), closes [#103](https://github.com/noetl/server/issues/103) [#118](https://github.com/noetl/server/issues/118) [noetl/ai-meta#154](https://github.com/noetl/ai-meta/issues/154) [noetl/ai-meta#161](https://github.com/noetl/ai-meta/issues/161) [noetl/ai-meta#163](https://github.com/noetl/ai-meta/issues/163)
+
 ## [3.49.0](https://github.com/noetl/server/compare/v3.48.0...v3.49.0) (2026-07-02)
 
 ### Features
