@@ -154,10 +154,12 @@ pub fn record_orchestrate_drive(stage: &str) {
 /// `noetl_offserver_tail_attached_total{outcome}` — off-server drive dispatches
 /// by whether the server attached a non-empty per-execution event tail
 /// ([`crate::state::ChainTails`]).  `outcome` = `attached` (the dispatch carried
-/// `tail_events` so the worker can advance its WAL index drain-independently) or
+/// `tail_events` so the worker can advance its WAL index drain-independently),
 /// `empty` (the ring held nothing for this execution — a cold dispatch falling
-/// back to today's drain-served path).  Zero increments when the accelerator is
-/// off (`NOETL_OFFSERVER_ATTACH_TAIL=false`).
+/// back to today's drain-served path), or `scoped_out` (the master flag is on
+/// but this playbook is outside the `NOETL_OFFSERVER_TAIL_PLAYBOOK_PREFIXES`
+/// allowlist — e.g. the auth path — so the drive intentionally carries no tail).
+/// Zero increments when the accelerator is off (`NOETL_OFFSERVER_ATTACH_TAIL=false`).
 pub fn offserver_tail_attached_total() -> &'static IntCounterVec {
     static M: OnceLock<IntCounterVec> = OnceLock::new();
     M.get_or_init(|| {
@@ -208,6 +210,15 @@ pub fn record_offserver_tail_attached(n: usize) {
         offserver_tail_attached_total().with_label_values(&["attached"]).inc();
         offserver_tail_size().observe(n as f64);
     }
+}
+
+/// Record an off-server drive dispatch whose playbook is **outside** the
+/// tail-attach allowlist (`NOETL_OFFSERVER_TAIL_PLAYBOOK_PREFIXES`) while the
+/// master flag is on — e.g. the auth/login path (noetl/ai-meta#156).  The drive
+/// carries no tail and keeps today's drain-served behavior; this counter makes
+/// the scoping observable (auth executions should land here, never in `attached`).
+pub fn record_offserver_tail_scoped_out() {
+    offserver_tail_attached_total().with_label_values(&["scoped_out"]).inc();
 }
 
 // ── Terminal-event dedup (noetl/ai-meta#118) ─────────────────────────────────

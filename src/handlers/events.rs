@@ -2613,12 +2613,23 @@ async fn dispatch_offserver_stateless_drive(
     // drain to catch up (the source of the per-hop variance).  Empty when the
     // accelerator is off or the ring holds nothing (cold dispatch) → the worker
     // falls back to today's drain-served path, so worst case equals today.
-    let tail_events = if state.config.offserver_attach_tail {
+    // noetl/ai-meta#156: scope the accelerator to the allowlisted playbooks
+    // (planner + MCP children).  Auth/login executions fall here with the master
+    // flag on but no prefix match → empty tail → today's drain-served path, so the
+    // 15s-gateway-timeout login regression cannot recur.
+    let tail_attach = state
+        .config
+        .tail_attach_applies(playbook.metadata.path.as_deref().unwrap_or(""), &playbook.metadata.name);
+    let tail_events = if tail_attach {
         state.chain_tails.snapshot(execution_id)
     } else {
         Vec::new()
     };
-    crate::metrics::record_offserver_tail_attached(tail_events.len());
+    if !tail_attach && state.config.offserver_attach_tail {
+        crate::metrics::record_offserver_tail_scoped_out();
+    } else {
+        crate::metrics::record_offserver_tail_attached(tail_events.len());
+    }
 
     let input = serde_json::json!({
         "__offserver_build__": true,
@@ -3127,13 +3138,25 @@ async fn trigger_orchestrator_inner(
         // only meaningful on the off-server path (`offserver` true), where the
         // worker self-sources the spine.  Empty when the flag is off or nothing is
         // buffered; the server-built `state` here is the fallback regardless.
-        let tail_events = if offserver && state.config.offserver_attach_tail {
+        // noetl/ai-meta#156: scope the accelerator to the allowlisted playbooks
+        // (planner + MCP children); auth executions get an empty tail even with the
+        // master flag on, keeping today's drain-served path (no login regression).
+        let tail_attach = offserver
+            && state.config.tail_attach_applies(
+                playbook.metadata.path.as_deref().unwrap_or(""),
+                &playbook.metadata.name,
+            );
+        let tail_events = if tail_attach {
             state.chain_tails.snapshot(execution_id)
         } else {
             Vec::new()
         };
         if offserver {
-            crate::metrics::record_offserver_tail_attached(tail_events.len());
+            if !tail_attach && state.config.offserver_attach_tail {
+                crate::metrics::record_offserver_tail_scoped_out();
+            } else {
+                crate::metrics::record_offserver_tail_attached(tail_events.len());
+            }
         }
         let input = serde_json::json!({
             "state": cache.state.as_ref().expect("state present after rebuild"),
