@@ -149,6 +149,38 @@ pub fn record_orchestrate_drive(stage: &str) {
     orchestrate_drive_total().with_label_values(&[stage]).inc();
 }
 
+// ── Orphaned-command guardrail sweep (zombie-exec fix; refs #154/#161/#163) ───
+
+/// `noetl_orphan_sweep_total{outcome}` — outcomes of the orphaned-command
+/// sweep ([`crate::handlers::orphan_sweep`]).  `outcome` is one of: `candidate`
+/// (a RUNNING exec with an outstanding claimed command was examined),
+/// `terminated` (owner worker dead → `playbook.failed` emitted), `skipped_live`
+/// (owner still a live worker — never failed), `capped` (eligible orphan
+/// deferred to a later tick by the rate limit), `error` (scan / emit failure).
+/// Zero increments while the sweep is off (`NOETL_ORPHAN_SWEEP_ENABLED=false`).
+pub fn orphan_sweep_total() -> &'static IntCounterVec {
+    static M: OnceLock<IntCounterVec> = OnceLock::new();
+    M.get_or_init(|| {
+        let counter = IntCounterVec::new(
+            Opts::new(
+                "noetl_orphan_sweep_total",
+                "Orphaned-command guardrail sweep outcomes, by outcome.",
+            ),
+            &["outcome"],
+        )
+        .expect("static counter spec must be valid");
+        registry()
+            .register(Box::new(counter.clone()))
+            .expect("counter registration must succeed");
+        counter
+    })
+}
+
+/// Record one orphaned-command sweep outcome (see [`orphan_sweep_total`]).
+pub fn record_orphan_sweep(outcome: &str) {
+    orphan_sweep_total().with_label_values(&[outcome]).inc();
+}
+
 // ── Off-server tail-attach accelerator (noetl/ai-meta#156) ───────────────────
 
 /// `noetl_offserver_tail_attached_total{outcome}` — off-server drive dispatches

@@ -801,6 +801,15 @@ async fn main() -> anyhow::Result<()> {
     // under DB backpressure (e.g. a small Cloud SQL tier behind PgBouncer).
     handlers::events::spawn_orchestrator_reconciler(state.clone());
 
+    // Orphaned-command guardrail sweep (zombie-exec fix; refs #154/#161/#163):
+    // terminates append-only (playbook.failed) any RUNNING execution whose head
+    // outstanding command.claimed is owned by a dead worker (rolled/crashed pod
+    // absent or stale in noetl.runtime) — so a worker roll auto-recovers instead
+    // of re-driving __orchestrate__ forever.  Default OFF
+    // (NOETL_ORPHAN_SWEEP_ENABLED); the task spawns but scans nothing until ops
+    // flips it on, so this is behavior-neutral until enabled.
+    handlers::orphan_sweep::spawn_orphan_command_sweep(state.clone());
+
     // CQRS write-path producer (noetl/ai-meta#103 phase 2a): a background tailer
     // that batch-publishes committed `noetl.event` rows onto the `noetl_events`
     // JetStream stream for the system/projector playbook to fold.  Default OFF
