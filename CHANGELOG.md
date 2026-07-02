@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.49.0](https://github.com/noetl/server/compare/v3.48.0...v3.49.0) (2026-07-02)
+
+### Features
+
+* **offserver:** scope tail-attach to allowlisted playbooks ([#156](https://github.com/noetl/server/issues/156)) ([#269](https://github.com/noetl/server/issues/269)) ([de5ac33](https://github.com/noetl/server/commit/de5ac33d90e74db91358293be5e680da3a463533))
+
 ## [3.48.0](https://github.com/noetl/server/compare/v3.47.0...v3.48.0) (2026-06-29)
 
 ### Features
