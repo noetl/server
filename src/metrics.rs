@@ -986,7 +986,7 @@ pub fn auth_sync_total() -> &'static IntCounterVec {
         let counter = IntCounterVec::new(
             Opts::new(
                 "noetl_auth_sync_total",
-                "Synchronous in-process auth calls by operation (validate/login) and outcome.",
+                "Synchronous in-process auth calls by operation (validate/login/check_access) and outcome.",
             ),
             &["operation", "outcome"],
         )

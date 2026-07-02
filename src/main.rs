@@ -128,6 +128,14 @@ fn build_router(
             post(handlers::auth::validate_session),
         )
         .route("/api/auth/login", post(handlers::auth::login))
+        // Per-turn authorization gate (noetl/ai-meta#168): the byte-identical
+        // `check_playbook_access` session + role/grant lookup, run in-process so
+        // the pre-planner access check can't fall to the drive and drop the turn
+        // ("Load failed").  Same NOETL_AUTH_SYNC opt-in as validate/login.
+        .route(
+            "/api/auth/check-playbook-access",
+            post(handlers::auth::check_playbook_access),
+        )
         .with_state(credential_service.clone());
 
     // Sealed-credential endpoint (Secrets Wallet Phase 5b, noetl/ai-meta#61).

@@ -309,6 +309,7 @@ impl LoginResponse {
 }
 
 /// Decoded Auth0 ID-token claims we act on (matches the playbook's `start` step).
+#[derive(Debug)]
 struct TokenClaims {
     sub: String,
     email: Option<String>,
@@ -505,6 +506,201 @@ async fn login_create_session(
     })
 }
 
+// ---------------------------------------------------------------------------
+// Playbook access — synchronous mirror of `check_playbook_access`.
+// ---------------------------------------------------------------------------
+//
+// The per-turn authorization gate has the same structural fragility login had:
+// every Muno turn, before the planner runs, the gateway authorizes the user for
+// the target playbook by executing `api_integration/auth0/check_playbook_access`
+// as a **multi-hop off-server orchestration drive** (session lookup → normalize
+// → permission lookup → grant/deny callback).  Under drive load that gate took
+// ~7s in the incident; stacked in front of the (also multi-hop) planner turn it
+// blew the SPA/gateway request budget and the turn was dropped before the
+// planner execution was even created — the UI showed "Load failed" with no
+// execution.  Like session validation, the authorization decision is a plain
+// auth-DB lookup (session row + role/grant rows) that never needed a
+// deadline-gated distributed workflow.
+//
+// This handler runs the *byte-identical* SQL the playbook runs — the same
+// session-validity filter and the same role → playbook_permissions grant query,
+// with the same action → can_execute/can_view/can_modify mapping and the same
+// allow/deny pattern logic — but synchronously and in-process.  No NATS, no
+// worker, no drive, no callback.  It returns the same grant/deny decision (and
+// the same `{allowed, user, message}` payload the drive callback delivers), so
+// the gateway makes identical authorization decisions; only the execution shape
+// changes.  Gated behind the same `NOETL_AUTH_SYNC` gateway flag as login.
+
+/// `POST /api/auth/check-playbook-access` request body.  Matches the gateway's
+/// `NoetlClient::check_access_via_api` payload.
+#[derive(Debug, Deserialize)]
+pub struct CheckAccessRequest {
+    pub session_token: String,
+    pub playbook_path: String,
+    /// `execute` | `view` | `modify` — the playbook's `action` (default matches
+    /// the playbook workload default).
+    #[serde(default = "default_action")]
+    pub action: String,
+    #[serde(default = "default_pg_auth")]
+    pub credential: String,
+}
+
+fn default_action() -> String {
+    "execute".to_string()
+}
+
+/// `POST /api/auth/check-playbook-access` response.  The `data` object mirrors
+/// the `check_playbook_access` playbook's `/api/internal/callback` body so the
+/// gateway parses both paths through the same tail: `status == "success"` for a
+/// completed check (grant OR deny), `status == "error"` when the lookup itself
+/// failed (auth DB unreachable) — surfaced by the gateway as a retryable backend
+/// error rather than a false deny.
+#[derive(Debug, Serialize)]
+pub struct CheckAccessResponse {
+    pub status: String,
+    pub data: serde_json::Value,
+}
+
+impl CheckAccessResponse {
+    /// A completed check → the drive callback's granted/denied `data` shape.
+    fn decided(allowed: bool, user: Option<serde_json::Value>, action: &str) -> Self {
+        // Mirror what the gateway receives on the wire today: the granted
+        // callback carries `"Access granted to <action> playbook"`, and BOTH
+        // denial branches collapse to `"Access denied"` in the callback body.
+        let mut data = serde_json::json!({
+            "allowed": allowed,
+            "message": if allowed {
+                format!("Access granted to {action} playbook")
+            } else {
+                "Access denied".to_string()
+            },
+        });
+        if let (true, Some(u)) = (allowed, user) {
+            data.as_object_mut().unwrap().insert("user".to_string(), u);
+        }
+        Self { status: "success".into(), data }
+    }
+
+    fn error(msg: String) -> Self {
+        Self {
+            status: "error".into(),
+            data: serde_json::json!({ "error": msg, "message": "Access check failed" }),
+        }
+    }
+}
+
+/// Authorize a user for a playbook synchronously against the auth database.
+///
+/// Runs the identical `check_playbook_access` SQL: the session-validity lookup
+/// (`is_active` + non-expired session + active user), then — when a session is
+/// found — the role → `playbook_permissions` grant query with the same
+/// allow/deny-pattern and action → capability mapping.  Returns the same
+/// grant/deny decision the playbook's callback returns.  Fails **closed**: a DB
+/// lookup error returns `status: "error"` (no grant) so the gateway surfaces a
+/// retryable backend error instead of wrongly granting access.
+pub async fn check_playbook_access(
+    State(cred): State<CredentialService>,
+    Json(req): Json<CheckAccessRequest>,
+) -> Json<CheckAccessResponse> {
+    match check_playbook_access_inner(&cred, &req).await {
+        Ok(resp) => {
+            let outcome = if resp.status == "success" {
+                if resp.data.get("allowed").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    "granted"
+                } else {
+                    "denied"
+                }
+            } else {
+                "error"
+            };
+            crate::metrics::record_auth_sync("check_access", outcome);
+            Json(resp)
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "auth-sync check_playbook_access lookup failed");
+            crate::metrics::record_auth_sync("check_access", "error");
+            Json(CheckAccessResponse::error(e.to_string()))
+        }
+    }
+}
+
+async fn check_playbook_access_inner(
+    cred: &CredentialService,
+    req: &CheckAccessRequest,
+) -> AppResult<CheckAccessResponse> {
+    let pool = resolve_auth_pool(cred, &req.credential).await?;
+
+    // Step `get_user_from_session` from check_playbook_access: the active-session
+    // + active-user lookup.  This is the gate's OWN session-validity filter
+    // (is_active AND expires_at > NOW() AND user is_active) — replicated exactly,
+    // not the `auth0_validate_session` CASE variant.  No row → denied (no
+    // session); the drive path's send_denied_callback returns allowed=false.
+    let session: Option<(i32, String, Option<String>)> = sqlx::query_as(
+        r#"
+        SELECT s.user_id, u.email, u.display_name
+        FROM auth.sessions s
+        JOIN auth.users u ON s.user_id = u.user_id
+        WHERE s.session_token = $1
+          AND s.is_active = true
+          AND s.expires_at > NOW()
+          AND u.is_active = true
+        "#,
+    )
+    .bind(&req.session_token)
+    .fetch_optional(&pool)
+    .await?;
+
+    let Some((user_id, email, display_name)) = session else {
+        return Ok(CheckAccessResponse::decided(false, None, &req.action));
+    };
+
+    // Step `check_permission`: role → playbook_permissions grant lookup, with the
+    // identical allow-pattern / deny-pattern logic and action → capability
+    // mapping.  Parameterised binds replace the playbook's jsonb-escaped literals
+    // (same match semantics, safer quoting).  $2 is the playbook path (used for
+    // exact match, allow-pattern LIKE, and deny-pattern NOT LIKE); $3 is the
+    // action string.
+    let has_permission: bool = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*) > 0 AS has_permission
+        FROM auth.user_roles ur
+        JOIN auth.roles r ON ur.role_id = r.role_id
+        JOIN auth.playbook_permissions pp ON r.role_id = pp.role_id
+        WHERE ur.user_id = $1
+          AND (ur.expires_at IS NULL OR ur.expires_at > NOW())
+          AND (
+            pp.playbook_path = $2
+            OR (pp.allow_pattern IS NOT NULL AND $2 LIKE pp.allow_pattern)
+          )
+          AND (pp.deny_pattern IS NULL OR $2 NOT LIKE pp.deny_pattern)
+          AND (
+            ($3 = 'execute' AND pp.can_execute = true)
+            OR ($3 = 'view' AND pp.can_view = true)
+            OR ($3 = 'modify' AND pp.can_modify = true)
+          )
+        "#,
+    )
+    .bind(user_id)
+    .bind(&req.playbook_path)
+    .bind(&req.action)
+    .fetch_one(&pool)
+    .await?;
+
+    if !has_permission {
+        // Mirrors access_denied_no_permission → send_denied_callback.
+        return Ok(CheckAccessResponse::decided(false, None, &req.action));
+    }
+
+    // Mirrors access_granted → send_granted_callback: allowed=true with the
+    // user object (user_id/email/display_name) the gateway echoes back.
+    let user = serde_json::json!({
+        "user_id": user_id,
+        "email": email,
+        "display_name": display_name.unwrap_or_else(|| email.clone()),
+    });
+    Ok(CheckAccessResponse::decided(true, Some(user), &req.action))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -590,6 +786,49 @@ mod tests {
             decode_and_validate_token("not-a-jwt", "tenant.us.auth0.com").unwrap_err(),
             "Invalid JWT format"
         );
+    }
+
+    #[test]
+    fn check_access_granted_shape_matches_callback() {
+        // Granted → allowed=true, user echoed, message mirrors the playbook's
+        // access_granted step ("Access granted to <action> playbook").
+        let user = serde_json::json!({"user_id": 7, "email": "a@b.com", "display_name": "Ann"});
+        let resp = CheckAccessResponse::decided(true, Some(user.clone()), "execute");
+        assert_eq!(resp.status, "success");
+        assert_eq!(resp.data.get("allowed").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(
+            resp.data.get("message").and_then(|v| v.as_str()),
+            Some("Access granted to execute playbook")
+        );
+        assert_eq!(resp.data.get("user"), Some(&user));
+    }
+
+    #[test]
+    fn check_access_denied_shape_matches_callback() {
+        // Denied → allowed=false, no user, message collapses to the callback's
+        // hard-coded "Access denied" (both denial branches send the same body).
+        let resp = CheckAccessResponse::decided(false, None, "execute");
+        assert_eq!(resp.status, "success");
+        assert_eq!(resp.data.get("allowed").and_then(|v| v.as_bool()), Some(false));
+        assert_eq!(resp.data.get("message").and_then(|v| v.as_str()), Some("Access denied"));
+        assert!(resp.data.get("user").is_none());
+    }
+
+    #[test]
+    fn check_access_denied_never_leaks_user_even_if_passed() {
+        // Fail-closed hygiene: a user object is only attached on a grant.
+        let user = serde_json::json!({"user_id": 7});
+        let resp = CheckAccessResponse::decided(false, Some(user), "view");
+        assert!(resp.data.get("user").is_none());
+    }
+
+    #[test]
+    fn check_access_error_shape_is_retryable() {
+        // Lookup failure → status "error" (gateway surfaces retryable backend
+        // error, never a false grant).
+        let resp = CheckAccessResponse::error("db down".into());
+        assert_eq!(resp.status, "error");
+        assert_eq!(resp.data.get("allowed").and_then(|v| v.as_bool()), None);
     }
 
     #[test]
