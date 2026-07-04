@@ -169,6 +169,31 @@ pub struct AppConfig {
     #[serde(default)]
     pub shard_count: Option<u32>,
 
+    /// noetl/ai-meta#166 Phase 5 (server-routed publish). When `true`, the
+    /// server publishes an execution's **system-pool** command notifications to
+    /// a per-shard subject `noetl.commands.system.shard.<n>.<eid>` (where
+    /// `n = shard_for(eid, command_shard_count)`) instead of the legacy
+    /// `noetl.commands.system.<eid>`, so the owning drive replica's per-shard
+    /// consumer filter receives it first with no Phase-4 NAK redirect. Envy maps
+    /// `NOETL_SHARD_SUBJECT_ROUTE`. **Default `false`** → legacy subject, exact
+    /// current behavior. Safe to flip even before the worker fleet switches to
+    /// per-shard filters: the shard subject is a subtree of the pool wildcard,
+    /// so a broad-filter consumer still receives it and falls through to the
+    /// Phase-4 NAK path (subject subsumption; see [`crate::sharding::command_subject`]).
+    #[serde(default)]
+    pub shard_subject_route: bool,
+
+    /// noetl/ai-meta#166 Phase 5 — the **worker pool's** drive-shard count used
+    /// to route command notifications when [`Self::shard_subject_route`] is on.
+    /// Envy maps `NOETL_COMMAND_SHARD_COUNT`. This is a **distinct axis** from
+    /// [`Self::shard_count`] (`NOETL_SHARD_COUNT`, which shards the server's own
+    /// `noetl.event`/`noetl.command` tables across server replicas) — the two
+    /// must not be conflated. Must equal the system worker pool's
+    /// `NOETL_SHARD_COUNT`. When unset or `1`, shard routing is a no-op (legacy
+    /// subject) even if [`Self::shard_subject_route`] is on.
+    #[serde(default)]
+    pub command_shard_count: Option<u32>,
+
     /// Maximum serialised size (bytes) of a `command.issued` event's `context`
     /// before it is offloaded to the result store (noetl/ai-meta#114).  When the
     /// off-server orchestrate drive (`orchestrate_plugin_drive`) builds the next
@@ -779,6 +804,9 @@ impl Default for AppConfig {
             server_machine_id: None,
             shard_index: None,
             shard_count: None,
+            // noetl/ai-meta#166 Phase 5: server-routed shard publish is opt-in.
+            shard_subject_route: false,
+            command_shard_count: None,
             command_context_max_bytes: default_command_context_max_bytes(),
             // noetl/ai-meta#115 Phase 3: event-scan is the default; chain_walk is opt-in.
             state_build_mode: StateBuildMode::EventScan,
