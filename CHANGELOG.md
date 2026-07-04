@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.52.0](https://github.com/noetl/server/compare/v3.51.0...v3.52.0) (2026-07-04)
+
+### Features
+
+* **auth:** dark-launch Auth0 JWT signature verification ([#169](https://github.com/noetl/server/issues/169)) ([#276](https://github.com/noetl/server/issues/276)) ([b6a6fb4](https://github.com/noetl/server/commit/b6a6fb4c3c0283a14f496a8a6288611e23126a0e)), closes [#167](https://github.com/noetl/server/issues/167) [#168](https://github.com/noetl/server/issues/168)
+
 ## [3.51.0](https://github.com/noetl/server/compare/v3.50.0...v3.51.0) (2026-07-04)
 
 ### Features
