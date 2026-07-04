@@ -116,6 +116,10 @@ impl Default for GcRequest {
 pub struct GcCandidate {
     pub key: String,
     pub execution_id: i64,
+    /// Object class (`result` / `state_open` / `state_sealed` / `other`) — lets
+    /// an operator see whether a candidate is a result object or a state shard
+    /// (noetl/ai-meta#166 Phase 5).
+    pub class: &'static str,
     /// Why the object is dead (`unreferenced` — no surviving event for its
     /// execution; covers both aged-out and orphan).
     pub reason: &'static str,
@@ -141,6 +145,14 @@ pub struct GcReport {
     pub skipped_grace: usize,
     /// Objects skipped because the key did not parse to an `execution=` segment.
     pub skipped_unparseable: usize,
+    /// Echo of the `NOETL_STATE_SHARD_GC` opt-in guard (noetl/ai-meta#166 Phase 5).
+    pub state_shard_guard: bool,
+    /// Open state shards that `decide` ruled dead but the guard held back for the
+    /// extended open-shard grace. Always 0 when the guard is off.
+    pub state_open_guard_protected: usize,
+    /// State shards (open + sealed) among the dead candidates — the subset of
+    /// `candidates` whose class is `state_open` / `state_sealed`.
+    pub state_shard_candidates: usize,
     /// Delete failures (non-fatal; counted, the sweep continues).
     pub errors: usize,
     /// The dead objects (deleted, or would-be-deleted in dry-run).
@@ -158,6 +170,9 @@ impl GcReport {
             skipped_live: 0,
             skipped_grace: 0,
             skipped_unparseable: 0,
+            state_shard_guard: false,
+            state_open_guard_protected: 0,
+            state_shard_candidates: 0,
             errors: 0,
             candidates: Vec::new(),
         }
@@ -199,6 +214,114 @@ pub fn decide(
     // An undecodable age (shouldn't happen for a real eid) is treated as young.
     match age_seconds {
         Some(age) if age >= grace_seconds => Decision::Dead,
+        _ => Decision::SkipGrace,
+    }
+}
+
+/// The kind of tier object a key addresses (noetl/ai-meta#166 Phase 5). Result
+/// bytes and state shards co-locate under the same `execution=<eid>/` prefix
+/// (§3.1) — they diverge only in the trailing `results/` vs `state/<seal>`
+/// segment. Classifying lets the sweep report per-class counts and apply the
+/// opt-in state-shard guard without changing the liveness invariant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectClass {
+    /// `.../execution=<eid>/results/...` — a #104 result-tier object.
+    Result,
+    /// `.../execution=<eid>/state/open.<ext>` — an in-progress (never-sealed)
+    /// state shard (noetl/ai-meta#166 Phase 2).
+    StateOpen,
+    /// `.../execution=<eid>/state/sealed.<ext>` — a sealed (terminal) state shard.
+    StateSealed,
+    /// Anything else under the prefix (neither a result nor a recognised state
+    /// shard). Treated exactly like a result object for GC — classification only
+    /// drives reporting + the open-shard guard, never deletability on its own.
+    Other,
+}
+
+impl ObjectClass {
+    /// Stable metric/report label.
+    pub fn label(self) -> &'static str {
+        match self {
+            ObjectClass::Result => "result",
+            ObjectClass::StateOpen => "state_open",
+            ObjectClass::StateSealed => "state_sealed",
+            ObjectClass::Other => "other",
+        }
+    }
+}
+
+/// Classify a §7 physical object key. Pure string inspection — never touches the
+/// DB, never panics. Keys the state-shard writer emits end in
+/// `/state/open.<ext>` or `/state/sealed.<ext>`
+/// (`noetl/worker` `state_locator::StateCoordinates::physical_key`); result
+/// objects carry a `/results/` segment.
+pub fn classify_object(key: &str) -> ObjectClass {
+    if key.contains("/state/open.") {
+        ObjectClass::StateOpen
+    } else if key.contains("/state/sealed.") {
+        ObjectClass::StateSealed
+    } else if key.contains("/results/") {
+        ObjectClass::Result
+    } else {
+        ObjectClass::Other
+    }
+}
+
+/// `NOETL_STATE_SHARD_GC` — opt-in stricter policy for **open** state shards
+/// (noetl/ai-meta#166 Phase 5). Default off → state shards follow the exact same
+/// policy as result objects (today's behavior; the #104 sweep already reclaims
+/// them identically). On → an open state shard that `decide` marked `Dead` is
+/// held for an extended grace (`grace_seconds × open_grace_multiplier`) —
+/// belt-and-suspenders against a late cold-load racing retention on a
+/// never-sealed execution. Sealed shards + result objects are unaffected.
+pub fn state_shard_gc_enabled() -> bool {
+    matches!(
+        std::env::var("NOETL_STATE_SHARD_GC")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+/// Default multiplier applied to the grace window for an **open** state shard
+/// when the [`state_shard_gc_enabled`] guard is on. `7` → open shards survive
+/// seven grace windows past their execution aging out.
+fn default_open_grace_multiplier() -> i64 {
+    std::env::var("NOETL_STATE_SHARD_OPEN_GRACE_MULTIPLIER")
+        .ok()
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .filter(|m| *m >= 1)
+        .unwrap_or(7)
+}
+
+/// Class-aware GC verdict. Wraps the pure [`decide`] core and applies the opt-in
+/// state-shard guard: when `state_shard_guard` is on, an [`ObjectClass::StateOpen`]
+/// object that `decide` ruled `Dead` is downgraded to [`Decision::SkipGrace`]
+/// unless it is *also* past `grace_seconds × open_grace_multiplier`. Every other
+/// class uses `decide` verbatim. **The `SkipLive` invariant is never weakened** —
+/// the guard can only make the sweep *more* conservative, never less: it never
+/// turns a `Skip*` into a `Dead`. `open_grace_multiplier` is clamped to `>= 1`.
+#[allow(clippy::too_many_arguments)]
+pub fn decide_object(
+    class: ObjectClass,
+    execution_id: Option<i64>,
+    has_live_events: bool,
+    age_seconds: Option<i64>,
+    grace_seconds: i64,
+    state_shard_guard: bool,
+    open_grace_multiplier: i64,
+) -> Decision {
+    let base = decide(execution_id, has_live_events, age_seconds, grace_seconds);
+    // The guard only ever protects further; it never promotes to Dead.
+    if !state_shard_guard || class != ObjectClass::StateOpen || base != Decision::Dead {
+        return base;
+    }
+    let mult = open_grace_multiplier.max(1);
+    let extended = grace_seconds.saturating_mul(mult);
+    match age_seconds {
+        Some(age) if age >= extended => Decision::Dead,
         _ => Decision::SkipGrace,
     }
 }
@@ -258,6 +381,10 @@ pub async fn sweep(pool: &DbPool, backend: &ObjectBackend, req: &GcRequest) -> A
 
     let keys = backend.list(pool, &req.prefix, req.limit).await?;
     let now = now_ms();
+    // noetl/ai-meta#166 Phase 5: opt-in stricter open-state-shard guard. Off by
+    // default → state shards follow the exact result-object policy (today).
+    let state_shard_guard = state_shard_gc_enabled();
+    let open_grace_multiplier = default_open_grace_multiplier();
 
     let mut report = GcReport {
         enabled: true,
@@ -268,6 +395,9 @@ pub async fn sweep(pool: &DbPool, backend: &ObjectBackend, req: &GcRequest) -> A
         skipped_live: 0,
         skipped_grace: 0,
         skipped_unparseable: 0,
+        state_shard_guard,
+        state_open_guard_protected: 0,
+        state_shard_candidates: 0,
         errors: 0,
         candidates: Vec::new(),
     };
@@ -275,6 +405,7 @@ pub async fn sweep(pool: &DbPool, backend: &ObjectBackend, req: &GcRequest) -> A
     for key in keys {
         report.scanned += 1;
         let eid = parse_execution_id(&key);
+        let class = classify_object(&key);
 
         // The liveness lookup only runs once we have an eid — an unparseable key
         // is never deletable, so we short-circuit without touching the DB.
@@ -284,35 +415,65 @@ pub async fn sweep(pool: &DbPool, backend: &ObjectBackend, req: &GcRequest) -> A
         };
         let age = eid.and_then(|id| age_seconds(id, now));
 
-        match decide(eid, has_live, age, req.grace_seconds) {
+        // Whether the open-shard guard *would* have deleted this object under the
+        // base policy — used to count objects the guard specifically protected.
+        let guard_downgraded = state_shard_guard
+            && class == ObjectClass::StateOpen
+            && decide(eid, has_live, age, req.grace_seconds) == Decision::Dead;
+
+        match decide_object(
+            class,
+            eid,
+            has_live,
+            age,
+            req.grace_seconds,
+            state_shard_guard,
+            open_grace_multiplier,
+        ) {
             Decision::SkipUnparseable => {
                 report.skipped_unparseable += 1;
+                crate::metrics::record_result_tier_gc_object(class.label(), "skip_unparseable");
             }
             Decision::SkipLive => {
                 report.skipped_live += 1;
+                crate::metrics::record_result_tier_gc_object(class.label(), "skip_live");
             }
             Decision::SkipGrace => {
                 report.skipped_grace += 1;
+                if guard_downgraded {
+                    // The base policy said Dead; the open-shard guard held it back.
+                    report.state_open_guard_protected += 1;
+                    crate::metrics::record_result_tier_gc_object(class.label(), "guard_protected");
+                } else {
+                    crate::metrics::record_result_tier_gc_object(class.label(), "skip_grace");
+                }
             }
             Decision::Dead => {
                 let id = eid.expect("Dead verdict implies a parsed execution_id");
+                if class == ObjectClass::StateOpen || class == ObjectClass::StateSealed {
+                    report.state_shard_candidates += 1;
+                }
                 let mut deleted = false;
                 if !req.dry_run {
                     match backend.delete(pool, &key).await {
                         Ok(_) => {
                             report.deleted += 1;
                             deleted = true;
+                            crate::metrics::record_result_tier_gc_object(class.label(), "deleted");
                         }
                         Err(e) => {
                             report.errors += 1;
-                            tracing::warn!(execution_id = id, object_key = %key, error = %e, "result-tier GC delete failed");
+                            tracing::warn!(execution_id = id, object_key = %key, class = class.label(), error = %e, "result-tier GC delete failed");
                             continue;
                         }
                     }
+                } else {
+                    crate::metrics::record_result_tier_gc_object(class.label(), "dead_dryrun");
                 }
                 report.candidates.push(GcCandidate {
                     key,
                     execution_id: id,
+                    class: class.label(),
                     reason: "unreferenced",
                     deleted,
                 });
@@ -401,5 +562,129 @@ mod tests {
         assert!(!r.enabled);
         assert_eq!(r.deleted, 0);
         assert!(r.candidates.is_empty());
+    }
+
+    // ---- classify_object (noetl/ai-meta#166 Phase 5) -----------------
+
+    #[test]
+    fn classifies_result_and_state_shard_keys() {
+        let root = "noetl/env=prod/region=usc1/cell=usc1-a/shard=s0053/\
+                    tenant=muno/project=travel/date=2026-06-30/execution=325";
+        assert_eq!(
+            classify_object(&format!("{root}/results/start/0/0/1.feather")),
+            ObjectClass::Result
+        );
+        assert_eq!(
+            classify_object(&format!("{root}/state/open.feather")),
+            ObjectClass::StateOpen
+        );
+        assert_eq!(
+            classify_object(&format!("{root}/state/sealed.feather")),
+            ObjectClass::StateSealed
+        );
+        // A key under neither results/ nor a recognised state seal → Other.
+        assert_eq!(
+            classify_object(&format!("{root}/misc/thing.json")),
+            ObjectClass::Other
+        );
+        assert_eq!(classify_object(""), ObjectClass::Other);
+    }
+
+    #[test]
+    fn object_class_labels_are_stable() {
+        assert_eq!(ObjectClass::Result.label(), "result");
+        assert_eq!(ObjectClass::StateOpen.label(), "state_open");
+        assert_eq!(ObjectClass::StateSealed.label(), "state_sealed");
+        assert_eq!(ObjectClass::Other.label(), "other");
+    }
+
+    // ---- decide_object guard -----------------------------------------
+
+    #[test]
+    fn decide_object_is_decide_when_guard_off() {
+        // Guard off → every class uses `decide` verbatim, for all inputs.
+        for class in [
+            ObjectClass::Result,
+            ObjectClass::StateOpen,
+            ObjectClass::StateSealed,
+            ObjectClass::Other,
+        ] {
+            for (eid, live, age, grace) in [
+                (Some(7_i64), false, Some(100_000_i64), 86_400_i64),
+                (Some(7), false, Some(10), 86_400),
+                (Some(7), true, Some(100_000), 86_400),
+                (None, false, Some(100_000), 0),
+            ] {
+                assert_eq!(
+                    decide_object(class, eid, live, age, grace, false, 7),
+                    decide(eid, live, age, grace),
+                    "guard-off must equal decide (class={class:?})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn guard_protects_open_shard_within_extended_grace() {
+        // Base policy: Dead (unreferenced, age 100k >= grace 86_400).
+        assert_eq!(
+            decide(Some(7), false, Some(100_000), 86_400),
+            Decision::Dead
+        );
+        // Guard on: an OPEN shard at that age is held (100k < 86_400*7=604_800).
+        assert_eq!(
+            decide_object(
+                ObjectClass::StateOpen,
+                Some(7),
+                false,
+                Some(100_000),
+                86_400,
+                true,
+                7
+            ),
+            Decision::SkipGrace
+        );
+        // Past the extended grace → Dead again.
+        assert_eq!(
+            decide_object(
+                ObjectClass::StateOpen,
+                Some(7),
+                false,
+                Some(700_000),
+                86_400,
+                true,
+                7
+            ),
+            Decision::Dead
+        );
+    }
+
+    #[test]
+    fn guard_does_not_touch_sealed_or_result_or_live() {
+        // Sealed shard + result object: guard on, but they follow the base policy.
+        for class in [ObjectClass::StateSealed, ObjectClass::Result, ObjectClass::Other] {
+            assert_eq!(
+                decide_object(class, Some(7), false, Some(100_000), 86_400, true, 7),
+                Decision::Dead,
+                "guard must not protect {class:?}"
+            );
+        }
+        // Live is never weakened, even for an open shard with the guard on — and
+        // the guard can NEVER promote a Skip to Dead.
+        assert_eq!(
+            decide_object(ObjectClass::StateOpen, Some(7), true, Some(700_000), 86_400, true, 7),
+            Decision::SkipLive
+        );
+    }
+
+    #[test]
+    fn guard_multiplier_is_clamped_to_at_least_one() {
+        // A pathological multiplier of 0 must not make the extended grace 0
+        // (which would delete every aged-out open shard immediately). Clamped
+        // to 1 → behaves like the base grace.
+        assert_eq!(
+            decide_object(ObjectClass::StateOpen, Some(7), false, Some(100_000), 86_400, true, 0),
+            Decision::Dead
+        );
     }
 }
