@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.51.0](https://github.com/noetl/server/compare/v3.50.0...v3.51.0) (2026-07-04)
+
+### Features
+
+* **result-tier-gc:** classify state shards + opt-in open-shard guard ([#166](https://github.com/noetl/server/issues/166) Phase 5) ([#275](https://github.com/noetl/server/issues/275)) ([af26bd2](https://github.com/noetl/server/commit/af26bd262c610df4313b9726b63c276aeda1394c)), closes [#104](https://github.com/noetl/server/issues/104)
+
 ## [3.50.0](https://github.com/noetl/server/compare/v3.49.0...v3.50.0) (2026-07-02)
 
 ### Features
