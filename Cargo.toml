@@ -115,6 +115,14 @@ minijinja = { version = "2.5", features = ["loader"] }
 # Cryptography
 aes-gcm = "0.10"
 base64 = "0.22"
+# Auth0 ID-token RS256 signature verification (noetl/ai-meta#169), shipped dark
+# behind NOETL_AUTH_VERIFY_SIGNATURE.  Uses the same `ring` provider the rustls
+# stack already pulls in (no new crypto backend) and its built-in `jwk` module
+# parses the tenant JWKS we fetch via the existing `reqwest`/rustls client, so
+# no separate JWKS crate is added.  Restricting `Validation` to RS256 also closes
+# the alg-confusion class (a forged `alg: none` / `HS256` token is rejected
+# before any key lookup).
+jsonwebtoken = "9"
 rand = "0.8"
 async-trait = "0.1"
 zeroize = "1"
