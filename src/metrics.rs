@@ -181,6 +181,41 @@ pub fn record_orphan_sweep(outcome: &str) {
     orphan_sweep_total().with_label_values(&[outcome]).inc();
 }
 
+// ── Server-routed command publish (noetl/ai-meta#166 Phase 5) ────────────────
+
+/// `noetl_command_publish_total{route,pool}` — command notifications published
+/// to NATS, by routing shape. `route` = `sharded` (published to the per-shard
+/// subject `noetl.commands.<pool>.shard.<n>.<eid>` under
+/// `NOETL_SHARD_SUBJECT_ROUTE`) or `legacy` (the pool subject
+/// `noetl.commands.<pool>.<eid>`). `pool` is the resolved pool segment
+/// (`system`/`shared`/`subscription`/…). With server-routing off every publish
+/// is `legacy`; the `sharded` series only materialises once the flag is on and
+/// `NOETL_COMMAND_SHARD_COUNT > 1` for the system pool.
+pub fn command_publish_total() -> &'static IntCounterVec {
+    static M: OnceLock<IntCounterVec> = OnceLock::new();
+    M.get_or_init(|| {
+        let counter = IntCounterVec::new(
+            Opts::new(
+                "noetl_command_publish_total",
+                "Command notifications published to NATS, by routing shape (noetl/ai-meta#166).",
+            ),
+            &["route", "pool"],
+        )
+        .expect("static counter spec must be valid");
+        registry()
+            .register(Box::new(counter.clone()))
+            .expect("counter registration must succeed");
+        counter
+    })
+}
+
+/// Record one command-notification publish (see [`command_publish_total`]).
+pub fn record_command_publish(route: &str, pool: &str) {
+    command_publish_total()
+        .with_label_values(&[route, pool])
+        .inc();
+}
+
 // ── Off-server tail-attach accelerator (noetl/ai-meta#156) ───────────────────
 
 /// `noetl_offserver_tail_attached_total{outcome}` — off-server drive dispatches

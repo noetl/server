@@ -1629,7 +1629,24 @@ async fn publish_command_notification(
             _ => "shared",
         },
     };
-    let subject = format!("noetl.commands.{}.{}", pool_segment, execution_id);
+    // noetl/ai-meta#166 Phase 5: route the system pool's commands to a per-shard
+    // subject so the owning drive replica's per-shard consumer receives them
+    // first (no Phase-4 NAK redirect). Default off → legacy pool subject. The
+    // shard subject stays under `noetl.commands.<pool>.>`, so flipping the flag
+    // before the fleet switches to per-shard filters degrades to the NAK path
+    // rather than dropping a hop (see `sharding::command_subject`).
+    let command_shard_count = state.config.command_shard_count.unwrap_or(1);
+    let subject = crate::sharding::command_subject(
+        pool_segment,
+        execution_id,
+        state.config.shard_subject_route,
+        command_shard_count,
+    );
+    let publish_route = if subject.contains(".shard.") {
+        "sharded"
+    } else {
+        "legacy"
+    };
 
     let server_url = state
         .config
@@ -1666,10 +1683,13 @@ async fn publish_command_notification(
         .await
         .map_err(|e| AppError::Internal(format!("NATS publish ack failed: {e}")))?;
 
+    crate::metrics::record_command_publish(publish_route, pool_segment);
+
     tracing::info!(
         execution_id,
         event_id,
         %subject,
+        route = publish_route,
         command_id = %command_id,
         "Published command notification to NATS"
     );

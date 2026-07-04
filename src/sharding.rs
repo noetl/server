@@ -203,6 +203,56 @@ pub fn shard_for(execution_id: i64, shard_count: u32) -> u32 {
     (h.finish() % shard_count as u64) as u32
 }
 
+/// The pool segment whose commands carry the sharded off-server state cache
+/// and are therefore eligible for per-shard subject routing (noetl/ai-meta#166
+/// Phase 5). Only the system pool runs the stateful off-server drive builder;
+/// the `shared` / `subscription` pools are stateless-ish and stay on the legacy
+/// subject so their commands aren't needlessly pinned to a single shard replica.
+pub const ROUTABLE_POOL: &str = "system";
+
+/// Build the NATS command-notification subject for one command.
+///
+/// noetl/ai-meta#166 Phase 5 (server-routed publish). Two shapes:
+///
+/// - **Legacy** (`shard_route` off, or `command_shard_count <= 1`, or the pool
+///   is not [`ROUTABLE_POOL`]):
+///   `noetl.commands.<pool>.<execution_id>` — today's exact subject.
+/// - **Sharded** (`shard_route` on, `command_shard_count > 1`, routable pool):
+///   `noetl.commands.<pool>.shard.<n>.<execution_id>` where
+///   `n = shard_for(execution_id, command_shard_count)` — the **same**
+///   XxHash64 ownership hash the worker re-implements byte-for-byte
+///   ([`shard_for`]), so the owning shard replica's per-shard consumer filter
+///   (`noetl.commands.<pool>.shard.<n>.>`) receives it first with no NAK
+///   redirect.
+///
+/// **Subject subsumption is the safety property**: the sharded subject is a
+/// subtree of the legacy pool wildcard `noetl.commands.<pool>.>`. A replica
+/// still bound to the broad filter (a fleet mid-rollout, or a shard with no
+/// dedicated consumer) *still receives* the shard-routed command and falls
+/// through to the Phase-4 NAK-affinity path — so a "wrong" route degrades to
+/// the existing NAK path, never drops a hop. `claim_command` atomicity remains
+/// the single exactly-once gate regardless of which consumer delivers it.
+///
+/// `command_shard_count` is the **worker pool's** drive-shard count
+/// (`NOETL_COMMAND_SHARD_COUNT`), a distinct axis from the server's own
+/// [`ShardConfig::shard_count`] (`NOETL_SHARD_COUNT`, which shards the
+/// `noetl.event`/`noetl.command` tables across server replicas). Do not
+/// conflate them.
+pub fn command_subject(
+    pool: &str,
+    execution_id: i64,
+    shard_route: bool,
+    command_shard_count: u32,
+) -> String {
+    let routed = shard_route && command_shard_count > 1 && pool == ROUTABLE_POOL;
+    if routed {
+        let n = shard_for(execution_id, command_shard_count);
+        format!("noetl.commands.{pool}.shard.{n}.{execution_id}")
+    } else {
+        format!("noetl.commands.{pool}.{execution_id}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -380,5 +430,103 @@ mod tests {
         assert_eq!(cfg.shard_index, 0);
         assert_eq!(cfg.shard_count, 1);
         assert!(cfg.owns(42));
+    }
+
+    // ---- command_subject (noetl/ai-meta#166 Phase 5) -----------------
+
+    #[test]
+    fn command_subject_legacy_when_route_off() {
+        // Flag off → today's exact subject regardless of count.
+        assert_eq!(
+            command_subject("system", 325, false, 4),
+            "noetl.commands.system.325"
+        );
+        assert_eq!(
+            command_subject("shared", 99, false, 4),
+            "noetl.commands.shared.99"
+        );
+    }
+
+    #[test]
+    fn command_subject_legacy_when_single_shard() {
+        // Flag on but count<=1 → no-op, legacy subject (single owner = today).
+        assert_eq!(
+            command_subject("system", 325, true, 1),
+            "noetl.commands.system.325"
+        );
+        assert_eq!(
+            command_subject("system", 325, true, 0),
+            "noetl.commands.system.325"
+        );
+    }
+
+    #[test]
+    fn command_subject_legacy_for_non_routable_pool() {
+        // Only the system pool is shard-routed; shared/subscription stay legacy
+        // even with the flag on and count>1 (their commands aren't shard-pinned).
+        assert_eq!(
+            command_subject("shared", 325, true, 4),
+            "noetl.commands.shared.325"
+        );
+        assert_eq!(
+            command_subject("subscription", 325, true, 4),
+            "noetl.commands.subscription.325"
+        );
+    }
+
+    #[test]
+    fn command_subject_routes_system_pool_by_shard_for() {
+        // Sharded subject uses shard_for(eid, count) — the identical hash the
+        // worker re-implements, so the owner's per-shard filter matches.
+        let count = 4;
+        for eid in [1_i64, 42, 325, 320_816_801_799_737_344, i64::MAX] {
+            let n = shard_for(eid, count);
+            assert_eq!(
+                command_subject("system", eid, true, count),
+                format!("noetl.commands.system.shard.{n}.{eid}"),
+            );
+        }
+    }
+
+    #[test]
+    fn shard_for_matches_worker_pinned_vectors() {
+        // Cross-repo parity guard. The worker re-implements this hash byte-for-
+        // byte (`noetl/worker` src/sharding.rs, twox-hash 1.6.3, seed 0, LE
+        // bytes) and pins the SAME vectors in
+        // `tests::shard_for_matches_server_pinned_vectors`. These are the
+        // resolved literals; a twox-hash major bump (or a seed/endianness
+        // change) on EITHER side breaks this test instead of silently routing
+        // a command to a subject no worker consumes. Owner-first delivery is
+        // correct only while these two impls agree — that is exactly what this
+        // pins. Do NOT edit the literals to "fix" a failure; a change here means
+        // the two repos diverged and the shard subject would miss its owner.
+        assert_eq!(shard_for(320_816_801_799_737_344, 16), 14);
+        assert_eq!(shard_for(1, 4), 1);
+        assert_eq!(shard_for(42, 4), 3);
+        assert_eq!(shard_for(325, 4), 0);
+        assert_eq!(shard_for(325, 8), 4);
+        assert_eq!(shard_for(i64::MAX, 4), 0);
+    }
+
+    #[test]
+    fn command_subject_pins_the_full_shard_subject() {
+        // The exact wire subject a shard-4 owner's consumer must filter.
+        assert_eq!(
+            command_subject("system", 325, true, 8),
+            "noetl.commands.system.shard.4.325"
+        );
+    }
+
+    #[test]
+    fn command_subject_sharded_is_subtree_of_legacy_wildcard() {
+        // Subject subsumption: the shard subject lives under
+        // `noetl.commands.system.>`, so a broad-filter consumer still receives
+        // it (degrade-to-NAK safety). Assert the prefix relationship holds.
+        let sharded = command_subject("system", 325, true, 8);
+        assert!(
+            sharded.starts_with("noetl.commands.system."),
+            "shard subject {sharded} must sit under the pool wildcard"
+        );
+        assert!(sharded.contains(".shard."));
     }
 }
