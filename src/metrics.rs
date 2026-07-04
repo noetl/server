@@ -181,6 +181,41 @@ pub fn record_orphan_sweep(outcome: &str) {
     orphan_sweep_total().with_label_values(&[outcome]).inc();
 }
 
+// ── Result/state tier GC (noetl/ai-meta#104 Phase F + #166 Phase 5) ──────────
+
+/// `noetl_result_tier_gc_objects_total{class,action}` — objects a tier-GC sweep
+/// examined, by class and outcome. `class` = `result` / `state_open` /
+/// `state_sealed` / `other` (noetl/ai-meta#166 Phase 5 classification); `action`
+/// = `skip_live` / `skip_grace` / `skip_unparseable` / `guard_protected`
+/// (open state shard held by `NOETL_STATE_SHARD_GC`) / `dead_dryrun` /
+/// `deleted`. Lets an operator see how many state shards vs result objects a
+/// sweep reclaims without parsing the JSON report. Zero increments when
+/// `NOETL_RESULT_TIER_GC` is off (the sweep is a no-op).
+pub fn result_tier_gc_objects_total() -> &'static IntCounterVec {
+    static M: OnceLock<IntCounterVec> = OnceLock::new();
+    M.get_or_init(|| {
+        let counter = IntCounterVec::new(
+            Opts::new(
+                "noetl_result_tier_gc_objects_total",
+                "Tier-GC objects by class and action (noetl/ai-meta#104 + #166).",
+            ),
+            &["class", "action"],
+        )
+        .expect("static counter spec must be valid");
+        registry()
+            .register(Box::new(counter.clone()))
+            .expect("counter registration must succeed");
+        counter
+    })
+}
+
+/// Record one tier-GC object outcome (see [`result_tier_gc_objects_total`]).
+pub fn record_result_tier_gc_object(class: &str, action: &str) {
+    result_tier_gc_objects_total()
+        .with_label_values(&[class, action])
+        .inc();
+}
+
 // ── Off-server tail-attach accelerator (noetl/ai-meta#156) ───────────────────
 
 /// `noetl_offserver_tail_attached_total{outcome}` — off-server drive dispatches
