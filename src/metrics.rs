@@ -1118,6 +1118,66 @@ pub fn record_auth_sync(operation: &str, outcome: &str) {
         .inc();
 }
 
+/// Counter: Auth0 ID-token signature verification attempts (noetl/ai-meta#169),
+/// bucketed by `mode` (`shadow` / `enforce`) and `outcome` (`success` /
+/// `bad_signature` / `bad_claims` / `unknown_kid` / `malformed` /
+/// `jwks_unavailable` / `no_domain`).  Shipped dark behind
+/// `NOETL_AUTH_VERIFY_SIGNATURE`; the counter makes the canary observable —
+/// during `shadow` rollout a nonzero non-`success` count means real prod tokens
+/// would be rejected under `enforce`, so DO NOT flip until this reads
+/// success-only for live traffic.
+pub fn auth_jwt_verify_total() -> &'static IntCounterVec {
+    static M: OnceLock<IntCounterVec> = OnceLock::new();
+    M.get_or_init(|| {
+        let counter = IntCounterVec::new(
+            Opts::new(
+                "noetl_auth_jwt_verify_total",
+                "Auth0 ID-token signature verification attempts by mode (shadow/enforce) and outcome.",
+            ),
+            &["mode", "outcome"],
+        )
+        .expect("static counter spec must be valid");
+        registry()
+            .register(Box::new(counter.clone()))
+            .expect("counter registration must succeed");
+        counter
+    })
+}
+
+/// Increment [`auth_jwt_verify_total`] by 1 for the given mode + outcome.
+pub fn record_jwt_verify(mode: &str, outcome: &str) {
+    auth_jwt_verify_total()
+        .with_label_values(&[mode, outcome])
+        .inc();
+}
+
+/// Counter: JWKS cache events (noetl/ai-meta#169), bucketed by `event`
+/// (`cache_hit` / `cache_miss` / `unknown_kid_refresh`).  `unknown_kid_refresh`
+/// is the Auth0 key-rotation signal — a spike means keys rotated and the cache
+/// re-fetched to pick up the new `kid`.
+pub fn auth_jwks_total() -> &'static IntCounterVec {
+    static M: OnceLock<IntCounterVec> = OnceLock::new();
+    M.get_or_init(|| {
+        let counter = IntCounterVec::new(
+            Opts::new(
+                "noetl_auth_jwks_total",
+                "Auth0 JWKS cache events by type (cache_hit/cache_miss/unknown_kid_refresh).",
+            ),
+            &["event"],
+        )
+        .expect("static counter spec must be valid");
+        registry()
+            .register(Box::new(counter.clone()))
+            .expect("counter registration must succeed");
+        counter
+    })
+}
+
+/// Increment [`auth_jwks_total`] by 1 for the given cache event.
+pub fn record_jwks_event(event: &str) {
+    auth_jwks_total().with_label_values(&[event]).inc();
+}
+
 /// Secrets-Wallet Phase 6a: per-resolve counter for keychain entries
 /// against external secret providers.
 ///

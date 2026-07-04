@@ -384,6 +384,25 @@ pub async fn login(
         }
     };
 
+    // 1b. Auth0 JWT **signature** verification (noetl/ai-meta#169), shipped dark.
+    // With `NOETL_AUTH_VERIFY_SIGNATURE` unset/off this is a no-op and the login
+    // decision is byte-identical to the claims-decode above.  In `shadow` it
+    // logs + meters a would-reject but still lets the login proceed; only in
+    // `enforce` does a bad signature / bad standard-claim reject the login (same
+    // `token_error` envelope a bad claims-decode returns).  See
+    // handlers::auth_verify for the JWKS fetch/cache + kid-rotation logic.
+    let verify_mode = crate::handlers::auth_verify::verify_mode();
+    if let Err(reason) = crate::handlers::auth_verify::enforce_for_login(
+        &req.auth0_token,
+        &req.auth0_domain,
+        verify_mode,
+    )
+    .await
+    {
+        crate::metrics::record_auth_sync("login", "invalid");
+        return Json(LoginResponse::token_error(reason));
+    }
+
     // 2. Upsert user + create session (mirrors `create_user_session`).
     match login_create_session(&cred, &req, &claims).await {
         Ok(resp) => {
