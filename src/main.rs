@@ -321,6 +321,29 @@ fn build_router(
             "/api/executions/{execution_id}/finalize",
             post(handlers::executions::finalize),
         )
+        .with_state(execution_service.clone());
+
+    // EHDB Data Query Interface (noetl/ai-meta#178).  Read-only query
+    // API over NoETL platform read-model data under `/api/ehdb/...`.
+    // The server stays control-plane: projection / read-model tiers are
+    // served DIRECTLY from the read-model store (via `ExecutionService`);
+    // raw data-plane tier queries route to the worker (stubbed seam at
+    // `/api/ehdb/tiers/{tier}`).  No EHDB data-plane engine is linked into
+    // this binary — the control-plane guard stays intact.  See
+    // `handlers::ehdb`.
+    let ehdb_routes = Router::new()
+        .route("/api/ehdb", get(handlers::ehdb::index))
+        .route("/api/ehdb/executions", get(handlers::ehdb::list_executions))
+        .route(
+            "/api/ehdb/executions/{execution_id}",
+            get(handlers::ehdb::get_execution_state),
+        )
+        .route(
+            "/api/ehdb/executions/{execution_id}/events",
+            get(handlers::ehdb::list_execution_events),
+        )
+        .route("/api/ehdb/events", get(handlers::ehdb::scan_events))
+        .route("/api/ehdb/tiers/{tier}", get(handlers::ehdb::raw_tier_query))
         .with_state(execution_service);
 
     // Replay engine routes (Phase D R5 of noetl/ai-meta#49 →
@@ -597,6 +620,7 @@ fn build_router(
         .merge(keychain_routes)
         .merge(execution_routes)
         .merge(executions_routes)
+        .merge(ehdb_routes)
         .merge(subscription_routes)
         .merge(replay_routes)
         .merge(result_store_routes)
