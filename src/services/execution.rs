@@ -523,6 +523,111 @@ impl ExecutionService {
         })
     }
 
+    /// Bounded, ordered read of the **event read-model** for one
+    /// execution — the read-serving primitive behind
+    /// `GET /api/ehdb/executions/{id}/events`.
+    ///
+    /// Read-only, secret-free by construction: only the projected
+    /// columns (`event_id`, `event_type`, `node_name`, `status`,
+    /// `created_at`) are selected — the `result` / `error` / `context`
+    /// payload bodies (which can carry credential material) are never
+    /// read, mirroring `ehdb_reference::projection::EventReadModelView`.
+    ///
+    /// Ordered ASC by `event_id` (the application-side snowflake, which
+    /// is the monotonic global-ordering key for events) with an
+    /// `after`-cursor for forward pagination. Routed to the
+    /// execution's shard via `pool_for(execution_id)`.
+    #[allow(clippy::type_complexity)]
+    pub async fn ehdb_events_by_execution(
+        &self,
+        execution_id: i64,
+        after: Option<i64>,
+        limit: i64,
+    ) -> AppResult<Vec<(i64, String, Option<String>, Option<String>, DateTime<Utc>)>> {
+        let rows =
+            sqlx::query_as::<_, (i64, String, Option<String>, Option<String>, DateTime<Utc>)>(
+                r#"
+            SELECT
+                event_id,
+                event_type,
+                node_name,
+                status,
+                created_at AT TIME ZONE 'UTC' as created_at
+            FROM noetl.event
+            WHERE execution_id = $1
+              AND ($2::BIGINT IS NULL OR event_id > $2)
+            ORDER BY event_id ASC
+            LIMIT $3
+            "#,
+            )
+            .bind(execution_id)
+            .bind(after)
+            .bind(limit)
+            .fetch_all(self.pool_for(execution_id))
+            .await?;
+        Ok(rows)
+    }
+
+    /// Bounded, ordered scan of the **event read-model** across the log
+    /// by global sequence — the read-serving primitive behind
+    /// `GET /api/ehdb/events`.
+    ///
+    /// Same secret-free projection as [`Self::ehdb_events_by_execution`].
+    /// Ordered ASC by `event_id` with an `after`-cursor.
+    ///
+    /// Reads the cluster-master pool (`pools.cluster()`). In single-pool
+    /// (kind / unsharded) deployments this is the whole log and the scan
+    /// is globally ordered. Under multi-shard prod a globally-ordered
+    /// scan needs a per-shard fan-out + k-way merge (follow-up); this
+    /// slice is scoped to the control-plane read-model the server already
+    /// serves single-pool.
+    #[allow(clippy::type_complexity)]
+    pub async fn ehdb_events_scan(
+        &self,
+        after: Option<i64>,
+        limit: i64,
+    ) -> AppResult<
+        Vec<(
+            i64,
+            i64,
+            String,
+            Option<String>,
+            Option<String>,
+            DateTime<Utc>,
+        )>,
+    > {
+        let rows = sqlx::query_as::<
+            _,
+            (
+                i64,
+                i64,
+                String,
+                Option<String>,
+                Option<String>,
+                DateTime<Utc>,
+            ),
+        >(
+            r#"
+            SELECT
+                event_id,
+                execution_id,
+                event_type,
+                node_name,
+                status,
+                created_at AT TIME ZONE 'UTC' as created_at
+            FROM noetl.event
+            WHERE ($1::BIGINT IS NULL OR event_id > $1)
+            ORDER BY event_id ASC
+            LIMIT $2
+            "#,
+        )
+        .bind(after)
+        .bind(limit)
+        .fetch_all(self.pools.cluster())
+        .await?;
+        Ok(rows)
+    }
+
     /// Get execution status.
     pub async fn get_status(&self, execution_id: i64) -> AppResult<ExecutionStatus> {
         // Check if execution exists
