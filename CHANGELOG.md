@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.53.0](https://github.com/noetl/server/compare/v3.52.0...v3.53.0) (2026-07-07)
+
+### Features
+
+* **ehdb:** read-only EHDB Data Query Interface — /api/ehdb/* read-model surface ([#277](https://github.com/noetl/server/issues/277)) ([08cbe9f](https://github.com/noetl/server/commit/08cbe9f154e1f24ce7d735e93b47f2ac3df23afb)), closes [noetl/ai-meta#178](https://github.com/noetl/ai-meta/issues/178) [noetl/ai-meta#178](https://github.com/noetl/ai-meta/issues/178)
+
 ## [3.52.0](https://github.com/noetl/server/compare/v3.51.0...v3.52.0) (2026-07-04)
 
 ### Features
