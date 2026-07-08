@@ -99,6 +99,64 @@ pub async fn get(pool: &DbPool, object_key: &str) -> AppResult<Option<ObjectRow>
     }))
 }
 
+/// Resolve an over-budget result's JSON-tier object by its canonical logical
+/// coordinates (noetl/ai-meta#104 Phase C read path for the explicit
+/// `artifact get` / `result_fetch` lazy-load surface).
+///
+/// The producer-staged / materialised result-tier object lives at the §7
+/// physical key
+/// `noetl/env=…/region=…/cell=…/shard=…/tenant=…/project=…/date=…/execution=<eid>/results/<step>/<frame>/<row>/<attempt>.json`.
+/// The caller (`resolve_ref`) has the canonical logical coordinates
+/// (`<eid>/<step>/<frame>/<row>/<attempt>`) from the worker-stamped
+/// `reference.uri` but NOT the env/region/cell/shard/date placement prefix
+/// (that needs the cell registry + the snowflake date partition). Rather than
+/// reconstruct the full key — which would drag the cell-placement + arrow-decode
+/// graph onto the lean control plane — anchor on the placement-independent
+/// **suffix**: the logical tail is unique per `(execution, step, frame, row,
+/// attempt)`, so a single suffix match resolves the object without knowing the
+/// physical placement.
+///
+/// Scoped to the JSON tier (`.json`): a non-tabular over-budget result stores
+/// its scrubbed `result.context` as JSON, byte-identical to what the legacy
+/// `result_store` row held, so the returned body matches the legacy resolve
+/// contract exactly. Tabular results tier as Arrow Feather and are resolved via
+/// the worker's bulk-binding `resolve_by_urn` path (which owns the arrow decode
+/// the control plane deliberately does not carry).
+///
+/// `logical_tail` is `<step>/<frame>/<row>/<attempt>`; LIKE metacharacters in it
+/// are escaped so a step name with `%`/`_` cannot widen the match.
+pub async fn get_result_tier_json(
+    pool: &DbPool,
+    execution_id: i64,
+    logical_tail: &str,
+) -> AppResult<Option<ObjectRow>> {
+    // Escape LIKE metacharacters (\ % _) in the caller-supplied tail so the
+    // match stays anchored to exactly this result's coordinates.
+    let escaped_tail = logical_tail
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    let pattern = format!("%/execution={execution_id}/results/{escaped_tail}.json");
+    let rows = sqlx::query(
+        r#"
+        SELECT digest, media_type, bytes
+        FROM noetl.object_store
+        WHERE object_key LIKE $1 ESCAPE '\'
+        ORDER BY created_at DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(pattern)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows.into_iter().next().map(|r| ObjectRow {
+        digest: r.get::<String, _>("digest"),
+        media_type: r.get::<String, _>("media_type"),
+        bytes: r.get::<Vec<u8>, _>("bytes"),
+    }))
+}
+
 /// List object keys under `prefix` (most-recently-written first), capped at
 /// `limit`. Backs the result-tier GC sweep ([noetl/ai-meta#104](https://github.com/noetl/ai-meta/issues/104)
 /// Phase F) for the Postgres backend.

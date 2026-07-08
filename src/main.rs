@@ -500,6 +500,15 @@ fn build_router(
             "/api/internal/objects/{*key}",
             put(handlers::objects::put).get(handlers::objects::get),
         )
+        // Producer-staged result-tier objects (noetl/ai-meta#104) carry the
+        // same over-budget tool results the `PUT /api/result/{execution_id}`
+        // route accepts — 10s of MB (e.g. test_storage_tiers stages a 15 MB
+        // `test_large_storage` result). Without a matching limit this route
+        // inherits axum's 2 MB default and 413s the write; producer-staging
+        // swallows the error (best-effort), so the tier object silently never
+        // lands and a later `artifact get` resolves 404. Mirror the 64 MB cap
+        // the result-store route uses.
+        .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
         .with_state(handlers::objects::ObjectStoreDeps {
             pool: db_pool.clone(),
             backend: object_backend.clone(),
