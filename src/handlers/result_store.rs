@@ -20,7 +20,9 @@ use axum::{
 use serde::Deserialize;
 
 use crate::error::AppResult;
-use crate::services::result_store::{parse_noetl_ref, PutResultBody, ResultStoreService};
+use crate::services::result_store::{
+    parse_result_ref, PutResultBody, ResultRef, ResultStoreService,
+};
 
 // ---------------------------------------------------------------------------
 // Handler state
@@ -165,7 +167,15 @@ pub async fn resolve_ref(
 
     let t0 = std::time::Instant::now();
 
-    let parsed = match parse_noetl_ref(&params.r#ref) {
+    // Accept BOTH reference shapes (noetl/ai-meta#104):
+    //   - Legacy `noetl://execution/<eid>/result/<name>/<id>` → `noetl.result_store`.
+    //   - Canonical `noetl://<tenant>/<project>/results/<eid>/<step>/<frame>/<row>/<attempt>`
+    //     → the #104 object tier (the authoritative byte source under dual-write
+    //     retirement).  The worker exposes the canonical URI as a step's `_ref`
+    //     when the tier is authoritative, so the `artifact get` / `result_fetch`
+    //     lazy-load surface can resolve an over-budget result even though the
+    //     legacy `result_store` row was never written.
+    let parsed = match parse_result_ref(&params.r#ref) {
         Ok(r) => r,
         Err(msg) => {
             tracing::warn!(
@@ -182,10 +192,21 @@ pub async fn resolve_ref(
         }
     };
 
-    let execution_id = parsed.execution_id;
-    let name = parsed.name.clone();
-
-    let result = deps.service.resolve(&parsed).await;
+    let (execution_id, name, result) = match &parsed {
+        ResultRef::Legacy(l) => (
+            l.execution_id,
+            l.name.clone(),
+            deps.service.resolve(l).await,
+        ),
+        ResultRef::Canonical(loc) => {
+            // Best-effort coords for the log/metric fields; resolution itself
+            // re-parses inside `resolve_canonical`.
+            let (eid, step) = noetl_locator::ResultCoordinates::from_locator(loc)
+                .map(|c| (c.execution_id, c.step))
+                .unwrap_or((0, params.r#ref.clone()));
+            (eid, step, deps.service.resolve_canonical(loc).await)
+        }
+    };
     let elapsed = t0.elapsed().as_secs_f64();
 
     match result {

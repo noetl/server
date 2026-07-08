@@ -1157,12 +1157,28 @@ impl WorkflowOrchestrator {
                 if !forward_reachable(target, steps).contains(src_name.as_str()) {
                     continue;
                 }
-                // (3) recency: src completed strictly after target.
-                let src_done = state.steps.get(src_name).and_then(|s| s.completed_at);
-                let tgt_done = state.steps.get(target).and_then(|s| s.completed_at);
-                match (src_done, tgt_done) {
-                    (Some(s), Some(t)) if s > t => {}
-                    _ => continue,
+                // (3) recency: src completed strictly after target — EXCEPT for a
+                // self-loop (`src == target`, e.g. a pagination step whose own
+                // `next` arc re-enters it under a `when:` guard off its `set:`
+                // ctx mutations).  A self-loop is its own back-edge: there is one
+                // step and one `completed_at`, so the strict recency comparison
+                // `s > t` can never hold (`s == t`) and the arc would never be
+                // recognised — the step wedges Completed, its exit arc stays
+                // Pending (protected by `structural_loop_branch_points`), and the
+                // execution hangs with no terminal event (the
+                // `test_pagination_max_iterations` / `test_pagination_retry`
+                // 14-event stall).  Conditions (1) `is_step_done` and (2) cycle
+                // already hold, so a self-loop is a genuine loop back-edge;
+                // classify it directly.  Termination stays guard-driven: the
+                // self arc's `when:` (e.g. `iteration_count < max_iterations`)
+                // goes false and the arc stops matching, so the exit arc fires.
+                if src_name != target {
+                    let src_done = state.steps.get(src_name).and_then(|s| s.completed_at);
+                    let tgt_done = state.steps.get(target).and_then(|s| s.completed_at);
+                    match (src_done, tgt_done) {
+                        (Some(s), Some(t)) if s > t => {}
+                        _ => continue,
+                    }
                 }
                 loop_back_arcs.insert((src_name.clone(), target.clone()));
                 loop_branch_points.insert(src_name.clone());
@@ -4631,6 +4647,64 @@ workflow:
         }
     }
 
+    /// A **self-loop** counter playbook: a single step `fetch` whose own `next`
+    /// arc re-enters `fetch` while the guard holds — the exact shape of
+    /// `tests/pagination/{max_iterations,retry}` (a step that loops to itself,
+    /// not a 2-cycle through a separate brancher). Regression fixture for the
+    /// self-loop back-edge classification (self-loop `src == target`, where the
+    /// strict recency test can never fire).
+    fn make_self_loop_playbook() -> Playbook {
+        use crate::playbook::{NextArc, NextRouter, NextRouterSpec};
+        let start = make_step_with_set(
+            "start",
+            NextSpec::Single("fetch".to_string()),
+            &[("ctx.counter", "{{ workload.counter }}")],
+        );
+        let fetch = {
+            let mut s = make_step_with_set(
+                "fetch",
+                NextSpec::Router(NextRouter {
+                    spec: Some(NextRouterSpec {
+                        mode: Some("exclusive".to_string()),
+                    }),
+                    arcs: vec![
+                        NextArc {
+                            step: "fetch".to_string(),
+                            when: Some("{{ ctx.counter < 3 }}".to_string()),
+                            set_vars: None,
+                        },
+                        NextArc {
+                            step: "validate".to_string(),
+                            when: Some("{{ ctx.counter >= 3 }}".to_string()),
+                            set_vars: None,
+                        },
+                    ],
+                }),
+                &[("ctx.counter", "{{ fetch.next_counter }}")],
+            );
+            s.desc = Some("self-loop pagination head".to_string());
+            s
+        };
+        let validate = make_step("validate", Some("end"));
+        let end = make_step("end", None);
+        Playbook {
+            api_version: "noetl.io/v2".to_string(),
+            kind: "Playbook".to_string(),
+            metadata: Metadata {
+                name: "self_loop".to_string(),
+                path: Some("test/self_loop".to_string()),
+                description: None,
+                labels: None,
+                extra: HashMap::new(),
+            },
+            workload: None,
+            vars: None,
+            keychain: None,
+            workbook: None,
+            workflow: vec![start, fetch, validate, end],
+        }
+    }
+
     /// Persist an `EventToEmit` into a growing event log the way
     /// `handlers::events::trigger_orchestrator` does: a `context`
     /// payload is wrapped in the `{status, context}` result envelope so
@@ -4766,6 +4840,86 @@ workflow:
         assert_eq!(
             work_dispatched_counters, vec![0, 1, 2],
             "counter must advance 0->1->2 monotonically, not thrash",
+        );
+    }
+
+    #[test]
+    fn test_self_loop_reenters_and_terminates() {
+        // Regression for the pagination self-loop wedge
+        // (tests/pagination/{max_iterations,retry}): a step whose own `next` arc
+        // re-enters itself (`src == target`) must be recognised as a loop
+        // back-edge and re-dispatch each iteration until its guard goes false,
+        // then take the exit arc. Before the fix the strict recency test
+        // (`src.completed_at > target.completed_at`) could never hold for a
+        // self-loop (same step, same `completed_at`), so the arc was never
+        // classified, the step wedged `Completed`, and the execution hung with
+        // no terminal event (the 14-event stall).
+        let orchestrator = WorkflowOrchestrator::new();
+        let playbook = make_self_loop_playbook();
+        let t0 = DateTime::from_timestamp(0, 0).unwrap();
+        let mut seq = 0i64;
+
+        let mut log: Vec<Event> = Vec::new();
+        {
+            let mut started = make_event("playbook_started", None);
+            started.event_id = 0;
+            started.timestamp = t0;
+            started.context = Some(serde_json::json!({
+                "workload": { "counter": 0 },
+                "path": "test/self_loop",
+                "version": "1",
+            }));
+            log.push(started);
+        }
+
+        let mut fetch_dispatched_counters: Vec<i64> = Vec::new();
+        let mut trigger: Option<&str> = None;
+        let mut completed = false;
+
+        for _pass in 0..40 {
+            let result = orchestrator
+                .evaluate(&log, &playbook, trigger)
+                .expect("evaluate must not error");
+
+            if result.should_complete {
+                completed = true;
+                break;
+            }
+            for emit in &result.events_to_emit {
+                persist_emit(&mut log, emit, &mut seq, t0);
+            }
+            if result.commands.is_empty() {
+                // Nothing dispatched and not complete — the self-loop wedge.
+                break;
+            }
+            for command in &result.commands {
+                let step = command.step_name.as_str();
+                let seen = command
+                    .context
+                    .as_ref()
+                    .and_then(|c| c.get("counter"))
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(-1);
+                let done_result = match step {
+                    "fetch" => serde_json::json!({ "next_counter": seen + 1 }),
+                    _ => serde_json::json!({}),
+                };
+                if step == "fetch" {
+                    fetch_dispatched_counters.push(seen);
+                }
+                simulate_worker(&mut log, step, done_result, &mut seq, t0);
+            }
+            trigger = Some("command.completed");
+        }
+
+        assert!(
+            completed,
+            "self-loop did not terminate; fetch dispatched with counters {:?}",
+            fetch_dispatched_counters,
+        );
+        assert_eq!(
+            fetch_dispatched_counters, vec![0, 1, 2],
+            "self-loop must re-enter fetch 0->1->2 then exit, not wedge after the first iteration",
         );
     }
 

@@ -342,6 +342,54 @@ impl ResultStoreService {
         .await?;
         Ok(row.map(|r| r.data))
     }
+
+    /// Resolve a **canonical** result reference
+    /// (`noetl://<tenant>/<project>/results/<eid>/<step>/<frame>/<row>/<attempt>`)
+    /// from the #104 object tier (noetl/ai-meta#104 Phase C read path).
+    ///
+    /// Under the dual-write-retired regime (`NOETL_RESULT_STORE_DUAL_WRITE=false`,
+    /// `NOETL_RESULT_MINT_AUTHORITATIVE=true`) the legacy `noetl.result_store`
+    /// row is not written — the object tier is the authoritative byte source. The
+    /// worker exposes the canonical logical URI as a step's `_ref`, so the
+    /// explicit `artifact get` / `result_fetch` lazy-load surface arrives here
+    /// with a `Canonical` reference. Resolve it from the JSON tier (the byte
+    /// source is the scrubbed `result.context`, byte-identical to what the legacy
+    /// `result_store` row held). Tabular (Feather) tiers are resolved via the
+    /// worker's `resolve_by_urn` bulk-binding path.
+    ///
+    /// Returns `None` when no matching tier object exists (caller → 404).
+    pub async fn resolve_canonical(
+        &self,
+        loc: &noetl_locator::ResourceLocator,
+    ) -> AppResult<Option<serde_json::Value>> {
+        let coords = match noetl_locator::ResultCoordinates::from_locator(loc) {
+            Ok(c) => c,
+            // A non-`results` locator (e.g. a datasets/ URI) is not a resolvable
+            // result reference — treat as not-found rather than an error.
+            Err(_) => return Ok(None),
+        };
+        let logical_tail = format!(
+            "{}/{}/{}/{}",
+            coords.step, coords.frame, coords.row, coords.attempt
+        );
+        let obj = crate::db::queries::object_store::get_result_tier_json(
+            &self.pool,
+            coords.execution_id,
+            &logical_tail,
+        )
+        .await?;
+        match obj {
+            Some(o) => {
+                let value: serde_json::Value = serde_json::from_slice(&o.bytes).map_err(|e| {
+                    AppError::Internal(format!(
+                        "result_store.resolve_canonical: decode JSON tier: {e}"
+                    ))
+                })?;
+                Ok(Some(value))
+            }
+            None => Ok(None),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
