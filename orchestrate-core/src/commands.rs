@@ -370,9 +370,13 @@ impl CommandBuilder {
         let tool_call = ToolCall::from_spec(tool);
         let config_value = serde_json::to_value(&tool_call.config).ok();
 
-        // Render any templates in the config
+        // Render any templates in the config.  `keychain.*` references are
+        // DEFERRED (left verbatim) so the secret is resolved transiently at
+        // user-worker dispatch time instead of being rendered into — and
+        // persisted on — this command (noetl/ai-meta#151).  Every other
+        // template renders exactly as before.
         let config = if let Some(cfg) = config_value {
-            Some(self.renderer.render_value(&cfg, context)?)
+            Some(self.renderer.render_value_deferring_keychain(&cfg, context)?)
         } else {
             None
         };

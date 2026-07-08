@@ -287,6 +287,76 @@ impl TemplateRenderer {
         false
     }
 
+    /// Render a nested structure like [`render_value`], but DEFER (return
+    /// verbatim) any string template that references the `keychain.*`
+    /// namespace (noetl/ai-meta#151).
+    ///
+    /// The `keychain.<alias>.<field>` namespace is populated only at
+    /// user-worker dispatch time — resolved transiently so the secret never
+    /// lands in the persisted command / event log (the same discipline the
+    /// `auth:` alias path follows).  The drive builds tool configs against a
+    /// context that has no `keychain`, so rendering `{{ keychain.* }}` here
+    /// would collapse it to an empty string and the downstream HTTP/auth step
+    /// would send an empty credential → 401.  Deferring the whole template
+    /// string lets the worker re-render it against the resolved namespace.
+    ///
+    /// Every non-keychain template renders exactly as [`render_value`] —
+    /// byte-identical for fields that don't reference `keychain`.
+    pub fn render_value_deferring_keychain(
+        &self,
+        value: &serde_json::Value,
+        context: &HashMap<String, serde_json::Value>,
+    ) -> CoreResult<serde_json::Value> {
+        match value {
+            serde_json::Value::String(s) => {
+                if self.template_references_keychain(s) {
+                    Ok(serde_json::Value::String(s.clone()))
+                } else {
+                    self.render_to_value(s, context)
+                }
+            }
+            serde_json::Value::Object(map) => {
+                let mut result = serde_json::Map::new();
+                for (k, v) in map {
+                    let rendered_key = if self.template_references_keychain(k) {
+                        k.clone()
+                    } else {
+                        self.render(k, context)?
+                    };
+                    result.insert(rendered_key, self.render_value_deferring_keychain(v, context)?);
+                }
+                Ok(serde_json::Value::Object(result))
+            }
+            serde_json::Value::Array(arr) => {
+                let result: Result<Vec<_>, _> = arr
+                    .iter()
+                    .map(|v| self.render_value_deferring_keychain(v, context))
+                    .collect();
+                Ok(serde_json::Value::Array(result?))
+            }
+            _ => Ok(value.clone()),
+        }
+    }
+
+    /// True when `s` is a template that references the `keychain` root — e.g.
+    /// `{{ keychain.openai_token.api_key }}`.  Uses minijinja's
+    /// `undeclared_variables(true)` to get the nested dotted paths (same
+    /// mechanism as [`Self::template_has_unresolved_path`]); a fragment that
+    /// won't parse is treated as non-keychain (rendered normally, matching the
+    /// prior behaviour for malformed fragments).
+    fn template_references_keychain(&self, s: &str) -> bool {
+        if !contains_template_syntax(s) {
+            return false;
+        }
+        let tmpl = match self.env.template_from_str(s) {
+            Ok(t) => t,
+            Err(_) => return false,
+        };
+        tmpl.undeclared_variables(true)
+            .iter()
+            .any(|path| path == "keychain" || path.starts_with("keychain."))
+    }
+
     /// Evaluate a condition expression.
     pub fn evaluate_condition(
         &self,
