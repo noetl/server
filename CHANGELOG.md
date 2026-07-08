@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.53.2](https://github.com/noetl/server/compare/v3.53.1...v3.53.2) (2026-07-08)
+
+### Bug Fixes
+
+* **keychain:** resolve {{ keychain.* }} templates in tool configs ([#151](https://github.com/noetl/server/issues/151)) ([#279](https://github.com/noetl/server/issues/279)) ([fe500df](https://github.com/noetl/server/commit/fe500df9adc099c9c4d80718b550477624de9c8b))
+
 ## [3.53.1](https://github.com/noetl/server/compare/v3.53.0...v3.53.1) (2026-07-08)
 
 ### Bug Fixes
