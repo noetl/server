@@ -23,6 +23,7 @@ use crate::playbook::types::Playbook;
 use crate::secrets::{build_secret_provider, dynamic, resolve_keychain_entry_with_meta};
 use crate::services::keychain::KeychainService;
 use crate::services::keychain_refresh::RefreshInflight;
+use crate::template::TemplateRenderer;
 
 /// TTL (seconds) for a keychain-resolved secret cached after a provider fetch.
 /// Execution-scoped, so it's also cleaned up when the execution ends; the TTL
@@ -256,10 +257,55 @@ impl CredentialService {
             }
         };
 
-        // Only provider-backed keychain entries resolve here.
         let Some(kc) = playbook.find_keychain(alias) else {
             return Ok(None);
         };
+
+        // `kind: credential` keychain entry (noetl/ai-meta#151): an entry with
+        // no `provider:` but a `credential:` reference indirects to a stored
+        // credential in `noetl.credential`.  Render the reference against the
+        // execution's workload, fetch that stored credential, and return its
+        // decrypted data object so `{{ keychain.<alias>.<field> }}` resolves.
+        // Without this the entry fell through to the `provider` check below and
+        // returned `None` — the empty-token root cause for the auth0 fixtures.
+        if kc.provider.is_none() {
+            let Some(cred_ref_template) = kc.credential.clone() else {
+                return Ok(None);
+            };
+            let workload_map: HashMap<String, serde_json::Value> = workload
+                .as_ref()
+                .and_then(|w| w.as_object())
+                .map(|m| m.clone().into_iter().collect())
+                .unwrap_or_default();
+            let cred_alias = TemplateRenderer::new()
+                .render(&cred_ref_template, &workload_map)?
+                .trim()
+                .to_string();
+            if cred_alias.is_empty() {
+                tracing::warn!(
+                    execution_id,
+                    alias,
+                    "keychain.resolve: `kind: credential` entry rendered an empty `credential:` reference"
+                );
+                return Ok(None);
+            }
+            return match self.find_credential(&cred_alias).await {
+                Ok(cred_entry) => {
+                    let data = self.cipher.open_storage_json(&cred_entry.data).await?;
+                    tracing::info!(
+                        execution_id,
+                        alias,
+                        credential = %cred_alias,
+                        "keychain.resolve: credential-indirect"
+                    );
+                    Ok(Some(data))
+                }
+                Err(AppError::NotFound(_)) => Ok(None),
+                Err(e) => Err(e),
+            };
+        }
+
+        // Only provider-backed keychain entries resolve past here.
         let Some(provider_id) = kc.provider.as_deref() else {
             return Ok(None);
         };
