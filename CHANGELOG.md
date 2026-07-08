@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.53.1](https://github.com/noetl/server/compare/v3.53.0...v3.53.1) (2026-07-08)
+
+### Bug Fixes
+
+* pagination self-loop wedge + large-result artifact-get resolve 404 (kind [#179](https://github.com/noetl/server/issues/179)) ([#278](https://github.com/noetl/server/issues/278)) ([cc6c08e](https://github.com/noetl/server/commit/cc6c08e7f3d8511c5709faca39f709e6efc5745d)), closes [#85](https://github.com/noetl/server/issues/85) [#104](https://github.com/noetl/server/issues/104) [#104](https://github.com/noetl/server/issues/104)
+
 ## [3.53.0](https://github.com/noetl/server/compare/v3.52.0...v3.53.0) (2026-07-07)
 
 ### Features
