@@ -16,11 +16,13 @@
 //! refused data-plane access).
 //!
 //! For **raw data-plane tier queries** (raw event-log scan, KV, object, vector)
-//! the server ROUTES the query to the worker / system data-plane over the drive
-//! rather than reading tier storage itself. That routing seam is documented and
-//! stubbed here ([`raw_tier_query`]) as an extension point for the follow-up
-//! slices; it returns `501 Not Implemented` with the routing contract until the
-//! worker-side query handler lands.
+//! the server RELAYS the query to the worker data-plane rather than reading tier
+//! storage itself. [`raw_tier_query`] makes a synchronous HTTP read straight to
+//! the worker's query port (`worker-service:9090`, [`WORKER_QUERY_URL_ENV`]) —
+//! a direct data-plane call that does NOT ride the NATS drive/command bus — and
+//! relays the worker's tier `*Outcome` verbatim. When the relay URL is
+//! unconfigured it returns `501` with the reason (the server never opens tier
+//! storage itself).
 //!
 //! ## Secret-free by construction
 //!
@@ -44,6 +46,9 @@
 //! the server; the server exposes the read-model read scope. No mutation scope
 //! is reachable through this module.
 
+use std::collections::HashMap;
+use std::time::Duration;
+
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -56,6 +61,16 @@ use serde_json::json;
 
 use crate::error::AppError;
 use crate::services::execution::{ExecutionFilter, ExecutionService};
+
+/// Env var naming the worker data-plane query base URL the server relays raw tier
+/// queries to (the worker-service ClusterIP on :9090, e.g.
+/// `http://noetl-worker-rust-metrics:9090`).  Unset ⇒ the relay is not configured
+/// and raw tier queries return `501` (the server never opens tier storage
+/// itself — control-plane guard).
+pub const WORKER_QUERY_URL_ENV: &str = "NOETL_EHDB_WORKER_QUERY_URL";
+
+/// How long the server waits on the worker's synchronous read before giving up.
+const WORKER_QUERY_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Cap on rows any single EHDB list/scan will return.
 const MAX_EHDB_LIMIT: i32 = 1000;
@@ -133,14 +148,14 @@ pub async fn index() -> Json<serde_json::Value> {
             {"method": "GET", "path": "/api/ehdb/events", "tier": "eventlog",
              "serves": "direct", "desc": "Event read-model scan by global sequence."},
             {"method": "GET", "path": "/api/ehdb/tiers/{tier}", "tier": "eventlog|kv|object|vector",
-             "serves": "routed", "desc": "Raw data-plane tier query — routed to worker (stub)."}
+             "serves": "relayed", "desc": "Raw data-plane tier query — relayed to the worker data-plane (:9090)."}
         ],
         "tiers": {
             "projection": "served-direct",
-            "eventlog": "read-model served-direct; raw scan routed",
-            "kv": "routed (not-yet-wired)",
-            "object": "routed (not-yet-wired)",
-            "vector": "routed (not-yet-wired)"
+            "eventlog": "read-model served-direct; raw scan relayed to worker",
+            "kv": "relayed to worker",
+            "object": "relayed to worker",
+            "vector": "relayed to worker"
         }
     }))
 }
@@ -349,33 +364,55 @@ pub async fn scan_events(
     })))
 }
 
-/// `GET /api/ehdb/tiers/{tier}` — raw data-plane tier query routing seam.
+/// State for the raw-tier relay: an HTTP client + the worker data-plane query
+/// base URL.  The server never opens tier storage (control-plane guard); it
+/// relays the read straight to the worker over HTTP.
+#[derive(Clone)]
+pub struct TierRelayState {
+    http: reqwest::Client,
+    /// The worker query base URL (`NOETL_EHDB_WORKER_QUERY_URL`); `None` ⇒
+    /// unconfigured ⇒ raw tier queries return `501`.
+    worker_query_base: Option<String>,
+}
+
+impl TierRelayState {
+    /// Build from the env.  Reads [`WORKER_QUERY_URL_ENV`]; an unset / empty
+    /// value leaves the relay unconfigured (raw tier queries `501` until ops
+    /// wires the worker-service URL).
+    pub fn from_env() -> Self {
+        let worker_query_base = std::env::var(WORKER_QUERY_URL_ENV)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        Self {
+            http: reqwest::Client::new(),
+            worker_query_base,
+        }
+    }
+}
+
+/// `GET /api/ehdb/tiers/{tier}` — raw data-plane tier query (relayed to worker).
 ///
-/// This is the documented extension point for the raw data-plane tiers
-/// (`eventlog` raw scan, `kv`, `object`, `vector`). The server is barred from
-/// opening tier storage directly (control-plane guard), so a raw tier query is
-/// **routed to the worker / system data-plane over the drive**. Until that
-/// worker-side query handler lands, this returns `501 Not Implemented` with the
-/// routing contract so callers get a precise, machine-readable stub rather than
-/// a 404.
+/// The server is barred from opening tier storage directly (control-plane
+/// guard), so a raw tier query is **relayed to the worker data-plane** via a
+/// synchronous HTTP read to the worker's query port (`worker-service:9090`,
+/// [`WORKER_QUERY_URL_ENV`]).  This is a direct data-plane read — it does **not**
+/// enqueue on the NATS drive/command bus (a query is a read, not a unit of
+/// playbook work).  The worker guards the request (data-plane roles only),
+/// resolves the tier backend, invokes the matching `ehdb_reference` driver read
+/// (`EventLogDriver::scan_global`/`read_execution`, `KvStateDriver::get/scan`,
+/// `ObjectBlobDriver::get/list/locate`, `VectorDriver::query`), and returns the
+/// tier `*Outcome` (already `Serialize` + secret-free); the server relays that
+/// body + status verbatim.
 ///
-/// ### Routing contract (follow-up slices)
-///
-/// 1. Server validates `tier` ∈ {eventlog, kv, object, vector} and the
-///    read-only tier request (bounded limit, secret-free projection).
-/// 2. Server enqueues an internal query command on the drive addressed to the
-///    system data-plane pool (NATS subject; the same mechanism the server uses
-///    to dispatch work to the worker), carrying `tier` + request JSON +
-///    `execution_id` correlation.
-/// 3. Worker guards the request (`worker/src/ehdb/guard.rs` — data-plane roles
-///    only), resolves the backend for the tier
-///    (`worker/src/ehdb/backends.rs::resolve`), and invokes the matching
-///    `ehdb_reference` driver read (`EventLogDriver::scan_global`,
-///    `KvStateDriver::get/scan`, `ObjectBlobDriver::get/list`,
-///    `VectorDriver::query`).
-/// 4. Worker returns the tier `*Outcome` (already `Serialize` + secret-free) on
-///    a query-response subject; server relays it as the HTTP body.
-pub async fn raw_tier_query(Path(tier): Path<String>) -> impl IntoResponse {
+/// All query-string params (`limit`, `after`, `bucket`, `key`, `prefix`,
+/// `collection`, `model_id`, `top_k`, `vector`, `execution`, `execution_id`, …)
+/// are forwarded to the worker unchanged.
+pub async fn raw_tier_query(
+    State(relay): State<TierRelayState>,
+    Path(tier): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
     let tier_l = tier.to_ascii_lowercase();
     let known = matches!(tier_l.as_str(), "eventlog" | "kv" | "object" | "vector");
     if !known {
@@ -389,28 +426,69 @@ pub async fn raw_tier_query(Path(tier): Path<String>) -> impl IntoResponse {
             })),
         );
     }
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(json!({
-            "action": "ehdb.tier.query",
-            "tier": tier_l,
-            "status": "routing-not-wired",
-            "read_only": true,
-            "control_plane_guard": "server does not open data-plane tier storage; \
-                                    raw tier queries route to the worker/system data-plane",
-            "contract": {
-                "1_validate": "server validates tier + bounded read-only request",
-                "2_dispatch": "server enqueues an internal query command on the drive \
-                               to the system data-plane pool (NATS), carrying tier + \
-                               request + execution_id",
-                "3_execute": "worker guards (data-plane role only), resolves the tier \
-                              backend, invokes the ehdb_reference driver read",
-                "4_relay": "worker returns the tier *Outcome (Serialize, secret-free); \
-                            server relays it as the HTTP body"
-            },
-            "tracks": "noetl/ai-meta#178"
-        })),
-    )
+
+    let Some(base) = relay.worker_query_base.as_deref() else {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(json!({
+                "action": "ehdb.tier.query",
+                "tier": tier_l,
+                "status": "relay-not-configured",
+                "read_only": true,
+                "control_plane_guard": "server does not open data-plane tier storage; \
+                                        raw tier queries relay to the worker data-plane",
+                "reason": format!(
+                    "{WORKER_QUERY_URL_ENV} is not set; point it at the worker query \
+                     service (e.g. http://noetl-worker-rust-metrics:9090)"
+                ),
+                "tracks": "noetl/ai-meta#178"
+            })),
+        );
+    };
+
+    let url = format!("{}/ehdb/tiers/{}", base.trim_end_matches('/'), tier_l);
+    let span = tracing::info_span!(
+        "ehdb.tier.relay",
+        tier = %tier_l,
+        execution_id = params.get("execution_id").map(String::as_str).unwrap_or("")
+    );
+    let _e = span.enter();
+
+    match relay
+        .http
+        .get(&url)
+        .query(&params)
+        .timeout(WORKER_QUERY_TIMEOUT)
+        .send()
+        .await
+    {
+        Ok(resp) => {
+            let status = StatusCode::from_u16(resp.status().as_u16())
+                .unwrap_or(StatusCode::BAD_GATEWAY);
+            match resp.json::<serde_json::Value>().await {
+                Ok(body) => (status, Json(body)),
+                Err(e) => (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({
+                        "action": "ehdb.tier.query",
+                        "tier": tier_l,
+                        "outcome": "unavailable",
+                        "error": format!("worker query response was not JSON: {e}"),
+                    })),
+                ),
+            }
+        }
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({
+                "action": "ehdb.tier.query",
+                "tier": tier_l,
+                "outcome": "unavailable",
+                "error": format!("worker query relay failed: {e}"),
+                "worker_query_url": url,
+            })),
+        ),
+    }
 }
 
 #[cfg(test)]
