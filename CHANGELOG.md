@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.54.0](https://github.com/noetl/server/compare/v3.53.2...v3.54.0) (2026-07-11)
+
+### Features
+
+* **ehdb:** relay raw-tier queries to the worker data-plane ([#178](https://github.com/noetl/server/issues/178)) ([#280](https://github.com/noetl/server/issues/280)) ([1c062c2](https://github.com/noetl/server/commit/1c062c20ef4973bb9868bfdbd21fac19c863074b))
+
 ## [3.53.2](https://github.com/noetl/server/compare/v3.53.1...v3.53.2) (2026-07-08)
 
 ### Bug Fixes
