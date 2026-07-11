@@ -343,8 +343,16 @@ fn build_router(
             get(handlers::ehdb::list_execution_events),
         )
         .route("/api/ehdb/events", get(handlers::ehdb::scan_events))
-        .route("/api/ehdb/tiers/{tier}", get(handlers::ehdb::raw_tier_query))
         .with_state(execution_service);
+
+    // Raw data-plane tier queries (`/api/ehdb/tiers/{tier}`) are a separate
+    // router because they carry a distinct state: the server does NOT open tier
+    // storage (control-plane guard), it relays the read straight to the worker's
+    // data-plane query port over HTTP (`NOETL_EHDB_WORKER_QUERY_URL`, the
+    // worker-service :9090).  Reads do not ride the NATS drive.
+    let ehdb_tier_routes = Router::new()
+        .route("/api/ehdb/tiers/{tier}", get(handlers::ehdb::raw_tier_query))
+        .with_state(handlers::ehdb::TierRelayState::from_env());
 
     // Replay engine routes (Phase D R5 of noetl/ai-meta#49 →
     // noetl/server#148).  Round 1 ships `GET /api/replay/state`
@@ -630,6 +638,7 @@ fn build_router(
         .merge(execution_routes)
         .merge(executions_routes)
         .merge(ehdb_routes)
+        .merge(ehdb_tier_routes)
         .merge(subscription_routes)
         .merge(replay_routes)
         .merge(result_store_routes)
