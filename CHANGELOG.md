@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.55.0](https://github.com/noetl/server/compare/v3.54.0...v3.55.0) (2026-07-21)
+
+### Features
+
+* **command-bus:** L1 T4 server publish wiring behind NOETL_COMMAND_BUS ([#281](https://github.com/noetl/server/issues/281)) ([752a60a](https://github.com/noetl/server/commit/752a60ad4f06f5c03fcc10bde93aaa2d3096b70a)), closes [noetl/ehdb#295](https://github.com/noetl/ehdb/issues/295) [noetl/ai-meta#194](https://github.com/noetl/ai-meta/issues/194) [noetl/ai-meta#194](https://github.com/noetl/ai-meta/issues/194)
+
 ## [3.54.0](https://github.com/noetl/server/compare/v3.53.2...v3.54.0) (2026-07-11)
 
 ### Features
