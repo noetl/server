@@ -194,6 +194,22 @@ pub struct AppConfig {
     #[serde(default)]
     pub command_shard_count: Option<u32>,
 
+    /// noetl/ai-meta#194 L1 T4 — the command-bus transport. Envy maps
+    /// `NOETL_COMMAND_BUS`. `nats` (default / any unrecognised value) keeps
+    /// today's path; `ehdb` publishes commands to the per-shard EHDB writer
+    /// (the cutover); `shadow` publishes to both (NATS authoritative, EHDB
+    /// mirrored for parity). Parsed by [`crate::command_bus::CommandBusMode`].
+    #[serde(default)]
+    pub command_bus: Option<String>,
+
+    /// noetl/ai-meta#194 L1 T4 — the per-shard EHDB writers' ingest addresses,
+    /// `"0@host:port,1@host:port,..."`. Envy maps
+    /// `NOETL_COMMAND_BUS_WRITER_ADDRS`. Only consulted when [`Self::command_bus`]
+    /// selects `ehdb`/`shadow`. Empty → no writers configured (publishes skipped
+    /// with a WARN, like NATS-not-configured).
+    #[serde(default)]
+    pub command_bus_writer_addrs: Option<String>,
+
     /// Maximum serialised size (bytes) of a `command.issued` event's `context`
     /// before it is offloaded to the result store (noetl/ai-meta#114).  When the
     /// off-server orchestrate drive (`orchestrate_plugin_drive`) builds the next
@@ -807,6 +823,8 @@ impl Default for AppConfig {
             // noetl/ai-meta#166 Phase 5: server-routed shard publish is opt-in.
             shard_subject_route: false,
             command_shard_count: None,
+            command_bus: None,
+            command_bus_writer_addrs: None,
             command_context_max_bytes: default_command_context_max_bytes(),
             // noetl/ai-meta#115 Phase 3: event-scan is the default; chain_walk is opt-in.
             state_build_mode: StateBuildMode::EventScan,
@@ -903,7 +921,9 @@ mod tests {
     fn test_tail_attach_scoping() {
         // Master flag off → never, regardless of prefixes.
         let mut cfg = AppConfig::default();
-        assert!(!cfg.tail_attach_applies("muno/playbooks/itinerary-planner", "muno_itinerary_planner"));
+        assert!(
+            !cfg.tail_attach_applies("muno/playbooks/itinerary-planner", "muno_itinerary_planner")
+        );
 
         // Flag on, empty allowlist → applies to all (original global behavior).
         cfg.offserver_attach_tail = true;
@@ -914,7 +934,9 @@ mod tests {
             "muno/playbooks/itinerary-planner".to_string(),
             "automation/agents/mcp/".to_string(),
         ];
-        assert!(cfg.tail_attach_applies("muno/playbooks/itinerary-planner", "muno_itinerary_planner"));
+        assert!(
+            cfg.tail_attach_applies("muno/playbooks/itinerary-planner", "muno_itinerary_planner")
+        );
         assert!(cfg.tail_attach_applies("automation/agents/mcp/duffel", "duffel_mcp"));
         // The auth/login + session-validate drives — the parked regression — stay off.
         assert!(!cfg.tail_attach_applies("api_integration/auth0/auth0_login", "auth0_login"));

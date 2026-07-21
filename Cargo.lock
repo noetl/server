@@ -77,6 +77,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "arrow-schema"
+version = "53.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "35b0f9c0c3582dd55db0f136d3b44bfa0189df07adcf7dc7f2f2e74db0f52eb8"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "async-nats"
 version = "0.38.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -604,6 +613,38 @@ dependencies = [
  "sha2",
  "signature",
  "subtle",
+]
+
+[[package]]
+name = "ehdb-core"
+version = "0.1.0"
+source = "git+https://github.com/noetl/ehdb?rev=ccdef55c0a7f50faf1a37c6bb7e4c2d89ef6bb3c#ccdef55c0a7f50faf1a37c6bb7e4c2d89ef6bb3c"
+dependencies = [
+ "arrow-schema",
+ "serde",
+]
+
+[[package]]
+name = "ehdb-feed"
+version = "0.1.0"
+source = "git+https://github.com/noetl/ehdb?rev=ccdef55c0a7f50faf1a37c6bb7e4c2d89ef6bb3c#ccdef55c0a7f50faf1a37c6bb7e4c2d89ef6bb3c"
+dependencies = [
+ "ehdb-core",
+ "ehdb-l0",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "ehdb-l0"
+version = "0.1.0"
+source = "git+https://github.com/noetl/ehdb?rev=ccdef55c0a7f50faf1a37c6bb7e4c2d89ef6bb3c#ccdef55c0a7f50faf1a37c6bb7e4c2d89ef6bb3c"
+dependencies = [
+ "ehdb-core",
+ "serde",
+ "serde_json",
+ "twox-hash",
 ]
 
 [[package]]
@@ -1449,6 +1490,8 @@ dependencies = [
  "chrono",
  "ctor",
  "dotenvy",
+ "ehdb-feed",
+ "ehdb-l0",
  "envy",
  "gcp_auth",
  "hex",
@@ -3102,6 +3145,7 @@ checksum = "97fee6b57c6a41524a810daee9286c02d7752c4253064d0b05472833a438f675"
 dependencies = [
  "cfg-if",
  "rand 0.8.6",
+ "serde",
  "static_assertions",
 ]
 
