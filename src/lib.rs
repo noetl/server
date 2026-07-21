@@ -47,6 +47,7 @@
 
 pub mod affinity;
 pub mod coherence;
+pub mod command_bus;
 pub mod config;
 pub mod crypto;
 pub mod db;
@@ -61,11 +62,11 @@ pub mod sanitize;
 pub mod secrets;
 pub mod services;
 pub mod sharding;
-pub mod system_plugins;
-pub mod tls;
 pub mod snowflake;
 pub mod state;
+pub mod system_plugins;
 pub mod template;
+pub mod tls;
 
 pub use error::{AppError, AppResult};
 pub use result_ext::ResultExt;

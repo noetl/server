@@ -331,8 +331,14 @@ pub(crate) async fn execute_one(
             DedupOutcome::Duplicate {
                 existing_execution_id,
             } => {
-                emit_deduplicated_event(state, scope, &dedup.key, existing_execution_id, execution_id)
-                    .await;
+                emit_deduplicated_event(
+                    state,
+                    scope,
+                    &dedup.key,
+                    existing_execution_id,
+                    execution_id,
+                )
+                .await;
                 crate::metrics::record_execute_outcome(entry, "duplicate");
                 info!(
                     subscription_id = scope,
@@ -401,10 +407,7 @@ pub(crate) async fn execute_one(
         _ => None,
     };
     let routing = CommandRouting {
-        pool: request
-            .execution_pool
-            .clone()
-            .filter(|s| !s.is_empty()),
+        pool: request.execution_pool.clone().filter(|s| !s.is_empty()),
         trace,
     };
 
@@ -497,14 +500,12 @@ async fn emit_deduplicated_event(
         // Cold descriptor under audit_only: catalog_id from `noetl.command` — the
         // synchronous queue — ZERO `noetl.event` read.
         crate::metrics::record_event_hotpath_read("dedup_audit_catalog", "served_command");
-        sqlx::query_scalar(
-            "SELECT catalog_id FROM noetl.command WHERE execution_id = $1 LIMIT 1",
-        )
-        .bind(scope)
-        .fetch_optional(state.pools.pool_for(scope))
-        .await
-        .ok()
-        .flatten()
+        sqlx::query_scalar("SELECT catalog_id FROM noetl.command WHERE execution_id = $1 LIMIT 1")
+            .bind(scope)
+            .fetch_optional(state.pools.pool_for(scope))
+            .await
+            .ok()
+            .flatten()
     } else {
         crate::metrics::record_event_hotpath_read("dedup_audit_catalog", "scan");
         sqlx::query_scalar(
@@ -517,7 +518,10 @@ async fn emit_deduplicated_event(
         .flatten()
     };
     let Some(catalog_id) = catalog_id else {
-        tracing::debug!(subscription_id = scope, "dedup audit: no catalog_id for scope; skipping audit event");
+        tracing::debug!(
+            subscription_id = scope,
+            "dedup audit: no catalog_id for scope; skipping audit event"
+        );
         return;
     };
     let context = serde_json::json!({
@@ -681,7 +685,10 @@ async fn emit_playbook_started_event(
 /// Inherit the W3C trace context (RFC §7.4) from a parent execution's
 /// `playbook_started` event so a child run joins the same distributed trace.
 /// Best-effort: a missing parent / missing trace simply yields `None`.
-async fn inherit_parent_trace(state: &AppState, parent_execution_id: i64) -> Option<serde_json::Value> {
+async fn inherit_parent_trace(
+    state: &AppState,
+    parent_execution_id: i64,
+) -> Option<serde_json::Value> {
     // RFC #115 Phase 6: under `event_read_path=audit_only`, read the parent's
     // trace off its in-memory execute-time descriptor (its `routing_meta` is the
     // `playbook_started` meta this query reads) — ZERO `noetl.event` read.  A cold
@@ -692,7 +699,10 @@ async fn inherit_parent_trace(state: &AppState, parent_execution_id: i64) -> Opt
     ) {
         if let Some(desc) = state.exec_descriptors.get(parent_execution_id).await {
             if desc.catalog_id != 0 {
-                crate::metrics::record_event_hotpath_read("inherit_parent_trace", "served_descriptor");
+                crate::metrics::record_event_hotpath_read(
+                    "inherit_parent_trace",
+                    "served_descriptor",
+                );
                 return desc
                     .routing_meta
                     .as_ref()
@@ -1035,7 +1045,10 @@ pub(crate) async fn persist_engine_commands_batch(
 
         let event_id = state.snowflake.generate()?;
         let command_id = if let Some(iter) = command.iterator.as_ref() {
-            format!("{}:{}:{}:i{}", execution_id, step.step, event_id, iter.index)
+            format!(
+                "{}:{}:{}:i{}",
+                execution_id, step.step, event_id, iter.index
+            )
         } else {
             format!("{}:{}:{}", execution_id, step.step, event_id)
         };
@@ -1078,7 +1091,10 @@ pub(crate) async fn persist_engine_commands_batch(
                     "iterator_step".to_string(),
                     serde_json::json!(iter.iterator_step.clone()),
                 );
-                map.insert("item_var".to_string(), serde_json::json!(iter.item_var.clone()));
+                map.insert(
+                    "item_var".to_string(),
+                    serde_json::json!(iter.item_var.clone()),
+                );
             }
         }
         if let Some(trace) = routing.trace.as_ref() {
@@ -1363,7 +1379,8 @@ async fn generate_initial_commands(
         // ranges and strings to splits), the initial-dispatch boundary
         // enforces strict array typing so callers pass an explicit list.
         let renderer = crate::template::TemplateRenderer::new();
-        let raw_value = renderer.render_to_value(loop_cfg.in_expr.as_deref().unwrap_or(""), &context)?;
+        let raw_value =
+            renderer.render_to_value(loop_cfg.in_expr.as_deref().unwrap_or(""), &context)?;
 
         let items: Vec<serde_json::Value> = match raw_value {
             serde_json::Value::Array(arr) => arr,
@@ -1603,14 +1620,10 @@ async fn publish_command_notification(
     playbook: &crate::playbook::types::Playbook,
     routing: &CommandRouting,
 ) -> AppResult<()> {
-    let Some(nats_client) = state.nats.as_ref() else {
-        tracing::warn!(
-            execution_id,
-            event_id,
-            "NATS not configured; command notification skipped — worker won't claim this command"
-        );
-        return Ok(());
-    };
+    // noetl/ai-meta#194 L1 T4 — the command-bus transport. `nats` (default)
+    // preserves the exact path below; `ehdb`/`shadow` also/only publish to the
+    // EHDB writer (see the dispatch after the notification is built).
+    let mode = state.command_bus_mode;
 
     // Pool segment selection (noetl/ai-meta#90 Phase 2).  Precedence:
     //   1. an explicit per-execution `execution_pool` override (the
@@ -1676,23 +1689,75 @@ async fn publish_command_notification(
     let payload = serde_json::to_vec(&notification)
         .map_err(|e| AppError::Internal(format!("Serialize command notification: {e}")))?;
 
-    let js = async_nats::jetstream::new((**nats_client).clone());
-    js.publish(subject.clone(), payload.into())
-        .await
-        .map_err(|e| AppError::Internal(format!("NATS publish failed: {e}")))?
-        .await
-        .map_err(|e| AppError::Internal(format!("NATS publish ack failed: {e}")))?;
+    // --- EHDB command bus (L1 T4) --------------------------------------------
+    // In `ehdb`/`shadow` mode, mirror the command onto the per-shard EHDB writer
+    // (routed by execution_id; event_id is the sort key). In `ehdb` mode a
+    // publish failure fails the dispatch (the command wasn't delivered); in
+    // `shadow` mode NATS is authoritative, so a failure is logged and swallowed.
+    if mode.publishes_ehdb() {
+        match state.ehdb_command_publisher.as_ref() {
+            Some(publisher) => match publisher.publish(execution_id, event_id, &payload).await {
+                Ok(seq) => {
+                    tracing::info!(
+                        execution_id,
+                        event_id,
+                        ehdb_sort_key = seq,
+                        command_id = %command_id,
+                        "Published command notification to EHDB bus"
+                    );
+                }
+                Err(e) => {
+                    if matches!(mode, crate::command_bus::CommandBusMode::Ehdb) {
+                        return Err(AppError::Internal(format!("EHDB command publish: {e}")));
+                    }
+                    tracing::warn!(
+                        execution_id,
+                        event_id,
+                        error = %e,
+                        "EHDB shadow command publish failed (NATS authoritative)"
+                    );
+                }
+            },
+            None if matches!(mode, crate::command_bus::CommandBusMode::Ehdb) => {
+                tracing::warn!(
+                    execution_id,
+                    event_id,
+                    "EHDB command bus selected but no writers configured; command not delivered"
+                );
+            }
+            None => {}
+        }
+    }
 
-    crate::metrics::record_command_publish(publish_route, pool_segment);
+    // --- NATS command bus (today's path) -------------------------------------
+    if mode.publishes_nats() {
+        let Some(nats_client) = state.nats.as_ref() else {
+            tracing::warn!(
+                execution_id,
+                event_id,
+                "NATS not configured; command notification skipped — worker won't claim this command"
+            );
+            return Ok(());
+        };
 
-    tracing::info!(
-        execution_id,
-        event_id,
-        %subject,
-        route = publish_route,
-        command_id = %command_id,
-        "Published command notification to NATS"
-    );
+        let js = async_nats::jetstream::new((**nats_client).clone());
+        js.publish(subject.clone(), payload.into())
+            .await
+            .map_err(|e| AppError::Internal(format!("NATS publish failed: {e}")))?
+            .await
+            .map_err(|e| AppError::Internal(format!("NATS publish ack failed: {e}")))?;
+
+        crate::metrics::record_command_publish(publish_route, pool_segment);
+
+        tracing::info!(
+            execution_id,
+            event_id,
+            %subject,
+            route = publish_route,
+            command_id = %command_id,
+            "Published command notification to NATS"
+        );
+    }
     Ok(())
 }
 

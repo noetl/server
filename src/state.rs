@@ -142,6 +142,16 @@ pub struct AppState {
     /// (default) path never builds it and the gate-on path ensures the stream
     /// exactly once.  `None` inner stays uninitialised until the first publish.
     pub event_stream_publisher: Arc<tokio::sync::OnceCell<crate::nats::EventStreamPublisher>>,
+
+    /// noetl/ai-meta#194 L1 T4 — the command-bus transport mode
+    /// (`NOETL_COMMAND_BUS`; default `nats`). Selects whether command
+    /// notifications go to NATS, the EHDB writer, or both (shadow).
+    pub command_bus_mode: crate::command_bus::CommandBusMode,
+
+    /// noetl/ai-meta#194 L1 T4 — the lazily-connected EHDB command publisher.
+    /// `Some` only when `command_bus_mode` publishes to EHDB and writers are
+    /// configured; `None` keeps the NATS-only path with zero new state.
+    pub ehdb_command_publisher: Option<Arc<crate::command_bus::EhdbCommandPublisher>>,
 }
 
 /// Cached orchestrator state for one execution, advanced incrementally.
@@ -180,7 +190,6 @@ pub struct ExecOrchState {
     /// only; a server restart re-derives the drive from the event log.
     pub orchestrate_in_flight: bool,
 }
-
 
 /// Per-execution chain head for the one-level event chain (RFC #115 Phase 2,
 /// noetl/ai-meta#115 §4).  Maps `execution_id → event_id of the last event
@@ -289,16 +298,15 @@ impl ChainHeads {
         if self.coherence.enabled() {
             match self.coherence.get_head(execution_id).await {
                 crate::coherence::KvRead::Hit(v) => {
-                    let local_had = self
-                        .map
-                        .lock()
-                        .unwrap()
-                        .insert(execution_id, v)
-                        .is_some();
+                    let local_had = self.map.lock().unwrap().insert(execution_id, v).is_some();
                     crate::metrics::record_replica_coherence(
                         "chain_head",
                         "head",
-                        if local_had { "kv_local_hit" } else { "kv_remote_hit" },
+                        if local_had {
+                            "kv_local_hit"
+                        } else {
+                            "kv_remote_hit"
+                        },
                     );
                     return Some(v);
                 }
@@ -353,7 +361,9 @@ impl ChainHeads {
 /// reconcile path — so correctness is preserved, worst case equals today.
 #[derive(Default)]
 pub struct ChainTails {
-    map: std::sync::Mutex<std::collections::HashMap<i64, std::collections::VecDeque<serde_json::Value>>>,
+    map: std::sync::Mutex<
+        std::collections::HashMap<i64, std::collections::VecDeque<serde_json::Value>>,
+    >,
 }
 
 impl ChainTails {
@@ -496,7 +506,11 @@ impl ExecDescriptors {
                     crate::metrics::record_replica_coherence(
                         "descriptor",
                         "get",
-                        if local.is_some() { "kv_local_hit" } else { "kv_remote_hit" },
+                        if local.is_some() {
+                            "kv_local_hit"
+                        } else {
+                            "kv_remote_hit"
+                        },
                     );
                     self.map.lock().unwrap().insert(execution_id, desc.clone());
                     return Some(desc);
@@ -506,11 +520,7 @@ impl ExecDescriptors {
                     return None;
                 }
                 crate::coherence::KvRead::Unavailable => {
-                    crate::metrics::record_replica_coherence(
-                        "descriptor",
-                        "get",
-                        "kv_unavailable",
-                    );
+                    crate::metrics::record_replica_coherence("descriptor", "get", "kv_unavailable");
                     return local;
                 }
             }
@@ -635,9 +645,7 @@ impl FinalizedGuard {
 /// (different executions never contend).
 #[derive(Default)]
 pub struct OrchStateCache {
-    map: std::sync::Mutex<
-        std::collections::HashMap<i64, Arc<tokio::sync::Mutex<ExecOrchState>>>,
-    >,
+    map: std::sync::Mutex<std::collections::HashMap<i64, Arc<tokio::sync::Mutex<ExecOrchState>>>>,
 }
 
 impl OrchStateCache {
@@ -791,12 +799,49 @@ impl AppState {
             "Replica coherence backend initialized"
         );
 
+        // noetl/ai-meta#194 L1 T4 — the command-bus transport. Default `nats`
+        // leaves the path unchanged and builds no EHDB state. `ehdb`/`shadow`
+        // build a lazily-connected publisher over the per-shard writers (routed
+        // by `command_shard_count`, which must match the worker pool's shards).
+        let command_bus_mode = crate::command_bus::CommandBusMode::from_env_value(
+            config.command_bus.as_deref().unwrap_or("nats"),
+        );
+        let ehdb_command_publisher = if command_bus_mode.publishes_ehdb() {
+            let addrs = crate::command_bus::parse_writer_addrs(
+                config.command_bus_writer_addrs.as_deref().unwrap_or(""),
+            );
+            let shard_count = config.command_shard_count.unwrap_or(1);
+            if addrs.is_empty() {
+                tracing::warn!(
+                    ?command_bus_mode,
+                    "NOETL_COMMAND_BUS selects EHDB but NOETL_COMMAND_BUS_WRITER_ADDRS is empty; \
+                     EHDB command publishes will be skipped"
+                );
+                None
+            } else {
+                tracing::info!(
+                    ?command_bus_mode,
+                    shard_count,
+                    writers = addrs.len(),
+                    "EHDB command bus enabled"
+                );
+                Some(Arc::new(crate::command_bus::EhdbCommandPublisher::new(
+                    shard_count,
+                    addrs,
+                )))
+            }
+        } else {
+            None
+        };
+
         Self {
             db,
             pools,
             config: Arc::new(config),
             nats,
             snowflake: Arc::new(snowflake),
+            command_bus_mode,
+            ehdb_command_publisher,
             shard,
             affinity,
             start_time: std::time::Instant::now(),
@@ -819,11 +864,7 @@ impl AppState {
     /// built from [`ShardingConfig::from_env`] so the production
     /// path honors `NOETL_SHARDS` if set.  Test code that
     /// already has a `DbPool` in hand uses this shim.
-    pub fn new_legacy(
-        db: DbPool,
-        config: AppConfig,
-        nats: Option<async_nats::Client>,
-    ) -> Self {
+    pub fn new_legacy(db: DbPool, config: AppConfig, nats: Option<async_nats::Client>) -> Self {
         let pools = DbPoolMap::from_single_pool(db.clone());
         Self::new(db, pools, config, nats)
     }
@@ -898,13 +939,19 @@ mod tests {
     fn finalized_guard_first_terminal_wins_duplicate_suppressed() {
         let g = FinalizedGuard::new(8);
         assert!(!g.contains(7), "cold execution is not finalized");
-        assert!(g.mark(7), "first terminal for an execution is newly inserted");
+        assert!(
+            g.mark(7),
+            "first terminal for an execution is newly inserted"
+        );
         assert!(g.contains(7), "now recorded as finalized");
         // Every subsequent terminal for the SAME execution is a duplicate.
         assert!(!g.mark(7), "second terminal is a suppressed duplicate");
         assert!(!g.mark(7), "third terminal is still a suppressed duplicate");
         // A different execution is independent.
-        assert!(g.mark(8), "a different execution's first terminal still wins");
+        assert!(
+            g.mark(8),
+            "a different execution's first terminal still wins"
+        );
         assert!(!g.mark(8));
     }
 
@@ -937,7 +984,12 @@ mod tests {
         let d = ExecDescriptors::default();
         assert!(d.get(7).await.is_none(), "cold execution has no descriptor");
 
-        d.seed(7, 42, Some(serde_json::json!({"execution_pool": "default"}))).await;
+        d.seed(
+            7,
+            42,
+            Some(serde_json::json!({"execution_pool": "default"})),
+        )
+        .await;
         let got = d.get(7).await.expect("seeded");
         assert_eq!(got.catalog_id, 42);
         assert_eq!(got.routing_meta.unwrap()["execution_pool"], "default");
@@ -948,7 +1000,10 @@ mod tests {
         d.mark_terminal(7).await;
         let got = d.get(7).await.expect("still present");
         assert!(got.terminal, "terminal flag set");
-        assert_eq!(got.catalog_id, 42, "catalog_id preserved across terminal stamp");
+        assert_eq!(
+            got.catalog_id, 42,
+            "catalog_id preserved across terminal stamp"
+        );
 
         d.evict(7).await;
         assert!(d.get(7).await.is_none(), "evicted");
@@ -964,7 +1019,10 @@ mod tests {
         d.seed(9, 0, None).await;
         let got = d.get(9).await.expect("present");
         assert!(got.terminal, "terminal flag survives a seed");
-        assert_eq!(got.catalog_id, 0, "catalog_id stays 0 (nothing real to seed yet)");
+        assert_eq!(
+            got.catalog_id, 0,
+            "catalog_id stays 0 (nothing real to seed yet)"
+        );
         // A real seed fills catalog_id, still keeping terminal.
         d.seed(9, 55, Some(serde_json::json!({"x": 1}))).await;
         let got = d.get(9).await.expect("present");
@@ -990,7 +1048,11 @@ mod tests {
         // links each row to the previous one in order; the first to the head.
         let prevs = heads.link_batch(7, &[10, 11, 12]).await;
         assert_eq!(prevs, vec![None, Some(10), Some(11)]);
-        assert_eq!(heads.head(7).await, Some(12), "head advances to the last id");
+        assert_eq!(
+            heads.head(7).await,
+            Some(12),
+            "head advances to the last id"
+        );
         // A following batch continues the chain from the advanced head.
         let prevs = heads.link_batch(7, &[20, 21]).await;
         assert_eq!(prevs, vec![Some(12), Some(20)]);
@@ -1041,7 +1103,11 @@ mod tests {
         heads.link_batch(7, &[10]).await;
         assert_eq!(heads.head(7).await, Some(10));
         heads.evict(7).await;
-        assert_eq!(heads.head(7).await, None, "evicted execution starts a fresh chain");
+        assert_eq!(
+            heads.head(7).await,
+            None,
+            "evicted execution starts a fresh chain"
+        );
         // After eviction the next event is treated as a root again.
         let prevs = heads.link_batch(7, &[20]).await;
         assert_eq!(prevs, vec![None]);
@@ -1072,7 +1138,7 @@ mod tests {
             match prev_of.get(&id).copied().flatten() {
                 Some(prev) => cur = Some(prev),
                 None if id == genesis => cur = None, // reached the real root
-                None => return None,                // orphaned non-genesis head
+                None => return None,                 // orphaned non-genesis head
             }
         }
         walked.reverse();
@@ -1128,8 +1194,16 @@ mod tests {
         for (id, prev) in seq.iter().zip(fixed.link_batch(7, &seq).await) {
             prev_of.insert(*id, prev);
         }
-        assert_eq!(prev_of[&claimed], Some(issued), "claim links to command.issued");
-        assert_eq!(prev_of[&cmd_started], Some(claimed), "started links to claim");
+        assert_eq!(
+            prev_of[&claimed],
+            Some(issued),
+            "claim links to command.issued"
+        );
+        assert_eq!(
+            prev_of[&cmd_started],
+            Some(claimed),
+            "started links to claim"
+        );
         assert_eq!(fixed.head(7).await, Some(cmd_started));
         // The off-server spine walk now reconstructs the full sequence — complete.
         assert_eq!(
