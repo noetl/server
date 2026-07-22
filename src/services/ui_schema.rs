@@ -284,11 +284,10 @@ fn extract_directives_from_line(line: &str) -> Directive {
                     d.credential = Some(strip_quotes(&raw_value));
                 }
             }
-            "description" => {
-                if !raw_value.is_empty() {
+            "description"
+                if !raw_value.is_empty() => {
                     d.description = Some(strip_quotes(&raw_value));
                 }
-            }
             _ => {
                 // Unknown directive — silently ignored to mirror Python.
             }
