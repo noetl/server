@@ -386,13 +386,12 @@ fn validate_spool_config(spool: &serde_yaml::Value) -> AppResult<()> {
                 )));
             }
         }
-        "local_disk" => {
-            if !nonempty("path") {
+        "local_disk"
+            if !nonempty("path") => {
                 return Err(AppError::Validation(
                     "subscription 'spool.backend' 'local_disk' requires a non-empty 'path'".into(),
                 ));
             }
-        }
         _ => {}
     }
     // `credential` is optional for gcs/s3 — absent means ADC / Workload

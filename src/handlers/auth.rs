@@ -204,6 +204,7 @@ async fn validate_session_inner(
     // exact same validity CASE (expired / session-inactive / user-inactive →
     // invalid; else valid).  Parameterised bind replaces the playbook's
     // jsonb-escaped literal — same match semantics, safer quoting.
+    #[allow(clippy::type_complexity)] // one-off sqlx query-row tuple
     let row: Option<(i32, Option<String>, String, Option<String>, bool)> = sqlx::query_as(
         r#"
         SELECT
@@ -430,6 +431,7 @@ async fn login_create_session(
     // Identical CTE to auth0_login.create_user_session: upsert the Auth0 user,
     // copy same-email roles, create a fresh session, resolve the role names.
     // Parameterised binds replace the playbook's jsonb-escaped literals.
+    #[allow(clippy::type_complexity)] // one-off sqlx query-row tuple
     let row: Option<(String, i32, Option<String>, String, Option<String>, serde_json::Value)> =
         sqlx::query_as(
             r#"

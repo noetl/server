@@ -472,7 +472,7 @@ pub fn record_state_build(mode: &str, outcome: &str) {
 ///   `WHERE execution_id` scan — cold descriptor, or `event_read_path=event_scan`).
 ///
 /// The never-scan invariant proof (RFC §7): under `event_read_path=audit_only`
-/// + `state_builder=offserver`, across a full execution lifecycle the
+/// with `state_builder=offserver`, across a full execution lifecycle the
 /// `{outcome="scan"}` series stays **flat** (Δ0) while the lifecycle still
 /// completes — every hot-path event read was served from a read model, and
 /// `noetl.event` was scanned by nobody on the hot path.  Pairs with the

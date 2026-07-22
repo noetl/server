@@ -337,7 +337,7 @@ impl ExecutionService {
             .into_iter()
             .flat_map(|(_idx, rows)| rows)
             .collect();
-        merged.sort_by(|a, b| b.3.cmp(&a.3));
+        merged.sort_by_key(|b| std::cmp::Reverse(b.3));
 
         // Stage 3 — cluster-master catalog lookup for the
         // (deduped) catalog_id set.  One SELECT regardless of

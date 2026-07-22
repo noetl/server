@@ -19,7 +19,6 @@
 //! the writers being up at boot — matching how it tolerates NATS being absent.
 
 use std::collections::BTreeMap;
-use std::net::SocketAddr;
 
 use ehdb_feed::PublishRouter;
 use ehdb_l0::{D1EventLog, EventRecord};
@@ -60,9 +59,13 @@ impl CommandBusMode {
 }
 
 /// Parse `NOETL_COMMAND_BUS_WRITER_ADDRS` = `"0@host:port,1@host:port,..."` into
-/// a shard→address map. Entries that don't parse are skipped (logged by the
-/// caller); an empty map means "no writers configured".
-pub fn parse_writer_addrs(spec: &str) -> BTreeMap<u32, SocketAddr> {
+/// a shard→address map. The address is kept as a `host:port` **string**, not a
+/// parsed `SocketAddr`, so a Kubernetes service DNS name
+/// (`noetl-cmdbus-writer.noetl.svc.cluster.local:9100`) passes and is resolved
+/// at connect time (finding #2, noetl/ai-meta#194). Entries missing an `@`, a
+/// numeric shard, or a `:port` separator are skipped; an empty map means "no
+/// writers configured".
+pub fn parse_writer_addrs(spec: &str) -> BTreeMap<u32, String> {
     let mut out = BTreeMap::new();
     for entry in spec.split(',') {
         let entry = entry.trim();
@@ -72,13 +75,14 @@ pub fn parse_writer_addrs(spec: &str) -> BTreeMap<u32, SocketAddr> {
         let Some((shard, addr)) = entry.split_once('@') else {
             continue;
         };
-        let (Ok(shard), Ok(addr)) = (
-            shard.trim().parse::<u32>(),
-            addr.trim().parse::<SocketAddr>(),
-        ) else {
+        let Ok(shard) = shard.trim().parse::<u32>() else {
             continue;
         };
-        out.insert(shard, addr);
+        let addr = addr.trim();
+        if addr.is_empty() || !addr.contains(':') {
+            continue;
+        }
+        out.insert(shard, addr.to_string());
     }
     out
 }
@@ -86,13 +90,14 @@ pub fn parse_writer_addrs(spec: &str) -> BTreeMap<u32, SocketAddr> {
 /// A lazily-connected EHDB command publisher over the per-shard writers.
 pub struct EhdbCommandPublisher {
     shard_count: u32,
-    addrs: BTreeMap<u32, SocketAddr>,
+    addrs: BTreeMap<u32, String>,
     router: Mutex<Option<PublishRouter<D1EventLog>>>,
 }
 
 impl EhdbCommandPublisher {
-    /// A publisher routing over `shard_count` shards to the writers at `addrs`.
-    pub fn new(shard_count: u32, addrs: BTreeMap<u32, SocketAddr>) -> Self {
+    /// A publisher routing over `shard_count` shards to the writers at `addrs`
+    /// (`host:port` strings — DNS names resolved at connect time).
+    pub fn new(shard_count: u32, addrs: BTreeMap<u32, String>) -> Self {
         Self {
             shard_count: shard_count.max(1),
             addrs,
@@ -165,9 +170,22 @@ mod tests {
     fn writer_addr_parsing() {
         let m = parse_writer_addrs("0@127.0.0.1:9100, 1@127.0.0.1:9101 ,bad,2@10.0.0.5:9100");
         assert_eq!(m.len(), 3);
-        assert_eq!(m[&0], "127.0.0.1:9100".parse().unwrap());
-        assert_eq!(m[&1], "127.0.0.1:9101".parse().unwrap());
-        assert_eq!(m[&2], "10.0.0.5:9100".parse().unwrap());
+        assert_eq!(m[&0], "127.0.0.1:9100");
+        assert_eq!(m[&1], "127.0.0.1:9101");
+        assert_eq!(m[&2], "10.0.0.5:9100");
         assert!(parse_writer_addrs("").is_empty());
+    }
+
+    #[test]
+    fn writer_addr_parsing_accepts_dns_names() {
+        // Finding #2 (noetl/ai-meta#194): a K8s service DNS name is NOT a
+        // parseable `SocketAddr`, but must be kept for resolution at connect.
+        let m =
+            parse_writer_addrs("0@noetl-cmdbus-writer.noetl.svc.cluster.local:9100,1@writer-1:9100");
+        assert_eq!(m.len(), 2);
+        assert_eq!(m[&0], "noetl-cmdbus-writer.noetl.svc.cluster.local:9100");
+        assert_eq!(m[&1], "writer-1:9100");
+        // A host with no `:port` separator is rejected.
+        assert!(parse_writer_addrs("0@nohost").is_empty());
     }
 }

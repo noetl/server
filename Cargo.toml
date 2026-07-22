@@ -98,8 +98,8 @@ gcp_auth = "0.12"
 async-nats = "0.38"
 # EHDB command bus (L1 T4, flag-gated behind NOETL_COMMAND_BUS; default off).
 # The networked publish path to the per-shard writer (noetl/ehdb ehdb-feed).
-ehdb-feed = { git = "https://github.com/noetl/ehdb", rev = "ccdef55c0a7f50faf1a37c6bb7e4c2d89ef6bb3c" }
-ehdb-l0 = { git = "https://github.com/noetl/ehdb", rev = "ccdef55c0a7f50faf1a37c6bb7e4c2d89ef6bb3c" }
+ehdb-feed = { git = "https://github.com/noetl/ehdb", rev = "fa730e0b6b3a57e661518e8aa6e16b198121c576" }
+ehdb-l0 = { git = "https://github.com/noetl/ehdb", rev = "fa730e0b6b3a57e661518e8aa6e16b198121c576" }
 # Value type for the JetStream KV puts in `src/coherence.rs` (multi-replica
 # watermark/descriptor coherence, RFC #115 program-scale).  Matches the version
 # async-nats already pulls in transitively.
