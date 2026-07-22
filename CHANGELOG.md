@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.56.0](https://github.com/noetl/server/compare/v3.55.0...v3.56.0) (2026-07-22)
+
+### Features
+
+* **command-bus:** DNS-resolvable writer addrs (L1 T4 finding [#2](https://github.com/noetl/server/issues/2)) ([#282](https://github.com/noetl/server/issues/282)) ([f5afce6](https://github.com/noetl/server/commit/f5afce68ca8c7dd05e9c07d148eccf01635242cd)), closes [noetl/ai-meta#194](https://github.com/noetl/ai-meta/issues/194) [#1](https://github.com/noetl/server/issues/1) [noetl/ai-meta#194](https://github.com/noetl/ai-meta/issues/194)
+
 ## [3.55.0](https://github.com/noetl/server/compare/v3.54.0...v3.55.0) (2026-07-21)
 
 ### Features
