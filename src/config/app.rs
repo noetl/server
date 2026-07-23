@@ -230,6 +230,29 @@ pub struct AppConfig {
     #[serde(default = "default_command_context_max_bytes")]
     pub command_context_max_bytes: usize,
 
+    /// Keep the **permanent** `noetl.event` log lean (noetl/ai-meta#195, EHDB
+    /// write-behind-cache boundary).  When true, the `system/event_materializer`
+    /// path (`events_project`) strips an over-floor inline business step result
+    /// out of the persisted row — staging the payload to the byte source and
+    /// rewriting it to the same `reference` + `extracted` shape a large result
+    /// already carries — so business payloads do not accumulate **permanently**
+    /// in the append-only log (they stay only in the transient WAL cache, sunk to
+    /// the customer store + evicted per noetl/ai-meta#198).  Envy maps
+    /// `NOETL_PERMANENT_LOG_LEAN`.  **Default false** — behavior-neutral until an
+    /// operator opts in.  Safe because the live off-server drive reads the WAL,
+    /// not `noetl.event` (`dispatch_offserver_stateless_drive` does zero event
+    /// reads); the recovery/status readers resolve the staged reference via
+    /// `hydrate_result_references`.
+    #[serde(default)]
+    pub permanent_log_lean: bool,
+
+    /// Floor (bytes) below which an inline business result stays in the permanent
+    /// `noetl.event` row even when [`Self::permanent_log_lean`] is on — bounds
+    /// churn on the byte source and keeps trivial control scalars inline.  Envy
+    /// maps `NOETL_PERMANENT_LOG_INLINE_MAX_BYTES`.  **Default 512.**
+    #[serde(default = "default_permanent_log_inline_max_bytes")]
+    pub permanent_log_inline_max_bytes: usize,
+
     /// How the orchestrator drive reconstructs `WorkflowState` for an execution
     /// (RFC noetl/ai-meta#115 Phase 3).  Envy maps `NOETL_STATE_BUILD_MODE`.
     ///
@@ -719,6 +742,12 @@ fn default_command_context_max_bytes() -> usize {
     512 * 1024
 }
 
+fn default_permanent_log_inline_max_bytes() -> usize {
+    // 512 bytes — trivial control scalars stay in the permanent row; anything
+    // carrying a real business rowset gets externalized (noetl/ai-meta#195).
+    512
+}
+
 fn default_orphan_sweep_interval_secs() -> u64 {
     60
 }
@@ -826,6 +855,10 @@ impl Default for AppConfig {
             command_bus: None,
             command_bus_writer_addrs: None,
             command_context_max_bytes: default_command_context_max_bytes(),
+            // noetl/ai-meta#195: the permanent-log-lean strip is opt-in; default
+            // off keeps the persisted row byte-identical to today.
+            permanent_log_lean: false,
+            permanent_log_inline_max_bytes: default_permanent_log_inline_max_bytes(),
             // noetl/ai-meta#115 Phase 3: event-scan is the default; chain_walk is opt-in.
             state_build_mode: StateBuildMode::EventScan,
             state_build_parity_check: false,

@@ -318,13 +318,30 @@ pub async fn outbox_pending_count(
 pub async fn events_project(
     State(state): State<AppState>,
     _token: RequireInternalApiToken,
-    Json(request): Json<EventsProjectRequest>,
+    Json(mut request): Json<EventsProjectRequest>,
 ) -> AppResult<Json<EventsProjectResponse>> {
     if request.events.is_empty() {
         return Err(crate::error::AppError::BadRequest(
             "events must not be empty".to_string(),
         ));
     }
+
+    // Keep the permanent `noetl.event` log lean (noetl/ai-meta#195): strip
+    // over-floor inline business step results out of the persisted rows before
+    // the INSERT — staging each to the byte source and rewriting it to a
+    // resolvable `reference` + `extracted`.  This runs downstream of the
+    // `noetl_events` publish fork (the worker's off-server drive already
+    // consumed the full-payload envelope off the WAL), so it never touches the
+    // drive decision.  Default-off flag.
+    if state.config.permanent_log_lean {
+        crate::services::permanent_log_lean::slim_events_for_permanent_log(
+            &mut request.events,
+            &state,
+            state.config.permanent_log_inline_max_bytes,
+        )
+        .await;
+    }
+
     let (projected, duplicates) = svc::project_events(&state.db, &request.events).await?;
     info!(projected, duplicates, "events/project done");
 

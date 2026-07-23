@@ -14,6 +14,7 @@ pub mod internal;
 pub mod keychain;
 pub mod keychain_refresh;
 pub mod orch_snapshot;
+pub mod permanent_log_lean;
 pub mod registry;
 pub mod replay;
 pub mod result_store;

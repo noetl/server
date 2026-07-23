@@ -974,6 +974,44 @@ pub fn record_events_materialized(rows: u64) {
     events_materialized_total().inc_by(rows);
 }
 
+/// Count of inline business step results stripped out of the permanent
+/// `noetl.event` log by the permanent-log-lean strip (noetl/ai-meta#195), and
+/// the total pre-strip payload bytes kept out of the append-only log.
+fn permanent_log_slimmed_total() -> &'static prometheus::IntCounter {
+    static M: OnceLock<prometheus::IntCounter> = OnceLock::new();
+    M.get_or_init(|| {
+        let counter = prometheus::IntCounter::new(
+            "noetl_permanent_log_slimmed_total",
+            "Inline business step results stripped from the permanent noetl.event log (noetl/ai-meta#195).",
+        )
+        .expect("static counter spec must be valid");
+        registry()
+            .register(Box::new(counter.clone()))
+            .expect("counter registration must succeed");
+        counter
+    })
+}
+
+fn permanent_log_slimmed_bytes_total() -> &'static prometheus::IntCounter {
+    static M: OnceLock<prometheus::IntCounter> = OnceLock::new();
+    M.get_or_init(|| {
+        let counter = prometheus::IntCounter::new(
+            "noetl_permanent_log_slimmed_bytes_total",
+            "Business-payload bytes kept out of the permanent noetl.event log by the lean strip (noetl/ai-meta#195).",
+        )
+        .expect("static counter spec must be valid");
+        registry()
+            .register(Box::new(counter.clone()))
+            .expect("counter registration must succeed");
+        counter
+    })
+}
+
+pub fn record_permanent_log_slimmed(count: u64, bytes: u64) {
+    permanent_log_slimmed_total().inc_by(count);
+    permanent_log_slimmed_bytes_total().inc_by(bytes);
+}
+
 // ---------------------------------------------------------------------------
 // Round 2 — generic write-endpoint surface
 // ---------------------------------------------------------------------------
