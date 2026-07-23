@@ -745,7 +745,9 @@ pub(crate) const COMMAND_CONTEXT_REF_KEY: &str = "__context_ref__";
 /// Logical `name` segment used for offloaded command contexts in the result
 /// store.  A constant (not the step name) keeps the `noetl://` URI parseable
 /// regardless of step-name characters and unambiguous to spot in the store.
-const COMMAND_CONTEXT_RESULT_NAME: &str = "__command_context__";
+/// Shared with the permanent-log-lean strip (noetl/ai-meta#196), which reuses
+/// the same offload shape so `resolve_command_context_ref` hydrates it.
+pub(crate) const COMMAND_CONTEXT_RESULT_NAME: &str = "__command_context__";
 
 /// Offload an over-budget command context to the result store, returning a tiny
 /// `{ "__context_ref__": "noetl://…", "__context_bytes__": N }` marker in its
