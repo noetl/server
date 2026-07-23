@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.58.0](https://github.com/noetl/server/compare/v3.57.0...v3.58.0) (2026-07-23)
+
+### Features
+
+* **events:** tier command input out of the permanent log (default-off) ([#284](https://github.com/noetl/server/issues/284)) ([0511585](https://github.com/noetl/server/commit/0511585edb9b94a889c4a9f9819e1456ad7e5ffd)), closes [#196](https://github.com/noetl/server/issues/196) [#195](https://github.com/noetl/server/issues/195) [#114](https://github.com/noetl/server/issues/114) [noetl/ai-meta#196](https://github.com/noetl/ai-meta/issues/196) [noetl/ai-meta#194](https://github.com/noetl/ai-meta/issues/194)
+
 ## [3.57.0](https://github.com/noetl/server/compare/v3.56.0...v3.57.0) (2026-07-23)
 
 ### Features
