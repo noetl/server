@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.57.0](https://github.com/noetl/server/compare/v3.56.0...v3.57.0) (2026-07-23)
+
+### Features
+
+* **events:** keep the permanent noetl.event log lean (default-off) ([#283](https://github.com/noetl/server/issues/283)) ([e10e970](https://github.com/noetl/server/commit/e10e970b3cd7196e1b5114c99e3f86184c528235)), closes [noetl/ai-meta#195](https://github.com/noetl/ai-meta/issues/195) [noetl/ai-meta#194](https://github.com/noetl/ai-meta/issues/194)
+
 ## [3.56.0](https://github.com/noetl/server/compare/v3.55.0...v3.56.0) (2026-07-22)
 
 ### Features
