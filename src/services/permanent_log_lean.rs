@@ -1,5 +1,15 @@
-//! Keep the **permanent** `noetl.event` log lean (noetl/ai-meta#195, EHDB
-//! write-behind-cache boundary, RFC `docs/rfc/ehdb-layered-platform.md` §0/§0.2).
+//! Keep the **permanent** `noetl.event` log lean (noetl/ai-meta#195 + #196,
+//! EHDB write-behind-cache boundary, RFC `docs/rfc/ehdb-layered-platform.md`
+//! §0/§0.2).
+//!
+//! Two symmetric business-payload strips at the same materializer chokepoint:
+//! **#195** tiers a step **result** out of a completed event's `result`, and
+//! **#196** tiers a step **input** out of a `command.issued` event's `context`.
+//! Both stage the payload to the byte source and leave a resolvable reference
+//! that the existing read paths hydrate — results via `hydrate_result_references`
+//! (`{reference{ref, extracted}}`), command inputs via `resolve_command_context_ref`
+//! (the `{__context_ref__}` marker `maybe_offload_command_context` #114 already
+//! produces for the >512 KB case; #196 extends it below that bound).
 //!
 //! ## The gap this closes
 //!
@@ -296,6 +306,91 @@ fn rewrite_node_to_reference(
 /// a resolvable reference + `extracted`. Records the count + bytes stripped.
 /// Best-effort per envelope: an ineligible shape or a staging failure leaves
 /// that row inline — never drops a payload.
+/// Is this envelope a `command.issued` event carrying an inline business input
+/// context eligible to be tiered out of the permanent log (noetl/ai-meta#196)?
+/// The business step input rides in the event's top-level `context` field as the
+/// whole `{tool_config, args, render_context}` object. Eligible when it is an
+/// over-floor object that is not already an offloaded `__context_ref__` marker.
+fn eligible_command_context(env: &EventEnvelope, floor_bytes: usize) -> Option<Value> {
+    if env.event_type.as_deref() != Some("command.issued") {
+        return None;
+    }
+    let context = env.context.as_ref()?;
+    let obj = context.as_object()?;
+    // Already offloaded by #114's over-budget path → nothing to do.
+    if obj.contains_key(crate::handlers::execute::COMMAND_CONTEXT_REF_KEY) {
+        return None;
+    }
+    let approx = serde_json::to_string(context).map(|s| s.len()).unwrap_or(0);
+    if approx <= floor_bytes {
+        return None;
+    }
+    Some(context.clone())
+}
+
+/// Tier a `command.issued` event's inline business input out of the permanent
+/// log (noetl/ai-meta#196): stage the `{tool_config, args, render_context}`
+/// context to the byte source and replace it with the same `__context_ref__`
+/// marker `maybe_offload_command_context` (#114) produces — so the existing
+/// server-side `resolve_command_context_ref` hydrates it for the worker at
+/// claim/get time with no read-side change. Returns the payload byte count when
+/// it stripped.
+///
+/// Safe for the drive: `orchestrate-core`'s `apply_event` reads only
+/// `node_name` + `meta.cursor` for a `command.issued` event (never `context`),
+/// and the transient `noetl.command` table row (written at dispatch, purged
+/// after completion) still holds the full context for a claim that reads it
+/// before materialization.
+async fn slim_command_context(
+    env: &mut EventEnvelope,
+    state: &AppState,
+    floor_bytes: usize,
+) -> Option<usize> {
+    let execution_id = env.execution_id?;
+    let context = eligible_command_context(env, floor_bytes)?;
+    let approx_bytes = serde_json::to_string(&context)
+        .map(|s| s.len())
+        .unwrap_or(0);
+
+    let result_store = ResultStoreService::new(
+        state.pools.pool_for(execution_id).clone(),
+        state.snowflake.clone(),
+    );
+    let body = PutResultBody {
+        name: crate::handlers::execute::COMMAND_CONTEXT_RESULT_NAME.to_string(),
+        data: context,
+        scope: "execution".to_string(),
+        source_step: env.node_name.clone(),
+        store: None,
+        ttl: None,
+        correlation: None,
+        compress: false,
+    };
+    let put = match result_store.put(execution_id, &body).await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(
+                execution_id,
+                error = %e,
+                "permanent_log_lean: command-context stage failed; leaving context inline",
+            );
+            return None;
+        }
+    };
+    // Replace with the #114 marker shape `resolve_command_context_ref` reads.
+    env.context = Some(serde_json::json!({
+        crate::handlers::execute::COMMAND_CONTEXT_REF_KEY: put.r#ref,
+        "__context_bytes__": approx_bytes,
+    }));
+    tracing::debug!(
+        execution_id,
+        payload_bytes = approx_bytes,
+        context_ref = %put.r#ref,
+        "permanent_log_lean: tiered command input to a reference",
+    );
+    Some(approx_bytes)
+}
+
 pub async fn slim_events_for_permanent_log(
     events: &mut [EventEnvelope],
     state: &AppState,
@@ -304,7 +399,14 @@ pub async fn slim_events_for_permanent_log(
     let mut stripped = 0usize;
     let mut bytes = 0usize;
     for env in events.iter_mut() {
+        // A given event carries either a completed-step result (`result`) or a
+        // command input (`context` on `command.issued`) — mutually exclusive by
+        // event type, so both are attempted and whichever applies runs.
         if let Some(n) = slim_one(env, state, floor_bytes).await {
+            stripped += 1;
+            bytes += n;
+        }
+        if let Some(n) = slim_command_context(env, state, floor_bytes).await {
             stripped += 1;
             bytes += n;
         }
@@ -453,5 +555,66 @@ mod tests {
         assert_eq!(ex["big"], serde_json::json!({ "_len": 10_000 }));
         // The array keeps its first element so `rows[0].id` still resolves.
         assert_eq!(ex["rows"][0]["id"], serde_json::json!(0));
+    }
+
+    // ── #196: command input (command.issued context) ───────────────────────
+
+    fn command_issued(context: Value) -> EventEnvelope {
+        EventEnvelope {
+            event_id: 7,
+            execution_id: Some(1),
+            event_type: Some("command.issued".to_string()),
+            node_name: Some("query_users".to_string()),
+            context: Some(context),
+            ..Default::default()
+        }
+    }
+
+    fn big_command_context() -> Value {
+        serde_json::json!({
+            "tool_config": { "query": "x".repeat(400) },
+            "args": { "limit": 10, "filter": "y".repeat(400) },
+            "render_context": { "upstream": "z".repeat(400) },
+        })
+    }
+
+    #[test]
+    fn command_issued_over_floor_context_is_eligible() {
+        let env = command_issued(big_command_context());
+        let got = eligible_command_context(&env, 512);
+        assert!(got.is_some(), "an over-floor command.issued context is eligible");
+        // The whole {tool_config, args, render_context} object is returned to stage.
+        let ctx = got.unwrap();
+        assert!(ctx.get("tool_config").is_some() && ctx.get("args").is_some());
+    }
+
+    #[test]
+    fn command_issued_already_offloaded_is_skipped() {
+        // A context already carrying the #114 `__context_ref__` marker must not
+        // be double-offloaded.
+        let marker = serde_json::json!({
+            crate::handlers::execute::COMMAND_CONTEXT_REF_KEY: "noetl://execution/1/__command_context__/9",
+            "__context_bytes__": 999_999,
+        });
+        let env = command_issued(marker);
+        assert!(eligible_command_context(&env, 0).is_none());
+    }
+
+    #[test]
+    fn non_command_issued_event_context_is_skipped() {
+        // Only command.issued carries business INPUT; a completed event's context
+        // is control-shape and handled (if at all) by the result strip.
+        let mut env = command_issued(big_command_context());
+        env.event_type = Some("command.completed".to_string());
+        assert!(eligible_command_context(&env, 512).is_none());
+    }
+
+    #[test]
+    fn command_issued_under_floor_context_is_skipped() {
+        let env = command_issued(serde_json::json!({ "args": { "n": 1 } }));
+        assert!(
+            eligible_command_context(&env, 512).is_none(),
+            "a tiny control-shape context stays inline"
+        );
     }
 }
