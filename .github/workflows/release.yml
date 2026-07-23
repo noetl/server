@@ -80,11 +80,21 @@ jobs:
             # Give the sparse index a moment so the root crate's publish resolves it.
             sleep 20
           fi
-      - name: Publish noetl-server crate
-        if: ${{ env.CRATES_IO_TOKEN != '' }}
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ env.CRATES_IO_TOKEN }}
-        run: cargo publish -p noetl-server
+      # noetl-server is a server BINARY, not a library.  The release
+      # artifact is the container image (ghcr.io/noetl/server, published
+      # by the publish-image job below); nothing on crates.io depends on
+      # noetl-server (verified: 0 reverse dependencies).  The crate also
+      # carries git-only dependencies (ehdb-feed / ehdb-l0, added by the
+      # EHDB NATS-takeover wiring in v3.55.0), and `cargo publish` rejects
+      # a crate whose git deps carry no version ("all dependencies must
+      # have a version requirement specified when publishing.  dependency
+      # `ehdb-feed` does not specify a version").  So this step could not
+      # succeed and we intentionally do NOT publish the noetl-server crate
+      # to crates.io.  The noetl-orchestrate-core library above is still
+      # published for anyone who wants the pure drive core.
+      # See https://github.com/noetl/ai-meta/issues/200.
+      - name: Publish noetl-server crate (intentionally skipped — binary, not a library)
+        run: echo "noetl-server is a binary; the release artifact is ghcr.io/noetl/server. Not publishing to crates.io (0 reverse deps; git-only ehdb deps forbid cargo publish)."
       - name: Skip publish (no token)
         if: ${{ env.CRATES_IO_TOKEN == '' }}
         run: echo "CRATES_IO_TOKEN is not set; skipping crate publish."
