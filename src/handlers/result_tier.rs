@@ -37,7 +37,14 @@ pub async fn gc(
     body: Option<Json<GcRequest>>,
 ) -> AppResult<Json<GcReport>> {
     let req = body.map(|Json(r)| r).unwrap_or_default();
-    let report = result_tier_gc::sweep(&deps.pool, &deps.backend, &req).await?;
+    // noetl/ai-meta#199 Slice B — write-behind-cache sink-state source. The gate
+    // (`NOETL_RESULT_TIER_GC_SINK_GATE`) retains any object whose execution is
+    // still pending-sink. The server-visible feed of pending-sink executions (a
+    // worker-reported set, cross-process from the worker's in-process sink gate)
+    // is a tracked follow-up; until it lands the source is empty, so the gate is
+    // behavior-neutral — it can only ever retain more, never delete more.
+    let pending_sink: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    let report = result_tier_gc::sweep(&deps.pool, &deps.backend, &req, &pending_sink).await?;
 
     // Observability: one counter, deltas tell the story (no_op when the gate is
     // off, scanned/deleted/skipped_live/errors otherwise).
@@ -52,6 +59,7 @@ pub async fn gc(
             "skipped_unparseable",
             report.skipped_unparseable as u64,
         );
+        crate::metrics::record_result_tier_gc("skipped_unsunk", report.skipped_unsunk as u64);
         crate::metrics::record_result_tier_gc("error", report.errors as u64);
     }
 
