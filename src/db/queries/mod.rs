@@ -12,5 +12,6 @@ pub mod object_store;
 pub mod registry;
 pub mod result_store;
 pub mod secret_audit;
+pub mod sink_pending;
 pub mod subscription_dedup;
 pub mod wallet_rotate;

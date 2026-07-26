@@ -578,6 +578,22 @@ fn build_router(
             backend: object_backend.clone(),
         });
 
+    // Sink-state feed (noetl/ai-meta#199 Slice B) — workers report / clear
+    // pending-sink executions here; the result-tier GC reads the set. Internal-
+    // only, service-account gated like the result-tier GC route.
+    let sink_state_routes = Router::new()
+        .route(
+            "/api/internal/sink-state/mark",
+            post(handlers::sink_state::mark),
+        )
+        .route(
+            "/api/internal/sink-state/confirm",
+            post(handlers::sink_state::confirm),
+        )
+        .with_state(handlers::sink_state::SinkStateDeps {
+            pool: db_pool.clone(),
+        });
+
     // Gateway push-ingress config endpoint (noetl/ai-meta#90 Phase 3).  The
     // gateway calls GET /api/internal/ingress/{listener} (service-account
     // gated) to resolve a push subscription's verify scheme + Wallet-resolved
@@ -650,6 +666,7 @@ fn build_router(
         .merge(object_store_routes)
         .merge(cell_routes)
         .merge(result_tier_routes)
+        .merge(sink_state_routes)
         .merge(ingress_routes)
         .merge(system_routes)
         .merge(dashboard_routes);
@@ -925,6 +942,10 @@ async fn main() -> anyhow::Result<()> {
     // pattern as secret_audit above.  The table is server-owned end-to-end;
     // no out-of-band migration required.
     noetl_server::db::queries::result_store::ensure_table(&db_pool).await?;
+    // Sink-state feed (noetl/ai-meta#199 Slice B) — the server-visible set of
+    // executions holding un-sunk business context, so the result-tier GC never
+    // reclaims it. Same idempotent startup-DDL pattern; server-owned end-to-end.
+    noetl_server::db::queries::sink_pending::ensure_table(&db_pool).await?;
     // Plug-in module registry (noetl/ai-meta#105 Round 4) — the durable backing
     // for the system worker pool's wasmtime PluginSource.  Same idempotent
     // startup-DDL pattern; server-owned end-to-end.
