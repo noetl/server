@@ -609,7 +609,7 @@ dependencies = [
 [[package]]
 name = "ehdb-core"
 version = "0.1.0"
-source = "git+https://github.com/noetl/ehdb?rev=d4b623512db279e55b0093cf7207f7b400dd511e#d4b623512db279e55b0093cf7207f7b400dd511e"
+source = "git+https://github.com/noetl/ehdb?rev=03e94be444d48406dccd59969a726ba797f78300#03e94be444d48406dccd59969a726ba797f78300"
 dependencies = [
  "arrow-schema",
  "serde",
@@ -618,7 +618,7 @@ dependencies = [
 [[package]]
 name = "ehdb-feed"
 version = "0.1.0"
-source = "git+https://github.com/noetl/ehdb?rev=d4b623512db279e55b0093cf7207f7b400dd511e#d4b623512db279e55b0093cf7207f7b400dd511e"
+source = "git+https://github.com/noetl/ehdb?rev=03e94be444d48406dccd59969a726ba797f78300#03e94be444d48406dccd59969a726ba797f78300"
 dependencies = [
  "ehdb-core",
  "ehdb-l0",
@@ -630,7 +630,7 @@ dependencies = [
 [[package]]
 name = "ehdb-l0"
 version = "0.1.0"
-source = "git+https://github.com/noetl/ehdb?rev=d4b623512db279e55b0093cf7207f7b400dd511e#d4b623512db279e55b0093cf7207f7b400dd511e"
+source = "git+https://github.com/noetl/ehdb?rev=03e94be444d48406dccd59969a726ba797f78300#03e94be444d48406dccd59969a726ba797f78300"
 dependencies = [
  "ehdb-core",
  "serde",
@@ -669,7 +669,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1882,7 +1882,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

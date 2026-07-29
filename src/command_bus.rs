@@ -19,6 +19,7 @@
 //! the writers being up at boot — matching how it tolerates NATS being absent.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use ehdb_feed::PublishRouter;
 use ehdb_l0::{D1EventLog, EventRecord};
@@ -88,10 +89,19 @@ pub fn parse_writer_addrs(spec: &str) -> BTreeMap<u32, String> {
 }
 
 /// A lazily-connected EHDB command publisher over the per-shard writers.
+///
+/// The router is held behind the mutex only to *swap* it (lazy connect, redial
+/// after a failure) — never across a publish. A publish clones the `Arc` out,
+/// drops the guard, and then does its round-trip, so concurrent publishes run
+/// concurrently. Holding the lock across the round-trip serialised the control
+/// plane's whole command path behind one writer `fsync` each, which was the
+/// dominant term in command dispatch latency (noetl/ai-meta#205); it also kept
+/// the writer from ever seeing two records at once, so it could never
+/// group-commit them.
 pub struct EhdbCommandPublisher {
     shard_count: u32,
     addrs: BTreeMap<u32, String>,
-    router: Mutex<Option<PublishRouter<D1EventLog>>>,
+    router: Mutex<Option<Arc<PublishRouter<D1EventLog>>>>,
 }
 
 impl EhdbCommandPublisher {
@@ -125,19 +135,31 @@ impl EhdbCommandPublisher {
             String::new(),
             String::from_utf8_lossy(payload).into_owned(),
         );
-        let mut guard = self.router.lock().await;
-        if guard.is_none() {
-            let router = PublishRouter::<D1EventLog>::connect(self.shard_count, self.addrs.clone())
-                .await
-                .map_err(|e| format!("EHDB writer connect failed: {e}"))?;
-            *guard = Some(router);
-        }
-        match guard.as_mut().unwrap().publish(&record).await {
+        // Take a handle to the router, then release the lock: the round-trip
+        // below runs unserialised so concurrent commands reach the writer
+        // together and share one group commit.
+        let router = {
+            let mut guard = self.router.lock().await;
+            if guard.is_none() {
+                let router =
+                    PublishRouter::<D1EventLog>::connect(self.shard_count, self.addrs.clone())
+                        .await
+                        .map_err(|e| format!("EHDB writer connect failed: {e}"))?;
+                *guard = Some(Arc::new(router));
+            }
+            Arc::clone(guard.as_ref().unwrap())
+        };
+        match router.publish(&record).await {
             Ok(seq) => Ok(seq),
             Err(e) => {
                 // Drop the router so the next publish redials (writer restarted,
-                // rolled, or a shard moved).
-                *guard = None;
+                // rolled, or a shard moved) — but only if it is still the one
+                // that failed, so a redial another task already completed is not
+                // thrown away.
+                let mut guard = self.router.lock().await;
+                if guard.as_ref().is_some_and(|r| Arc::ptr_eq(r, &router)) {
+                    *guard = None;
+                }
                 Err(format!("EHDB publish failed: {e}"))
             }
         }
