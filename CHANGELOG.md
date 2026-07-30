@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.58.2](https://github.com/noetl/server/compare/v3.58.1...v3.58.2) (2026-07-30)
+
+### Performance Improvements
+
+* **command-bus:** publish to the EHDB writer without serialising on one mutex ([2d547e0](https://github.com/noetl/server/commit/2d547e07e2a85cee1a8822b428e424b0dff86c87)), closes [noetl/ehdb#301](https://github.com/noetl/ehdb/issues/301) [noetl/ai-meta#205](https://github.com/noetl/ai-meta/issues/205) [noetl/ehdb#301](https://github.com/noetl/ehdb/issues/301) [ehdb#301](https://github.com/noetl/ehdb/issues/301) [noetl/ai-meta#205](https://github.com/noetl/ai-meta/issues/205)
+
 ## [3.58.1](https://github.com/noetl/server/compare/v3.58.0...v3.58.1) (2026-07-28)
 
 ### Bug Fixes
