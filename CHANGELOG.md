@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.58.3](https://github.com/noetl/server/compare/v3.58.2...v3.58.3) (2026-07-30)
+
+### Bug Fixes
+
+* **command-bus:** retry an EHDB publish across a writer restart ([#208](https://github.com/noetl/server/issues/208)) ([8958b1a](https://github.com/noetl/server/commit/8958b1a8a8e3b0d7de42054abcfa938d91d1282e)), closes [#203](https://github.com/noetl/server/issues/203) [noetl/ai-meta#171](https://github.com/noetl/ai-meta/issues/171)
+
 ## [3.58.2](https://github.com/noetl/server/compare/v3.58.1...v3.58.2) (2026-07-30)
 
 ### Performance Improvements
