@@ -609,7 +609,7 @@ dependencies = [
 [[package]]
 name = "ehdb-core"
 version = "0.1.0"
-source = "git+https://github.com/noetl/ehdb?rev=d4b623512db279e55b0093cf7207f7b400dd511e#d4b623512db279e55b0093cf7207f7b400dd511e"
+source = "git+https://github.com/noetl/ehdb?rev=86a24f95841be0d2cf031eba1bcf44c9a627c1d1#86a24f95841be0d2cf031eba1bcf44c9a627c1d1"
 dependencies = [
  "arrow-schema",
  "serde",
@@ -618,19 +618,20 @@ dependencies = [
 [[package]]
 name = "ehdb-feed"
 version = "0.1.0"
-source = "git+https://github.com/noetl/ehdb?rev=d4b623512db279e55b0093cf7207f7b400dd511e#d4b623512db279e55b0093cf7207f7b400dd511e"
+source = "git+https://github.com/noetl/ehdb?rev=86a24f95841be0d2cf031eba1bcf44c9a627c1d1#86a24f95841be0d2cf031eba1bcf44c9a627c1d1"
 dependencies = [
  "ehdb-core",
  "ehdb-l0",
  "serde",
  "serde_json",
+ "socket2 0.5.10",
  "tokio",
 ]
 
 [[package]]
 name = "ehdb-l0"
 version = "0.1.0"
-source = "git+https://github.com/noetl/ehdb?rev=d4b623512db279e55b0093cf7207f7b400dd511e#d4b623512db279e55b0093cf7207f7b400dd511e"
+source = "git+https://github.com/noetl/ehdb?rev=86a24f95841be0d2cf031eba1bcf44c9a627c1d1#86a24f95841be0d2cf031eba1bcf44c9a627c1d1"
 dependencies = [
  "ehdb-core",
  "serde",
@@ -669,7 +670,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1092,7 +1093,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2",
+ "socket2 0.6.5",
  "tokio",
  "tower-service",
  "tracing",
@@ -1842,7 +1843,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls",
- "socket2",
+ "socket2 0.6.5",
  "thiserror 2.0.19",
  "tokio",
  "tracing",
@@ -1880,9 +1881,9 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2",
+ "socket2 0.6.5",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2482,6 +2483,16 @@ dependencies = [
 
 [[package]]
 name = "socket2"
+version = "0.5.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e22376abed350d73dd1cd119b57ffccad95b4e585a7cda43e286245ce23c0678"
+dependencies = [
+ "libc",
+ "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "socket2"
 version = "0.6.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
@@ -2908,7 +2919,7 @@ dependencies = [
  "mio",
  "pin-project-lite",
  "signal-hook-registry",
- "socket2",
+ "socket2 0.6.5",
  "tokio-macros",
  "windows-sys 0.61.2",
 ]
