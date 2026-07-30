@@ -120,9 +120,40 @@ impl EhdbCommandPublisher {
         !self.addrs.is_empty()
     }
 
+    /// How many times a publish is attempted before it gives up. A writer
+    /// restart breaks every socket the router holds, so the first attempt after
+    /// one always fails; the retries carry the command across the gap while the
+    /// replacement pod's endpoint appears (noetl/ai-meta#208).
+    const PUBLISH_ATTEMPTS: u32 = 3;
+    /// Pause between publish attempts — long enough for a pod swap's endpoint
+    /// update, short enough that the API request behind this publish is not held
+    /// up noticeably.
+    const RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(250);
+
     /// Publish one command notification onto the EHDB bus. `execution_id` routes
     /// the shard; `event_id` is the sort key; `payload` is the notification JSON.
     /// Returns the writer-assigned sort key. Lazily (re)connects the router.
+    ///
+    /// **Retries across a writer restart (noetl/ai-meta#208).** The router holds
+    /// live sockets to the shard writers, so a writer pod that goes away breaks
+    /// every publish in flight on it — and the first publish afterwards, which
+    /// only discovers the socket is dead by using it. Dropping the router made the
+    /// *next* command redial, but the command that hit the broken socket was
+    /// simply lost: `command.issued` was already durable in the event log, nothing
+    /// ever reached the bus, and the caller got a 500. Observed in kind on a
+    /// routine writer rollout as `EHDB publish failed: early eof` plus one
+    /// execution stuck with an issued-but-never-claimed command. A command
+    /// dropped this way is only recovered by the orphaned-command guardrail
+    /// (noetl/ai-meta#171), and after T5 there is no NATS to fall back to.
+    ///
+    /// So a failed attempt now redials and publishes again, up to
+    /// [`PUBLISH_ATTEMPTS`](Self::PUBLISH_ATTEMPTS). A retry can only ever
+    /// *duplicate* a command — if the record was appended but its ack was lost,
+    /// the retry appends a second copy — and duplicate delivery is already what
+    /// the bus's `ack_wait` redelivery produces, so the worker's claim path
+    /// dedupes it (the second claimer is told the command is already claimed).
+    /// Losing the command has no such safety net, so at-least-once is the right
+    /// trade here.
     pub async fn publish(
         &self,
         execution_id: i64,
@@ -135,34 +166,68 @@ impl EhdbCommandPublisher {
             String::new(),
             String::from_utf8_lossy(payload).into_owned(),
         );
-        // Take a handle to the router, then release the lock: the round-trip
-        // below runs unserialised so concurrent commands reach the writer
-        // together and share one group commit.
-        let router = {
-            let mut guard = self.router.lock().await;
-            if guard.is_none() {
-                let router =
-                    PublishRouter::<D1EventLog>::connect(self.shard_count, self.addrs.clone())
-                        .await
-                        .map_err(|e| format!("EHDB writer connect failed: {e}"))?;
-                *guard = Some(Arc::new(router));
-            }
-            Arc::clone(guard.as_ref().unwrap())
-        };
-        match router.publish(&record).await {
-            Ok(seq) => Ok(seq),
-            Err(e) => {
-                // Drop the router so the next publish redials (writer restarted,
-                // rolled, or a shard moved) — but only if it is still the one
-                // that failed, so a redial another task already completed is not
-                // thrown away.
-                let mut guard = self.router.lock().await;
-                if guard.as_ref().is_some_and(|r| Arc::ptr_eq(r, &router)) {
-                    *guard = None;
+        let mut last_err = String::new();
+        for attempt in 1..=Self::PUBLISH_ATTEMPTS {
+            let router = match self.router().await {
+                Ok(r) => r,
+                Err(e) => {
+                    last_err = e;
+                    if attempt < Self::PUBLISH_ATTEMPTS {
+                        tokio::time::sleep(Self::RETRY_BACKOFF).await;
+                    }
+                    continue;
                 }
-                Err(format!("EHDB publish failed: {e}"))
+            };
+            match router.publish(&record).await {
+                Ok(seq) => {
+                    if attempt > 1 {
+                        tracing::info!(
+                            execution_id,
+                            event_id,
+                            attempt,
+                            "EHDB command published after redialing the writer"
+                        );
+                    }
+                    return Ok(seq);
+                }
+                Err(e) => {
+                    last_err = format!("EHDB publish failed: {e}");
+                    // Drop the router so the next attempt redials (writer
+                    // restarted, rolled, or a shard moved) — but only if it is
+                    // still the one that failed, so a redial another task already
+                    // completed is not thrown away.
+                    let mut guard = self.router.lock().await;
+                    if guard.as_ref().is_some_and(|r| Arc::ptr_eq(r, &router)) {
+                        *guard = None;
+                    }
+                    drop(guard);
+                    if attempt < Self::PUBLISH_ATTEMPTS {
+                        tracing::warn!(
+                            execution_id,
+                            event_id,
+                            attempt,
+                            error = %last_err,
+                            "EHDB publish failed; redialing the writer and retrying"
+                        );
+                        tokio::time::sleep(Self::RETRY_BACKOFF).await;
+                    }
+                }
             }
         }
+        Err(last_err)
+    }
+
+    /// The live router, connecting it if this is the first use or the previous
+    /// one was dropped after a failure.
+    async fn router(&self) -> Result<Arc<PublishRouter<D1EventLog>>, String> {
+        let mut guard = self.router.lock().await;
+        if guard.is_none() {
+            let router = PublishRouter::<D1EventLog>::connect(self.shard_count, self.addrs.clone())
+                .await
+                .map_err(|e| format!("EHDB writer connect failed: {e}"))?;
+            *guard = Some(Arc::new(router));
+        }
+        Ok(Arc::clone(guard.as_ref().unwrap()))
     }
 }
 
