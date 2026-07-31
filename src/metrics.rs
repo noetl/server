@@ -1029,6 +1029,58 @@ pub fn events_materialized_total() -> &'static prometheus::IntCounter {
     })
 }
 
+/// Counter: `noetl.event` rows written by `/api/internal/events/project` — the
+/// live durable-log write path.
+///
+/// [`events_materialized_total`] counts the *other* sink
+/// (`/api/internal/events/materialize`), which the deployed configuration does
+/// not use, so it reads 0 forever and is not a usable signal for "is the durable
+/// log still being written". This one tracks the path that actually runs under
+/// `NOETL_EVENT_INGEST_PUBLISH_ONLY`, where the worker-side `noetl_materializer`
+/// draining the events bus is the sole writer of `noetl.event`.
+///
+/// That makes it the ground-truth gate for the T3 events-bus cutover
+/// (noetl/ai-meta#212): publish counters prove the *publisher*, this proves rows
+/// are still landing in the log. `duplicates` is tracked separately because
+/// at-least-once redelivery makes a non-zero duplicate count normal — collapsing
+/// the two would hide a real drop behind retried writes.
+pub fn events_projected_total() -> &'static prometheus::IntCounter {
+    static M: OnceLock<prometheus::IntCounter> = OnceLock::new();
+    M.get_or_init(|| {
+        let counter = prometheus::IntCounter::new(
+            "noetl_events_projected_total",
+            "noetl.event rows written via /api/internal/events/project (the live materializer sink).",
+        )
+        .expect("static counter spec must be valid");
+        registry()
+            .register(Box::new(counter.clone()))
+            .expect("counter registration must succeed");
+        counter
+    })
+}
+
+/// Counter: rows `/api/internal/events/project` skipped as already-present.
+pub fn events_projected_duplicates_total() -> &'static prometheus::IntCounter {
+    static M: OnceLock<prometheus::IntCounter> = OnceLock::new();
+    M.get_or_init(|| {
+        let counter = prometheus::IntCounter::new(
+            "noetl_events_projected_duplicates_total",
+            "Rows /api/internal/events/project skipped as duplicates (at-least-once redelivery).",
+        )
+        .expect("static counter spec must be valid");
+        registry()
+            .register(Box::new(counter.clone()))
+            .expect("counter registration must succeed");
+        counter
+    })
+}
+
+/// Record the outcome of one `events/project` batch.
+pub fn record_events_projected(projected: u64, duplicates: u64) {
+    events_projected_total().inc_by(projected);
+    events_projected_duplicates_total().inc_by(duplicates);
+}
+
 /// Record a batch of materialized event rows.
 pub fn record_events_materialized(rows: u64) {
     events_materialized_total().inc_by(rows);
