@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.60.0](https://github.com/noetl/server/compare/v3.59.0...v3.60.0) (2026-07-31)
+
+### Features
+
+* **metrics:** count noetl.event rows written by events/project ([ece55ef](https://github.com/noetl/server/commit/ece55eff4fe720a68e78206e4384b39453cef75f))
+
 ## [3.59.0](https://github.com/noetl/server/compare/v3.58.4...v3.59.0) (2026-07-31)
 
 ### Features
