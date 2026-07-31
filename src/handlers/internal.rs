@@ -344,6 +344,11 @@ pub async fn events_project(
 
     let (projected, duplicates) = svc::project_events(&state.db, &request.events).await?;
     info!(projected, duplicates, "events/project done");
+    // The durable-log write counter (noetl/ai-meta#212). This sink is the sole
+    // writer of `noetl.event` under NOETL_EVENT_INGEST_PUBLISH_ONLY, and until
+    // now it emitted only a log line — so "are rows still landing in the log"
+    // had no queryable answer, which is exactly the T3 cutover's gate.
+    crate::metrics::record_events_projected(projected as u64, duplicates as u64);
 
     // Relocated orchestrator trigger (gate-on only).  For each execution whose
     // just-materialized batch carried a triggering event, fire the drive with
