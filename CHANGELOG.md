@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.59.0](https://github.com/noetl/server/compare/v3.58.4...v3.59.0) (2026-07-31)
+
+### Features
+
+* **event-bus:** NOETL_EVENT_BUS — dual-publish events to NATS and EHDB ([f67a60e](https://github.com/noetl/server/commit/f67a60eb8e7105dc086c53b65350b00b40110a5f)), closes [#208](https://github.com/noetl/server/issues/208) [#205](https://github.com/noetl/server/issues/205)
+
 ## [3.58.4](https://github.com/noetl/server/compare/v3.58.3...v3.58.4) (2026-07-31)
 
 ### Bug Fixes
