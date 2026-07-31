@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.58.4](https://github.com/noetl/server/compare/v3.58.3...v3.58.4) (2026-07-31)
+
+### Bug Fixes
+
+* **command-bus:** widen the EHDB publish retry to span a writer pod restart ([#208](https://github.com/noetl/server/issues/208)) ([4f52bb7](https://github.com/noetl/server/commit/4f52bb7f002153cf567c7fc4410a552326224a6b)), closes [#290](https://github.com/noetl/server/issues/290)
+
 ## [3.58.3](https://github.com/noetl/server/compare/v3.58.2...v3.58.3) (2026-07-30)
 
 ### Bug Fixes
