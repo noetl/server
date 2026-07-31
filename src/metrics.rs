@@ -873,6 +873,66 @@ pub fn record_event_published(event_type: &str) {
         .inc();
 }
 
+/// Counter: events mirrored onto the EHDB events feed (noetl/ai-meta#212 L1 T3).
+///
+/// Paired with [`record_event_published`], this is the shadow-parity signal: in
+/// `NOETL_EVENT_BUS=shadow` the two counters must track each other event-for-event
+/// and label-for-label.  A divergence by `event_type` localises which events are
+/// missing, which a single total would hide.
+fn ehdb_event_published_total() -> &'static IntCounterVec {
+    static M: OnceLock<IntCounterVec> = OnceLock::new();
+    M.get_or_init(|| {
+        let counter = IntCounterVec::new(
+            Opts::new(
+                "noetl_ehdb_events_published_total",
+                "Total events published onto the EHDB events feed, by event type.",
+            ),
+            &["event_type"],
+        )
+        .expect("static counter spec must be valid");
+        registry()
+            .register(Box::new(counter.clone()))
+            .expect("counter registration must succeed");
+        counter
+    })
+}
+
+pub fn record_ehdb_event_published(event_type: &str) {
+    ehdb_event_published_total()
+        .with_label_values(&[event_type])
+        .inc();
+}
+
+/// Counter: EHDB event publishes that failed.
+///
+/// In `shadow` these are swallowed so the shadow path can never take down event
+/// ingest — which means this counter is the *only* place a failing shadow shows
+/// up.  A silent shadow that is quietly dropping events would otherwise read as
+/// perfect parity right up until the cutover.
+fn ehdb_event_publish_errors_total() -> &'static IntCounterVec {
+    static M: OnceLock<IntCounterVec> = OnceLock::new();
+    M.get_or_init(|| {
+        let counter = IntCounterVec::new(
+            Opts::new(
+                "noetl_ehdb_events_publish_errors_total",
+                "Total EHDB events-feed publish failures, by event type.",
+            ),
+            &["event_type"],
+        )
+        .expect("static counter spec must be valid");
+        registry()
+            .register(Box::new(counter.clone()))
+            .expect("counter registration must succeed");
+        counter
+    })
+}
+
+pub fn record_ehdb_event_publish_error(event_type: &str) {
+    ehdb_event_publish_errors_total()
+        .with_label_values(&[event_type])
+        .inc();
+}
+
 /// Gauge: the tailer's current cursor (`noetl.event.id` last published).  Pair
 /// with the table's `MAX(id)` to read publish lag.  Single series (no labels) —
 /// one tailer per server.

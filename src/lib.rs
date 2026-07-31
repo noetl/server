@@ -48,6 +48,7 @@
 pub mod affinity;
 pub mod coherence;
 pub mod command_bus;
+pub mod event_bus;
 pub mod config;
 pub mod crypto;
 pub mod db;

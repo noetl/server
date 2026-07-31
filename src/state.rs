@@ -152,6 +152,16 @@ pub struct AppState {
     /// `Some` only when `command_bus_mode` publishes to EHDB and writers are
     /// configured; `None` keeps the NATS-only path with zero new state.
     pub ehdb_command_publisher: Option<Arc<crate::command_bus::EhdbCommandPublisher>>,
+
+    /// noetl/ai-meta#212 L1 T3 — the events-bus transport mode
+    /// (`NOETL_EVENT_BUS`; default `nats`). Selects whether `noetl.event`
+    /// payloads go to NATS, the EHDB events feed, or both (shadow).
+    pub event_bus_mode: crate::event_bus::EventBusMode,
+
+    /// noetl/ai-meta#212 L1 T3 — the lazily-connected EHDB events publisher.
+    /// `Some` only when `event_bus_mode` publishes to EHDB and writers are
+    /// configured; `None` keeps the NATS-only path with zero new state.
+    pub ehdb_event_publisher: Option<Arc<crate::event_bus::EhdbEventPublisher>>,
 }
 
 /// Cached orchestrator state for one execution, advanced incrementally.
@@ -834,6 +844,33 @@ impl AppState {
             None
         };
 
+        // noetl/ai-meta#212 L1 T3 — the events-bus transport. Same shape as the
+        // command bus above: default `nats` builds no EHDB state at all.
+        let event_bus_mode = crate::event_bus::EventBusMode::from_env_value(
+            &std::env::var("NOETL_EVENT_BUS").unwrap_or_default(),
+        );
+        let ehdb_event_publisher = if event_bus_mode.publishes_ehdb() {
+            let publisher = crate::event_bus::EhdbEventPublisher::from_env();
+            if publisher.is_configured() {
+                tracing::info!(
+                    ?event_bus_mode,
+                    "EHDB events bus enabled"
+                );
+                Some(Arc::new(publisher))
+            } else {
+                // Loud, because in `ehdb` mode this is the difference between
+                // publishing the durable event log and dropping it on the floor.
+                tracing::error!(
+                    ?event_bus_mode,
+                    "NOETL_EVENT_BUS selects EHDB but NOETL_EVENT_BUS_WRITER_ADDRS is empty; \
+                     EHDB event publishes will be skipped"
+                );
+                None
+            }
+        } else {
+            None
+        };
+
         Self {
             db,
             pools,
@@ -842,6 +879,8 @@ impl AppState {
             snowflake: Arc::new(snowflake),
             command_bus_mode,
             ehdb_command_publisher,
+            event_bus_mode,
+            ehdb_event_publisher,
             shard,
             affinity,
             start_time: std::time::Instant::now(),
