@@ -120,15 +120,34 @@ impl EhdbCommandPublisher {
         !self.addrs.is_empty()
     }
 
-    /// How many times a publish is attempted before it gives up. A writer
-    /// restart breaks every socket the router holds, so the first attempt after
-    /// one always fails; the retries carry the command across the gap while the
-    /// replacement pod's endpoint appears (noetl/ai-meta#208).
-    const PUBLISH_ATTEMPTS: u32 = 3;
-    /// Pause between publish attempts — long enough for a pod swap's endpoint
-    /// update, short enough that the API request behind this publish is not held
-    /// up noticeably.
-    const RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(250);
+    /// How long a publish keeps retrying before it gives up — sized to span a
+    /// writer **pod restart**, not just a broken socket.
+    ///
+    /// The first cut of this retry (3 attempts × 250 ms) covered ~0.5 s of
+    /// retrying, which is enough to redial a socket the writer closed cleanly but
+    /// far short of a pod swap. The measured prod gap is ~2.7 s from the writer's
+    /// SIGTERM to a re-dialable replacement — terminate, reschedule, reopen the
+    /// durable log, rebind the ingest listener, endpoint propagate — and a rollout
+    /// under load or a cold image pull is longer. So the window closed while the
+    /// writer was still coming back and two `POST /api/execute` calls returned 500
+    /// during the restart: fail-closed, no silent loss, but not transparent, which
+    /// is the bar for a bus that has no NATS behind it after T5.
+    ///
+    /// 10 s covers the observed gap with room for a slow reschedule. It is a
+    /// ceiling, not a cost: a healthy publish still returns on the first attempt,
+    /// and the only request that waits is one that would otherwise have failed.
+    const PUBLISH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+    /// First pause between publish attempts. Short, so a transient broken socket
+    /// (the common case — the writer is already back) costs ~100 ms rather than a
+    /// quarter second.
+    const RETRY_BACKOFF_INITIAL: std::time::Duration = std::time::Duration::from_millis(100);
+    /// Ceiling on the exponential backoff, so a long gap is still probed ~every
+    /// second rather than sleeping through the writer's return.
+    const RETRY_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_millis(1_000);
+    /// Hard cap on attempts — a backstop against a pathological zero-cost failure
+    /// spinning inside the deadline. With the backoff schedule above, the deadline
+    /// is what actually ends the loop.
+    const PUBLISH_ATTEMPTS: u32 = 32;
 
     /// Publish one command notification onto the EHDB bus. `execution_id` routes
     /// the shard; `event_id` is the sort key; `payload` is the notification JSON.
@@ -146,8 +165,10 @@ impl EhdbCommandPublisher {
     /// dropped this way is only recovered by the orphaned-command guardrail
     /// (noetl/ai-meta#171), and after T5 there is no NATS to fall back to.
     ///
-    /// So a failed attempt now redials and publishes again, up to
-    /// [`PUBLISH_ATTEMPTS`](Self::PUBLISH_ATTEMPTS). A retry can only ever
+    /// So a failed attempt redials and publishes again, with exponential backoff,
+    /// until [`PUBLISH_DEADLINE`](Self::PUBLISH_DEADLINE) elapses — a window sized
+    /// to span a writer pod restart rather than just a broken socket. A retry can
+    /// only ever
     /// *duplicate* a command — if the record was appended but its ack was lost,
     /// the retry appends a second copy — and duplicate delivery is already what
     /// the bus's `ack_wait` redelivery produces, so the worker's claim path
@@ -166,14 +187,16 @@ impl EhdbCommandPublisher {
             String::new(),
             String::from_utf8_lossy(payload).into_owned(),
         );
+        let started = std::time::Instant::now();
         let mut last_err = String::new();
+        let mut backoff = Self::RETRY_BACKOFF_INITIAL;
         for attempt in 1..=Self::PUBLISH_ATTEMPTS {
             let router = match self.router().await {
                 Ok(r) => r,
                 Err(e) => {
                     last_err = e;
-                    if attempt < Self::PUBLISH_ATTEMPTS {
-                        tokio::time::sleep(Self::RETRY_BACKOFF).await;
+                    if !Self::sleep_before_retry(started, &mut backoff).await {
+                        break;
                     }
                     continue;
                 }
@@ -185,6 +208,7 @@ impl EhdbCommandPublisher {
                             execution_id,
                             event_id,
                             attempt,
+                            waited_ms = started.elapsed().as_millis() as u64,
                             "EHDB command published after redialing the writer"
                         );
                     }
@@ -201,20 +225,51 @@ impl EhdbCommandPublisher {
                         *guard = None;
                     }
                     drop(guard);
-                    if attempt < Self::PUBLISH_ATTEMPTS {
-                        tracing::warn!(
-                            execution_id,
-                            event_id,
-                            attempt,
-                            error = %last_err,
-                            "EHDB publish failed; redialing the writer and retrying"
-                        );
-                        tokio::time::sleep(Self::RETRY_BACKOFF).await;
+                    tracing::warn!(
+                        execution_id,
+                        event_id,
+                        attempt,
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        error = %last_err,
+                        "EHDB publish failed; redialing the writer and retrying"
+                    );
+                    if !Self::sleep_before_retry(started, &mut backoff).await {
+                        break;
                     }
                 }
             }
         }
+        tracing::error!(
+            execution_id,
+            event_id,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            error = %last_err,
+            "EHDB publish gave up after the retry window"
+        );
         Err(last_err)
+    }
+
+    /// Wait out the backoff before the next publish attempt, doubling it (capped
+    /// at [`RETRY_BACKOFF_MAX`](Self::RETRY_BACKOFF_MAX)). Returns `false` when
+    /// the [`PUBLISH_DEADLINE`](Self::PUBLISH_DEADLINE) leaves no room for another
+    /// attempt, so the caller stops instead of sleeping past it — the deadline is
+    /// the total wall-clock the caller's request can be held, not a per-attempt
+    /// budget.
+    async fn sleep_before_retry(
+        started: std::time::Instant,
+        backoff: &mut std::time::Duration,
+    ) -> bool {
+        let remaining = match Self::PUBLISH_DEADLINE.checked_sub(started.elapsed()) {
+            Some(r) => r,
+            None => return false,
+        };
+        let nap = (*backoff).min(remaining);
+        if nap.is_zero() {
+            return false;
+        }
+        tokio::time::sleep(nap).await;
+        *backoff = (*backoff * 2).min(Self::RETRY_BACKOFF_MAX);
+        true
     }
 
     /// The live router, connecting it if this is the first use or the previous
@@ -267,8 +322,9 @@ mod tests {
     fn writer_addr_parsing_accepts_dns_names() {
         // Finding #2 (noetl/ai-meta#194): a K8s service DNS name is NOT a
         // parseable `SocketAddr`, but must be kept for resolution at connect.
-        let m =
-            parse_writer_addrs("0@noetl-cmdbus-writer.noetl.svc.cluster.local:9100,1@writer-1:9100");
+        let m = parse_writer_addrs(
+            "0@noetl-cmdbus-writer.noetl.svc.cluster.local:9100,1@writer-1:9100",
+        );
         assert_eq!(m.len(), 2);
         assert_eq!(m[&0], "noetl-cmdbus-writer.noetl.svc.cluster.local:9100");
         assert_eq!(m[&1], "writer-1:9100");
