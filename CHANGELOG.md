@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.60.1](https://github.com/noetl/server/compare/v3.60.0...v3.60.1) (2026-08-01)
+
+### Bug Fixes
+
+* **events:** do not gate the publish path on a NATS connection ([9d1fd75](https://github.com/noetl/server/commit/9d1fd75832ba28d0ab0272141718c141e155f1f9))
+
 ## [3.60.0](https://github.com/noetl/server/compare/v3.59.0...v3.60.0) (2026-07-31)
 
 ### Features
