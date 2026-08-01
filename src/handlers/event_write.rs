@@ -21,9 +21,12 @@
 //! `services::internal::project_events` — are NOT routed here: they ARE the
 //! materializer, the one path that writes when the gate is on.
 //!
-//! Gate-on requires NATS.  If NATS is not connected the chokepoint falls back to
-//! the synchronous INSERT (logged once) so a misconfiguration degrades to
-//! today's behaviour rather than dropping events.
+//! Gate-on requires **a usable event transport** — the EHDB events feed or NATS,
+//! per `NOETL_EVENT_BUS`.  With none available the chokepoint falls back to the
+//! synchronous INSERT so a misconfiguration degrades to today's behaviour rather
+//! than dropping events.  See [`has_event_transport`]: this check used to be
+//! NATS-only, which turned the whole publish path inert the moment NATS was
+//! removed from the cluster (noetl/ai-meta#212).
 
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
@@ -223,8 +226,26 @@ fn is_system_path(path: &str) -> bool {
 /// single decision the chokepoint and the relocated trigger both consult.
 pub async fn should_publish(state: &AppState, catalog_id: i64) -> bool {
     state.config.event_ingest_publish_only
-        && state.nats.is_some()
+        && has_event_transport(state)
         && !is_system_execution(state, catalog_id).await
+}
+
+/// Is *some* event transport available to publish on?
+///
+/// This used to be `state.nats.is_some()`, which silently became "never" the
+/// moment NATS was removed from the cluster: `should_publish` went false for
+/// every event, the chokepoint fell through to `insert_rows`, and the server
+/// quietly resumed writing `noetl.event` rows synchronously. Nothing errored —
+/// executions still completed — but the whole CQRS publish path was inert and
+/// the EHDB events feed sat at a flat cursor. Found exactly that way on the
+/// prod EHDB-only cutover (noetl/ai-meta#212).
+///
+/// The honest gate is "does the configured bus have a usable transport",
+/// evaluated per mode, so removing NATS disables the NATS path and nothing else.
+fn has_event_transport(state: &AppState) -> bool {
+    let mode = state.event_bus_mode;
+    (mode.publishes_ehdb() && state.ehdb_event_publisher.is_some())
+        || (mode.publishes_nats() && state.nats.is_some())
 }
 
 /// Is this a terminal execution event?  Both the dotted (`playbook.completed`)
