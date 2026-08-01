@@ -1700,6 +1700,11 @@ async fn publish_command_notification(
         match state.ehdb_command_publisher.as_ref() {
             Some(publisher) => match publisher.publish(execution_id, event_id, &payload).await {
                 Ok(seq) => {
+                    // The publish metric used to live only in the NATS arm, so
+                    // removing that arm dropped it entirely — a dispatch-rate
+                    // signal that would have gone quiet without anything
+                    // erroring (noetl/ai-meta#212).
+                    crate::metrics::record_command_publish(publish_route, pool_segment);
                     tracing::info!(
                         execution_id,
                         event_id,
@@ -1731,33 +1736,15 @@ async fn publish_command_notification(
         }
     }
 
-    // --- NATS command bus (today's path) -------------------------------------
+    // The NATS command bus is gone (noetl/ai-meta#212). `publishes_nats()`
+    // survives only so a stale `NOETL_COMMAND_BUS=nats` is a loud "command not
+    // delivered" rather than a silent no-op.
     if mode.publishes_nats() {
-        let Some(nats_client) = state.nats.as_ref() else {
-            tracing::warn!(
-                execution_id,
-                event_id,
-                "NATS not configured; command notification skipped — worker won't claim this command"
-            );
-            return Ok(());
-        };
-
-        let js = async_nats::jetstream::new((**nats_client).clone());
-        js.publish(subject.clone(), payload.into())
-            .await
-            .map_err(|e| AppError::Internal(format!("NATS publish failed: {e}")))?
-            .await
-            .map_err(|e| AppError::Internal(format!("NATS publish ack failed: {e}")))?;
-
-        crate::metrics::record_command_publish(publish_route, pool_segment);
-
-        tracing::info!(
+        tracing::error!(
             execution_id,
             event_id,
-            %subject,
-            route = publish_route,
-            command_id = %command_id,
-            "Published command notification to NATS"
+            "NOETL_COMMAND_BUS selects NATS, which no longer exists — the command \
+             was NOT delivered. Set NOETL_COMMAND_BUS=ehdb."
         );
     }
     Ok(())

@@ -243,9 +243,11 @@ pub async fn should_publish(state: &AppState, catalog_id: i64) -> bool {
 /// The honest gate is "does the configured bus have a usable transport",
 /// evaluated per mode, so removing NATS disables the NATS path and nothing else.
 fn has_event_transport(state: &AppState) -> bool {
-    let mode = state.event_bus_mode;
-    (mode.publishes_ehdb() && state.ehdb_event_publisher.is_some())
-        || (mode.publishes_nats() && state.nats.is_some())
+    // EHDB is the only transport now. The NATS arm is gone with the rest of the
+    // NATS code; `EventBusMode::publishes_nats()` survives only so an operator's
+    // stale `NOETL_EVENT_BUS=nats` is a loud "no transport" rather than a silent
+    // fall-through to synchronous inserts (noetl/ai-meta#212).
+    state.event_bus_mode.publishes_ehdb() && state.ehdb_event_publisher.is_some()
 }
 
 /// Is this a terminal execution event?  Both the dotted (`playbook.completed`)
@@ -269,21 +271,6 @@ fn is_terminal_event_type(event_type: &str) -> bool {
 /// Lazily build (once) + return the `noetl_events` publisher.  Returns `None`
 /// only if NATS is absent or the stream can't be ensured — callers then fall
 /// back to the synchronous INSERT.
-async fn publisher(state: &AppState) -> Option<&crate::nats::EventStreamPublisher> {
-    let client = state.nats.clone()?;
-    state
-        .event_stream_publisher
-        .get_or_try_init(|| async move {
-            let cfg = crate::services::event_stream::EventStreamConfig::from_env();
-            crate::nats::EventStreamPublisher::new(client, cfg.dedup_window, cfg.max_age).await
-        })
-        .await
-        .map_err(|e| {
-            tracing::error!(%e, "publish-only: failed to build noetl_events publisher; falling back to synchronous INSERT");
-            e
-        })
-        .ok()
-}
 
 /// Write one `noetl.event` row through the chokepoint.
 ///
@@ -381,22 +368,12 @@ pub async fn emit_events(state: &AppState, pool: &DbPool, rows: &[EventRow]) -> 
     if should_publish(state, rows[0].catalog_id).await {
         // noetl/ai-meta#212 L1 T3 — which transports are live for this batch.
         //
-        // The NATS publisher is resolved only when the mode actually wants NATS.
-        // That matters for the end state: once `NOETL_EVENT_BUS=ehdb`, this path
-        // must still publish even though there is no NATS publisher to build —
-        // otherwise the server silently falls through to `insert_rows` and starts
-        // writing event rows itself, double-writing against the materializer that
-        // is already the sole writer.
-        let nats_pub = if state.event_bus_mode.publishes_nats() {
-            publisher(state).await
-        } else {
-            None
-        };
+        // EHDB is the only transport. Resolved here (rather than assumed) so a
+        // stale `NOETL_EVENT_BUS=nats` falls through to `insert_rows` loudly
+        // instead of publishing into the void.
         let ehdb_live =
             state.event_bus_mode.publishes_ehdb() && state.ehdb_event_publisher.is_some();
-        // A transport is available when the mode wants it AND it is usable.
-        let nats_live = state.event_bus_mode.publishes_nats() && nats_pub.is_some();
-        if nats_live || ehdb_live {
+        if ehdb_live {
             // noetl/ai-meta#156: when the tail-attach accelerator is on, keep the
             // `to_stream_json()` payloads we publish in the per-execution ring so
             // the off-server drive dispatch can carry the new tail to the worker
@@ -410,13 +387,6 @@ pub async fn emit_events(state: &AppState, pool: &DbPool, rows: &[EventRow]) -> 
                 let bytes = serde_json::to_vec(&stream_json).map_err(|e| {
                     crate::error::AppError::Internal(format!("event publish encode: {e}"))
                 })?;
-                if let Some(pubr) = nats_pub.as_ref() {
-                    pubr.publish_event(row.event_id, &row.event_type, &bytes)
-                        .await
-                        .map_err(|e| {
-                            crate::error::AppError::Internal(format!("event publish: {e}"))
-                        })?;
-                }
                 // noetl/ai-meta#212 L1 T3 — mirror onto the EHDB events feed.
                 // The SAME bytes as NATS gets, so shadow parity is a straight
                 // comparison rather than a schema translation.

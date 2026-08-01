@@ -92,11 +92,9 @@ pub async fn api_health(State(state): State<AppState>) -> (StatusCode, Json<ApiH
     // needed for the basic readiness signal.
     let db_healthy = db_health_check(state.pools.cluster()).await;
 
-    let nats_status = if state.has_nats() {
-        Some("connected".to_string())
-    } else {
-        Some("not_configured".to_string())
-    };
+    // NATS is gone (noetl/ai-meta#212). The field is retained as a constant so
+    // an existing health scraper does not break on a missing key.
+    let nats_status = Some("removed".to_string());
 
     let overall_status = if db_healthy {
         "ok".to_string()

@@ -31,9 +31,6 @@ pub struct AppConfig {
     #[serde(default = "default_server_name")]
     pub server_name: String,
 
-    /// NATS URL (optional)
-    #[serde(default)]
-    pub nats_url: Option<String>,
 
     /// Enable GCP token API endpoint
     #[serde(default = "default_true")]
@@ -693,10 +690,6 @@ pub enum ReplicaCoherence {
     /// Default — prod behavior; correct for a single replica.
     #[default]
     Local,
-    /// The maps are backed by JetStream KV buckets so 2+ replicas resolve the
-    /// same watermark/descriptor (CAS on the head advance + descriptor merge);
-    /// the in-process maps become a write-through cache (RFC #115 program-scale).
-    NatsKv,
 }
 
 /// Strategy for reconstructing orchestrator `WorkflowState` — see
@@ -831,7 +824,6 @@ impl Default for AppConfig {
             workers: None,
             debug: false,
             server_name: default_server_name(),
-            nats_url: None,
             enable_gcp_token_api: true,
             disable_metrics: false,
             // noetl/ai-meta#115 Phase 1: references stay out of state/commands by
