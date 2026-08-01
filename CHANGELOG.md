@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.60.2](https://github.com/noetl/server/compare/v3.60.1...v3.60.2) (2026-08-01)
+
+### Bug Fixes
+
+* **nats:** fail loudly when a removed NATS transport is selected ([9a22659](https://github.com/noetl/server/commit/9a22659eb3fdb6c9d3fde3e3709b331307953976))
+
 ## [3.60.1](https://github.com/noetl/server/compare/v3.60.0...v3.60.1) (2026-08-01)
 
 ### Bug Fixes
