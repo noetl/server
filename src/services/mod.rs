@@ -7,7 +7,6 @@ pub mod catalog;
 pub mod cell_registry;
 pub mod credential;
 pub mod event;
-pub mod event_stream;
 pub mod object_backend;
 pub mod execution;
 pub mod internal;
