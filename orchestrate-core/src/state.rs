@@ -132,6 +132,41 @@ pub struct StepInfo {
     pub completed_event_id: Option<i64>,
     pub attempt: i32,
 
+    // -------- Async callback parking (noetl/ai-meta#186) --------
+    //
+    // A tool that dispatches long-running external work (today only
+    // `kind: container`, which creates a K8s Job) returns
+    // `ToolResult.pending_callback = Some(true)` and the worker deliberately
+    // skips its own `call.done`, freeing the slot per the execution model's
+    // callback rule.  The terminal arrives later via
+    // `POST /api/internal/container-callback/…`, which emits the `call.done`.
+    //
+    // That INVERTS the usual order.  Normally a step goes
+    // `command.issued → call.done → command.completed`, and
+    // `command.completed` is what flips it to `Completed`.  On this path
+    // `command.completed` arrives FIRST — carrying only the Job handle — and
+    // the real result lands on the LATER `call.done`.
+    //
+    // Completing the step on that first `command.completed` is what let the DAG
+    // run ahead of the container: dependent steps dispatched while the Job was
+    // still starting, and read a database the previous step had not finished
+    // creating.
+    /// The step is parked on an async callback: a `command.completed` carrying
+    /// `pending_callback` has arrived, but the terminal `call.done` has not.
+    /// Never flips the step to `Completed`, so no transition can advance past it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pending_callback: bool,
+    /// Sticky: this step has parked on a callback at least once.
+    ///
+    /// Kept AFTER the resume clears `pending_callback`, because the
+    /// orchestrator needs to know that `call.done` is a meaningful
+    /// advancement trigger for this execution.  Without it the resume would
+    /// complete the step in state and nothing would ever re-evaluate the DAG —
+    /// the step would sit `Completed` forever with no successor dispatched,
+    /// trading a premature advance for a permanent stall.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub uses_callback: bool,
+
     // -------- Iterator fan-out (Phase D R3b) --------
     //
     // A step with `step.loop` fans out into N iteration commands at
@@ -236,6 +271,8 @@ impl StepInfo {
             completed_at: None,
             completed_event_id: None,
             attempt: 0,
+            pending_callback: false,
+            uses_callback: false,
             iterations_expected: None,
             iteration_command_ids: std::collections::HashSet::new(),
             iteration_results: Vec::new(),
@@ -320,6 +357,22 @@ pub struct WorkflowState {
 /// (constraint-compliant envelope), or — in older shapes — on
 /// `result.data`.  Returns the first match.  Used by R3b iterator
 /// state aggregation to deduplicate `command.completed` events.
+/// Does this `command.completed` say the step is parked on an async callback?
+///
+/// The worker stamps `pending_callback: true` into the event context when a
+/// tool returned `ToolResult.pending_callback` (noetl/ai-meta#186 / #227 part
+/// B).  Absent on every other path, and absence means "not parked" — never
+/// "parked", so an old event or a tool that does not set it behaves exactly as
+/// before.
+pub fn is_parked_on_callback(event: &Event) -> bool {
+    event
+        .context
+        .as_ref()
+        .and_then(|c| c.get("pending_callback"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
 pub fn extract_command_id(event: &Event) -> Option<String> {
     if let Some(meta) = &event.meta {
         if let Some(s) = meta.get("command_id").and_then(|v| v.as_str()) {
@@ -754,6 +807,22 @@ impl WorkflowState {
                         // Mid-iteration: leave step.state at whatever
                         // command.started / command.claimed last set
                         // it to so `is_step_completed` returns false.
+                    } else if is_parked_on_callback(event) {
+                        // noetl/ai-meta#186 — the step is NOT finished.
+                        //
+                        // The tool dispatched external work and returned
+                        // immediately; this `command.completed` carries only the
+                        // handle.  Completing here is what let the DAG run ahead
+                        // of a container Job: dependents dispatched seconds
+                        // later and read a schema the previous step had not
+                        // finished creating.
+                        //
+                        // Leave `state` where command.started put it, so
+                        // `is_step_completed` stays false and no transition can
+                        // advance past this step.  The terminal `call.done` from
+                        // the callback (below) is what completes it.
+                        step.pending_callback = true;
+                        step.uses_callback = true;
                     } else {
                         // Plain (non-iterator) step.
                         step.state = StepState::Completed;
@@ -837,6 +906,27 @@ impl WorkflowState {
                             step.result = Some(result);
                         }
                     }
+
+                    // noetl/ai-meta#186 — the resume.
+                    //
+                    // For a parked step this `call.done` is not the mid-flight
+                    // data-attachment event it is on every other path: it is the
+                    // TERMINAL, arriving from
+                    // `POST /api/internal/container-callback/…` after the K8s
+                    // Job reached a terminal state.  Its `command.completed`
+                    // already came and went without completing the step, so
+                    // nothing else will ever complete it.
+                    //
+                    // Completing here is what makes the park safe.  Without it
+                    // the step would sit parked for ever and the fix would trade
+                    // a premature advance for a permanent stall — a worse bug,
+                    // and a silent one.
+                    if step.pending_callback {
+                        step.pending_callback = false;
+                        step.state = StepState::Completed;
+                        step.completed_at = Some(event.timestamp);
+                        step.completed_event_id = Some(event.event_id);
+                    }
                 }
             }
             "command.failed" | "action_failed" | "step_failed" => {
@@ -847,6 +937,11 @@ impl WorkflowState {
                         .or_insert_with(|| StepInfo::new(name));
                     step.state = StepState::Failed;
                     step.completed_at = Some(event.timestamp);
+                    // noetl/ai-meta#186 — a parked step whose external work
+                    // FAILED must unpark too.  Leaving `pending_callback` set on
+                    // a failure would keep the step out of every terminal path
+                    // and the execution would never finish.
+                    step.pending_callback = false;
                     // Extract error from result.  Two shapes seen in
                     // the wild — top-level `result.error` and the
                     // nested `result.context.error` (the worker's
@@ -2175,5 +2270,125 @@ mod tests {
             ctx.get("workload").and_then(|w| w.get("offset")),
             Some(&serde_json::json!(0)),
         );
+    }
+}
+
+#[cfg(test)]
+mod pending_callback_tests {
+    use super::*;
+    use chrono::DateTime;
+
+    fn ev(id: i64, ty: &str, step: &str, ctx: Option<serde_json::Value>) -> Event {
+        Event {
+            event_id: id,
+            execution_id: 1,
+            catalog_id: 1,
+            event_type: ty.to_string(),
+            node_name: Some(step.to_string()),
+            status: "success".to_string(),
+            context: ctx,
+            result: None,
+            meta: None,
+            timestamp: DateTime::from_timestamp(id, 0).expect("fixed epoch"),
+            parent_execution_id: None,
+            attempt: None,
+        }
+    }
+
+    fn parked() -> serde_json::Value {
+        serde_json::json!({"command_id": "e:s:1", "status": "success", "pending_callback": true})
+    }
+
+    /// noetl/ai-meta#186 Bug 1. The observed prod/kind timeline was:
+    /// `run_schema_creation` dispatched the Job, `command.completed` arrived
+    /// 1.2 s later, the DAG advanced, and `verify_data` failed with
+    /// `42P01 relation ... does not exist` ~15 s BEFORE the Jobs succeeded.
+    ///
+    /// A `command.completed` carrying `pending_callback` must NOT complete the
+    /// step, or nothing can stop a dependent step from dispatching.
+    #[test]
+    fn a_parked_command_completed_does_not_complete_the_step() {
+        let mut st = WorkflowState::new(1, 1);
+        st.apply_event(&ev(1, "command.started", "run_schema", None));
+        st.apply_event(&ev(2, "command.completed", "run_schema", Some(parked())));
+        let step = st.steps.get("run_schema").expect("step recorded");
+        assert!(step.pending_callback, "the step must be parked");
+        assert!(step.uses_callback, "and marked as a callback user");
+        assert_ne!(
+            step.state,
+            StepState::Completed,
+            "a parked step must not be Completed — this is the premature DAG advance in #186"
+        );
+    }
+
+    /// The other half. Parking without a resume would trade a premature
+    /// advance for a permanent stall, which is worse because it is silent.
+    #[test]
+    fn the_callback_call_done_completes_the_parked_step() {
+        let mut st = WorkflowState::new(1, 1);
+        st.apply_event(&ev(1, "command.started", "run_schema", None));
+        st.apply_event(&ev(2, "command.completed", "run_schema", Some(parked())));
+        st.apply_event(&ev(3, "call.done", "run_schema", None));
+        let step = st.steps.get("run_schema").unwrap();
+        assert!(!step.pending_callback, "the resume must unpark");
+        assert_eq!(step.state, StepState::Completed, "and complete the step");
+        assert_eq!(step.completed_event_id, Some(3), "completed BY the resume");
+        assert!(step.uses_callback, "sticky, so call.done stays a valid trigger");
+    }
+
+    /// A failed Job must unpark too, or the execution can never terminate.
+    #[test]
+    fn a_failed_parked_step_unparks() {
+        let mut st = WorkflowState::new(1, 1);
+        st.apply_event(&ev(1, "command.started", "run_schema", None));
+        st.apply_event(&ev(2, "command.completed", "run_schema", Some(parked())));
+        st.apply_event(&ev(3, "command.failed", "run_schema", None));
+        let step = st.steps.get("run_schema").unwrap();
+        assert!(!step.pending_callback, "a failure must not leave the step parked for ever");
+        assert_eq!(step.state, StepState::Failed);
+    }
+
+    /// The negative control, and the reason this is safe to ship on by default:
+    /// a step that never sets the marker must behave EXACTLY as before —
+    /// completed by `command.completed`, never parked, never sticky.
+    #[test]
+    fn an_ordinary_step_is_untouched() {
+        let mut st = WorkflowState::new(1, 1);
+        st.apply_event(&ev(1, "command.started", "plain", None));
+        st.apply_event(&ev(2, "call.done", "plain", None));
+        st.apply_event(&ev(
+            3,
+            "command.completed",
+            "plain",
+            Some(serde_json::json!({"command_id": "e:s:1", "status": "success"})),
+        ));
+        let step = st.steps.get("plain").unwrap();
+        assert!(!step.pending_callback);
+        assert!(!step.uses_callback, "no callback machinery for an ordinary step");
+        assert_eq!(step.state, StepState::Completed);
+        assert_eq!(
+            step.completed_event_id,
+            Some(3),
+            "still completed by command.completed, not by the earlier call.done"
+        );
+    }
+
+    /// Absence means "not parked", never "parked" — so an event log written by
+    /// an older worker replays with the pre-#186 behaviour.
+    #[test]
+    fn a_missing_marker_is_not_parked() {
+        assert!(!is_parked_on_callback(&ev(1, "command.completed", "s", None)));
+        assert!(!is_parked_on_callback(&ev(
+            1,
+            "command.completed",
+            "s",
+            Some(serde_json::json!({"status": "success"}))
+        )));
+        assert!(is_parked_on_callback(&ev(
+            1,
+            "command.completed",
+            "s",
+            Some(parked())
+        )));
     }
 }
