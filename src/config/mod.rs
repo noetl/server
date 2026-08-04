@@ -6,5 +6,8 @@
 mod app;
 pub mod database;
 
-pub use app::{AppConfig, EventReadPath, ReplicaCoherence, StateBuildMode, StateBuilder};
+pub use app::{
+    AppConfig, EventReadPath, ReplicaCoherence, StateBuildMode, StateBuilder,
+    MIN_NONCONVERGENCE_GRACE_SECS,
+};
 pub use database::{DatabaseConfig, ShardConnection, ShardConnectionError, ShardingConfig};
