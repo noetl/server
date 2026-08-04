@@ -58,6 +58,11 @@
 //!    `execution.cancelled` is left alone; it needs the status projection
 //!    fixed, not a `playbook.failed` written over the top of a deliberate
 //!    cancellation.
+//! 6. **Its parent is not still progressing** — a child execution whose parent
+//!    has emitted an event inside the grace period is left alone. 2919 of the
+//!    3258 executions eligible on prod are children, so this is the common
+//!    shape; a parent mid-flight may still drive the child it is waiting on,
+//!    and terminating it would be failing work another live execution owns.
 //!
 //! ## Callbacks: the case that would otherwise be terminated wrongly
 //!
@@ -158,6 +163,9 @@ pub(crate) struct StalledExecution {
     /// The execution's newest `command.completed` carries `pending_callback`
     /// and no `call.done` follows it — parked by design, not stalled.
     pub awaiting_callback: bool,
+    /// This is a child execution whose **parent** has emitted an event inside
+    /// the grace period — the parent is still moving and may yet drive it.
+    pub parent_active: bool,
 }
 
 /// The grace period actually used, never below
@@ -178,6 +186,9 @@ pub(crate) enum Disposition {
     SkippedLive,
     /// Parked on an external callback by design → not stalled.
     SkippedAwaitingCallback,
+    /// A child whose parent is still progressing → the parent may still drive
+    /// it, so this is not ours to terminate.
+    SkippedParentActive,
     /// Eligible, but this tick's termination budget is spent.
     Capped,
 }
@@ -188,6 +199,7 @@ impl Disposition {
             Disposition::Terminate => "terminated",
             Disposition::SkippedLive => "skipped_live",
             Disposition::SkippedAwaitingCallback => "skipped_awaiting_callback",
+            Disposition::SkippedParentActive => "skipped_parent_active",
             Disposition::Capped => "capped",
         }
     }
@@ -289,7 +301,9 @@ async fn run_nonconvergence_sweep(state: &AppState) -> AppResult<()> {
         crate::metrics::record_nonconvergence_sweep("candidate");
         crate::metrics::record_nonconvergence_sweep(disp.metric_label());
         match disp {
-            Disposition::SkippedLive | Disposition::SkippedAwaitingCallback => {}
+            Disposition::SkippedLive
+            | Disposition::SkippedAwaitingCallback
+            | Disposition::SkippedParentActive => {}
             Disposition::Capped => deferred += 1,
             Disposition::Terminate => match emit_nonconvergent_failed(state, cand).await {
                 Ok(()) => info!(
@@ -351,6 +365,15 @@ pub(crate) fn plan_dispositions(
             if c.awaiting_callback {
                 return Disposition::SkippedAwaitingCallback;
             }
+            // A child of a parent that is still emitting events. 2919 of the
+            // 3258 executions eligible on prod are children, so this is the
+            // common shape, not an edge case — and a parent mid-flight may
+            // still drive the child it is waiting on. Terminating it would be
+            // failing work another live execution owns, which is the same
+            // mistake the live-claim guard exists to prevent, one level up.
+            if c.parent_active {
+                return Disposition::SkippedParentActive;
+            }
             let held_by_live = c.claim_worker_id.as_ref().is_some_and(|w| live.contains(w));
             if held_by_live {
                 // Opt-in override: a live-held claim older than the configured
@@ -400,6 +423,7 @@ async fn query_nonconvergence_candidates(
         i64,
         Option<String>,
         Option<i64>,
+        bool,
         bool,
     );
     let rows = sqlx::query_as::<_, Row>(
@@ -457,7 +481,8 @@ async fn query_nonconvergence_candidates(
             FLOOR(EXTRACT(EPOCH FROM (NOW() - w.created_at)))::BIGINT AS stalled_secs,
             claim.worker_id                                   AS claim_worker_id,
             FLOOR(EXTRACT(EPOCH FROM (NOW() - claim.created_at)))::BIGINT AS claim_age_secs,
-            (cb.execution_id IS NOT NULL)                     AS awaiting_callback
+            (cb.execution_id IS NOT NULL)                     AS awaiting_callback,
+            COALESCE(pa.active, false)                        AS parent_active
         FROM open o
         CROSS JOIN LATERAL (
             SELECT e.event_id, e.event_type, e.created_at
@@ -520,6 +545,25 @@ async fn query_nonconvergence_candidates(
             ORDER BY cc.created_at DESC
             LIMIT 1
         ) cb ON TRUE
+        LEFT JOIN LATERAL (
+            -- Is this a child whose parent is still moving?  `parent_execution_id`
+            -- is carried on the child's own events, so the parent id comes from
+            -- there; "moving" is the same watermark test applied one level up.
+            SELECT EXISTS (
+                SELECT 1
+                FROM noetl.event pe
+                WHERE pe.execution_id = (
+                        SELECT ce.parent_execution_id
+                        FROM noetl.event ce
+                        WHERE ce.execution_id = o.execution_id
+                          AND ce.parent_execution_id IS NOT NULL
+                          AND ce.parent_execution_id <> 0
+                        ORDER BY ce.event_id ASC
+                        LIMIT 1
+                    )
+                  AND pe.created_at >= NOW() - INTERVAL '1 second' * $1
+            ) AS active
+        ) pa ON TRUE
         WHERE w.created_at < NOW() - INTERVAL '1 second' * $1
         "#,
     )
@@ -540,6 +584,7 @@ async fn query_nonconvergence_candidates(
                 claim_worker_id,
                 claim_age_secs,
                 awaiting_callback,
+                parent_active,
             )| StalledExecution {
                 execution_id,
                 catalog_id,
@@ -549,6 +594,7 @@ async fn query_nonconvergence_candidates(
                 claim_worker_id,
                 claim_age_secs,
                 awaiting_callback,
+                parent_active,
             },
         )
         .collect())
@@ -608,6 +654,7 @@ mod tests {
             claim_worker_id: None,
             claim_age_secs: None,
             awaiting_callback: false,
+            parent_active: false,
         }
     }
 
@@ -744,6 +791,59 @@ mod tests {
         let c: Vec<_> = (1..=3).map(stalled).collect();
         let plan = plan_dispositions(&c, &live_set(&[]), 0, 0);
         assert!(plan.iter().all(|d| *d == Disposition::Capped));
+    }
+
+    /// SAFETY: a child whose parent is still emitting events is never
+    /// terminated. 2919 of the 3258 executions eligible on prod are children,
+    /// so this is the common shape — and a parent mid-flight may still drive
+    /// the child it is waiting on.
+    #[test]
+    fn child_of_an_active_parent_is_never_terminated() {
+        let mut c = stalled(100);
+        c.parent_active = true;
+        c.stalled_secs = 90 * 24 * 3600;
+        let plan = plan_dispositions(&[c], &live_set(&[]), 9999, 0);
+        assert_eq!(plan, vec![Disposition::SkippedParentActive]);
+    }
+
+    /// A child whose parent has gone quiet too is fair game — otherwise a whole
+    /// dead tree would be permanently unreachable, which is most of the prod
+    /// backlog.
+    #[test]
+    fn child_of_a_quiet_parent_is_terminated() {
+        let c = stalled(100);
+        assert!(!c.parent_active);
+        let plan = plan_dispositions(&[c], &live_set(&[]), 20, 0);
+        assert_eq!(plan, vec![Disposition::Terminate]);
+    }
+
+    /// The callback exclusion still outranks the parent check — a parked child
+    /// is parked whatever its parent is doing.
+    #[test]
+    fn callback_check_outranks_parent_active() {
+        let mut c = stalled(100);
+        c.awaiting_callback = true;
+        c.parent_active = true;
+        let plan = plan_dispositions(&[c], &live_set(&[]), 20, 0);
+        assert_eq!(plan, vec![Disposition::SkippedAwaitingCallback]);
+    }
+
+    /// A skipped-for-parent candidate must not consume the termination budget
+    /// either.
+    #[test]
+    fn parent_active_skips_do_not_consume_the_budget() {
+        let mut a = stalled(1);
+        a.parent_active = true;
+        let c = vec![a, stalled(2), stalled(3)];
+        let plan = plan_dispositions(&c, &live_set(&[]), 2, 0);
+        assert_eq!(
+            plan,
+            vec![
+                Disposition::SkippedParentActive,
+                Disposition::Terminate,
+                Disposition::Terminate,
+            ]
+        );
     }
 
     /// SAFETY: a grace below the floor is raised, not honoured.  A validation
