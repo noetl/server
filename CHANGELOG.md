@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.62.0](https://github.com/noetl/server/compare/v3.61.0...v3.62.0) (2026-08-04)
+
+### Features
+
+* **result-tier-gc:** sink-confirmation gate on the Feather tier GC ([9a72b3f](https://github.com/noetl/server/commit/9a72b3f4c4e3836988cdda2a395ad8a0f01bd87a)), closes [#104](https://github.com/noetl/server/issues/104) [worker#188](https://github.com/noetl/worker/issues/188) [worker#190](https://github.com/noetl/worker/issues/190)
+* **sink-state:** server-visible sink-state feed for the Feather GC gate ([6a785ef](https://github.com/noetl/server/commit/6a785ef80c6321ee35250063ed7bf15071bfbb01)), closes [#199](https://github.com/noetl/server/issues/199)
+
 ## [3.61.0](https://github.com/noetl/server/compare/v3.60.2...v3.61.0) (2026-08-04)
 
 ### Features
