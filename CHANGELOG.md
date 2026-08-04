@@ -2,6 +2,65 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.61.0](https://github.com/noetl/server/compare/v3.60.2...v3.61.0) (2026-08-04)
+
+### Features
+
+* **sweep:** terminate systemically non-convergent executions, off by default ([7e238f3](https://github.com/noetl/server/commit/7e238f3112e653d1567d2314e615ef84910e5411)), closes [#171](https://github.com/noetl/server/issues/171) [#62](https://github.com/noetl/server/issues/62) [#103](https://github.com/noetl/server/issues/103) [#118](https://github.com/noetl/server/issues/118) [noetl/ai-meta#227](https://github.com/noetl/ai-meta/issues/227)
+
+### Bug Fixes
+
+* **sweep:** floor the non-convergence grace at 1h — 120s ate healthy work ([429399f](https://github.com/noetl/server/commit/429399fceafd51e3562bae18adeb4eeadf885b1e)), closes [noetl/ai-meta#227](https://github.com/noetl/ai-meta/issues/227)
+* **sweep:** never terminate a child whose parent is still progressing ([ea786af](https://github.com/noetl/server/commit/ea786af23adcd3cced5ffd974f41be44379abea5)), closes [noetl/ai-meta#227](https://github.com/noetl/ai-meta/issues/227)
+
+## [3.60.2](https://github.com/noetl/server/compare/v3.60.1...v3.60.2) (2026-08-01)
+
+### Bug Fixes
+
+* **nats:** fail loudly when a removed NATS transport is selected ([9a22659](https://github.com/noetl/server/commit/9a22659eb3fdb6c9d3fde3e3709b331307953976))
+
+## [3.60.1](https://github.com/noetl/server/compare/v3.60.0...v3.60.1) (2026-08-01)
+
+### Bug Fixes
+
+* **events:** do not gate the publish path on a NATS connection ([9d1fd75](https://github.com/noetl/server/commit/9d1fd75832ba28d0ab0272141718c141e155f1f9))
+
+## [3.60.0](https://github.com/noetl/server/compare/v3.59.0...v3.60.0) (2026-07-31)
+
+### Features
+
+* **metrics:** count noetl.event rows written by events/project ([ece55ef](https://github.com/noetl/server/commit/ece55eff4fe720a68e78206e4384b39453cef75f))
+
+## [3.59.0](https://github.com/noetl/server/compare/v3.58.4...v3.59.0) (2026-07-31)
+
+### Features
+
+* **event-bus:** NOETL_EVENT_BUS — dual-publish events to NATS and EHDB ([f67a60e](https://github.com/noetl/server/commit/f67a60eb8e7105dc086c53b65350b00b40110a5f)), closes [#208](https://github.com/noetl/server/issues/208) [#205](https://github.com/noetl/server/issues/205)
+
+## [3.58.4](https://github.com/noetl/server/compare/v3.58.3...v3.58.4) (2026-07-31)
+
+### Bug Fixes
+
+* **command-bus:** widen the EHDB publish retry to span a writer pod restart ([#208](https://github.com/noetl/server/issues/208)) ([4f52bb7](https://github.com/noetl/server/commit/4f52bb7f002153cf567c7fc4410a552326224a6b)), closes [#290](https://github.com/noetl/server/issues/290)
+
+## [3.58.3](https://github.com/noetl/server/compare/v3.58.2...v3.58.3) (2026-07-30)
+
+### Bug Fixes
+
+* **command-bus:** retry an EHDB publish across a writer restart ([#208](https://github.com/noetl/server/issues/208)) ([8958b1a](https://github.com/noetl/server/commit/8958b1a8a8e3b0d7de42054abcfa938d91d1282e)), closes [#203](https://github.com/noetl/server/issues/203) [noetl/ai-meta#171](https://github.com/noetl/ai-meta/issues/171)
+
+## [3.58.2](https://github.com/noetl/server/compare/v3.58.1...v3.58.2) (2026-07-30)
+
+### Performance Improvements
+
+* **command-bus:** publish to the EHDB writer without serialising on one mutex ([2d547e0](https://github.com/noetl/server/commit/2d547e07e2a85cee1a8822b428e424b0dff86c87)), closes [noetl/ehdb#301](https://github.com/noetl/ehdb/issues/301) [noetl/ai-meta#205](https://github.com/noetl/ai-meta/issues/205) [noetl/ehdb#301](https://github.com/noetl/ehdb/issues/301) [ehdb#301](https://github.com/noetl/ehdb/issues/301) [noetl/ai-meta#205](https://github.com/noetl/ai-meta/issues/205)
+
+## [3.58.1](https://github.com/noetl/server/compare/v3.58.0...v3.58.1) (2026-07-28)
+
+### Bug Fixes
+
+* **ehdb:** bump ehdb pin to d4b6235 — command-bus delivery-loss fix ([#203](https://github.com/noetl/server/issues/203)) ([#287](https://github.com/noetl/server/issues/287)) ([8457628](https://github.com/noetl/server/commit/845762838e7f24ded91072caac0dad1c31a991cb)), closes [noetl/ehdb#300](https://github.com/noetl/ehdb/issues/300)
+
 ## [3.58.0](https://github.com/noetl/server/compare/v3.57.0...v3.58.0) (2026-07-23)
 
 ### Features

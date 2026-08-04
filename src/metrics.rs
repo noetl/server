@@ -181,6 +181,47 @@ pub fn record_orphan_sweep(outcome: &str) {
     orphan_sweep_total().with_label_values(&[outcome]).inc();
 }
 
+// ── Systemic non-convergence sweep (noetl/ai-meta#227 part B) ────────────────
+
+/// `noetl_nonconvergence_sweep_total{outcome}` — outcomes of the systemic
+/// non-convergence sweep ([`crate::handlers::nonconvergence_sweep`]).  `outcome`
+/// is one of: `candidate` (an execution whose watermark has not moved for the
+/// grace period was examined), `terminated` (`playbook.failed` emitted),
+/// `skipped_live` (an outstanding command is held by a live worker — never
+/// failed), `skipped_awaiting_callback` (parked on an external callback by
+/// design — never failed), `capped` (eligible but deferred to a later tick by
+/// the rate limit), `error` (scan / emit failure).  Zero increments while the
+/// sweep is off (`NOETL_NONCONVERGENCE_SWEEP_ENABLED=false`).
+///
+/// `skipped_live` and `skipped_awaiting_callback` are the negative-control
+/// signals: during a drain they should account for every healthy execution the
+/// sweep looked at, and any drift in `terminated` against a known target list is
+/// the alarm.
+pub fn nonconvergence_sweep_total() -> &'static IntCounterVec {
+    static M: OnceLock<IntCounterVec> = OnceLock::new();
+    M.get_or_init(|| {
+        let counter = IntCounterVec::new(
+            Opts::new(
+                "noetl_nonconvergence_sweep_total",
+                "Systemic non-convergence sweep outcomes, by outcome.",
+            ),
+            &["outcome"],
+        )
+        .expect("static counter spec must be valid");
+        registry()
+            .register(Box::new(counter.clone()))
+            .expect("counter registration must succeed");
+        counter
+    })
+}
+
+/// Record one non-convergence sweep outcome (see [`nonconvergence_sweep_total`]).
+pub fn record_nonconvergence_sweep(outcome: &str) {
+    nonconvergence_sweep_total()
+        .with_label_values(&[outcome])
+        .inc();
+}
+
 // ── Result/state tier GC (noetl/ai-meta#104 Phase F + #166 Phase 5) ──────────
 
 /// `noetl_result_tier_gc_objects_total{class,action}` — objects a tier-GC sweep
@@ -873,6 +914,66 @@ pub fn record_event_published(event_type: &str) {
         .inc();
 }
 
+/// Counter: events mirrored onto the EHDB events feed (noetl/ai-meta#212 L1 T3).
+///
+/// Paired with [`record_event_published`], this is the shadow-parity signal: in
+/// `NOETL_EVENT_BUS=shadow` the two counters must track each other event-for-event
+/// and label-for-label.  A divergence by `event_type` localises which events are
+/// missing, which a single total would hide.
+fn ehdb_event_published_total() -> &'static IntCounterVec {
+    static M: OnceLock<IntCounterVec> = OnceLock::new();
+    M.get_or_init(|| {
+        let counter = IntCounterVec::new(
+            Opts::new(
+                "noetl_ehdb_events_published_total",
+                "Total events published onto the EHDB events feed, by event type.",
+            ),
+            &["event_type"],
+        )
+        .expect("static counter spec must be valid");
+        registry()
+            .register(Box::new(counter.clone()))
+            .expect("counter registration must succeed");
+        counter
+    })
+}
+
+pub fn record_ehdb_event_published(event_type: &str) {
+    ehdb_event_published_total()
+        .with_label_values(&[event_type])
+        .inc();
+}
+
+/// Counter: EHDB event publishes that failed.
+///
+/// In `shadow` these are swallowed so the shadow path can never take down event
+/// ingest — which means this counter is the *only* place a failing shadow shows
+/// up.  A silent shadow that is quietly dropping events would otherwise read as
+/// perfect parity right up until the cutover.
+fn ehdb_event_publish_errors_total() -> &'static IntCounterVec {
+    static M: OnceLock<IntCounterVec> = OnceLock::new();
+    M.get_or_init(|| {
+        let counter = IntCounterVec::new(
+            Opts::new(
+                "noetl_ehdb_events_publish_errors_total",
+                "Total EHDB events-feed publish failures, by event type.",
+            ),
+            &["event_type"],
+        )
+        .expect("static counter spec must be valid");
+        registry()
+            .register(Box::new(counter.clone()))
+            .expect("counter registration must succeed");
+        counter
+    })
+}
+
+pub fn record_ehdb_event_publish_error(event_type: &str) {
+    ehdb_event_publish_errors_total()
+        .with_label_values(&[event_type])
+        .inc();
+}
+
 /// Gauge: the tailer's current cursor (`noetl.event.id` last published).  Pair
 /// with the table's `MAX(id)` to read publish lag.  Single series (no labels) —
 /// one tailer per server.
@@ -967,6 +1068,58 @@ pub fn events_materialized_total() -> &'static prometheus::IntCounter {
             .expect("counter registration must succeed");
         counter
     })
+}
+
+/// Counter: `noetl.event` rows written by `/api/internal/events/project` — the
+/// live durable-log write path.
+///
+/// [`events_materialized_total`] counts the *other* sink
+/// (`/api/internal/events/materialize`), which the deployed configuration does
+/// not use, so it reads 0 forever and is not a usable signal for "is the durable
+/// log still being written". This one tracks the path that actually runs under
+/// `NOETL_EVENT_INGEST_PUBLISH_ONLY`, where the worker-side `noetl_materializer`
+/// draining the events bus is the sole writer of `noetl.event`.
+///
+/// That makes it the ground-truth gate for the T3 events-bus cutover
+/// (noetl/ai-meta#212): publish counters prove the *publisher*, this proves rows
+/// are still landing in the log. `duplicates` is tracked separately because
+/// at-least-once redelivery makes a non-zero duplicate count normal — collapsing
+/// the two would hide a real drop behind retried writes.
+pub fn events_projected_total() -> &'static prometheus::IntCounter {
+    static M: OnceLock<prometheus::IntCounter> = OnceLock::new();
+    M.get_or_init(|| {
+        let counter = prometheus::IntCounter::new(
+            "noetl_events_projected_total",
+            "noetl.event rows written via /api/internal/events/project (the live materializer sink).",
+        )
+        .expect("static counter spec must be valid");
+        registry()
+            .register(Box::new(counter.clone()))
+            .expect("counter registration must succeed");
+        counter
+    })
+}
+
+/// Counter: rows `/api/internal/events/project` skipped as already-present.
+pub fn events_projected_duplicates_total() -> &'static prometheus::IntCounter {
+    static M: OnceLock<prometheus::IntCounter> = OnceLock::new();
+    M.get_or_init(|| {
+        let counter = prometheus::IntCounter::new(
+            "noetl_events_projected_duplicates_total",
+            "Rows /api/internal/events/project skipped as duplicates (at-least-once redelivery).",
+        )
+        .expect("static counter spec must be valid");
+        registry()
+            .register(Box::new(counter.clone()))
+            .expect("counter registration must succeed");
+        counter
+    })
+}
+
+/// Record the outcome of one `events/project` batch.
+pub fn record_events_projected(projected: u64, duplicates: u64) {
+    events_projected_total().inc_by(projected);
+    events_projected_duplicates_total().inc_by(duplicates);
 }
 
 /// Record a batch of materialized event rows.

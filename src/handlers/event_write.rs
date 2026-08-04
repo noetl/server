@@ -21,9 +21,12 @@
 //! `services::internal::project_events` — are NOT routed here: they ARE the
 //! materializer, the one path that writes when the gate is on.
 //!
-//! Gate-on requires NATS.  If NATS is not connected the chokepoint falls back to
-//! the synchronous INSERT (logged once) so a misconfiguration degrades to
-//! today's behaviour rather than dropping events.
+//! Gate-on requires **a usable event transport** — the EHDB events feed or NATS,
+//! per `NOETL_EVENT_BUS`.  With none available the chokepoint falls back to the
+//! synchronous INSERT so a misconfiguration degrades to today's behaviour rather
+//! than dropping events.  See [`has_event_transport`]: this check used to be
+//! NATS-only, which turned the whole publish path inert the moment NATS was
+//! removed from the cluster (noetl/ai-meta#212).
 
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
@@ -223,8 +226,28 @@ fn is_system_path(path: &str) -> bool {
 /// single decision the chokepoint and the relocated trigger both consult.
 pub async fn should_publish(state: &AppState, catalog_id: i64) -> bool {
     state.config.event_ingest_publish_only
-        && state.nats.is_some()
+        && has_event_transport(state)
         && !is_system_execution(state, catalog_id).await
+}
+
+/// Is *some* event transport available to publish on?
+///
+/// This used to be `state.nats.is_some()`, which silently became "never" the
+/// moment NATS was removed from the cluster: `should_publish` went false for
+/// every event, the chokepoint fell through to `insert_rows`, and the server
+/// quietly resumed writing `noetl.event` rows synchronously. Nothing errored —
+/// executions still completed — but the whole CQRS publish path was inert and
+/// the EHDB events feed sat at a flat cursor. Found exactly that way on the
+/// prod EHDB-only cutover (noetl/ai-meta#212).
+///
+/// The honest gate is "does the configured bus have a usable transport",
+/// evaluated per mode, so removing NATS disables the NATS path and nothing else.
+fn has_event_transport(state: &AppState) -> bool {
+    // EHDB is the only transport now. The NATS arm is gone with the rest of the
+    // NATS code; `EventBusMode::publishes_nats()` survives only so an operator's
+    // stale `NOETL_EVENT_BUS=nats` is a loud "no transport" rather than a silent
+    // fall-through to synchronous inserts (noetl/ai-meta#212).
+    state.event_bus_mode.publishes_ehdb() && state.ehdb_event_publisher.is_some()
 }
 
 /// Is this a terminal execution event?  Both the dotted (`playbook.completed`)
@@ -248,21 +271,6 @@ fn is_terminal_event_type(event_type: &str) -> bool {
 /// Lazily build (once) + return the `noetl_events` publisher.  Returns `None`
 /// only if NATS is absent or the stream can't be ensured — callers then fall
 /// back to the synchronous INSERT.
-async fn publisher(state: &AppState) -> Option<&crate::nats::EventStreamPublisher> {
-    let client = state.nats.clone()?;
-    state
-        .event_stream_publisher
-        .get_or_try_init(|| async move {
-            let cfg = crate::services::event_stream::EventStreamConfig::from_env();
-            crate::nats::EventStreamPublisher::new(client, cfg.dedup_window, cfg.max_age).await
-        })
-        .await
-        .map_err(|e| {
-            tracing::error!(%e, "publish-only: failed to build noetl_events publisher; falling back to synchronous INSERT");
-            e
-        })
-        .ok()
-}
 
 /// Write one `noetl.event` row through the chokepoint.
 ///
@@ -358,7 +366,14 @@ pub async fn emit_events(state: &AppState, pool: &DbPool, rows: &[EventRow]) -> 
     // All rows in a batch share the same execution + catalog, so one decision
     // covers the batch.
     if should_publish(state, rows[0].catalog_id).await {
-        if let Some(pubr) = publisher(state).await {
+        // noetl/ai-meta#212 L1 T3 — which transports are live for this batch.
+        //
+        // EHDB is the only transport. Resolved here (rather than assumed) so a
+        // stale `NOETL_EVENT_BUS=nats` falls through to `insert_rows` loudly
+        // instead of publishing into the void.
+        let ehdb_live =
+            state.event_bus_mode.publishes_ehdb() && state.ehdb_event_publisher.is_some();
+        if ehdb_live {
             // noetl/ai-meta#156: when the tail-attach accelerator is on, keep the
             // `to_stream_json()` payloads we publish in the per-execution ring so
             // the off-server drive dispatch can carry the new tail to the worker
@@ -372,11 +387,19 @@ pub async fn emit_events(state: &AppState, pool: &DbPool, rows: &[EventRow]) -> 
                 let bytes = serde_json::to_vec(&stream_json).map_err(|e| {
                     crate::error::AppError::Internal(format!("event publish encode: {e}"))
                 })?;
-                pubr.publish_event(row.event_id, &row.event_type, &bytes)
-                    .await
-                    .map_err(|e| {
-                        crate::error::AppError::Internal(format!("event publish: {e}"))
-                    })?;
+                // noetl/ai-meta#212 L1 T3 — mirror onto the EHDB events feed.
+                // The SAME bytes as NATS gets, so shadow parity is a straight
+                // comparison rather than a schema translation.
+                if ehdb_live {
+                    publish_event_to_ehdb(
+                        state,
+                        rows[0].execution_id,
+                        row.event_id,
+                        &row.event_type,
+                        &bytes,
+                    )
+                    .await?;
+                }
                 crate::metrics::record_event_published(&row.event_type);
                 if state.config.offserver_attach_tail {
                     tail_payloads.push(stream_json);
@@ -391,7 +414,7 @@ pub async fn emit_events(state: &AppState, pool: &DbPool, rows: &[EventRow]) -> 
             }
             return Ok(());
         }
-        // NATS unavailable / stream unbuildable → fall through to INSERT.
+        // No transport available → fall through to INSERT.
     }
 
     insert_rows(pool, rows).await
@@ -539,5 +562,52 @@ mod tests {
         let r = EventRow::new(1, 1, 1, "step.enter", "ENTERED", Utc::now()).with_node("s");
         assert_eq!(r.node_id.as_deref(), Some("s"));
         assert_eq!(r.node_name.as_deref(), Some("s"));
+    }
+}
+
+/// Mirror one event onto the EHDB events feed (noetl/ai-meta#212 L1 T3).
+///
+/// **Failure semantics differ by mode, deliberately.**
+///
+/// In `shadow`, NATS is authoritative and this publish is an observation. A
+/// failure is logged and counted but must **not** fail the caller's request —
+/// shadow exists to de-risk the cutover, and a shadow path that can take down
+/// event ingest is a bigger risk than the one it is measuring.
+///
+/// In `ehdb`, this is the only path the durable event log has. A failure is
+/// returned so the caller sees a 500 and retries, rather than the event being
+/// dropped silently. Fail-closed is the right posture once nothing is behind it.
+async fn publish_event_to_ehdb(
+    state: &crate::state::AppState,
+    execution_id: i64,
+    event_id: i64,
+    event_type: &str,
+    bytes: &[u8],
+) -> Result<(), crate::error::AppError> {
+    let Some(publisher) = state.ehdb_event_publisher.as_ref() else {
+        return Ok(());
+    };
+    match publisher.publish_event(execution_id, event_id, bytes).await {
+        Ok(_) => {
+            crate::metrics::record_ehdb_event_published(event_type);
+            Ok(())
+        }
+        Err(e) if state.event_bus_mode == crate::event_bus::EventBusMode::Shadow => {
+            crate::metrics::record_ehdb_event_publish_error(event_type);
+            tracing::warn!(
+                execution_id,
+                event_id,
+                event_type,
+                error = %e,
+                "EHDB shadow event publish failed; NATS remains authoritative"
+            );
+            Ok(())
+        }
+        Err(e) => {
+            crate::metrics::record_ehdb_event_publish_error(event_type);
+            Err(crate::error::AppError::Internal(format!(
+                "EHDB event publish: {e}"
+            )))
+        }
     }
 }

@@ -680,75 +680,6 @@ fn build_router(
     app.layer(TraceLayer::new_for_http()).layer(cors)
 }
 
-/// Connect to NATS if configured.
-///
-/// `async_nats::connect()` only parses the addr portion of the
-/// URL — it does NOT pick up the `user:pass@` segment, so an
-/// account-authenticated server (the cluster's `NOETL` account
-/// with `noetl/noetl`) rejects the connection with
-/// "authorization violation".  Mirror the worker's
-/// `subscriber.rs` shape: strip the userinfo, build
-/// `ConnectOptions::with_user_and_password`, pass the cleaned
-/// URL.  See noetl/server#26 for the discovery (Phase B R3 of
-/// noetl/ai-meta#49 surfaced this — pre-existing but unnoticed
-/// since prior rounds didn't need a Rust-side NATS publish).
-async fn connect_nats(config: &AppConfig) -> Option<async_nats::Client> {
-    let Some(ref nats_url) = config.nats_url else {
-        tracing::info!("NATS not configured, running without messaging");
-        return None;
-    };
-
-    // Strip + parse userinfo if present.
-    let (clean_url, creds) = strip_nats_userinfo(nats_url);
-    let connect_future = match creds {
-        Some((user, password)) => {
-            async_nats::ConnectOptions::with_user_and_password(user, password).connect(&clean_url)
-        }
-        None => async_nats::ConnectOptions::new().connect(&clean_url),
-    };
-
-    match connect_future.await {
-        Ok(client) => {
-            tracing::info!(url = %clean_url, "Connected to NATS");
-            Some(client)
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, url = %clean_url, "Failed to connect to NATS, continuing without it");
-            None
-        }
-    }
-}
-
-/// Strip the `user:pass@` portion from a NATS URL and return the
-/// cleaned URL alongside the parsed credentials, if any.
-///
-/// `async_nats::ConnectOptions` rejects URLs with embedded creds,
-/// so we feed it the cleaned form + the creds via
-/// `with_user_and_password`.  Mirrors the equivalent helper in
-/// `noetl-worker::nats::subscriber`.
-fn strip_nats_userinfo(url: &str) -> (String, Option<(String, String)>) {
-    // Match `<scheme>://<userinfo>@<rest>` — userinfo is the
-    // `user:password` pair the standard `host:port` URL parser
-    // ignores when it's embedded.
-    let scheme_sep = "://";
-    let Some(scheme_idx) = url.find(scheme_sep) else {
-        return (url.to_string(), None);
-    };
-    let after_scheme = &url[scheme_idx + scheme_sep.len()..];
-    let Some(at_idx) = after_scheme.find('@') else {
-        return (url.to_string(), None);
-    };
-    let userinfo = &after_scheme[..at_idx];
-    let rest = &after_scheme[at_idx + 1..];
-    let mut parts = userinfo.splitn(2, ':');
-    let user = parts.next().unwrap_or("").to_string();
-    let password = parts.next().unwrap_or("").to_string();
-    if user.is_empty() {
-        return (url.to_string(), None);
-    }
-    let cleaned = format!("{}{}{}", &url[..scheme_idx], scheme_sep, rest);
-    (cleaned, Some((user, password)))
-}
 
 /// Resolve the at-rest encryption key (noetl/ai-meta#61, Phase 1a).
 ///
@@ -867,7 +798,6 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // Connect to NATS (optional)
-    let nats_client = connect_nats(&app_config).await;
 
     // Get encryption key (fails closed if unset; see resolve_encryption_key).
     let encryption_key = get_encryption_key()?;
@@ -876,7 +806,7 @@ async fn main() -> anyhow::Result<()> {
     // (Phase F R1.5 of noetl/ai-meta#49) is initialized once and
     // shared with the services below.  Services that need to mint
     // ids take a clone of `state.snowflake` (an `Arc`).
-    let state = AppState::new(db_pool.clone(), pools, app_config.clone(), nats_client);
+    let state = AppState::new(db_pool.clone(), pools, app_config.clone());
 
     // Background reconcile poller (noetl/ai-meta#101 block b): periodically
     // force-advances any cached execution that got stuck on a missed
@@ -893,15 +823,16 @@ async fn main() -> anyhow::Result<()> {
     // flips it on, so this is behavior-neutral until enabled.
     handlers::orphan_sweep::spawn_orphan_command_sweep(state.clone());
 
-    // CQRS write-path producer (noetl/ai-meta#103 phase 2a): a background tailer
-    // that batch-publishes committed `noetl.event` rows onto the `noetl_events`
-    // JetStream stream for the system/projector playbook to fold.  Default OFF
-    // (`NOETL_EVENT_STREAM_ENABLED` unset) so landing 2a publishes nothing until
-    // ops opts the cluster into the CQRS write path; no-op without NATS.
-    noetl_server::services::event_stream::spawn_event_stream_tailer(
-        state.clone(),
-        noetl_server::services::event_stream::EventStreamConfig::from_env(),
-    );
+    // Systemic non-convergence sweep (noetl/ai-meta#227 part B): terminates
+    // append-only (playbook.failed) any execution whose watermark — its newest
+    // event of any type — has not moved for the grace period, while no live
+    // worker holds an outstanding command and no external callback is pending.
+    // Covers the shapes the orphan sweep above is structurally blind to (never
+    // claimed, no successor issued, imported history), which is most of them.
+    // Default OFF (NOETL_NONCONVERGENCE_SWEEP_ENABLED); behavior-neutral until
+    // ops flips it on.
+    handlers::nonconvergence_sweep::spawn_nonconvergence_sweep(state.clone());
+
 
     // CQRS write-path cutover (noetl/ai-meta#103 phase 2d-3): when
     // `NOETL_EVENT_INGEST_PUBLISH_ONLY` is on, server-originated events publish to
@@ -911,15 +842,15 @@ async fn main() -> anyhow::Result<()> {
     // now routes through the chokepoint, so the server writes ZERO noetl.event
     // rows under the gate (the materializer is the only writer).
     if app_config.event_ingest_publish_only {
-        if state.nats.is_some() {
+        if state.ehdb_event_publisher.is_some() {
             tracing::warn!(
                 target: "noetl_server::startup",
-                "NOETL_EVENT_INGEST_PUBLISH_ONLY=ON — ALL server-originated noetl.event writes PUBLISH to noetl_events (materializer is the sole writer; the server writes zero event rows)"
+                "NOETL_EVENT_INGEST_PUBLISH_ONLY=ON — ALL server-originated noetl.event writes PUBLISH to the EHDB events feed (the materializer is the sole writer; the server writes zero event rows)"
             );
         } else {
-            tracing::warn!(
+            tracing::error!(
                 target: "noetl_server::startup",
-                "NOETL_EVENT_INGEST_PUBLISH_ONLY set but NATS is not connected — falling back to synchronous INSERT (gate inert)"
+                "NOETL_EVENT_INGEST_PUBLISH_ONLY set but NO event transport is configured — falling back to synchronous INSERT (gate inert). Set NOETL_EVENT_BUS=ehdb + NOETL_EVENT_BUS_WRITER_ADDRS."
             );
         }
     }

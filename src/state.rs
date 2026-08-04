@@ -57,7 +57,6 @@ pub struct AppState {
     pub config: Arc<AppConfig>,
 
     /// NATS client (optional)
-    pub nats: Option<Arc<async_nats::Client>>,
 
     /// Application-side snowflake ID generator.  Phase F R1.5 of
     /// [noetl/ai-meta#49](https://github.com/noetl/ai-meta/issues/49)
@@ -140,8 +139,6 @@ pub struct AppState {
     /// publish to the `noetl_events` stream when
     /// `config.event_ingest_publish_only` is on.  `OnceCell` so the gate-off
     /// (default) path never builds it and the gate-on path ensures the stream
-    /// exactly once.  `None` inner stays uninitialised until the first publish.
-    pub event_stream_publisher: Arc<tokio::sync::OnceCell<crate::nats::EventStreamPublisher>>,
 
     /// noetl/ai-meta#194 L1 T4 — the command-bus transport mode
     /// (`NOETL_COMMAND_BUS`; default `nats`). Selects whether command
@@ -152,6 +149,16 @@ pub struct AppState {
     /// `Some` only when `command_bus_mode` publishes to EHDB and writers are
     /// configured; `None` keeps the NATS-only path with zero new state.
     pub ehdb_command_publisher: Option<Arc<crate::command_bus::EhdbCommandPublisher>>,
+
+    /// noetl/ai-meta#212 L1 T3 — the events-bus transport mode
+    /// (`NOETL_EVENT_BUS`; default `nats`). Selects whether `noetl.event`
+    /// payloads go to NATS, the EHDB events feed, or both (shadow).
+    pub event_bus_mode: crate::event_bus::EventBusMode,
+
+    /// noetl/ai-meta#212 L1 T3 — the lazily-connected EHDB events publisher.
+    /// `Some` only when `event_bus_mode` publishes to EHDB and writers are
+    /// configured; `None` keeps the NATS-only path with zero new state.
+    pub ehdb_event_publisher: Option<Arc<crate::event_bus::EhdbEventPublisher>>,
 }
 
 /// Cached orchestrator state for one execution, advanced incrementally.
@@ -708,7 +715,6 @@ impl AppState {
         db: DbPool,
         pools: DbPoolMap,
         config: AppConfig,
-        nats: Option<async_nats::Client>,
     ) -> Self {
         let machine_id = config.server_machine_id.unwrap_or_else(|| {
             let hostname = std::env::var("HOSTNAME")
@@ -785,14 +791,10 @@ impl AppState {
 
         // Multi-replica coherence backend (RFC #115 program-scale,
         // noetl/ai-meta#107).  `local` (default) → disabled, so `ChainHeads` +
-        // `ExecDescriptors` are the in-process maps (prod-unchanged).  `nats_kv`
-        // → both are backed by shared JetStream KV buckets so 2+ replicas resolve
-        // the same watermark/descriptor.  One backend shared by both structures.
-        let nats = nats.map(Arc::new);
-        let coherence = Arc::new(crate::coherence::CoherenceKv::new(
-            nats.clone(),
-            config.replica_coherence,
-        ));
+        // Cross-replica coherence is local-only since the NATS removal — the
+        // shared JetStream KV backing went with it (noetl/ai-meta#212). The seam
+        // is kept; see `crate::coherence`.
+        let coherence = Arc::new(crate::coherence::CoherenceKv::new());
         tracing::info!(
             replica_coherence = ?config.replica_coherence,
             coherence_enabled = coherence.enabled(),
@@ -834,14 +836,42 @@ impl AppState {
             None
         };
 
+        // noetl/ai-meta#212 L1 T3 — the events-bus transport. Same shape as the
+        // command bus above: default `nats` builds no EHDB state at all.
+        let event_bus_mode = crate::event_bus::EventBusMode::from_env_value(
+            &std::env::var("NOETL_EVENT_BUS").unwrap_or_default(),
+        );
+        let ehdb_event_publisher = if event_bus_mode.publishes_ehdb() {
+            let publisher = crate::event_bus::EhdbEventPublisher::from_env();
+            if publisher.is_configured() {
+                tracing::info!(
+                    ?event_bus_mode,
+                    "EHDB events bus enabled"
+                );
+                Some(Arc::new(publisher))
+            } else {
+                // Loud, because in `ehdb` mode this is the difference between
+                // publishing the durable event log and dropping it on the floor.
+                tracing::error!(
+                    ?event_bus_mode,
+                    "NOETL_EVENT_BUS selects EHDB but NOETL_EVENT_BUS_WRITER_ADDRS is empty; \
+                     EHDB event publishes will be skipped"
+                );
+                None
+            }
+        } else {
+            None
+        };
+
         Self {
             db,
             pools,
             config: Arc::new(config),
-            nats,
             snowflake: Arc::new(snowflake),
             command_bus_mode,
             ehdb_command_publisher,
+            event_bus_mode,
+            ehdb_event_publisher,
             shard,
             affinity,
             start_time: std::time::Instant::now(),
@@ -850,7 +880,6 @@ impl AppState {
             chain_tails: Arc::new(ChainTails::default()),
             exec_descriptors: Arc::new(ExecDescriptors::with_coherence(coherence)),
             finalized_guard: Arc::new(FinalizedGuard::default()),
-            event_stream_publisher: Arc::new(tokio::sync::OnceCell::new()),
         }
     }
 
@@ -864,9 +893,9 @@ impl AppState {
     /// built from [`ShardingConfig::from_env`] so the production
     /// path honors `NOETL_SHARDS` if set.  Test code that
     /// already has a `DbPool` in hand uses this shim.
-    pub fn new_legacy(db: DbPool, config: AppConfig, nats: Option<async_nats::Client>) -> Self {
+    pub fn new_legacy(db: DbPool, config: AppConfig) -> Self {
         let pools = DbPoolMap::from_single_pool(db.clone());
-        Self::new(db, pools, config, nats)
+        Self::new(db, pools, config)
     }
 
     /// Get the server uptime in seconds.
@@ -874,10 +903,6 @@ impl AppState {
         self.start_time.elapsed().as_secs()
     }
 
-    /// Check if NATS is configured and connected.
-    pub fn has_nats(&self) -> bool {
-        self.nats.is_some()
-    }
 }
 
 #[cfg(test)]
