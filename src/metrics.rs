@@ -181,6 +181,47 @@ pub fn record_orphan_sweep(outcome: &str) {
     orphan_sweep_total().with_label_values(&[outcome]).inc();
 }
 
+// ── Systemic non-convergence sweep (noetl/ai-meta#227 part B) ────────────────
+
+/// `noetl_nonconvergence_sweep_total{outcome}` — outcomes of the systemic
+/// non-convergence sweep ([`crate::handlers::nonconvergence_sweep`]).  `outcome`
+/// is one of: `candidate` (an execution whose watermark has not moved for the
+/// grace period was examined), `terminated` (`playbook.failed` emitted),
+/// `skipped_live` (an outstanding command is held by a live worker — never
+/// failed), `skipped_awaiting_callback` (parked on an external callback by
+/// design — never failed), `capped` (eligible but deferred to a later tick by
+/// the rate limit), `error` (scan / emit failure).  Zero increments while the
+/// sweep is off (`NOETL_NONCONVERGENCE_SWEEP_ENABLED=false`).
+///
+/// `skipped_live` and `skipped_awaiting_callback` are the negative-control
+/// signals: during a drain they should account for every healthy execution the
+/// sweep looked at, and any drift in `terminated` against a known target list is
+/// the alarm.
+pub fn nonconvergence_sweep_total() -> &'static IntCounterVec {
+    static M: OnceLock<IntCounterVec> = OnceLock::new();
+    M.get_or_init(|| {
+        let counter = IntCounterVec::new(
+            Opts::new(
+                "noetl_nonconvergence_sweep_total",
+                "Systemic non-convergence sweep outcomes, by outcome.",
+            ),
+            &["outcome"],
+        )
+        .expect("static counter spec must be valid");
+        registry()
+            .register(Box::new(counter.clone()))
+            .expect("counter registration must succeed");
+        counter
+    })
+}
+
+/// Record one non-convergence sweep outcome (see [`nonconvergence_sweep_total`]).
+pub fn record_nonconvergence_sweep(outcome: &str) {
+    nonconvergence_sweep_total()
+        .with_label_values(&[outcome])
+        .inc();
+}
+
 // ── Result/state tier GC (noetl/ai-meta#104 Phase F + #166 Phase 5) ──────────
 
 /// `noetl_result_tier_gc_objects_total{class,action}` — objects a tier-GC sweep

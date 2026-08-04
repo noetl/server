@@ -806,6 +806,16 @@ async fn main() -> anyhow::Result<()> {
     // flips it on, so this is behavior-neutral until enabled.
     handlers::orphan_sweep::spawn_orphan_command_sweep(state.clone());
 
+    // Systemic non-convergence sweep (noetl/ai-meta#227 part B): terminates
+    // append-only (playbook.failed) any execution whose watermark — its newest
+    // event of any type — has not moved for the grace period, while no live
+    // worker holds an outstanding command and no external callback is pending.
+    // Covers the shapes the orphan sweep above is structurally blind to (never
+    // claimed, no successor issued, imported history), which is most of them.
+    // Default OFF (NOETL_NONCONVERGENCE_SWEEP_ENABLED); behavior-neutral until
+    // ops flips it on.
+    handlers::nonconvergence_sweep::spawn_nonconvergence_sweep(state.clone());
+
 
     // CQRS write-path cutover (noetl/ai-meta#103 phase 2d-3): when
     // `NOETL_EVENT_INGEST_PUBLISH_ONLY` is on, server-originated events publish to

@@ -650,6 +650,86 @@ pub struct AppConfig {
     /// maps `NOETL_ORPHAN_SWEEP_LOOKBACK_SECS`.
     #[serde(default = "default_orphan_sweep_lookback_secs")]
     pub orphan_sweep_lookback_secs: u64,
+
+    // ---------------------------------------------------------------------
+    // Systemic non-convergence sweep (noetl/ai-meta#227 part B)
+    // ---------------------------------------------------------------------
+    /// Enable the systemic non-convergence sweep
+    /// ([`crate::handlers::nonconvergence_sweep`]).  Envy maps
+    /// `NOETL_NONCONVERGENCE_SWEEP_ENABLED`.
+    ///
+    /// The orphan sweep above handles exactly one shape: a command **claimed**
+    /// by a worker that then died.  It is deliberately blind to every other way
+    /// an execution can stop converging — an issued command that was never
+    /// claimed, a DAG whose branches all evaluated false so no successor was
+    /// ever issued, and history bulk-imported from another cluster (which has
+    /// no live command at all).  Those accumulate forever as permanent
+    /// `RUNNING` rows: 3359 of them on prod as of 2026-08-04, the oldest 160
+    /// days old, 1699 of which entered the database in a single migration
+    /// transaction and were never executed here.
+    ///
+    /// This sweep closes that gap with a **progress** predicate rather than a
+    /// shape predicate: an execution is eligible only when its newest event of
+    /// any kind is older than [`Self::nonconvergence_grace_secs`] — i.e. the
+    /// execution's own watermark has not moved — **and** nothing can still move
+    /// it.  See the module docs for the full conjunction and, more importantly,
+    /// for what is deliberately excluded.
+    ///
+    /// **Default false.**  The task spawns and returns immediately, scanning
+    /// nothing, so default behaviour is byte-identical.  Instant rollback =
+    /// flip back to false; no state is carried between ticks.
+    #[serde(default)]
+    pub nonconvergence_sweep_enabled: bool,
+
+    /// Seconds between non-convergence sweep ticks.  Envy maps
+    /// `NOETL_NONCONVERGENCE_SWEEP_INTERVAL_SECS`.  Default 300 — this sweep
+    /// chases a backlog measured in days, so it does not need the orphan
+    /// sweep's 60s cadence, and a longer interval keeps its (larger) candidate
+    /// query further off the database's back.
+    #[serde(default = "default_nonconvergence_sweep_interval_secs")]
+    pub nonconvergence_sweep_interval_secs: u64,
+
+    /// How long an execution's newest event must be in the past before the
+    /// execution is considered non-convergent, in seconds.  Envy maps
+    /// `NOETL_NONCONVERGENCE_GRACE_SECS`.
+    ///
+    /// **This is the entire safety margin of the sweep** and should be treated
+    /// as such.  Anything that legitimately runs longer than this without
+    /// emitting a single event would be terminated.  Default 86400 (24h),
+    /// which is ~430× the p99 wall-clock of a real execution on prod and
+    /// ~1700× the longest observed inter-event gap inside a healthy run.
+    #[serde(default = "default_nonconvergence_grace_secs")]
+    pub nonconvergence_grace_secs: u64,
+
+    /// Cap on executions terminated per non-convergence tick.  Envy maps
+    /// `NOETL_NONCONVERGENCE_SWEEP_MAX_PER_TICK`.  Default 20; a capped tick
+    /// logs the deferred backlog (no silent truncation).  With the prod backlog
+    /// of ~3.3k this drains over ~14 hours at the default interval, which is
+    /// the intended pace — a sweep that clears thousands of executions in one
+    /// tick is a sweep whose blast radius nobody can watch.
+    #[serde(default = "default_nonconvergence_sweep_max_per_tick")]
+    pub nonconvergence_sweep_max_per_tick: usize,
+
+    /// Per-shard `LIMIT` on the non-convergence candidate scan.  Envy maps
+    /// `NOETL_NONCONVERGENCE_SWEEP_SCAN_LIMIT`.  Default 500.
+    #[serde(default = "default_nonconvergence_sweep_scan_limit")]
+    pub nonconvergence_sweep_scan_limit: i64,
+
+    /// Opt-in escape hatch: also terminate an execution whose outstanding
+    /// `command.claimed` is held by a **live** worker, when that claim is older
+    /// than this many seconds.  Envy maps
+    /// `NOETL_NONCONVERGENCE_STUCK_CLAIM_SECS`.
+    ///
+    /// **Default 0 = disabled**, and it should stay disabled unless an operator
+    /// has a specific reason.  The Rust worker emits no per-command heartbeat
+    /// (`command.heartbeat` is a retired Python-worker event — the newest one on
+    /// prod is dated 2026-05-23), so there is no signal that distinguishes
+    /// "held by a live worker and grinding through a slow step" from "held by a
+    /// live worker and wedged".  Absent that signal this setting is a timeout,
+    /// not a proof, and it can terminate healthy work.  Reinstating a
+    /// per-command progress signal is the prerequisite for making this safe.
+    #[serde(default)]
+    pub nonconvergence_stuck_claim_secs: u64,
 }
 
 /// How the execution-lifecycle hot path reads `noetl.event` — see
@@ -766,6 +846,23 @@ fn default_orphan_sweep_lookback_secs() -> u64 {
     // so this only bounds the candidate scan; wide enough to catch anything a
     // couple of days old, narrow enough to keep the query off the full log.
     48 * 60 * 60
+}
+
+fn default_nonconvergence_sweep_interval_secs() -> u64 {
+    300
+}
+
+fn default_nonconvergence_grace_secs() -> u64 {
+    // 24h.  The safety margin, not a tuning knob — see the field docs.
+    24 * 60 * 60
+}
+
+fn default_nonconvergence_sweep_max_per_tick() -> usize {
+    20
+}
+
+fn default_nonconvergence_sweep_scan_limit() -> i64 {
+    500
 }
 
 fn default_offserver_tail_cap() -> usize {
@@ -901,6 +998,15 @@ impl Default for AppConfig {
             orphan_sweep_max_per_tick: default_orphan_sweep_max_per_tick(),
             orphan_sweep_scan_limit: default_orphan_sweep_scan_limit(),
             orphan_sweep_lookback_secs: default_orphan_sweep_lookback_secs(),
+            // noetl/ai-meta#227 part B — same discipline as the orphan sweep
+            // above: inert by default, so a permanently-stalled execution stays
+            // exactly as it is until an operator opts in.
+            nonconvergence_sweep_enabled: false,
+            nonconvergence_sweep_interval_secs: default_nonconvergence_sweep_interval_secs(),
+            nonconvergence_grace_secs: default_nonconvergence_grace_secs(),
+            nonconvergence_sweep_max_per_tick: default_nonconvergence_sweep_max_per_tick(),
+            nonconvergence_sweep_scan_limit: default_nonconvergence_sweep_scan_limit(),
+            nonconvergence_stuck_claim_secs: 0,
         }
     }
 }

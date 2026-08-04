@@ -301,7 +301,13 @@ impl ExecutionService {
                                 CASE
                                     WHEN bool_or(e.event_type IN ('playbook.completed', 'playbook_completed')) THEN 'COMPLETED'
                                     WHEN bool_or(e.event_type IN ('playbook.failed', 'playbook_failed') OR e.status = 'FAILED') THEN 'FAILED'
-                                    WHEN bool_or(e.event_type IN ('playbook.cancelled', 'playbook_cancelled')) THEN 'CANCELLED'
+                                    -- noetl/ai-meta#227: `execution.cancelled` is the
+                                    -- cancellation terminal the Python engine emits (it is in
+                                    -- that engine's own _EXECUTION_TERMINAL_EVENT_TYPES, and
+                                    -- auto_resume maps it to "cancelled").  This projection
+                                    -- never learned about it, so 234 deliberately-cancelled
+                                    -- executions on prod report RUNNING for ever.
+                                    WHEN bool_or(e.event_type IN ('playbook.cancelled', 'playbook_cancelled', 'execution.cancelled')) THEN 'CANCELLED'
                                     ELSE 'RUNNING'
                                 END as status
                             FROM noetl.event e
@@ -505,6 +511,8 @@ impl ExecutionService {
                         | "playbook_failed"
                         | "playbook.cancelled"
                         | "playbook_cancelled"
+                        // noetl/ai-meta#227 — see determine_status.
+                        | "execution.cancelled"
                 )
             })
             .map(|e| e.created_at)
@@ -734,7 +742,7 @@ impl ExecutionService {
             SELECT EXISTS(
                 SELECT 1 FROM noetl.event
                 WHERE execution_id = $1
-                  AND event_type IN ('playbook.cancelled', 'playbook_cancelled')
+                  AND event_type IN ('playbook.cancelled', 'playbook_cancelled', 'execution.cancelled')
             )
             "#,
         )
@@ -865,7 +873,7 @@ impl ExecutionService {
             SELECT EXISTS(
                 SELECT 1 FROM noetl.event
                 WHERE execution_id = $1
-                  AND event_type IN ('playbook.cancelled', 'playbook_cancelled')
+                  AND event_type IN ('playbook.cancelled', 'playbook_cancelled', 'execution.cancelled')
             )
             "#,
         )
@@ -936,7 +944,12 @@ impl ExecutionService {
             match event.event_type.as_str() {
                 "playbook.completed" | "playbook_completed" => return "COMPLETED".to_string(),
                 "playbook.failed" | "playbook_failed" => return "FAILED".to_string(),
-                "playbook.cancelled" | "playbook_cancelled" => return "CANCELLED".to_string(),
+                // noetl/ai-meta#227 — `execution.cancelled` is a cancellation
+                // terminal too (the Python engine's own terminal set includes it);
+                // without it a cancelled execution reads RUNNING for ever.
+                "playbook.cancelled" | "playbook_cancelled" | "execution.cancelled" => {
+                    return "CANCELLED".to_string()
+                }
                 _ => {}
             }
             if event.status == "FAILED" {
