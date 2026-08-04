@@ -31,6 +31,7 @@ pub mod result_tier;
 pub mod runtime;
 pub mod secret_audit;
 pub mod sharding;
+pub mod sink_state;
 pub mod subscription;
 pub mod system;
 pub mod variables;

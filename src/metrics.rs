@@ -2029,6 +2029,35 @@ pub fn record_result_tier_gc(outcome: &str, n: u64) {
     }
 }
 
+/// `noetl_sink_state_total{op}` — sink-state feed operations (noetl/ai-meta#199
+/// Slice B). `op` is `mark` (a worker reported an execution pending-sink),
+/// `confirm` (a worker cleared one — context sunk), or `gc_consult` (the
+/// result-tier GC read the pending set for a sweep). The write-behind-cache
+/// invariant's server-visible signal is observable here before the eviction gate
+/// is switched on.
+pub fn sink_state_total() -> &'static IntCounterVec {
+    static M: OnceLock<IntCounterVec> = OnceLock::new();
+    M.get_or_init(|| {
+        let counter = IntCounterVec::new(
+            Opts::new(
+                "noetl_sink_state_total",
+                "Sink-state feed operations by op — mark / confirm / gc_consult (noetl/ai-meta#199).",
+            ),
+            &["op"],
+        )
+        .expect("static counter spec must be valid");
+        registry()
+            .register(Box::new(counter.clone()))
+            .expect("counter registration must succeed");
+        counter
+    })
+}
+
+/// Record one sink-state feed operation (`mark` / `confirm` / `gc_consult`).
+pub fn record_sink_state(op: &str) {
+    sink_state_total().with_label_values(&[op]).inc();
+}
+
 /// Secrets-Wallet Phase 7c: histogram of token auto-renewal wall-clock
 /// latency.  Buckets `[0.05, 0.1, 0.25, 0.5, 1, 2, 5]` — span the range
 /// where auth round-trips actually live.  Observed regardless of

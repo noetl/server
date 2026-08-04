@@ -145,6 +145,13 @@ pub struct GcReport {
     pub skipped_grace: usize,
     /// Objects skipped because the key did not parse to an `execution=` segment.
     pub skipped_unparseable: usize,
+    /// Echo of the `NOETL_RESULT_TIER_GC_SINK_GATE` opt-in guard
+    /// (noetl/ai-meta#199 Slice B).
+    pub sink_gate: bool,
+    /// Objects skipped because their execution's business context is not yet sunk
+    /// to the customer's system of record (write-behind-cache invariant). Always 0
+    /// when the sink gate is off or the sink-state source is empty.
+    pub skipped_unsunk: usize,
     /// Echo of the `NOETL_STATE_SHARD_GC` opt-in guard (noetl/ai-meta#166 Phase 5).
     pub state_shard_guard: bool,
     /// Open state shards that `decide` ruled dead but the guard held back for the
@@ -170,6 +177,8 @@ impl GcReport {
             skipped_live: 0,
             skipped_grace: 0,
             skipped_unparseable: 0,
+            sink_gate: false,
+            skipped_unsunk: 0,
             state_shard_guard: false,
             state_open_guard_protected: 0,
             state_shard_candidates: 0,
@@ -188,6 +197,12 @@ pub enum Decision {
     SkipUnparseable,
     /// Skip: the execution still has surviving events (live-referenced).
     SkipLive,
+    /// Skip: the execution's business context is not yet sunk to the customer's
+    /// system of record (noetl/ai-meta#199 Slice B — write-behind-cache
+    /// invariant). Only ever returned when the sink gate is on and the sink-state
+    /// source reports this execution pending-sink; the object would otherwise be
+    /// `Dead`. Never weakens `SkipLive` — a live object stays `SkipLive`.
+    SkipUnsunk,
     /// Skip: the object is younger than the grace window.
     SkipGrace,
     /// Dead: reclaim.
@@ -285,6 +300,29 @@ pub fn state_shard_gc_enabled() -> bool {
     )
 }
 
+/// `NOETL_RESULT_TIER_GC_SINK_GATE` — opt-in write-behind-cache guard
+/// (noetl/ai-meta#199 Slice B). Default off → the sweep behaves exactly as
+/// today. On → an object whose execution the sink-state source reports still
+/// **pending-sink** (its business context has not yet been written to the
+/// customer's system of record) is never reclaimed, even once its events have
+/// aged out — the same "never GC un-sunk business context" invariant the worker's
+/// WAL-index LRU (noetl/ai-meta#198) and durable-segment GC (Slice B) enforce.
+///
+/// The flag is only half the gate: the sweep also needs a **sink-state source**
+/// (the set of pending-sink executions). Absent a feed the source is empty, so
+/// enabling the flag alone is still behavior-neutral — the gate can only ever
+/// make the sweep *more* conservative, never less.
+pub fn sink_gate_enabled() -> bool {
+    matches!(
+        std::env::var("NOETL_RESULT_TIER_GC_SINK_GATE")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
 /// Default multiplier applied to the grace window for an **open** state shard
 /// when the [`state_shard_gc_enabled`] guard is on. `7` → open shards survive
 /// seven grace windows past their execution aging out.
@@ -303,6 +341,14 @@ fn default_open_grace_multiplier() -> i64 {
 /// class uses `decide` verbatim. **The `SkipLive` invariant is never weakened** —
 /// the guard can only make the sweep *more* conservative, never less: it never
 /// turns a `Skip*` into a `Dead`. `open_grace_multiplier` is clamped to `>= 1`.
+///
+/// `has_unsunk_context` layers the noetl/ai-meta#199 Slice B write-behind-cache
+/// guard on top: when true (the sink gate is on **and** the sink-state source
+/// reports this execution pending-sink), a would-be `Dead` verdict becomes
+/// [`Decision::SkipUnsunk`] — the object is retained until its business context
+/// reaches the customer's system of record. Like the state-shard guard it only
+/// ever protects further: it never promotes a `Skip*` to `Dead`, and it never
+/// weakens `SkipLive`.
 #[allow(clippy::too_many_arguments)]
 pub fn decide_object(
     class: ObjectClass,
@@ -312,18 +358,30 @@ pub fn decide_object(
     grace_seconds: i64,
     state_shard_guard: bool,
     open_grace_multiplier: i64,
+    has_unsunk_context: bool,
 ) -> Decision {
     let base = decide(execution_id, has_live_events, age_seconds, grace_seconds);
-    // The guard only ever protects further; it never promotes to Dead.
-    if !state_shard_guard || class != ObjectClass::StateOpen || base != Decision::Dead {
-        return base;
+    // The state-shard guard only ever protects further; never promotes to Dead.
+    let verdict = if state_shard_guard
+        && class == ObjectClass::StateOpen
+        && base == Decision::Dead
+    {
+        let mult = open_grace_multiplier.max(1);
+        let extended = grace_seconds.saturating_mul(mult);
+        match age_seconds {
+            Some(age) if age >= extended => Decision::Dead,
+            _ => Decision::SkipGrace,
+        }
+    } else {
+        base
+    };
+    // Write-behind-cache guard: un-sunk business context is never reclaimed.
+    // Applied last so it wins over Dead regardless of class, but it only ever
+    // converts a Dead into a retain — never the reverse.
+    if has_unsunk_context && verdict == Decision::Dead {
+        return Decision::SkipUnsunk;
     }
-    let mult = open_grace_multiplier.max(1);
-    let extended = grace_seconds.saturating_mul(mult);
-    match age_seconds {
-        Some(age) if age >= extended => Decision::Dead,
-        _ => Decision::SkipGrace,
-    }
+    verdict
 }
 
 /// Parse the `execution=<eid>` segment out of a §7 physical object key. Returns
@@ -374,7 +432,19 @@ fn now_ms() -> u64 {
 /// Run one result-tier GC sweep. No-op (and deletes nothing) unless
 /// `NOETL_RESULT_TIER_GC` is set. Best-effort per object: a delete failure is
 /// counted on `errors` and the sweep continues.
-pub async fn sweep(pool: &DbPool, backend: &ObjectBackend, req: &GcRequest) -> AppResult<GcReport> {
+///
+/// `pending_sink` is the write-behind-cache sink-state source (noetl/ai-meta#199
+/// Slice B): the set of executions whose business context has **not** yet been
+/// sunk to the customer's system of record. When `NOETL_RESULT_TIER_GC_SINK_GATE`
+/// is on, an object whose execution is in this set is never reclaimed. Callers
+/// with no sink-state feed pass an empty set, so the gate is behavior-neutral —
+/// it can only ever retain more, never delete more.
+pub async fn sweep(
+    pool: &DbPool,
+    backend: &ObjectBackend,
+    req: &GcRequest,
+    pending_sink: &std::collections::HashSet<i64>,
+) -> AppResult<GcReport> {
     if !gc_enabled() {
         return Ok(GcReport::disabled());
     }
@@ -385,6 +455,9 @@ pub async fn sweep(pool: &DbPool, backend: &ObjectBackend, req: &GcRequest) -> A
     // default → state shards follow the exact result-object policy (today).
     let state_shard_guard = state_shard_gc_enabled();
     let open_grace_multiplier = default_open_grace_multiplier();
+    // noetl/ai-meta#199 Slice B: opt-in write-behind-cache guard. Off (or an empty
+    // sink-state source) → no object is ever retained for un-sunk context.
+    let sink_gate = sink_gate_enabled();
 
     let mut report = GcReport {
         enabled: true,
@@ -395,6 +468,8 @@ pub async fn sweep(pool: &DbPool, backend: &ObjectBackend, req: &GcRequest) -> A
         skipped_live: 0,
         skipped_grace: 0,
         skipped_unparseable: 0,
+        sink_gate,
+        skipped_unsunk: 0,
         state_shard_guard,
         state_open_guard_protected: 0,
         state_shard_candidates: 0,
@@ -414,6 +489,9 @@ pub async fn sweep(pool: &DbPool, backend: &ObjectBackend, req: &GcRequest) -> A
             None => false,
         };
         let age = eid.and_then(|id| age_seconds(id, now));
+        // Write-behind-cache: is this execution's business context still un-sunk?
+        // Only consulted when the sink gate is on; an empty source ⇒ always false.
+        let has_unsunk = sink_gate && eid.map(|id| pending_sink.contains(&id)).unwrap_or(false);
 
         // Whether the open-shard guard *would* have deleted this object under the
         // base policy — used to count objects the guard specifically protected.
@@ -429,6 +507,7 @@ pub async fn sweep(pool: &DbPool, backend: &ObjectBackend, req: &GcRequest) -> A
             req.grace_seconds,
             state_shard_guard,
             open_grace_multiplier,
+            has_unsunk,
         ) {
             Decision::SkipUnparseable => {
                 report.skipped_unparseable += 1;
@@ -437,6 +516,10 @@ pub async fn sweep(pool: &DbPool, backend: &ObjectBackend, req: &GcRequest) -> A
             Decision::SkipLive => {
                 report.skipped_live += 1;
                 crate::metrics::record_result_tier_gc_object(class.label(), "skip_live");
+            }
+            Decision::SkipUnsunk => {
+                report.skipped_unsunk += 1;
+                crate::metrics::record_result_tier_gc_object(class.label(), "skip_unsunk");
             }
             Decision::SkipGrace => {
                 report.skipped_grace += 1;
@@ -616,7 +699,7 @@ mod tests {
                 (None, false, Some(100_000), 0),
             ] {
                 assert_eq!(
-                    decide_object(class, eid, live, age, grace, false, 7),
+                    decide_object(class, eid, live, age, grace, false, 7, false),
                     decide(eid, live, age, grace),
                     "guard-off must equal decide (class={class:?})"
                 );
@@ -640,7 +723,8 @@ mod tests {
                 Some(100_000),
                 86_400,
                 true,
-                7
+                7,
+                false
             ),
             Decision::SkipGrace
         );
@@ -653,7 +737,8 @@ mod tests {
                 Some(700_000),
                 86_400,
                 true,
-                7
+                7,
+                false
             ),
             Decision::Dead
         );
@@ -664,7 +749,7 @@ mod tests {
         // Sealed shard + result object: guard on, but they follow the base policy.
         for class in [ObjectClass::StateSealed, ObjectClass::Result, ObjectClass::Other] {
             assert_eq!(
-                decide_object(class, Some(7), false, Some(100_000), 86_400, true, 7),
+                decide_object(class, Some(7), false, Some(100_000), 86_400, true, 7, false),
                 Decision::Dead,
                 "guard must not protect {class:?}"
             );
@@ -672,7 +757,7 @@ mod tests {
         // Live is never weakened, even for an open shard with the guard on — and
         // the guard can NEVER promote a Skip to Dead.
         assert_eq!(
-            decide_object(ObjectClass::StateOpen, Some(7), true, Some(700_000), 86_400, true, 7),
+            decide_object(ObjectClass::StateOpen, Some(7), true, Some(700_000), 86_400, true, 7, false),
             Decision::SkipLive
         );
     }
@@ -683,8 +768,81 @@ mod tests {
         // (which would delete every aged-out open shard immediately). Clamped
         // to 1 → behaves like the base grace.
         assert_eq!(
-            decide_object(ObjectClass::StateOpen, Some(7), false, Some(100_000), 86_400, true, 0),
+            decide_object(ObjectClass::StateOpen, Some(7), false, Some(100_000), 86_400, true, 0, false),
             Decision::Dead
         );
+    }
+
+    // ---- write-behind-cache sink gate (noetl/ai-meta#199 Slice B) ----------
+
+    #[test]
+    fn sink_gate_retains_unsunk_dead_object() {
+        // An object that the base policy rules Dead (unreferenced + aged out) is
+        // retained as SkipUnsunk when its execution is still pending-sink.
+        for class in [
+            ObjectClass::Result,
+            ObjectClass::StateOpen,
+            ObjectClass::StateSealed,
+            ObjectClass::Other,
+        ] {
+            // Base verdict Dead...
+            assert_eq!(
+                decide_object(class, Some(7), false, Some(100_000), 86_400, false, 7, false),
+                Decision::Dead,
+                "base is Dead (class={class:?})"
+            );
+            // ...but un-sunk context wins → retained.
+            assert_eq!(
+                decide_object(class, Some(7), false, Some(100_000), 86_400, false, 7, true),
+                Decision::SkipUnsunk,
+                "un-sunk Dead object is retained (class={class:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn sink_gate_only_ever_protects_further() {
+        // The sink guard can NEVER promote a Skip to Dead, and never weakens
+        // SkipLive — same monotonic-protection contract as the state-shard guard.
+        // Live stays live even when flagged un-sunk.
+        assert_eq!(
+            decide_object(ObjectClass::Result, Some(7), true, Some(100_000), 86_400, false, 7, true),
+            Decision::SkipLive
+        );
+        // A young (grace-protected) object stays SkipGrace, not converted.
+        assert_eq!(
+            decide_object(ObjectClass::Result, Some(7), false, Some(10), 86_400, false, 7, true),
+            Decision::SkipGrace
+        );
+        // An unparseable key is never reasoned about, un-sunk flag notwithstanding.
+        assert_eq!(
+            decide_object(ObjectClass::Other, None, false, Some(100_000), 0, false, 7, true),
+            Decision::SkipUnparseable
+        );
+    }
+
+    #[test]
+    fn sink_gate_off_never_yields_skip_unsunk() {
+        // has_unsunk_context=false (the default — no gate, or an empty sink-state
+        // source) can never produce SkipUnsunk: the sweep is byte-identical to the
+        // pre-#199 behavior. Exercised across every class × liveness × age.
+        for class in [
+            ObjectClass::Result,
+            ObjectClass::StateOpen,
+            ObjectClass::StateSealed,
+            ObjectClass::Other,
+        ] {
+            for eid in [Some(7_i64), None] {
+                for live in [true, false] {
+                    for age in [Some(-1_i64), Some(10), Some(100_000), None] {
+                        for guard in [true, false] {
+                            let v =
+                                decide_object(class, eid, live, age, 86_400, guard, 7, false);
+                            assert_ne!(v, Decision::SkipUnsunk, "gate off must never SkipUnsunk");
+                        }
+                    }
+                }
+            }
+        }
     }
 }
