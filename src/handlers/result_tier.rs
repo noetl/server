@@ -43,19 +43,31 @@ pub async fn gc(
     // cross-process from the worker's in-process sink gate); the sweep then retains
     // any object whose execution is still pending-sink. Gate off ⇒ empty set + no
     // DB read, so the sweep is byte-identical to the pre-#199 behavior.
-    let pending_sink: std::collections::HashSet<i64> = if result_tier_gc::sink_gate_enabled() {
-        crate::metrics::record_sink_state("gc_consult");
-        crate::db::queries::sink_pending::list_pending(
-            &deps.pool,
-            crate::db::queries::sink_pending::DEFAULT_LIST_LIMIT,
-        )
-        .await?
-        .into_iter()
-        .collect()
-    } else {
-        std::collections::HashSet::new()
-    };
-    let report = result_tier_gc::sweep(&deps.pool, &deps.backend, &req, &pending_sink).await?;
+    let (pending_sink, pending_sink_complete): (std::collections::HashSet<i64>, bool) =
+        if result_tier_gc::sink_gate_enabled() {
+            crate::metrics::record_sink_state("gc_consult");
+            // `_checked` reports whether the cap truncated the feed. A truncated
+            // feed makes the gate fail OPEN, so the sweep needs to know
+            // (noetl/ai-meta#199).
+            let (ids, complete) = crate::db::queries::sink_pending::list_pending_checked(
+                &deps.pool,
+                crate::db::queries::sink_pending::DEFAULT_LIST_LIMIT,
+            )
+            .await?;
+            (ids.into_iter().collect(), complete)
+        } else {
+            // Gate off ⇒ empty set, no DB read, and `complete` is vacuously true:
+            // there is nothing to be incomplete about.
+            (std::collections::HashSet::new(), true)
+        };
+    let report = result_tier_gc::sweep(
+        &deps.pool,
+        &deps.backend,
+        &req,
+        &pending_sink,
+        pending_sink_complete,
+    )
+    .await?;
 
     // Observability: one counter, deltas tell the story (no_op when the gate is
     // off, scanned/deleted/skipped_live/errors otherwise).

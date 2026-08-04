@@ -312,6 +312,34 @@ pub fn state_shard_gc_enabled() -> bool {
 /// (the set of pending-sink executions). Absent a feed the source is empty, so
 /// enabling the flag alone is still behavior-neutral — the gate can only ever
 /// make the sweep *more* conservative, never less.
+/// Should this object be held back as un-sunk? (noetl/ai-meta#199)
+///
+/// Pure so the sweep and its tests exercise the SAME decision — a test that
+/// re-implements the rule passes whether or not the shipped code still follows
+/// it, which is how a gate ends up asserted-but-not-enforced.
+///
+/// `feed_complete == false` means the sink feed hit its cap and this process is
+/// holding an incomplete view of what is un-sunk. Every object then reads as
+/// un-sunk: the safe interpretation of "I cannot see the whole set". Retaining
+/// costs storage; reclaiming business context that never reached the customer's
+/// system of record is unrecoverable, so the tie does not go to the sweep.
+pub(crate) fn is_unsunk(
+    sink_gate: bool,
+    feed_complete: bool,
+    pending_sink: &std::collections::HashSet<i64>,
+    execution_id: Option<i64>,
+) -> bool {
+    if !sink_gate {
+        return false;
+    }
+    if !feed_complete {
+        return true;
+    }
+    execution_id
+        .map(|id| pending_sink.contains(&id))
+        .unwrap_or(false)
+}
+
 pub fn sink_gate_enabled() -> bool {
     matches!(
         std::env::var("NOETL_RESULT_TIER_GC_SINK_GATE")
@@ -444,6 +472,7 @@ pub async fn sweep(
     backend: &ObjectBackend,
     req: &GcRequest,
     pending_sink: &std::collections::HashSet<i64>,
+    pending_sink_complete: bool,
 ) -> AppResult<GcReport> {
     if !gc_enabled() {
         return Ok(GcReport::disabled());
@@ -458,6 +487,25 @@ pub async fn sweep(
     // noetl/ai-meta#199 Slice B: opt-in write-behind-cache guard. Off (or an empty
     // sink-state source) → no object is ever retained for un-sunk context.
     let sink_gate = sink_gate_enabled();
+    // noetl/ai-meta#199 — the sink feed is capped (`DEFAULT_LIST_LIMIT`), and
+    // `ORDER BY marked_at` means truncation drops the NEWEST marks: the
+    // executions whose business context is most likely still live.  With an
+    // incomplete feed this sweep cannot tell un-sunk from sunk, so it must not
+    // delete anything.
+    //
+    // Fail closed, deliberately asymmetric: retaining objects costs storage,
+    // reclaiming un-sunk business context is unrecoverable.
+    let sink_feed_incomplete = sink_gate && !pending_sink_complete;
+    if sink_feed_incomplete {
+        tracing::error!(
+            pending = pending_sink.len(),
+            "result-tier GC: the sink feed is TRUNCATED — refusing to reclaim. \
+             The gate cannot see every un-sunk execution, so a sweep would delete \
+             business context that never reached the customer's system of record. \
+             Raise the list limit or drain noetl.sink_pending (noetl/ai-meta#199)."
+        );
+        crate::metrics::record_sink_state("gc_feed_truncated");
+    }
 
     let mut report = GcReport {
         enabled: true,
@@ -491,7 +539,9 @@ pub async fn sweep(
         let age = eid.and_then(|id| age_seconds(id, now));
         // Write-behind-cache: is this execution's business context still un-sunk?
         // Only consulted when the sink gate is on; an empty source ⇒ always false.
-        let has_unsunk = sink_gate && eid.map(|id| pending_sink.contains(&id)).unwrap_or(false);
+        // An incomplete feed makes EVERY object un-sunk as far as this sweep is
+        // concerned — the safe reading of "I cannot see the whole set".
+        let has_unsunk = is_unsunk(sink_gate, !sink_feed_incomplete, pending_sink, eid);
 
         // Whether the open-shard guard *would* have deleted this object under the
         // base policy — used to count objects the guard specifically protected.
@@ -844,5 +894,74 @@ mod tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod sink_feed_truncation_tests {
+    use super::*;
+
+    fn pending(ids: &[i64]) -> std::collections::HashSet<i64> {
+        ids.iter().copied().collect()
+    }
+
+    /// noetl/ai-meta#199 — the sink feed is capped at `DEFAULT_LIST_LIMIT` and
+    /// ordered by `marked_at`, so truncation drops the **newest** marks: exactly
+    /// the executions whose business context is most likely still live.
+    ///
+    /// The sweep's own doc comment claims the gate "can only ever retain more,
+    /// never delete more". A silent cap breaks that — the gate stops seeing
+    /// un-sunk executions and the sweep reclaims them, failing OPEN.
+    #[test]
+    fn a_truncated_feed_holds_back_an_execution_it_cannot_see() {
+        let p = pending(&[1, 2]);
+        // Complete feed: an unlisted execution is reclaimable.
+        assert!(!is_unsunk(true, true, &p, Some(9)));
+        // Truncated feed: the same execution must be retained — its mark may
+        // simply be past the cap.
+        assert!(
+            is_unsunk(true, false, &p, Some(9)),
+            "a truncated feed must retain an execution it cannot see; this is the \
+             fail-open the cap introduced"
+        );
+    }
+
+    /// The gate must still discriminate when the feed IS complete, or it
+    /// degenerates into "retain everything" and the retention means nothing.
+    #[test]
+    fn a_complete_feed_still_discriminates() {
+        let p = pending(&[1, 2]);
+        assert!(is_unsunk(true, true, &p, Some(1)), "a marked execution is un-sunk");
+        assert!(!is_unsunk(true, true, &p, Some(9)), "an unmarked one is reclaimable");
+        assert!(
+            !is_unsunk(true, true, &p, None),
+            "an unparseable key is not un-sunk — it is handled by skipped_unparseable"
+        );
+    }
+
+    /// Gate OFF must be byte-identical to pre-#199 behaviour, including when the
+    /// feed is nominally incomplete: with the gate off there is no feed to be
+    /// incomplete about, and no DB read happens at all.
+    #[test]
+    fn the_gate_off_path_is_untouched() {
+        let p = pending(&[1, 2]);
+        for complete in [true, false] {
+            for eid in [Some(1), Some(9), None] {
+                assert!(
+                    !is_unsunk(false, complete, &p, eid),
+                    "gate off must never retain (complete={complete}, eid={eid:?})"
+                );
+            }
+        }
+    }
+
+    /// Exactly-at-limit is indistinguishable from "there were more", so it must
+    /// read as truncated. Guessing complete is what fails the gate open.
+    #[test]
+    fn exactly_at_the_cap_reads_as_truncated() {
+        let complete = |n: usize, limit: i64| (n as i64) < limit;
+        assert!(complete(0, 100));
+        assert!(complete(99, 100));
+        assert!(!complete(100, 100), "at the cap must read as TRUNCATED");
     }
 }
