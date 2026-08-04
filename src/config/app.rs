@@ -862,20 +862,30 @@ fn default_nonconvergence_grace_secs() -> u64 {
 ///
 /// This exists because a short grace terminates work that was going to finish.
 ///
-/// Finalization is not instant.  Measured in kind on 2026-08-04, sweep OFF and
-/// no restarts, 40 `fixtures/playbooks/hello_world` executions: after the final
-/// step's `command.completed`, the orchestrator takes **p50 206s, p90 210s, max
-/// 393s** to emit `playbook.completed`.  All 40 finalized — nothing was lost,
-/// the tail is simply minutes long.
+/// Finalization is not instant, and — the part that matters for picking a
+/// number — **its tail scales with drive-queue depth**, so there is no single
+/// value to tune against.  Measured in kind on 2026-08-04, sweep OFF, no
+/// restarts, time from the final step's `command.completed` to
+/// `playbook.completed`:
 ///
-/// A validation run at `grace=120` therefore terminated 30 executions that had
-/// run every step successfully and were still inside that tail.  The predicate
-/// was right; the grace was wrong.  The negative control caught it, and this
-/// floor is what stops the same configuration reaching production.
+/// | load | p50 | max |
+/// | :-- | --: | --: |
+/// | light sustained (1 execution / 6s, 212 samples) | 49s | 138s |
+/// | after a burst, queue still draining (40 samples) | 206s | 393s |
 ///
-/// 3600s is a 9x margin over the observed maximum, and costs the real use case
-/// nothing: the prod backlog this sweep exists to clear is between 3.5 and 159
-/// **days** stale.  The 24h default is a 220x margin.
+/// Every execution finalized in both regimes — nothing is lost, the tail is
+/// simply minutes long and **8x longer under load than at rest**.  That spread
+/// is the argument for a floor rather than a tuned value: a grace chosen from a
+/// quiet cluster is wrong on a busy one, and busy is when it matters.
+///
+/// A validation run at `grace=120` duly terminated 30 executions that had run
+/// every step successfully and were still inside that tail.  The predicate was
+/// right; the grace was wrong.  The negative control caught it, and this floor
+/// is what stops the same configuration reaching production.
+///
+/// 3600s is 9x the worst observed tail (26x the light-load one), and costs the
+/// real use case nothing: the prod backlog this sweep exists to clear is
+/// between 3.5 and 159 **days** stale.  The 24h default is 220x.
 pub const MIN_NONCONVERGENCE_GRACE_SECS: u64 = 3600;
 
 fn default_nonconvergence_sweep_max_per_tick() -> usize {

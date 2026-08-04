@@ -848,9 +848,11 @@ mod tests {
 
     /// SAFETY: a grace below the floor is raised, not honoured.  A validation
     /// run at grace=120 terminated 30 executions that had run every step
-    /// successfully and were still inside the finalization tail (measured p50
-    /// 206s, max 393s); this is the guard that stops that configuration
-    /// reaching production.
+    /// successfully and were still inside the finalization tail — which scales
+    /// with drive-queue depth (p50 49s / max 138s at light load, p50 206s / max
+    /// 393s behind a burst), so it cannot be tuned against a single
+    /// measurement.  This is the guard that stops that configuration reaching
+    /// production.
     #[test]
     fn grace_below_the_floor_is_raised() {
         use crate::config::MIN_NONCONVERGENCE_GRACE_SECS;
