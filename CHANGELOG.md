@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.61.0](https://github.com/noetl/server/compare/v3.60.2...v3.61.0) (2026-08-04)
+
+### Features
+
+* **sweep:** terminate systemically non-convergent executions, off by default ([7e238f3](https://github.com/noetl/server/commit/7e238f3112e653d1567d2314e615ef84910e5411)), closes [#171](https://github.com/noetl/server/issues/171) [#62](https://github.com/noetl/server/issues/62) [#103](https://github.com/noetl/server/issues/103) [#118](https://github.com/noetl/server/issues/118) [noetl/ai-meta#227](https://github.com/noetl/ai-meta/issues/227)
+
+### Bug Fixes
+
+* **sweep:** floor the non-convergence grace at 1h — 120s ate healthy work ([429399f](https://github.com/noetl/server/commit/429399fceafd51e3562bae18adeb4eeadf885b1e)), closes [noetl/ai-meta#227](https://github.com/noetl/ai-meta/issues/227)
+* **sweep:** never terminate a child whose parent is still progressing ([ea786af](https://github.com/noetl/server/commit/ea786af23adcd3cced5ffd974f41be44379abea5)), closes [noetl/ai-meta#227](https://github.com/noetl/ai-meta/issues/227)
+
 ## [3.60.2](https://github.com/noetl/server/compare/v3.60.1...v3.60.2) (2026-08-01)
 
 ### Bug Fixes
