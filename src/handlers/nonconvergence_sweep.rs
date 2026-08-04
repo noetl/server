@@ -160,6 +160,15 @@ pub(crate) struct StalledExecution {
     pub awaiting_callback: bool,
 }
 
+/// The grace period actually used, never below
+/// [`crate::config::MIN_NONCONVERGENCE_GRACE_SECS`].
+///
+/// Applied at both the log site and the query site so the number an operator
+/// reads in the startup line is the number the predicate uses.
+fn effective_grace_secs(configured: u64) -> u64 {
+    configured.max(crate::config::MIN_NONCONVERGENCE_GRACE_SECS)
+}
+
 /// Fate of one candidate this tick.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Disposition {
@@ -197,10 +206,24 @@ pub fn spawn_nonconvergence_sweep(state: AppState) {
         }
         let interval =
             std::time::Duration::from_secs(state.config.nonconvergence_sweep_interval_secs.max(1));
+        // Enforce the grace floor here rather than trusting the deployment.  A
+        // grace shorter than the orchestrator's finalization tail terminates
+        // executions that ran every step successfully and were merely waiting to
+        // be finalized — measured, not theorised: see
+        // `MIN_NONCONVERGENCE_GRACE_SECS`.
+        let grace = effective_grace_secs(state.config.nonconvergence_grace_secs);
+        if grace != state.config.nonconvergence_grace_secs {
+            warn!(
+                target: "noetl_server::nonconvergence_sweep",
+                configured = state.config.nonconvergence_grace_secs,
+                effective = grace,
+                "non-convergence sweep: NOETL_NONCONVERGENCE_GRACE_SECS is below the safe floor and has been RAISED — a shorter grace terminates executions that are merely awaiting finalization"
+            );
+        }
         warn!(
             target: "noetl_server::nonconvergence_sweep",
             interval_secs = state.config.nonconvergence_sweep_interval_secs,
-            grace_secs = state.config.nonconvergence_grace_secs,
+            grace_secs = grace,
             max_per_tick = state.config.nonconvergence_sweep_max_per_tick,
             stuck_claim_secs = state.config.nonconvergence_stuck_claim_secs,
             "non-convergence sweep: ENABLED — executions whose watermark has not moved for the grace period will be terminated append-only (playbook.failed)"
@@ -218,7 +241,7 @@ pub fn spawn_nonconvergence_sweep(state: AppState) {
 /// Run one sweep tick.
 async fn run_nonconvergence_sweep(state: &AppState) -> AppResult<()> {
     let cfg = &state.config;
-    let grace = cfg.nonconvergence_grace_secs as i64;
+    let grace = effective_grace_secs(cfg.nonconvergence_grace_secs) as i64;
     let scan_limit = cfg.nonconvergence_sweep_scan_limit;
     let max_per_tick = cfg.nonconvergence_sweep_max_per_tick;
     let stuck_claim = cfg.nonconvergence_stuck_claim_secs as i64;
@@ -721,6 +744,41 @@ mod tests {
         let c: Vec<_> = (1..=3).map(stalled).collect();
         let plan = plan_dispositions(&c, &live_set(&[]), 0, 0);
         assert!(plan.iter().all(|d| *d == Disposition::Capped));
+    }
+
+    /// SAFETY: a grace below the floor is raised, not honoured.  A validation
+    /// run at grace=120 terminated 30 executions that had run every step
+    /// successfully and were still inside the finalization tail (measured p50
+    /// 206s, max 393s); this is the guard that stops that configuration
+    /// reaching production.
+    #[test]
+    fn grace_below_the_floor_is_raised() {
+        use crate::config::MIN_NONCONVERGENCE_GRACE_SECS;
+        assert_eq!(effective_grace_secs(0), MIN_NONCONVERGENCE_GRACE_SECS);
+        assert_eq!(effective_grace_secs(120), MIN_NONCONVERGENCE_GRACE_SECS);
+        assert_eq!(
+            effective_grace_secs(MIN_NONCONVERGENCE_GRACE_SECS - 1),
+            MIN_NONCONVERGENCE_GRACE_SECS
+        );
+    }
+
+    /// A grace at or above the floor is passed through untouched — the floor is
+    /// a floor, not an override.
+    #[test]
+    fn grace_at_or_above_the_floor_is_honoured() {
+        use crate::config::MIN_NONCONVERGENCE_GRACE_SECS;
+        assert_eq!(
+            effective_grace_secs(MIN_NONCONVERGENCE_GRACE_SECS),
+            MIN_NONCONVERGENCE_GRACE_SECS
+        );
+        assert_eq!(effective_grace_secs(86_400), 86_400);
+    }
+
+    /// The default must satisfy its own floor.
+    #[test]
+    fn default_grace_clears_the_floor() {
+        let cfg = crate::config::AppConfig::default();
+        assert!(cfg.nonconvergence_grace_secs >= crate::config::MIN_NONCONVERGENCE_GRACE_SECS);
     }
 
     /// Every disposition maps to a distinct metric label, so a dashboard can

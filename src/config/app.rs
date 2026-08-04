@@ -31,7 +31,6 @@ pub struct AppConfig {
     #[serde(default = "default_server_name")]
     pub server_name: String,
 
-
     /// Enable GCP token API endpoint
     #[serde(default = "default_true")]
     pub enable_gcp_token_api: bool,
@@ -695,9 +694,11 @@ pub struct AppConfig {
     ///
     /// **This is the entire safety margin of the sweep** and should be treated
     /// as such.  Anything that legitimately runs longer than this without
-    /// emitting a single event would be terminated.  Default 86400 (24h),
-    /// which is ~430× the p99 wall-clock of a real execution on prod and
-    /// ~1700× the longest observed inter-event gap inside a healthy run.
+    /// emitting a single event would be terminated.
+    ///
+    /// Default 86400 (24h).  Values below
+    /// [`MIN_NONCONVERGENCE_GRACE_SECS`] are raised to it at startup, loudly —
+    /// see that constant for the measurement that produced the floor.
     #[serde(default = "default_nonconvergence_grace_secs")]
     pub nonconvergence_grace_secs: u64,
 
@@ -856,6 +857,26 @@ fn default_nonconvergence_grace_secs() -> u64 {
     // 24h.  The safety margin, not a tuning knob — see the field docs.
     24 * 60 * 60
 }
+
+/// Hard floor on [`AppConfig::nonconvergence_grace_secs`], enforced at startup.
+///
+/// This exists because a short grace terminates work that was going to finish.
+///
+/// Finalization is not instant.  Measured in kind on 2026-08-04, sweep OFF and
+/// no restarts, 40 `fixtures/playbooks/hello_world` executions: after the final
+/// step's `command.completed`, the orchestrator takes **p50 206s, p90 210s, max
+/// 393s** to emit `playbook.completed`.  All 40 finalized — nothing was lost,
+/// the tail is simply minutes long.
+///
+/// A validation run at `grace=120` therefore terminated 30 executions that had
+/// run every step successfully and were still inside that tail.  The predicate
+/// was right; the grace was wrong.  The negative control caught it, and this
+/// floor is what stops the same configuration reaching production.
+///
+/// 3600s is a 9x margin over the observed maximum, and costs the real use case
+/// nothing: the prod backlog this sweep exists to clear is between 3.5 and 159
+/// **days** stale.  The 24h default is a 220x margin.
+pub const MIN_NONCONVERGENCE_GRACE_SECS: u64 = 3600;
 
 fn default_nonconvergence_sweep_max_per_tick() -> usize {
     20
