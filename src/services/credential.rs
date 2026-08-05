@@ -415,6 +415,7 @@ impl CredentialService {
                 // Don't fail the credential lookup on a refresh-decision
                 // read error — log + skip; the cached value already
                 // returned to the caller.
+                crate::metrics::record_secret_refresh("decision_failed");
                 tracing::warn!(
                     execution_id,
                     alias = %alias,
