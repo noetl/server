@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.64.0](https://github.com/noetl/server/compare/v3.63.0...v3.64.0) (2026-08-05)
+
+### Features
+
+* **metrics:** count EHDB command-publish failures ([fc6dded](https://github.com/noetl/server/commit/fc6dded2d581bdfff7edb31e4c35ba693ba0c4fa)), closes [noetl/ai-meta#208](https://github.com/noetl/ai-meta/issues/208) [noetl/ai-meta#208](https://github.com/noetl/ai-meta/issues/208) [noetl/ai-meta#238](https://github.com/noetl/ai-meta/issues/238)
+
 ## [3.63.0](https://github.com/noetl/server/compare/v3.62.1...v3.63.0) (2026-08-05)
 
 ### Features
