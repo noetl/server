@@ -750,6 +750,17 @@ async fn main() -> anyhow::Result<()> {
         "Starting NoETL Control Plane"
     );
 
+    // Publish the version and pin the known label sets, unconditionally and
+    // before any configuration branch can skip them.  `Registry::gather` prunes
+    // empty metric families, so a labelled metric is ABSENT from /metrics until
+    // a child series exists — and absent cannot be told apart from "this binary
+    // is too old to have it".  The version line above answers that question in
+    // the log, which is exactly the wrong place: it scrolls away, on a workload
+    // whose /metrics is what anyone actually queries (noetl/ai-meta#238).
+    noetl_server::metrics::init_build_info();
+    noetl_server::metrics::init_ehdb_command_publish_failed_series();
+    noetl_server::metrics::init_event_ingest_publish_skipped_series();
+
     // Load configuration
     let app_config = AppConfig::from_env().unwrap_or_else(|e| {
         tracing::warn!(error = %e, "Failed to load app config, using defaults");

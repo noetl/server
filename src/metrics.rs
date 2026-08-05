@@ -54,7 +54,7 @@
 use std::sync::OnceLock;
 
 use prometheus::{
-    Histogram, HistogramOpts, HistogramVec, IntCounterVec, IntGauge, Opts, Registry, TextEncoder,
+    Histogram, HistogramOpts, HistogramVec, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry, TextEncoder,
 };
 
 /// Bucket boundaries for the event-ingest histogram (seconds).
@@ -448,6 +448,50 @@ pub fn ehdb_event_publisher_configured() -> &'static IntGauge {
 /// [`ehdb_event_publisher_configured`]).
 pub fn set_ehdb_event_publisher_configured(configured: bool) {
     ehdb_event_publisher_configured().set(i64::from(configured));
+}
+
+/// `noetl_server_build_info{version}` — always 1; the version is the point.
+///
+/// A labelled metric has no series until a child exists, and `Registry::gather`
+/// **prunes empty metric families**, so registering a metric is not enough to
+/// make it visible. Every counter is therefore ABSENT until it first fires, and
+/// absent has two very different meanings: "this has never happened" or "this
+/// binary is too old to have the metric".
+///
+/// Pinning known label values fixes that one metric at a time
+/// (see [`init_ehdb_command_publish_failed_series`]), but it only works where
+/// the label set is closed — `noetl_worker_event_emit_failed_total{event_type}`
+/// takes a free-form string and cannot be pinned at all.
+///
+/// A build-info gauge answers the question once for every metric on the
+/// process: if the version here is new enough to have metric X, then X's
+/// absence means it has not fired. Nothing else on `/metrics` carries the
+/// version today — establishing which binary a pod ran meant reading the image
+/// tag out of the Deployment, which is a different representation and can
+/// disagree with what is actually running (noetl/ai-meta#238).
+pub fn build_info() -> &'static IntGaugeVec {
+    static M: OnceLock<IntGaugeVec> = OnceLock::new();
+    M.get_or_init(|| {
+        let g = IntGaugeVec::new(
+            Opts::new(
+                "noetl_server_build_info",
+                "Always 1; the version label identifies the running binary (noetl/ai-meta#238).",
+            ),
+            &["version"],
+        )
+        .expect("static gauge spec must be valid");
+        registry()
+            .register(Box::new(g.clone()))
+            .expect("gauge registration must succeed");
+        g
+    })
+}
+
+/// Publish this binary's version as [`build_info`]. Call once at startup.
+pub fn init_build_info() {
+    build_info()
+        .with_label_values(&[env!("CARGO_PKG_VERSION")])
+        .set(1);
 }
 
 // ── Off-server tail-attach accelerator (noetl/ai-meta#156) ───────────────────
@@ -2590,6 +2634,23 @@ mod tests {
                 "{reason} series must exist before any skip; got {lines:?}"
             );
         }
+    }
+
+    /// The gauge must carry the crate version, and must be present after init —
+    /// its whole purpose is to be readable when every other metric is absent.
+    #[test]
+    fn build_info_publishes_the_crate_version() {
+        init_build_info();
+        let text = gather_text().expect("gather metrics text");
+        let line = text
+            .lines()
+            .find(|l| l.starts_with("noetl_server_build_info{"))
+            .expect("build_info series must exist after init");
+        assert!(
+            line.contains(&format!("version=\"{}\"", env!("CARGO_PKG_VERSION"))),
+            "build_info must carry the crate version; got {line:?}"
+        );
+        assert!(line.ends_with(" 1"), "build_info must read 1; got {line:?}");
     }
 
     /// A recorded skip must land on its own `reason` series, not merge into a

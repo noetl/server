@@ -846,11 +846,10 @@ impl AppState {
         let ehdb_event_publisher = if event_bus_mode.publishes_ehdb() {
             let publisher = crate::event_bus::EhdbEventPublisher::from_env();
             crate::metrics::set_ehdb_event_publisher_configured(publisher.is_configured());
-            // Pin both failure series at 0 so an unfired counter reads 0 rather
-            // than being absent — absent cannot be told apart from "metric gone"
-            // or "older binary" (noetl/ai-meta#238).
-            crate::metrics::init_ehdb_command_publish_failed_series();
-            crate::metrics::init_event_ingest_publish_skipped_series();
+            // The failure/skip series are pinned unconditionally in `main`, not
+            // here: this branch only runs when EHDB is selected, so pinning here
+            // left them absent on exactly the configuration whose `no_transport`
+            // reason needed reading (noetl/ai-meta#238).
             if publisher.is_configured() {
                 tracing::info!(
                     ?event_bus_mode,
