@@ -1551,6 +1551,41 @@ pub fn credentials_sealed_total() -> &'static IntCounterVec {
     })
 }
 
+/// Every `status` the sealed-credential endpoint records, taken from the call
+/// sites in [`crate::handlers::credentials`].
+///
+/// This endpoint hands a worker an X25519-sealed credential (Secrets Wallet
+/// Phase 5b, noetl/ai-meta#61), so its failure modes are security-relevant:
+/// `residency_violation` is a policy denial, `no_pubkey` and `worker_not_found`
+/// are callers that could not be addressed, and `seal_error` is the crypto
+/// path failing.  A healthy deployment that has simply not sealed anything yet
+/// and a deployment where the endpoint is not reachable both rendered as an
+/// empty scrape, because a labelled counter has no series until incremented.
+///
+/// Note the name mismatch that hid this: the metric is
+/// `noetl_credentials_sealed_total` and the recorder is
+/// `record_credential_seal` — singular, and not a prefix of the metric.  A
+/// search keyed on the metric name finds nothing outside `metrics.rs` and
+/// reads as a dead recorder.
+pub const CREDENTIAL_SEAL_STATUSES: [&str; 7] = [
+    "ok",
+    "ok_via_broker",
+    "no_pubkey",
+    "worker_not_found",
+    "residency_violation",
+    "credential_error",
+    "seal_error",
+];
+
+/// Materialise every [`CREDENTIAL_SEAL_STATUSES`] series at 0.
+pub fn init_credential_seal_series() {
+    for status in CREDENTIAL_SEAL_STATUSES {
+        credentials_sealed_total()
+            .with_label_values(&[status])
+            .inc_by(0);
+    }
+}
+
 /// Increment [`credentials_sealed_total`] by 1 for the given outcome.
 pub fn record_credential_seal(status: &str) {
     credentials_sealed_total()
@@ -2712,6 +2747,42 @@ mod tests {
                 "{reason} series must exist before any skip; got {lines:?}"
             );
         }
+    }
+
+    /// Same guard as the GC one, on the security-relevant path.  Reuses the
+    /// after-the-call extraction rather than same-line matching, because that
+    /// is the variant that has already been caught missing a literal.
+    #[test]
+    fn credential_seal_literals_are_all_pinned() {
+        let src = include_str!("handlers/credentials.rs");
+        let call = "record_credential_seal(";
+        let mut found: Vec<&str> = Vec::new();
+        let mut rest = src;
+        while let Some(i) = rest.find(call) {
+            rest = &rest[i + call.len()..];
+            if let Some(q1) = rest.find('"') {
+                let after = &rest[q1 + 1..];
+                if let Some(q2) = after.find('"') {
+                    found.push(&after[..q2]);
+                }
+            }
+        }
+        assert!(
+            found.len() >= 8,
+            "extraction found only {} call site(s) — must fail loudly, not vacuously; got {found:?}",
+            found.len()
+        );
+        for lit in &found {
+            assert!(
+                CREDENTIAL_SEAL_STATUSES.contains(lit),
+                "record_credential_seal(\"{lit}\") is recorded but not pinned"
+            );
+        }
+        // The security-relevant denial must never quietly drop out of the set.
+        assert!(
+            CREDENTIAL_SEAL_STATUSES.contains(&"residency_violation"),
+            "residency_violation is a policy denial and must stay pinned"
+        );
     }
 
     /// Every outcome literal at a call site must be pinned.
