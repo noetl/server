@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.77.3](https://github.com/noetl/server/compare/v3.77.2...v3.77.3) (2026-08-05)
+
+### Bug Fixes
+
+* **command-bus:** require NOETL_COMMAND_BUS instead of defaulting to a dead transport ([ba49218](https://github.com/noetl/server/commit/ba492187fe94a7e194912cbd830885a9055bd6b6)), closes [noetl/ai-meta#243](https://github.com/noetl/ai-meta/issues/243)
+
 ## [3.77.2](https://github.com/noetl/server/compare/v3.77.1...v3.77.2) (2026-08-05)
 
 ### Bug Fixes
