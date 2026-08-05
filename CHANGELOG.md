@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.74.0](https://github.com/noetl/server/compare/v3.73.0...v3.74.0) (2026-08-05)
+
+### Features
+
+* **metrics:** pin the sealed-credential statuses ([dbf9d89](https://github.com/noetl/server/commit/dbf9d89ba6b35986130cb351f052e2030fe20196)), closes [noetl/ai-meta#61](https://github.com/noetl/ai-meta/issues/61) [noetl/ai-meta#238](https://github.com/noetl/ai-meta/issues/238) [noetl/ai-meta#61](https://github.com/noetl/ai-meta/issues/61)
+
 ## [3.73.0](https://github.com/noetl/server/compare/v3.72.0...v3.73.0) (2026-08-05)
 
 ### Features
