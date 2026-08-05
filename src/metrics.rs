@@ -1551,6 +1551,79 @@ pub fn credentials_sealed_total() -> &'static IntCounterVec {
     })
 }
 
+/// `noetl_system_plugin_seed_total{outcome}` — built-in wasm plug-ins seeded
+/// into the catalog at startup, and the ones that were skipped.
+///
+/// A `.wasm` file with a non-UTF8 name or that cannot be read is skipped with a
+/// `tracing::warn!` and startup continues.  The plug-in is simply not in the
+/// catalog, and the failure surfaces much later as a drive that cannot route to
+/// `system/<name>` — far from the cause.  The startup log line reports only the
+/// count that succeeded, so a run that seeded 3 of 4 is indistinguishable from
+/// one that seeded 3 of 3.
+pub fn system_plugin_seed_total() -> &'static IntCounterVec {
+    static M: OnceLock<IntCounterVec> = OnceLock::new();
+    M.get_or_init(|| {
+        let counter = IntCounterVec::new(
+            Opts::new(
+                "noetl_system_plugin_seed_total",
+                "Built-in wasm plug-ins seeded at startup, by outcome (noetl/ai-meta#238).",
+            ),
+            &["outcome"],
+        )
+        .expect("static counter spec must be valid");
+        registry()
+            .register(Box::new(counter.clone()))
+            .expect("counter registration must succeed");
+        counter
+    })
+}
+
+/// Every outcome [`system_plugin_seed_total`] records.
+pub const SYSTEM_PLUGIN_SEED_OUTCOMES: [&str; 3] =
+    ["seeded", "skipped_non_utf8", "skipped_unreadable"];
+
+/// Materialise every [`SYSTEM_PLUGIN_SEED_OUTCOMES`] series at 0.
+pub fn init_system_plugin_seed_series() {
+    for outcome in SYSTEM_PLUGIN_SEED_OUTCOMES {
+        system_plugin_seed_total()
+            .with_label_values(&[outcome])
+            .inc_by(0);
+    }
+}
+
+/// Record one plug-in seed outcome.
+pub fn record_system_plugin_seed(outcome: &str) {
+    system_plugin_seed_total()
+        .with_label_values(&[outcome])
+        .inc();
+}
+
+/// Every `outcome` [`secret_refresh_total`] records.
+///
+/// NOT derivable by scanning call-site literals: two of the five
+/// (`succeeded`, `failed`) are assigned to a local in a `match` and passed as a
+/// variable, so a literal scan finds three and would pin a set that is short by
+/// two — with the missing ones absent from `/metrics` while the rest read 0.
+/// Enumerated by reading `services/credential.rs` and `services/keychain.rs`,
+/// and deliberately excluded from the scan-based check in
+/// `playbooks/lib/pinned_sets.py` for the same reason.
+pub const SECRET_REFRESH_OUTCOMES: [&str; 5] = [
+    "triggered",
+    "stampede_collapsed",
+    "succeeded",
+    "failed",
+    "decision_failed",
+];
+
+/// Materialise every [`SECRET_REFRESH_OUTCOMES`] series at 0.
+pub fn init_secret_refresh_series() {
+    for outcome in SECRET_REFRESH_OUTCOMES {
+        secret_refresh_total()
+            .with_label_values(&[outcome])
+            .inc_by(0);
+    }
+}
+
 /// Every `status` the sealed-credential endpoint records, taken from the call
 /// sites in [`crate::handlers::credentials`].
 ///
@@ -2747,6 +2820,49 @@ mod tests {
                 "{reason} series must exist before any skip; got {lines:?}"
             );
         }
+    }
+
+    /// Both P1 server sets must be readable at 0, and every plug-in outcome
+    /// must be instrumented.
+    ///
+    /// The plug-in one matters because the startup log reports only the count
+    /// that succeeded: seeding 3 of 4 and 3 of 3 look identical there.  The
+    /// secret-refresh one is checked for COMPLETENESS here rather than by the
+    /// scan in `pinned_sets.py`, because two of its five outcomes are passed as
+    /// a variable and a literal scan under-reports it by exactly those two.
+    #[test]
+    fn plugin_seed_and_secret_refresh_series_exist() {
+        init_system_plugin_seed_series();
+        init_secret_refresh_series();
+        let text = gather_text().expect("gather metrics text");
+        for outcome in SYSTEM_PLUGIN_SEED_OUTCOMES {
+            assert!(
+                text.lines().any(|l| l.starts_with("noetl_system_plugin_seed_total{")
+                    && l.contains(&format!("outcome=\"{outcome}\""))),
+                "{outcome} must be pinned"
+            );
+        }
+        for outcome in SECRET_REFRESH_OUTCOMES {
+            assert!(
+                text.lines().any(|l| l.starts_with("noetl_secret_refresh_total{")
+                    && l.contains(&format!("outcome=\"{outcome}\""))),
+                "{outcome} must be pinned"
+            );
+        }
+
+        // Every skip path in the seeder must record, or a missing plug-in stays
+        // as silent as it was before.
+        let src = include_str!("system_plugins.rs");
+        assert_eq!(
+            src.matches("record_system_plugin_seed(").count(),
+            3,
+            "all three seed outcomes must be instrumented"
+        );
+        assert_eq!(
+            src.matches("tracing::warn!").count(),
+            src.matches("record_system_plugin_seed(\"skipped").count(),
+            "every warn! in the seeder must have a matching skipped_* counter"
+        );
     }
 
     /// Same guard as the GC one, on the security-relevant path.  Reuses the

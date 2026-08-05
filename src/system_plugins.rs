@@ -73,17 +73,20 @@ pub fn scan_system_plugins(dir: &Path) -> Vec<SeedEntry> {
             continue;
         }
         let Some(stem) = file.file_stem().and_then(|s| s.to_str()) else {
+            crate::metrics::record_system_plugin_seed("skipped_non_utf8");
             tracing::warn!(file = %file.display(), "skipping plug-in with non-UTF8 name");
             continue;
         };
         let bytes = match std::fs::read(&file) {
             Ok(b) => b,
             Err(e) => {
+                crate::metrics::record_system_plugin_seed("skipped_unreadable");
                 tracing::warn!(file = %file.display(), error = %e, "skipping unreadable plug-in");
                 continue;
             }
         };
         let digest = hex::encode(Sha256::digest(&bytes));
+        crate::metrics::record_system_plugin_seed("seeded");
         entries.push(SeedEntry {
             path: format!("system/{stem}"),
             version: SEED_VERSION,
