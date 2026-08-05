@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.73.0](https://github.com/noetl/server/compare/v3.72.0...v3.73.0) (2026-08-05)
+
+### Features
+
+* **metrics:** pin the result-tier GC outcomes — and the guard found one I missed ([4835cef](https://github.com/noetl/server/commit/4835cefaa32d898559340d8b7b175d4aedfc1027)), closes [noetl/ai-meta#238](https://github.com/noetl/ai-meta/issues/238)
+
 ## [3.72.0](https://github.com/noetl/server/compare/v3.71.0...v3.72.0) (2026-08-05)
 
 ### Features
