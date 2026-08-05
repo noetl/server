@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.71.0](https://github.com/noetl/server/compare/v3.70.0...v3.71.0) (2026-08-05)
+
+### Features
+
+* **metrics:** make the JWT-verify mode and its outcomes readable from /metrics ([2a5e055](https://github.com/noetl/server/commit/2a5e05591ab6ad72605452f87797130dcb2dbf15)), closes [noetl/ai-meta#169](https://github.com/noetl/ai-meta/issues/169) [#169](https://github.com/noetl/server/issues/169) [noetl/ai-meta#238](https://github.com/noetl/ai-meta/issues/238) [noetl/ai-meta#169](https://github.com/noetl/ai-meta/issues/169)
+
 ## [3.70.0](https://github.com/noetl/server/compare/v3.69.0...v3.70.0) (2026-08-05)
 
 ### Features
