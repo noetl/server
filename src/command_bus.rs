@@ -38,14 +38,19 @@ use ehdb_l0::{D1EventLog, EventRecord};
 use tokio::sync::Mutex;
 
 /// Which transport carries command notifications (env `NOETL_COMMAND_BUS`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+///
+/// There is deliberately **no `Default`**.  A default here would have to be a
+/// transport, and the only transport that exists is EHDB — so defaulting would
+/// mean guessing.  `NOETL_COMMAND_BUS` is required, and
+/// [`CommandBusMode::from_env_value`] returns an error rather than choosing
+/// (noetl/ai-meta#243).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommandBusMode {
     /// Publish to NATS only.
     ///
-    /// ⚠ Still the `Default`, but NATS was deleted at T5 — selecting this, or
-    /// leaving `NOETL_COMMAND_BUS` unset, points at a transport that is not
-    /// there. See the module header.
-    #[default]
+    /// ⚠ NATS was deleted at T5.  The variant survives so that a stale
+    /// `NOETL_COMMAND_BUS=nats` produces a specific, actionable error instead
+    /// of a generic parse failure — it is not selectable.
     Nats,
     /// Publish to the per-shard EHDB writer only — the cutover.
     Ehdb,
@@ -54,13 +59,31 @@ pub enum CommandBusMode {
 }
 
 impl CommandBusMode {
-    /// Parse the `NOETL_COMMAND_BUS` value; anything unrecognised is the safe
-    /// default (`nats`).
-    pub fn from_env_value(value: &str) -> Self {
+    /// Parse the `NOETL_COMMAND_BUS` value.  Required — there is no default.
+    ///
+    /// Before noetl/ai-meta#243 an unset or unrecognised value silently became
+    /// `Nats`, which T5 deleted.  The server then started cleanly, published
+    /// nothing, and every execution stalled with no error anywhere.  Each
+    /// failure mode now names itself.
+    pub fn from_env_value(value: &str) -> Result<Self, String> {
         match value.trim().to_ascii_lowercase().as_str() {
-            "ehdb" => Self::Ehdb,
-            "shadow" => Self::Shadow,
-            _ => Self::Nats,
+            "ehdb" => Ok(Self::Ehdb),
+            "shadow" => Ok(Self::Shadow),
+            "nats" => Err(
+                "NOETL_COMMAND_BUS=nats selects a transport that no longer exists — NATS was \
+                 removed at T5 (noetl/ai-meta#212). Set NOETL_COMMAND_BUS=ehdb."
+                    .to_string(),
+            ),
+            "" => Err(
+                "NOETL_COMMAND_BUS is required and unset. There is no default: the only \
+                 transport is EHDB, and guessing would mean starting a server that publishes \
+                 nothing while looking healthy. Set NOETL_COMMAND_BUS=ehdb."
+                    .to_string(),
+            ),
+            other => Err(format!(
+                "NOETL_COMMAND_BUS={other:?} is not a known transport. Valid values: ehdb, \
+                 shadow. (nats was removed at T5.)"
+            )),
         }
     }
 
@@ -311,22 +334,37 @@ impl EhdbCommandPublisher {
 mod tests {
     use super::*;
 
+    /// Every failure mode must NAME itself.
+    ///
+    /// This test replaces `mode_parsing_defaults_to_nats`, whose name was the
+    /// defect: an unset or unrecognised value became `Nats`, a transport T5
+    /// deleted.  The server then started cleanly, published nothing, and
+    /// stalled every execution with no error anywhere (noetl/ai-meta#243).
     #[test]
-    fn mode_parsing_defaults_to_nats() {
-        assert_eq!(CommandBusMode::from_env_value("nats"), CommandBusMode::Nats);
-        assert_eq!(CommandBusMode::from_env_value("EHDB"), CommandBusMode::Ehdb);
+    fn mode_parsing_is_required_and_every_failure_is_named() {
+        // The two live transports.
+        assert_eq!(CommandBusMode::from_env_value("EHDB"), Ok(CommandBusMode::Ehdb));
         assert_eq!(
             CommandBusMode::from_env_value(" Shadow "),
-            CommandBusMode::Shadow
+            Ok(CommandBusMode::Shadow)
         );
-        assert_eq!(
-            CommandBusMode::from_env_value("garbage"),
-            CommandBusMode::Nats
-        );
-        assert_eq!(CommandBusMode::default(), CommandBusMode::Nats);
+
+        // Unset is an error, not a guess — there is no safe default when the
+        // only transport is EHDB.
+        let e = CommandBusMode::from_env_value("").unwrap_err();
+        assert!(e.contains("required"), "unset must say so: {e}");
+        assert!(e.contains("ehdb"), "and must name the fix: {e}");
+
+        // A stale `nats` gets its OWN message rather than a generic parse
+        // error, because that is the value a pre-T5 manifest actually carries.
+        let e = CommandBusMode::from_env_value("nats").unwrap_err();
+        assert!(e.contains("no longer exists"), "nats must be specific: {e}");
+
+        // Anything else names what it saw.
+        let e = CommandBusMode::from_env_value("garbage").unwrap_err();
+        assert!(e.contains("garbage"), "must echo the bad value: {e}");
+
         assert!(CommandBusMode::Shadow.publishes_ehdb() && CommandBusMode::Shadow.publishes_nats());
-        assert!(CommandBusMode::Ehdb.publishes_ehdb() && !CommandBusMode::Ehdb.publishes_nats());
-        assert!(!CommandBusMode::Nats.publishes_ehdb() && CommandBusMode::Nats.publishes_nats());
     }
 
     #[test]
