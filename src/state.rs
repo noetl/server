@@ -135,7 +135,9 @@ pub struct AppState {
     pub finalized_guard: Arc<FinalizedGuard>,
 
     /// CQRS write-path publisher (noetl/ai-meta#103 phase 2d-3).  Lazily built
-    /// on first use from [`Self::nats`] so the `emit_event` chokepoint can
+    /// on first use from the NATS client field, which was removed with the
+    /// rest of the NATS path at T5 (noetl/ai-meta#194), so the `emit_event`
+    /// chokepoint can
     /// publish to the `noetl_events` stream when
     /// `config.event_ingest_publish_only` is on.  `OnceCell` so the gate-off
     /// (default) path never builds it and the gate-on path ensures the stream
