@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.75.0](https://github.com/noetl/server/compare/v3.74.0...v3.75.0) (2026-08-05)
+
+### Features
+
+* **metrics:** the three server P1 data-loss paths ([9b3edd8](https://github.com/noetl/server/commit/9b3edd8362f9b5193fda050a95ee3484fa955fe5)), closes [noetl/worker#238](https://github.com/noetl/worker/issues/238)
+
 ## [3.74.0](https://github.com/noetl/server/compare/v3.73.0...v3.74.0) (2026-08-05)
 
 ### Features
