@@ -289,6 +289,36 @@ pub fn init_nonconvergence_sweep_series() {
     }
 }
 
+/// Pin the two correctness-signal series that read as *absent* when nothing has
+/// gone wrong — which is the state they spend almost all their time in.
+///
+/// `noetl_state_build_parity_total{result}` compares the two state-build paths.
+/// A `mismatch` is a correctness divergence, so the question asked of it is
+/// "have there been any?" — and until now the answer to that was an empty
+/// scrape, equally consistent with "none" and "the comparison is not running".
+/// Both `match` and `mismatch` are pinned so the ratio is readable from the
+/// first scrape.
+///
+/// `noetl_terminal_dedup_total{outcome}` is the noetl/ai-meta#118 guard that
+/// suppresses a second terminal event for an execution — the one that would
+/// otherwise orphan the chain with a NULL-`prev_event_id` second root.  It has
+/// a single outcome, `suppressed`, and a healthy platform never increments it.
+/// A guard that has never fired and a guard that is not deployed are the two
+/// readings that must not look alike.
+///
+/// Both label sets come from the call sites (`handlers::events` and
+/// `handlers::event_write`), all of which pass literals — not from prose.
+pub fn init_parity_and_dedup_series() {
+    for result in ["match", "mismatch"] {
+        state_build_parity_total()
+            .with_label_values(&[result])
+            .inc_by(0);
+    }
+    terminal_dedup_total()
+        .with_label_values(&["suppressed"])
+        .inc_by(0);
+}
+
 /// Record one non-convergence sweep outcome (see [`nonconvergence_sweep_total`]).
 pub fn record_nonconvergence_sweep(outcome: &str) {
     nonconvergence_sweep_total()
@@ -2646,6 +2676,28 @@ mod tests {
             assert!(
                 lines.iter().any(|l| l.contains(&format!("reason=\"{reason}\""))),
                 "{reason} series must exist before any skip; got {lines:?}"
+            );
+        }
+    }
+
+    /// A correctness signal that reads as absent when nothing is wrong cannot
+    /// be told apart from one that is not running.  Both must read 0.
+    #[test]
+    fn parity_and_dedup_series_exist_at_zero() {
+        init_parity_and_dedup_series();
+        let text = gather_text().expect("gather metrics text");
+        for want in [
+            "noetl_state_build_parity_total{result=\"match\"}",
+            "noetl_state_build_parity_total{result=\"mismatch\"}",
+            "noetl_terminal_dedup_total{outcome=\"suppressed\"}",
+        ] {
+            let line = text
+                .lines()
+                .find(|l| l.starts_with(want))
+                .unwrap_or_else(|| panic!("{want} must be pinned"));
+            assert!(
+                line.trim_end().ends_with(" 0"),
+                "{want} must read 0 before anything happens; got {line:?}"
             );
         }
     }
