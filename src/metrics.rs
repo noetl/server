@@ -189,9 +189,16 @@ pub fn record_orphan_sweep(outcome: &str) {
 /// grace period was examined), `terminated` (`playbook.failed` emitted),
 /// `skipped_live` (an outstanding command is held by a live worker — never
 /// failed), `skipped_awaiting_callback` (parked on an external callback by
-/// design — never failed), `capped` (eligible but deferred to a later tick by
+/// design — never failed), `skipped_parent_active` (a parent execution is still
+/// running — never failed), `capped` (eligible but deferred to a later tick by
 /// the rate limit), `error` (scan / emit failure).  Zero increments while the
 /// sweep is off (`NOETL_NONCONVERGENCE_SWEEP_ENABLED=false`).
+///
+/// The authoritative list is `Disposition::metric_label` in
+/// [`crate::handlers::nonconvergence_sweep`] plus the two literals recorded at
+/// the call sites; this comment had drifted from it, omitting
+/// `skipped_parent_active`.  [`NONCONVERGENCE_SWEEP_OUTCOMES`] is now the
+/// single list both the pin and this doc follow.
 ///
 /// `skipped_live` and `skipped_awaiting_callback` are the negative-control
 /// signals: during a drain they should account for every healthy execution the
@@ -213,6 +220,45 @@ pub fn nonconvergence_sweep_total() -> &'static IntCounterVec {
             .expect("counter registration must succeed");
         counter
     })
+}
+
+/// The six `outcome` values, pinned at 0 so they exist before the sweep runs.
+///
+/// The doc above says "zero increments while the sweep is off". That is true of
+/// the counter and false of `/metrics`: an unincremented labelled counter has no
+/// series, and `Registry::gather` prunes empty families — so a server with the
+/// sweep off exposes **nothing at all** here, not zeros.
+///
+/// That distinction matters more on this metric than on most, because the sweep
+/// **terminates executions**. "Has it failed anything?" is a question an
+/// operator asks while deciding whether to enable it, and an empty answer is
+/// consistent with "it has failed nothing", "the sweep is off", and "this
+/// binary has no sweep". Pinning makes the first two readable and leaves only
+/// absence to mean the third.
+///
+/// The set is closed and small, so all six can be pinned — unlike an
+/// `{event_type}` label, where this technique does not apply at all and
+/// `noetl_server_build_info` is the fallback.
+/// Kept in sync with `Disposition::metric_label` in
+/// [`crate::handlers::nonconvergence_sweep`], plus the two literals
+/// (`candidate`, `error`) recorded directly at the call sites.
+pub const NONCONVERGENCE_SWEEP_OUTCOMES: [&str; 7] = [
+    "candidate",
+    "terminated",
+    "skipped_live",
+    "skipped_awaiting_callback",
+    "skipped_parent_active",
+    "capped",
+    "error",
+];
+
+/// Materialise every [`NONCONVERGENCE_SWEEP_OUTCOMES`] series at 0.
+pub fn init_nonconvergence_sweep_series() {
+    for outcome in NONCONVERGENCE_SWEEP_OUTCOMES {
+        nonconvergence_sweep_total()
+            .with_label_values(&[outcome])
+            .inc_by(0);
+    }
 }
 
 /// Record one non-convergence sweep outcome (see [`nonconvergence_sweep_total`]).
@@ -2574,6 +2620,32 @@ mod tests {
                 "{reason} series must exist before any skip; got {lines:?}"
             );
         }
+    }
+
+    /// The sweep terminates executions, so "it has failed nothing" and "there
+    /// is no sweep in this binary" must not look the same on `/metrics`.
+    #[test]
+    fn sweep_outcome_series_exist_at_zero_before_any_sweep() {
+        init_nonconvergence_sweep_series();
+        let text = gather_text().expect("gather metrics text");
+        let lines: Vec<&str> = text
+            .lines()
+            .filter(|l| l.starts_with("noetl_nonconvergence_sweep_total{"))
+            .collect();
+        for outcome in NONCONVERGENCE_SWEEP_OUTCOMES {
+            assert!(
+                lines
+                    .iter()
+                    .any(|l| l.contains(&format!("outcome=\"{outcome}\""))),
+                "{outcome} series must exist before any sweep; got {lines:?}"
+            );
+        }
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("outcome=\"terminated\"") && l.trim_end().ends_with(" 0")),
+            "terminated must read 0, not be absent; got {lines:?}"
+        );
     }
 
     /// The gauge must carry the crate version, and must be present after init —
