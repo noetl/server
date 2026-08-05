@@ -1065,32 +1065,27 @@ pub fn record_event_ingest(event_type: &str, status: &str, duration_seconds: f64
         .observe(duration_seconds);
 }
 
-/// Counter: events published onto the `noetl_events` JetStream stream by the
-/// CQRS write-path tailer (noetl/ai-meta#103 phase 2a), by event type.  Lets the
-/// producer's throughput be observed without a log line per event.
-pub fn event_stream_published_total() -> &'static IntCounterVec {
-    static M: OnceLock<IntCounterVec> = OnceLock::new();
-    M.get_or_init(|| {
-        let counter = IntCounterVec::new(
-            Opts::new(
-                "noetl_event_stream_published_total",
-                "Total events published to the noetl_events JetStream stream by the CQRS write-path tailer, by event type.",
-            ),
-            &["event_type"],
-        )
-        .expect("static counter spec must be valid");
-        registry()
-            .register(Box::new(counter.clone()))
-            .expect("counter registration must succeed");
-        counter
-    })
-}
+// The CQRS write-path tailer's metrics were removed here
+// (noetl/ai-meta#242): `noetl_event_stream_published_total`,
+// `noetl_event_stream_skipped_total` and `noetl_event_stream_cursor`.
+// They measured a tailer publishing onto the `noetl_events` JetStream
+// stream — the skip reason was literally "payload over the NATS max" —
+// and T5 deleted JetStream along with the tailer.  Nothing has called
+// their recorders since, and because these are lazily registered they
+// were never even present on /metrics to read as zero.
 
 /// Counter: events published through the `emit_event` chokepoint when the
 /// `NOETL_EVENT_INGEST_PUBLISH_ONLY` gate is on (noetl/ai-meta#103 phase 2d-3),
-/// by event type.  Distinct from the tailer's `event_stream_published_total`:
-/// this is the **producer cutover** path (the synchronous INSERT replaced by a
-/// publish), so a non-zero rate here means the materializer is the sole writer.
+/// by event type.  This is the **producer cutover** path (the synchronous
+/// INSERT replaced by a publish), so a non-zero rate here means the
+/// materializer is the sole writer.  It once had a sibling on the tailer, which
+/// went with JetStream at T5 (noetl/ai-meta#242).
+///
+/// Note the asymmetry with [`event_ingest_publish_skipped_total`]: this counter
+/// has no series until the first publish, so zero publishes reads as ABSENT
+/// rather than 0.  On a server carrying only system-pool traffic — which is
+/// what production reads today — that absence is the healthy state, and the
+/// skip counter's `reason` is what tells it apart from a missing transport.
 pub fn event_ingest_published_total() -> &'static IntCounterVec {
     static M: OnceLock<IntCounterVec> = OnceLock::new();
     M.get_or_init(|| {
@@ -1172,61 +1167,6 @@ fn ehdb_event_publish_errors_total() -> &'static IntCounterVec {
 
 pub fn record_ehdb_event_publish_error(event_type: &str) {
     ehdb_event_publish_errors_total()
-        .with_label_values(&[event_type])
-        .inc();
-}
-
-/// Gauge: the tailer's current cursor (`noetl.event.id` last published).  Pair
-/// with the table's `MAX(id)` to read publish lag.  Single series (no labels) —
-/// one tailer per server.
-pub fn event_stream_cursor() -> &'static IntGauge {
-    static M: OnceLock<IntGauge> = OnceLock::new();
-    M.get_or_init(|| {
-        let gauge = IntGauge::new(
-            "noetl_event_stream_cursor",
-            "noetl.event.id last published to the noetl_events stream by the CQRS write-path tailer.",
-        )
-        .expect("static gauge spec must be valid");
-        registry()
-            .register(Box::new(gauge.clone()))
-            .expect("gauge registration must succeed");
-        gauge
-    })
-}
-
-/// Record a batch published by the tailer: bump the per-type counter for each
-/// event and advance the cursor gauge.
-pub fn record_event_stream_published(event_type: &str, count: u64, cursor: i64) {
-    event_stream_published_total()
-        .with_label_values(&[event_type])
-        .inc_by(count);
-    event_stream_cursor().set(cursor);
-}
-
-/// Counter: events the tailer SKIPPED (payload over NATS max), by type.  A
-/// non-zero rate means oversized events aren't reaching the stream — visible
-/// rather than silently wedging the cursor (noetl/ai-meta#103).
-pub fn event_stream_skipped_total() -> &'static IntCounterVec {
-    static M: OnceLock<IntCounterVec> = OnceLock::new();
-    M.get_or_init(|| {
-        let counter = IntCounterVec::new(
-            Opts::new(
-                "noetl_event_stream_skipped_total",
-                "Events the CQRS write-path tailer skipped because the payload exceeded the NATS max, by event type.",
-            ),
-            &["event_type"],
-        )
-        .expect("static counter spec must be valid");
-        registry()
-            .register(Box::new(counter.clone()))
-            .expect("counter registration must succeed");
-        counter
-    })
-}
-
-/// Record one event skipped by the tailer (oversized payload).
-pub fn record_event_stream_skipped(event_type: &str) {
-    event_stream_skipped_total()
         .with_label_values(&[event_type])
         .inc();
 }
