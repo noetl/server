@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.68.1](https://github.com/noetl/server/compare/v3.68.0...v3.68.1) (2026-08-05)
+
+### Bug Fixes
+
+* **metrics:** remove the JetStream tailer metrics — nothing can write them ([4a26de4](https://github.com/noetl/server/commit/4a26de4e68db09f478d26883b87f879bfba64c89)), closes [noetl/ai-meta#242](https://github.com/noetl/ai-meta/issues/242)
+
 ## [3.68.0](https://github.com/noetl/server/compare/v3.67.0...v3.68.0) (2026-08-05)
 
 ### Features
