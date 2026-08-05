@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.63.0](https://github.com/noetl/server/compare/v3.62.1...v3.63.0) (2026-08-05)
+
+### Features
+
+* **orchestrate:** make a ref-not-found drive miss distinguishable from a decode error ([5cfa1a8](https://github.com/noetl/server/commit/5cfa1a8574420a8d6ea166753a563465d2717a15)), closes [noetl/ai-meta#154](https://github.com/noetl/ai-meta/issues/154) [noetl/ai-meta#154](https://github.com/noetl/ai-meta/issues/154)
+
 ## [3.62.1](https://github.com/noetl/server/compare/v3.62.0...v3.62.1) (2026-08-05)
 
 ### Bug Fixes
