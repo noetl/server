@@ -845,6 +845,7 @@ impl AppState {
         );
         let ehdb_event_publisher = if event_bus_mode.publishes_ehdb() {
             let publisher = crate::event_bus::EhdbEventPublisher::from_env();
+            crate::metrics::set_ehdb_event_publisher_configured(publisher.is_configured());
             if publisher.is_configured() {
                 tracing::info!(
                     ?event_bus_mode,
