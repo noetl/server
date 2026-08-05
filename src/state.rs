@@ -803,13 +803,25 @@ impl AppState {
             "Replica coherence backend initialized"
         );
 
-        // noetl/ai-meta#194 L1 T4 — the command-bus transport. Default `nats`
-        // leaves the path unchanged and builds no EHDB state. `ehdb`/`shadow`
-        // build a lazily-connected publisher over the per-shard writers (routed
-        // by `command_shard_count`, which must match the worker pool's shards).
-        let command_bus_mode = crate::command_bus::CommandBusMode::from_env_value(
-            config.command_bus.as_deref().unwrap_or("nats"),
-        );
+        // noetl/ai-meta#194 L1 T4 — the command-bus transport, REQUIRED since
+        // noetl/ai-meta#243.  An unset or dead value used to become `nats`
+        // silently, which meant a server that started cleanly, published
+        // nothing, and stalled every execution with no error anywhere.  Failing
+        // at startup is the point: loud, immediate, and it names the fix.
+        let command_bus_mode = match crate::command_bus::CommandBusMode::from_env_value(
+            config.command_bus.as_deref().unwrap_or(""),
+        ) {
+            Ok(m) => m,
+            Err(e) => {
+                // `AppState::new` returns Self, so the fail-fast is a logged
+                // panic: the pod CrashLoopBackOffs with an actionable message
+                // instead of serving traffic it cannot dispatch.  Loud and
+                // recoverable by fixing the env — which is the entire point of
+                // noetl/ai-meta#243.
+                tracing::error!(error = %e, "command bus misconfigured — refusing to start");
+                panic!("{e}");
+            }
+        };
         let ehdb_command_publisher = if command_bus_mode.publishes_ehdb() {
             let addrs = crate::command_bus::parse_writer_addrs(
                 config.command_bus_writer_addrs.as_deref().unwrap_or(""),
