@@ -140,8 +140,9 @@ impl TemplateRenderer {
         // Python-style, so a JSON `true` in the context came back out as
         // `"True"`, matched nothing here, and fell through to a plain String.
         // `test_issue_89_scalar_renders_unaffected` asserts the intended
-        // contract ("a number stays a number, a bool stays a bool") and has been
-        // RED on main for exactly that reason.
+        // contract ("a number stays a number, a bool stays a bool").  That test
+        // carried no `#[test]` attribute and so never ran; it is enabled and
+        // green as of the fix above.
         if let Some(b) = parse_engine_bool(trimmed) {
             return Ok(serde_json::Value::Bool(b));
         }
@@ -1084,7 +1085,6 @@ mod tests {
         assert!(out["next_cursor"].is_null());
     }
 
-    #[test]
     /// noetl/ai-meta#231. The FALSE direction is the one that matters: a
     /// `String("False")` is a non-empty string, so anything doing a bare
     /// truthiness check on it reads it as YES — silently running work that
@@ -1130,6 +1130,7 @@ mod tests {
         }
     }
 
+    #[test]
     fn test_issue_89_scalar_renders_unaffected() {
         // The retry only fires for container-shaped output; scalars keep
         // their existing typed parsing (number stays a number, etc.).
