@@ -1611,6 +1611,24 @@ pub fn permanent_log_lean_stage_failed_total() -> &'static IntCounter {
     })
 }
 
+/// Register the unlabelled metrics that nothing touches at startup.
+///
+/// On this crate every metric is behind a `OnceLock` and is registered when its
+/// ACCESSOR is first called — so "unlabelled, therefore always present at 0" is
+/// false here.  It is true on the worker, whose metrics are built eagerly in
+/// `WorkerMetrics::new`; assuming it transferred is how
+/// `noetl_permanent_log_lean_stage_failed_total` shipped absent from a released
+/// image while its unit test passed, because the test called the accessor and
+/// the binary never does.
+///
+/// `ehdb_event_publisher_configured` and `sharding_config_parse_failed` are
+/// already registered as a side effect of being SET at startup.  This covers
+/// the ones with no such setter.
+pub fn init_unlabelled_series() {
+    // Touching the accessor is what registers it.
+    let _ = permanent_log_lean_stage_failed_total();
+}
+
 /// Record one failed command-context stage.
 pub fn record_permanent_log_lean_stage_failed() {
     permanent_log_lean_stage_failed_total().inc();
@@ -2937,6 +2955,46 @@ mod tests {
         }
     }
 
+    /// Calling ONLY the startup inits must register every unlabelled metric.
+    ///
+    /// This is the test that was missing.  The previous one called
+    /// `permanent_log_lean_stage_failed_total()` directly to "touch its
+    /// registration" — which registered it, so the assertion passed while the
+    /// released binary served a `/metrics` without it.  Every metric here is
+    /// behind a `OnceLock` and registers when its ACCESSOR runs; nothing in the
+    /// binary called that one.  Caught by scraping a released image on kind, not
+    /// by any test.
+    ///
+    /// So this test deliberately touches no accessor: it runs what `main` runs
+    /// and then asks what a scrape would show.
+    #[test]
+    fn startup_inits_alone_register_every_unlabelled_metric() {
+        init_unlabelled_series();
+        set_sharding_config_parse_failed(false);
+        set_ehdb_event_publisher_configured(false);
+
+        let text = gather_text().expect("gather metrics text");
+        for name in [
+            "noetl_permanent_log_lean_stage_failed_total",
+            "noetl_sharding_config_parse_failed",
+            "noetl_ehdb_event_publisher_configured",
+        ] {
+            assert!(
+                text.lines().any(|l| l.starts_with(&format!("{name} "))),
+                "{name} must be registered by startup alone — a metric only \
+                 registers when its accessor runs, and the binary must be the \
+                 thing that runs it"
+            );
+        }
+
+        // main must call it; wiring the init and forgetting the call is the
+        // same bug one level up.
+        assert!(
+            include_str!("main.rs").contains("init_unlabelled_series()"),
+            "main must invoke init_unlabelled_series"
+        );
+    }
+
     /// The remaining P2 server signals must all be readable with no activity.
     ///
     /// Two are unlabelled on purpose.  `sharding_config_parse_failed` is set on
@@ -2947,8 +3005,6 @@ mod tests {
     fn p2_server_signals_are_present_at_zero() {
         init_command_row_insert_series();
         set_sharding_config_parse_failed(false);
-        // Touch the counter's registration without incrementing it.
-        permanent_log_lean_stage_failed_total();
         let text = gather_text().expect("gather metrics text");
 
         for mode in COMMAND_ROW_INSERT_MODES {
@@ -2964,11 +3020,6 @@ mod tests {
             .find(|l| l.starts_with("noetl_sharding_config_parse_failed "))
             .expect("the sharding gauge must be present even when parsing succeeded");
         assert!(g.ends_with(" 0"), "healthy startup must read 0; got {g:?}");
-        assert!(
-            text.lines()
-                .any(|l| l.starts_with("noetl_permanent_log_lean_stage_failed_total ")),
-            "the unlabelled lean-log counter must be present at 0"
-        );
 
         // Both startup arms must set the gauge, or the healthy path leaves it
         // absent and the fallback stays as invisible as it was.
