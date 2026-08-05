@@ -850,6 +850,7 @@ impl AppState {
             // than being absent — absent cannot be told apart from "metric gone"
             // or "older binary" (noetl/ai-meta#238).
             crate::metrics::init_ehdb_command_publish_failed_series();
+            crate::metrics::init_event_ingest_publish_skipped_series();
             if publisher.is_configured() {
                 tracing::info!(
                     ?event_bus_mode,
