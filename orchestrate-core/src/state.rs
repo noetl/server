@@ -379,8 +379,15 @@ pub fn is_parked_on_callback(event: &Event) -> bool {
     //
     // `event.context` is still checked so a caller that inlines the marker
     // there keeps working.
+    // Three locations, matching the sweep's SQL exactly
+    // (`handlers/nonconvergence_sweep.rs`, which checks
+    // `result->'context'`, `context` and `meta`).  Both predicates answer the
+    // same question — "is this execution parked by design?" — and they must not
+    // disagree: the sweep skipping an execution the orchestrator advanced past,
+    // or vice versa, is worse than either being wrong alone.
     marker(event.result.as_ref().and_then(|r| r.get("context")))
         .or_else(|| marker(event.context.as_ref()))
+        .or_else(|| marker(event.meta.as_ref()))
         .unwrap_or(false)
 }
 
@@ -2347,6 +2354,15 @@ mod pending_callback_tests {
             parent_execution_id: None,
             attempt: None,
         }
+    }
+
+    #[test]
+    fn the_marker_is_read_from_meta_like_the_sweep_sql() {
+        // The sweep's SQL accepts the marker in meta; this predicate must agree,
+        // or the sweep skips an execution the orchestrator already advanced past.
+        let mut e = ev(2, "command.completed", "run_schema", None);
+        e.meta = Some(serde_json::json!({"pending_callback": true}));
+        assert!(is_parked_on_callback(&e), "meta must be accepted, as the SQL does");
     }
 
     #[test]
