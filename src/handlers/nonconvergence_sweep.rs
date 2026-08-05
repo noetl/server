@@ -644,6 +644,37 @@ async fn emit_nonconvergent_failed(state: &AppState, cand: &StalledExecution) ->
 mod tests {
     use super::*;
 
+    /// Every disposition label must appear in the pinned outcome list, or its
+    /// series is absent from `/metrics` until the sweep first produces that
+    /// disposition — which for a rare one may be never.
+    ///
+    /// This guard exists because the drift already happened: the doc comment on
+    /// `nonconvergence_sweep_total` listed six outcomes and omitted
+    /// `skipped_parent_active`, and pinning from that comment rather than from
+    /// this enum would have shipped an incomplete set.  Adding a variant now
+    /// fails here rather than silently leaving one outcome unreadable.
+    #[test]
+    fn every_disposition_label_is_pinned() {
+        use crate::metrics::NONCONVERGENCE_SWEEP_OUTCOMES as PINNED;
+        for d in [
+            Disposition::Terminate,
+            Disposition::SkippedLive,
+            Disposition::SkippedAwaitingCallback,
+            Disposition::SkippedParentActive,
+            Disposition::Capped,
+        ] {
+            let label = d.metric_label();
+            assert!(
+                PINNED.contains(&label),
+                "{label:?} is recorded but not pinned; add it to NONCONVERGENCE_SWEEP_OUTCOMES"
+            );
+        }
+        // The two recorded directly at the call sites, not via Disposition.
+        for label in ["candidate", "error"] {
+            assert!(PINNED.contains(&label), "{label:?} must be pinned");
+        }
+    }
+
     fn stalled(execution_id: i64) -> StalledExecution {
         StalledExecution {
             execution_id,

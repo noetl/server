@@ -760,6 +760,7 @@ async fn main() -> anyhow::Result<()> {
     noetl_server::metrics::init_build_info();
     noetl_server::metrics::init_ehdb_command_publish_failed_series();
     noetl_server::metrics::init_event_ingest_publish_skipped_series();
+    noetl_server::metrics::init_nonconvergence_sweep_series();
 
     // Load configuration
     let app_config = AppConfig::from_env().unwrap_or_else(|e| {
