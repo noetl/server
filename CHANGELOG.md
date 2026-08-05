@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.77.2](https://github.com/noetl/server/compare/v3.77.1...v3.77.2) (2026-08-05)
+
+### Bug Fixes
+
+* **metrics:** register all 11 unlabelled metrics at startup, not just one ([2192774](https://github.com/noetl/server/commit/219277474d161e809e2f75122b938caa58d72887)), closes [noetl/ai-meta#238](https://github.com/noetl/ai-meta/issues/238)
+
 ## [3.77.1](https://github.com/noetl/server/compare/v3.77.0...v3.77.1) (2026-08-05)
 
 ### Bug Fixes
