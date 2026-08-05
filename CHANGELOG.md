@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.77.1](https://github.com/noetl/server/compare/v3.77.0...v3.77.1) (2026-08-05)
+
+### Bug Fixes
+
+* **metrics:** the lean-log counter shipped ABSENT — and the test that missed it ([a80b29b](https://github.com/noetl/server/commit/a80b29b3ce402a68bd9f0fd8878576cbadc291a4))
+
 ## [3.77.0](https://github.com/noetl/server/compare/v3.76.0...v3.77.0) (2026-08-05)
 
 ### Features
