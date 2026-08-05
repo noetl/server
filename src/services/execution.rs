@@ -88,6 +88,102 @@ pub struct ExecutionFilter {
 /// catalog paths against `pools.cluster()` in a single follow-up
 /// query.  In single-pool fallback mode (`NOETL_SHARDS` empty)
 /// every accessor returns the same handle as the legacy pool;
+/// Resolve a staged `noetl://` result reference back into the inline shape,
+/// for the **operator-facing** status view (noetl/ai-meta#195).
+///
+/// With `NOETL_PERMANENT_LOG_LEAN` on, the materializer strips an over-floor
+/// business result out of the persisted `noetl.event` row and leaves a
+/// `reference` + bounded `extracted` block in its place.  The drive and the
+/// recovery paths are unaffected — `handlers::events::hydrate_result_references`
+/// resolves the same shape for them.  This endpoint had no such call, so a
+/// stripped execution rendered as its `extracted` summary only: a 40-row result
+/// read back as one row.  Nothing was lost (the payload is in
+/// `noetl.result_store`), but the view an operator reaches for during an
+/// incident silently lost its detail.
+///
+/// Deliberately always resolves, and does **not** honour `refs_in_state`.  That
+/// flag exists so the *drive* can fold a bounded predicate block instead of
+/// paying for the full payload; a human reading execution detail wants the
+/// payload.  This is a read-only projection — it mutates the response, never
+/// the stored row.
+///
+/// Failures are non-fatal by design: an unresolvable reference leaves the event
+/// exactly as stored rather than failing the whole request, so the endpoint
+/// degrades to today's behaviour instead of going down.
+async fn hydrate_status_result(
+    result: &mut serde_json::Value,
+    result_store: &crate::services::result_store::ResultStoreService,
+    execution_id: i64,
+) -> bool {
+    use crate::services::result_store::parse_noetl_ref;
+
+    let Some((is_nested, ref_uri)) = find_result_reference(result) else {
+        return false;
+    };
+
+    let parsed = match parse_noetl_ref(&ref_uri) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(execution_id, ref_uri, %e, "status view: unparseable result reference; left as stored");
+            return false;
+        }
+    };
+    let resolved = match result_store.resolve(&parsed).await {
+        Ok(Some(data)) => data,
+        Ok(None) => {
+            tracing::warn!(execution_id, ref_uri, "status view: result reference not found in store; left as stored");
+            return false;
+        }
+        Err(e) => {
+            tracing::warn!(execution_id, ref_uri, %e, "status view: result reference resolution failed; left as stored");
+            return false;
+        }
+    };
+
+    splice_resolved(result, is_nested, resolved)
+}
+
+/// Locate a staged result reference and report which envelope shape carried it.
+///
+/// `true` = the standard nested `call.done` envelope
+/// (`result.context.result.reference`); `false` = an un-wrapped top-level tool
+/// result (`result.reference`).  Split out from [`hydrate_status_result`] so
+/// the shape rules are testable without a database.
+fn find_result_reference(result: &serde_json::Value) -> Option<(bool, String)> {
+    if let Some(u) = result
+        .pointer("/context/result/reference/ref")
+        .and_then(|v| v.as_str())
+    {
+        return Some((true, u.to_string()));
+    }
+    result
+        .pointer("/reference/ref")
+        .and_then(|v| v.as_str())
+        .map(|u| (false, u.to_string()))
+}
+
+/// Splice a resolved payload over the reference placeholder and drop the
+/// `reference` block, so the event reads exactly like an inline one.
+fn splice_resolved(result: &mut serde_json::Value, is_nested: bool, resolved: serde_json::Value) -> bool {
+    if is_nested {
+        if let Some(inner) = result
+            .get_mut("context")
+            .and_then(|c| c.get_mut("result"))
+            .and_then(|r| r.as_object_mut())
+        {
+            inner.insert("context".to_string(), resolved);
+            inner.remove("reference");
+            return true;
+        }
+    } else if let Some(obj) = result.as_object_mut() {
+        obj.insert("context".to_string(), resolved);
+        obj.remove("reference");
+        return true;
+    }
+    false
+}
+
+
 /// behaviour bit-identical to pre-R4.
 #[derive(Clone)]
 pub struct ExecutionService {
@@ -479,7 +575,7 @@ impl ExecutionService {
         // Restore chronological (ASC) order for the response.
         event_rows.reverse();
 
-        let events: Vec<ExecutionEvent> = event_rows
+        let mut events: Vec<ExecutionEvent> = event_rows
             .into_iter()
             .map(
                 |(event_id, event_type, node_name, status, created_at, result, error)| {
@@ -495,6 +591,32 @@ impl ExecutionService {
                 },
             )
             .collect();
+
+        // noetl/ai-meta#195 — resolve staged result references so the operator
+        // view is identical whether or not the permanent-log-lean strip is on.
+        // Without this the endpoint returns the bounded `extracted` summary and
+        // a stripped execution looks like it produced far less than it did.
+        {
+            let result_store = crate::services::result_store::ResultStoreService::new(
+                self.pool_for(execution_id).clone(),
+                self.snowflake.clone(),
+            );
+            let mut hydrated = 0usize;
+            for ev in events.iter_mut() {
+                if let Some(result) = ev.result.as_mut() {
+                    if hydrate_status_result(result, &result_store, execution_id).await {
+                        hydrated += 1;
+                    }
+                }
+            }
+            if hydrated > 0 {
+                tracing::debug!(
+                    execution_id,
+                    hydrated,
+                    "status view: resolved staged result references"
+                );
+            }
+        }
 
         // Determine overall status
         let status = self.determine_status(&events);
@@ -962,6 +1084,69 @@ impl ExecutionService {
 
 #[cfg(test)]
 mod tests {
+
+    /// noetl/ai-meta#195 — the status view must show what the step actually
+    /// produced, whether or not the permanent-log-lean strip rewrote the row.
+    ///
+    /// The fixture is the real stripped shape observed in kind against the
+    /// released v3.77.3 image: `reference` + a bounded `extracted` block where
+    /// the payload used to be.  Before this fix the endpoint returned the
+    /// `extracted` summary, so a 40-row result read back as one row.
+    #[test]
+    fn status_hydration_replaces_reference_with_resolved_payload() {
+        let mut result = serde_json::json!({
+            "status": "COMPLETED",
+            "context": { "result": {
+                "status": "success",
+                "reference": {
+                    "ref": "noetl://execution/1/result/start/2",
+                    "kind": "result_ref",
+                    "extracted": { "data": { "emit": { "rows": [{ "city": "paris" }] } } }
+                }
+            }}
+        });
+        let (is_nested, uri) = find_result_reference(&result).expect("nested reference");
+        assert!(is_nested);
+        assert_eq!(uri, "noetl://execution/1/result/start/2");
+
+        let resolved = serde_json::json!({ "data": { "emit": { "rows": [
+            { "city": "paris" }, { "city": "paris" }, { "city": "paris" }
+        ]}}});
+        assert!(splice_resolved(&mut result, is_nested, resolved));
+
+        let rows = result
+            .pointer("/context/result/context/data/emit/rows")
+            .and_then(|v| v.as_array())
+            .expect("resolved payload spliced in");
+        assert_eq!(rows.len(), 3, "full payload must replace the extracted summary");
+        assert!(
+            result.pointer("/context/result/reference").is_none(),
+            "the reference block must be dropped so the event reads as inline"
+        );
+    }
+
+    /// The un-wrapped top-level envelope resolves too.
+    #[test]
+    fn status_hydration_handles_top_level_envelope() {
+        let mut result = serde_json::json!({
+            "reference": { "ref": "noetl://execution/1/result/s/2", "kind": "result_ref" }
+        });
+        let (is_nested, _) = find_result_reference(&result).expect("top-level reference");
+        assert!(!is_nested);
+        assert!(splice_resolved(&mut result, is_nested, serde_json::json!({ "data": { "k": 1 } })));
+        assert_eq!(result.pointer("/context/data/k"), Some(&serde_json::json!(1)));
+        assert!(result.get("reference").is_none());
+    }
+
+    /// An ordinary inline result — the overwhelmingly common case, and every
+    /// case at all while the strip is off — must be left completely alone.
+    #[test]
+    fn status_hydration_ignores_inline_results() {
+        let inline = serde_json::json!({
+            "context": { "result": { "status": "success", "context": { "data": { "emit": { "n": 1 } } } } }
+        });
+        assert!(find_result_reference(&inline).is_none());
+    }
     use super::*;
 
     #[test]

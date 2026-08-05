@@ -34,15 +34,30 @@
 //! reads**. So slimming the persisted row does not touch the drive decision or
 //! its latency.
 //!
-//! The only readers of the persisted `result` are recovery paths — the
+//! The readers of the persisted `result` are the recovery paths — the
 //! server-built `rebuild_state` fall-through (cold execute-time descriptor after
-//! a server restart, or a `system/*` execution) — and the status/replay APIs.
-//! Those already resolve `noetl://` references via `hydrate_result_references`
-//! before `WorkflowState::from_events`, so a **staged, resolvable reference +
-//! `extracted`** keeps them correct: with `refs_in_state=true` the drive folds
+//! a server restart, or a `system/*` execution) and the replay/event APIs — plus
+//! the operator-facing execution-detail endpoint.
+//!
+//! The recovery paths resolve `noetl://` references via
+//! `hydrate_result_references` before `WorkflowState::from_events`, so a
+//! **staged, resolvable reference + `extracted`** keeps them correct: with `refs_in_state=true` the drive folds
 //! the small `extracted` predicate block (identical shape to a large result);
 //! with `refs_in_state=false` it resolves the staged payload from the byte
 //! source.
+//!
+//! `GET /api/executions/{id}` was **not** one of those callers, despite an
+//! earlier version of this note claiming every status API resolved references.
+//! It had no `hydrate_result_references` call at all, so with the strip on it
+//! rendered a stripped execution as its bounded `extracted` summary — a 40-row
+//! result read back as one row.  Correctness was never affected (the drive and
+//! recovery paths hydrate, and the payload is intact in `noetl.result_store`),
+//! but the view an operator reaches for during an incident quietly lost its
+//! detail, which is the sort of thing that only shows up when it is already
+//! expensive to discover.  `ExecutionService::get` now resolves the same
+//! reference shape for the response — see `hydrate_status_result` — so the
+//! strip is transparent to a human reader.  Measured in kind against the
+//! released v3.77.3 image: 1 row visible before the fix, 40 after.
 //!
 //! ## Shape produced
 //!
