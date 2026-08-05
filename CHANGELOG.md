@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.62.1](https://github.com/noetl/server/compare/v3.62.0...v3.62.1) (2026-08-05)
+
+### Bug Fixes
+
+* **orchestrate-core:** a Python-style bool must type back to a JSON bool ([d5966c2](https://github.com/noetl/server/commit/d5966c22dcab98561e0db6b6fda5cdb68daa8f5f)), closes [noetl/ai-meta#231](https://github.com/noetl/ai-meta/issues/231) [noetl/cli#78](https://github.com/noetl/cli/issues/78) [#89](https://github.com/noetl/server/issues/89) [noetl/ai-meta#231](https://github.com/noetl/ai-meta/issues/231)
+* **orchestrate-core:** a step parked on an async callback must not advance the DAG ([37296d1](https://github.com/noetl/server/commit/37296d1067aeb4fce26f5a2eb8c2b38e10de17a9)), closes [noetl/ai-meta#186](https://github.com/noetl/ai-meta/issues/186) [#227](https://github.com/noetl/server/issues/227) [pre-#186](https://github.com/noetl/pre-/issues/186) [#186](https://github.com/noetl/server/issues/186) [noetl/ai-meta#186](https://github.com/noetl/ai-meta/issues/186)
+* **result-tier-gc:** a truncated sink feed must fail closed, not open ([c35bc8b](https://github.com/noetl/server/commit/c35bc8b4601881b7bdd374822707b3b17517dc81)), closes [noetl/ai-meta#199](https://github.com/noetl/ai-meta/issues/199) [noetl/ai-meta#199](https://github.com/noetl/ai-meta/issues/199)
+
 ## [3.62.0](https://github.com/noetl/server/compare/v3.61.0...v3.62.0) (2026-08-04)
 
 ### Features
