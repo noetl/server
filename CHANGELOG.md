@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.72.0](https://github.com/noetl/server/compare/v3.71.0...v3.72.0) (2026-08-05)
+
+### Features
+
+* **metrics:** pin the two correctness signals that are silent when healthy ([6479901](https://github.com/noetl/server/commit/64799014c1e9ea4927f6e23219f97b15c390fe2b)), closes [noetl/ai-meta#118](https://github.com/noetl/ai-meta/issues/118) [noetl/ai-meta#238](https://github.com/noetl/ai-meta/issues/238) [noetl/ai-meta#118](https://github.com/noetl/ai-meta/issues/118)
+
 ## [3.71.0](https://github.com/noetl/server/compare/v3.70.0...v3.71.0) (2026-08-05)
 
 ### Features
