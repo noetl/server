@@ -1625,9 +1625,46 @@ pub fn permanent_log_lean_stage_failed_total() -> &'static IntCounter {
 /// already registered as a side effect of being SET at startup.  This covers
 /// the ones with no such setter.
 pub fn init_unlabelled_series() {
-    // Touching the accessor is what registers it.
+    // Touching the accessor is what registers it.  All of these were ABSENT
+    // from a released image's /metrics until this ran — verified by scraping
+    // v3.77.0 on kind and diffing the declared set against the served set: 17
+    // of 67 declared metrics were present, and these 11 were the unlabelled
+    // ones missing purely because nothing had called them yet.
+    //
+    // `state_build_event_scans_total` is the one that makes the case.  It
+    // exists to prove the never-scan invariant — "this drive did zero
+    // noetl.event scans" — and an ABSENT metric cannot prove zero.  It reads
+    // the same as a binary without the metric at all.
+    let _ = cell_registry_requests_total();
+    let _ = events_materialized_total();
+    let _ = events_projected_duplicates_total();
+    let _ = events_projected_total();
     let _ = permanent_log_lean_stage_failed_total();
+    let _ = permanent_log_slimmed_bytes_total();
+    let _ = permanent_log_slimmed_total();
+    let _ = projection_advanced_total();
+    let _ = result_store_dual_write_skipped_total();
+    let _ = result_store_dual_write_total();
+    let _ = state_build_event_scans_total();
 }
+
+/// Every unlabelled metric that `init_unlabelled_series` must register.
+///
+/// Kept as data so the test can assert the served set rather than re-listing
+/// names in two places that drift apart.
+pub const UNLABELLED_STARTUP_METRICS: [&str; 11] = [
+    "noetl_cell_registry_requests_total",
+    "noetl_events_materialized_total",
+    "noetl_events_projected_duplicates_total",
+    "noetl_events_projected_total",
+    "noetl_permanent_log_lean_stage_failed_total",
+    "noetl_permanent_log_slimmed_bytes_total",
+    "noetl_permanent_log_slimmed_total",
+    "noetl_projection_advanced_total",
+    "noetl_result_store_dual_write_skipped_total",
+    "noetl_result_store_dual_write_total",
+    "noetl_state_build_event_scans_total",
+];
 
 /// Record one failed command-context stage.
 pub fn record_permanent_log_lean_stage_failed() {
@@ -2974,11 +3011,11 @@ mod tests {
         set_ehdb_event_publisher_configured(false);
 
         let text = gather_text().expect("gather metrics text");
-        for name in [
-            "noetl_permanent_log_lean_stage_failed_total",
-            "noetl_sharding_config_parse_failed",
-            "noetl_ehdb_event_publisher_configured",
-        ] {
+        let mut want: Vec<&str> = UNLABELLED_STARTUP_METRICS.to_vec();
+        // These two register as a side effect of being SET at startup.
+        want.push("noetl_sharding_config_parse_failed");
+        want.push("noetl_ehdb_event_publisher_configured");
+        for name in want {
             assert!(
                 text.lines().any(|l| l.starts_with(&format!("{name} "))),
                 "{name} must be registered by startup alone — a metric only \
@@ -2992,6 +3029,19 @@ mod tests {
         assert!(
             include_str!("main.rs").contains("init_unlabelled_series()"),
             "main must invoke init_unlabelled_series"
+        );
+        // The list and the function must not drift apart: every name in the
+        // const has to actually be registered by the call above, and the count
+        // has to match the number of accessor touches in the function body.
+        let me = include_str!("metrics.rs");
+        let body_start = me
+            .find("pub fn init_unlabelled_series() {")
+            .expect("init must exist");
+        let body = &me[body_start..body_start + me[body_start..].find("\n}").unwrap()];
+        assert_eq!(
+            body.matches("let _ = ").count(),
+            UNLABELLED_STARTUP_METRICS.len(),
+            "every metric listed in UNLABELLED_STARTUP_METRICS must be touched by the init"
         );
     }
 
