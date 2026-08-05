@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.77.4](https://github.com/noetl/server/compare/v3.77.3...v3.77.4) (2026-08-05)
+
+### Bug Fixes
+
+* resolve staged result references in the execution-detail API ([d90f2d5](https://github.com/noetl/server/commit/d90f2d58812843b0dd391cd6d2d5f943247a673f)), closes [noetl/ai-meta#195](https://github.com/noetl/ai-meta/issues/195) [noetl/ai-meta#195](https://github.com/noetl/ai-meta/issues/195)
+
 ## [3.77.3](https://github.com/noetl/server/compare/v3.77.2...v3.77.3) (2026-08-05)
 
 ### Bug Fixes
