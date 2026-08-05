@@ -99,8 +99,28 @@ jobs:
         if: ${{ env.CRATES_IO_TOKEN == '' }}
         run: echo "CRATES_IO_TOKEN is not set; skipping crate publish."
 
+  # Multi-arch, mirroring noetl/worker's release.yml (noetl/ai-meta#236).
+  #
+  # WHY: every server release before this was amd64-only, while the worker has
+  # always published a manifest list.  The dev/validation kind cluster is arm64
+  # (Apple Silicon + podman), so a released server image could never run there —
+  # which meant validating any server change required building the image
+  # LOCALLY, on the same 6-CPU VM as the live kind control plane.  That is the
+  # operation that has corrupted etcd on that box, so in practice server changes
+  # shipped unit-proven and kind ran hand-built images no release produced.
+  # `deployment-validation.md` mandates kind validation before GKE; this is what
+  # makes that satisfiable with the artifact that actually ships.
   publish-image:
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+            arch_tag: amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            arch_tag: arm64
+    runs-on: ${{ matrix.runner }}
     needs: verify-version
     if: ${{ needs.verify-version.outputs.has_dockerfile == 'true' }}
     steps:
@@ -111,14 +131,42 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      # Per-arch image under an arch-suffixed tag; publish-manifest stitches the
+      # version + latest manifest list from the pair.  Native runners, so no
+      # QEMU emulation (an emulated arm64 Rust build is prohibitively slow).
       - uses: docker/build-push-action@v5
         with:
           context: .
           file: ./Dockerfile
           push: true
-          tags: |
-            ghcr.io/noetl/server:${{ needs.verify-version.outputs.version }}
-            ghcr.io/noetl/server:latest
+          platforms: ${{ matrix.platform }}
+          tags: ghcr.io/noetl/server:${{ needs.verify-version.outputs.version }}-${{ matrix.arch_tag }}
+
+  # Metadata only — combines the two per-arch images into the manifest list the
+  # version and `latest` tags point at.  Same shape as the worker's job.
+  publish-manifest:
+    runs-on: ubuntu-latest
+    needs: [verify-version, publish-image]
+    if: ${{ needs.verify-version.outputs.has_dockerfile == 'true' }}
+    steps:
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Create + push multi-arch manifest list
+        env:
+          VERSION: ${{ needs.verify-version.outputs.version }}
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create \
+            -t ghcr.io/noetl/server:${VERSION} \
+            -t ghcr.io/noetl/server:latest \
+            ghcr.io/noetl/server:${VERSION}-amd64 \
+            ghcr.io/noetl/server:${VERSION}-arm64
+          echo "=== manifest list ==="
+          docker buildx imagetools inspect ghcr.io/noetl/server:${VERSION}
 
   # Additive Artifact Registry path.  Builds the SAME release version
   # on Cloud Build (native amd64, in us-central1 next to the GKE
@@ -172,7 +220,7 @@ jobs:
 
   github-release:
     runs-on: ubuntu-latest
-    needs: [verify-version, publish-image]
+    needs: [verify-version, publish-image, publish-manifest]
     if: ${{ always() && needs.verify-version.result == 'success' && (needs.publish-image.result == 'success' || needs.publish-image.result == 'skipped') }}
     steps:
       - uses: softprops/action-gh-release@v2
