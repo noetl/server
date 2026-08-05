@@ -80,4 +80,31 @@ pub async fn list_pending(pool: &DbPool, limit: i64) -> AppResult<Vec<i64>> {
 }
 
 /// Default safety cap for [`list_pending`].
+///
+/// noetl/ai-meta#199 — a cap on a SAFETY gate has to be observable, because
+/// hitting it makes the gate fail OPEN.  `list_pending` is `ORDER BY marked_at
+/// LIMIT n`, so truncation silently drops the **newest** marks — precisely the
+/// executions whose business context is most likely still live — and the
+/// Feather GC then reclaims them.
+///
+/// That contradicts the sweep's own documented invariant, which says the gate
+/// "can only ever retain more, never delete more".  With a silent cap it can
+/// delete more.  See [`list_pending_checked`].
 pub const DEFAULT_LIST_LIMIT: i64 = 100_000;
+
+/// [`list_pending`] plus whether the result was truncated by the cap.
+///
+/// Returns `(ids, complete)`. `complete == false` means the feed hit
+/// `DEFAULT_LIST_LIMIT` and the caller is holding an INCOMPLETE view of what is
+/// un-sunk.
+///
+/// A caller gating deletion on this set must fail CLOSED when `complete` is
+/// false: retaining objects it might have reclaimed costs storage, whereas
+/// reclaiming business context that was never sunk to the customer's system of
+/// record is unrecoverable. Those are not symmetric, so the tie does not go to
+/// the sweep.
+pub async fn list_pending_checked(pool: &DbPool, limit: i64) -> AppResult<(Vec<i64>, bool)> {
+    let ids = list_pending(pool, limit).await?;
+    let complete = (ids.len() as i64) < limit;
+    Ok((ids, complete))
+}
