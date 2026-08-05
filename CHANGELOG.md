@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.64.2](https://github.com/noetl/server/compare/v3.64.1...v3.64.2) (2026-08-05)
+
+### Bug Fixes
+
+* **orchestrate-core:** accept the parked marker from meta, as the sweep does ([14a15b9](https://github.com/noetl/server/commit/14a15b9eed6183b2cd1a6714aa605edd18273bf2)), closes [noetl/ai-meta#186](https://github.com/noetl/ai-meta/issues/186) [noetl/ai-meta#186](https://github.com/noetl/ai-meta/issues/186) [noetl/ai-meta#227](https://github.com/noetl/ai-meta/issues/227)
+
 ## [3.64.1](https://github.com/noetl/server/compare/v3.64.0...v3.64.1) (2026-08-05)
 
 ### Bug Fixes
