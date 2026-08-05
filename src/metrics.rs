@@ -325,6 +325,25 @@ pub fn ehdb_command_publish_failed_total() -> &'static IntCounterVec {
     })
 }
 
+/// Materialise both `reason` series at 0 so they exist before the first failure.
+///
+/// A labelled counter has no series until it is incremented, so an unfired
+/// `noetl_ehdb_command_publish_failed_total` is simply ABSENT from `/metrics`.
+/// Absent is indistinguishable from three different things: nothing has failed,
+/// the metric was removed, or the binary predates it.  Verified on kind against
+/// a released image — the gauge showed up and this counter did not.
+///
+/// `reason` has exactly two known values, so both can be pinned at 0 and the
+/// absence question disappears: a scrape either shows 0 (healthy, current
+/// binary) or nothing (not this binary).
+pub fn init_ehdb_command_publish_failed_series() {
+    for reason in ["gave_up", "attempt"] {
+        ehdb_command_publish_failed_total()
+            .with_label_values(&[reason])
+            .inc_by(0);
+    }
+}
+
 /// Record a failed EHDB command publish (see [`ehdb_command_publish_failed_total`]).
 pub fn record_ehdb_command_publish_failed(reason: &str) {
     ehdb_command_publish_failed_total()
@@ -2468,5 +2487,24 @@ mod tests {
             .find(|l| l.starts_with("noetl_ehdb_event_publisher_configured "))
             .expect("gauge must appear in /metrics");
         assert!(line.ends_with(" 1"), "configured must read 1; got {line:?}");
+    }
+
+    /// A labelled counter is ABSENT from /metrics until first incremented, so an
+    /// unfired failure counter cannot be told apart from a removed metric or an
+    /// older binary.  Verified on kind: the gauge appeared, this counter did not.
+    #[test]
+    fn publish_failure_series_exist_at_zero_before_any_failure() {
+        init_ehdb_command_publish_failed_series();
+        let text = gather_text().expect("gather metrics text");
+        let lines: Vec<&str> = text
+            .lines()
+            .filter(|l| l.starts_with("noetl_ehdb_command_publish_failed_total{"))
+            .collect();
+        for reason in ["gave_up", "attempt"] {
+            assert!(
+                lines.iter().any(|l| l.contains(&format!("reason=\"{reason}\""))),
+                "{reason} series must exist before any failure; got {lines:?}"
+            );
+        }
     }
 }
