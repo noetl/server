@@ -471,11 +471,20 @@ pub fn ehdb_command_publish_failed_total() -> &'static IntCounterVec {
 /// the metric was removed, or the binary predates it.  Verified on kind against
 /// a released image — the gauge showed up and this counter did not.
 ///
-/// `reason` has exactly two known values, so both can be pinned at 0 and the
-/// absence question disappears: a scrape either shows 0 (healthy, current
-/// binary) or nothing (not this binary).
+/// The `reason` values are pinned at 0 so the absence question disappears: a
+/// scrape either shows 0 (healthy, current binary) or nothing (not this
+/// binary).
+///
+/// `no_writers` and `shadow_failed` were added when the P2 dispatch triage
+/// found two more ways a command fails to reach the bus, neither of which had
+/// any signal.  `no_writers` is the severe one: with `NOETL_COMMAND_BUS=ehdb`
+/// and no writer routes resolved, EVERY command is silently not delivered and
+/// every execution stalls — previously visible only as a `tracing::warn!`.
+pub const EHDB_COMMAND_PUBLISH_FAILED_REASONS: [&str; 4] =
+    ["gave_up", "attempt", "no_writers", "shadow_failed"];
+
 pub fn init_ehdb_command_publish_failed_series() {
-    for reason in ["gave_up", "attempt"] {
+    for reason in EHDB_COMMAND_PUBLISH_FAILED_REASONS {
         ehdb_command_publish_failed_total()
             .with_label_values(&[reason])
             .inc_by(0);
@@ -2820,6 +2829,42 @@ mod tests {
                 "{reason} series must exist before any skip; got {lines:?}"
             );
         }
+    }
+
+    /// Every way a command fails to reach the EHDB bus must be counted, and all
+    /// four reasons readable at 0.
+    ///
+    /// `no_writers` is the severe one: with `NOETL_COMMAND_BUS=ehdb` and no
+    /// writer routes resolved, every command is silently not delivered and
+    /// every execution stalls.  Before this it was a `tracing::warn!` and
+    /// nothing else, on a path where nothing else errors.
+    #[test]
+    fn ehdb_publish_failure_reasons_cover_every_undelivered_path() {
+        init_ehdb_command_publish_failed_series();
+        let text = gather_text().expect("gather metrics text");
+        for reason in EHDB_COMMAND_PUBLISH_FAILED_REASONS {
+            assert!(
+                text.lines().any(|l| l
+                    .starts_with("noetl_ehdb_command_publish_failed_total{")
+                    && l.contains(&format!("reason=\"{reason}\""))),
+                "{reason} must be pinned at 0"
+            );
+        }
+        // Both dispatch-side sites in execute.rs must record.
+        let src = include_str!("handlers/execute.rs");
+        for reason in ["no_writers", "shadow_failed"] {
+            assert!(
+                src.contains(&format!("record_ehdb_command_publish_failed(\"{reason}\")")),
+                "{reason} must be recorded at its dispatch site"
+            );
+        }
+        // The stale claim must not come back: NATS stopped being authoritative
+        // at T5, so a message saying it is would mislead exactly when someone
+        // is debugging an undelivered command.
+        assert!(
+            !src.contains("EHDB shadow command publish failed (NATS authoritative)"),
+            "the pre-T5 'NATS authoritative' wording must stay corrected"
+        );
     }
 
     /// Both P1 server sets must be readable at 0, and every plug-in outcome
