@@ -1,22 +1,34 @@
 //! **L1 T4 — the EHDB command bus (flag-gated).**
 //!
 //! Selects the transport that carries command notifications to workers, behind
-//! [`NOETL_COMMAND_BUS`](CommandBusMode). Default `nats` leaves today's path
-//! untouched. `ehdb` publishes each command to the per-shard EHDB writer (the
-//! cutover). `shadow` publishes to **both** — NATS stays authoritative and
-//! workers keep consuming it, while the same command is mirrored onto the EHDB
-//! bus so a shadow consumer can verify parity before any flip.
+//! [`NOETL_COMMAND_BUS`](CommandBusMode).
+//!
+//! ⚠ **The cutover is done and NATS is deleted** (noetl/ai-meta#194 T5). Every
+//! prod workload — server, user pool, and both system-pool shards — sets
+//! `NOETL_COMMAND_BUS=ehdb` explicitly.
+//!
+//! ⚠ **The code default is still `Nats`**, which is now a transport that does
+//! not exist. That is safe only because every deployment sets the variable. A
+//! new workload rolled without it would default to a dead transport, and
+//! "unset the flag" is no longer a rollback — it is an outage. Changing the
+//! default is a behaviour change and is tracked separately rather than done
+//! in passing.
+//!
+//! `shadow` mode published to both so a shadow consumer could verify parity
+//! before the flip. It has no meaning now: there is no second bus to mirror
+//! onto and nothing consuming NATS.
 //!
 //! A command notification maps to a D1 [`EventRecord`]: `event_id` is the sort
 //! key (monotonic → the single-writer ascending contract holds per shard),
 //! `execution_id` is the shard key (`shard_for_execution` is byte-identical to
 //! the server/worker `shard_for`), and the notification JSON is the payload —
-//! the worker decodes it back and fetches full command details from the API,
-//! exactly as it does off NATS today.
+//! the worker decodes it back and fetches full command details from the API —
+//! the same shape it used off NATS before the cutover.
 //!
 //! The publisher is **lazy-connected**: it dials the writers on first publish
 //! (and drops + redials on error), so the stateless server never hard-depends on
-//! the writers being up at boot — matching how it tolerates NATS being absent.
+//! the writers being up at boot. That tolerance was inherited from the NATS
+//! client and matters more now, not less: the writer is the only bus.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -28,7 +40,11 @@ use tokio::sync::Mutex;
 /// Which transport carries command notifications (env `NOETL_COMMAND_BUS`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CommandBusMode {
-    /// Publish to NATS only — today's path (default).
+    /// Publish to NATS only.
+    ///
+    /// ⚠ Still the `Default`, but NATS was deleted at T5 — selecting this, or
+    /// leaving `NOETL_COMMAND_BUS` unset, points at a transport that is not
+    /// there. See the module header.
     #[default]
     Nats,
     /// Publish to the per-shard EHDB writer only — the cutover.
