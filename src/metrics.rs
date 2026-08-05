@@ -332,6 +332,41 @@ pub fn record_ehdb_command_publish_failed(reason: &str) {
         .inc();
 }
 
+/// `noetl_ehdb_event_publisher_configured` — 1 when the server has a usable
+/// EHDB events publisher, 0 when `NOETL_EVENT_BUS` selects EHDB but
+/// `NOETL_EVENT_BUS_WRITER_ADDRS` resolved to no routes.
+///
+/// The zero case is not a degraded mode: post-T5 the events feed is the sole
+/// writer of the durable log, so every event publish is skipped and the log
+/// simply stops growing.  Until now the only signal was one `tracing::error!`
+/// at startup — a line that scrolls away, on a workload nothing scrapes
+/// (noetl/ai-meta#238).  A gauge is alertable and survives the boot it
+/// describes.
+///
+/// Deliberately a gauge rather than a counter: this is boot-time state, and the
+/// question an operator asks is "is it configured right now", not "how often did
+/// it fail".
+pub fn ehdb_event_publisher_configured() -> &'static IntGauge {
+    static M: OnceLock<IntGauge> = OnceLock::new();
+    M.get_or_init(|| {
+        let g = IntGauge::new(
+            "noetl_ehdb_event_publisher_configured",
+            "1 when the EHDB events publisher has writer routes, 0 when EHDB is selected but none resolved (noetl/ai-meta#238).",
+        )
+        .expect("static gauge spec must be valid");
+        registry()
+            .register(Box::new(g.clone()))
+            .expect("gauge registration must succeed");
+        g
+    })
+}
+
+/// Record whether the EHDB events publisher is usable (see
+/// [`ehdb_event_publisher_configured`]).
+pub fn set_ehdb_event_publisher_configured(configured: bool) {
+    ehdb_event_publisher_configured().set(i64::from(configured));
+}
+
 // ── Off-server tail-attach accelerator (noetl/ai-meta#156) ───────────────────
 
 /// `noetl_offserver_tail_attached_total{outcome}` — off-server drive dispatches
@@ -2410,5 +2445,28 @@ mod tests {
             lines.iter().any(|l| l.contains("reason=\"attempt\"")),
             "attempt series missing; got {lines:?}"
         );
+    }
+
+    /// noetl/ai-meta#238 — "the durable log is being dropped on the floor" must
+    /// be a metric, not only a startup log line.  A gauge because the operator
+    /// question is "is it configured now", and because a boot-time error scrolls
+    /// away while a gauge survives.
+    #[test]
+    fn the_event_publisher_configured_gauge_tracks_both_states() {
+        set_ehdb_event_publisher_configured(false);
+        let text = gather_text().expect("gather metrics text");
+        let line = text
+            .lines()
+            .find(|l| l.starts_with("noetl_ehdb_event_publisher_configured "))
+            .expect("gauge must appear in /metrics");
+        assert!(line.ends_with(" 0"), "unconfigured must read 0; got {line:?}");
+
+        set_ehdb_event_publisher_configured(true);
+        let text = gather_text().expect("gather metrics text");
+        let line = text
+            .lines()
+            .find(|l| l.starts_with("noetl_ehdb_event_publisher_configured "))
+            .expect("gauge must appear in /metrics");
+        assert!(line.ends_with(" 1"), "configured must read 1; got {line:?}");
     }
 }
