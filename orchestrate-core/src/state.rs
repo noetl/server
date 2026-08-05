@@ -365,11 +365,22 @@ pub struct WorkflowState {
 /// "parked", so an old event or a tool that does not set it behaves exactly as
 /// before.
 pub fn is_parked_on_callback(event: &Event) -> bool {
-    event
-        .context
-        .as_ref()
-        .and_then(|c| c.get("pending_callback"))
-        .and_then(|v| v.as_bool())
+    fn marker(v: Option<&serde_json::Value>) -> Option<bool> {
+        v.and_then(|c| c.get("pending_callback"))
+            .and_then(|v| v.as_bool())
+    }
+
+    // The worker stamps the marker into the TOOL RESULT's context, so on the
+    // wire it arrives at `result.context.pending_callback` and the event's own
+    // `context` is null.  Reading only `event.context` — which is what this did
+    // — returned false for every real event, so no step ever parked and the DAG
+    // advanced on the dispatch (noetl/ai-meta#186 Bug 1, caught by kind
+    // validation after the unit tests passed against a hand-built event).
+    //
+    // `event.context` is still checked so a caller that inlines the marker
+    // there keeps working.
+    marker(event.result.as_ref().and_then(|r| r.get("context")))
+        .or_else(|| marker(event.context.as_ref()))
         .unwrap_or(false)
 }
 
@@ -2306,6 +2317,62 @@ mod pending_callback_tests {
     ///
     /// A `command.completed` carrying `pending_callback` must NOT complete the
     /// step, or nothing can stop a dependent step from dispatching.
+    /// The shape the WORKER actually emits: the marker is nested in the tool
+    /// result's context and the event's own `context` is null.
+    ///
+    /// Every other test in this module hand-builds `context: Some(...)` with
+    /// `result: None`, which is the inverse of the wire format — so they passed
+    /// while the DAG advanced in production.  Kind validation on released images
+    /// caught it: three container Jobs created inside the same second while the
+    /// first took ~4s to finish.
+    fn ev_wire(id: i64, ty: &str, step: &str) -> Event {
+        Event {
+            event_id: id,
+            execution_id: 1,
+            catalog_id: 1,
+            event_type: ty.to_string(),
+            node_name: Some(step.to_string()),
+            status: "success".to_string(),
+            context: None,
+            result: Some(serde_json::json!({
+                "context": {
+                    "command_id": "e:s:1",
+                    "pending_callback": true,
+                    "status": "success"
+                },
+                "status": "success"
+            })),
+            meta: None,
+            timestamp: DateTime::from_timestamp(id, 0).expect("fixed epoch"),
+            parent_execution_id: None,
+            attempt: None,
+        }
+    }
+
+    #[test]
+    fn the_marker_is_read_from_the_wire_shape_result_context() {
+        let e = ev_wire(2, "command.completed", "run_schema");
+        assert!(
+            is_parked_on_callback(&e),
+            "the worker stamps pending_callback into result.context; reading only \
+             event.context misses every real event"
+        );
+    }
+
+    #[test]
+    fn a_wire_shaped_parked_completion_does_not_complete_the_step() {
+        let mut st = WorkflowState::new(1, 1);
+        st.apply_event(&ev(1, "command.started", "run_schema", None));
+        st.apply_event(&ev_wire(2, "command.completed", "run_schema"));
+        let step = st.steps.get("run_schema").expect("step present");
+        assert!(step.pending_callback, "the step must park on the wire shape");
+        assert!(step.uses_callback, "and be marked a callback user");
+        assert!(
+            step.completed_at.is_none(),
+            "a parked step must NOT be complete — this is what let the DAG advance"
+        );
+    }
+
     #[test]
     fn a_parked_command_completed_does_not_complete_the_step() {
         let mut st = WorkflowState::new(1, 1);
