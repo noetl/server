@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.69.0](https://github.com/noetl/server/compare/v3.68.1...v3.69.0) (2026-08-05)
+
+### Features
+
+* **metrics:** pin the sweep outcome series, and fix a drifted label list ([658c348](https://github.com/noetl/server/commit/658c348139da1624dbb88544ed68b82f099d5805)), closes [noetl/ai-meta#238](https://github.com/noetl/ai-meta/issues/238)
+
 ## [3.68.1](https://github.com/noetl/server/compare/v3.68.0...v3.68.1) (2026-08-05)
 
 ### Bug Fixes
