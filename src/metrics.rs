@@ -319,6 +319,40 @@ pub fn init_parity_and_dedup_series() {
         .inc_by(0);
 }
 
+/// Every `outcome` the result-tier GC records, taken from the call sites in
+/// [`crate::handlers::result_tier`].
+///
+/// Result-tier GC **deletes** stored results, so "how much has it deleted?" is
+/// a question with consequences, and until now the answer on a server that had
+/// not yet run a GC pass was an empty scrape rather than zeros.
+///
+/// This list is taken from the source, and two separate manual passes still got
+/// it wrong.  A same-line grep found six, because `skipped_unparseable`'s
+/// literal is wrapped onto the line after its call.  Reading the file found
+/// seven, because there are **two** GC call blocks and the second one adds
+/// `skipped_unsunk`.  The eighth was found only by the test below.  A set that
+/// silently omits an outcome is worse than no set at all, because the missing
+/// one reads as healthy.
+pub const RESULT_TIER_GC_OUTCOMES: [&str; 8] = [
+    "no_op",
+    "scanned",
+    "deleted",
+    "skipped_live",
+    "skipped_grace",
+    "skipped_unparseable",
+    "skipped_unsunk",
+    "error",
+];
+
+/// Materialise every [`RESULT_TIER_GC_OUTCOMES`] series at 0.
+pub fn init_result_tier_gc_series() {
+    for outcome in RESULT_TIER_GC_OUTCOMES {
+        result_tier_gc_total()
+            .with_label_values(&[outcome])
+            .inc_by(0);
+    }
+}
+
 /// Record one non-convergence sweep outcome (see [`nonconvergence_sweep_total`]).
 pub fn record_nonconvergence_sweep(outcome: &str) {
     nonconvergence_sweep_total()
@@ -2678,6 +2712,48 @@ mod tests {
                 "{reason} series must exist before any skip; got {lines:?}"
             );
         }
+    }
+
+    /// Every outcome literal at a call site must be pinned.
+    ///
+    /// The source is embedded with `include_str!`, so this reads the real calls
+    /// rather than a doc comment.  The extraction deliberately looks for the
+    /// next quoted string AFTER the call rather than on the same line: one of
+    /// these seven, `skipped_unparseable`, is wrapped onto the following line,
+    /// and a same-line pattern silently drops it — which is how a pinned set
+    /// ends up one short while looking complete.
+    #[test]
+    fn result_tier_gc_literals_are_all_pinned() {
+        let src = include_str!("handlers/result_tier.rs");
+        let call = "record_result_tier_gc(";
+        let mut found: Vec<&str> = Vec::new();
+        let mut rest = src;
+        while let Some(i) = rest.find(call) {
+            rest = &rest[i + call.len()..];
+            if let Some(q1) = rest.find('"') {
+                let after = &rest[q1 + 1..];
+                if let Some(q2) = after.find('"') {
+                    found.push(&after[..q2]);
+                }
+            }
+        }
+        assert!(
+            found.len() >= 8,
+            "extraction found only {} literal(s) — a broken parser must fail here, \
+             not pass vacuously; got {found:?}",
+            found.len()
+        );
+        for lit in &found {
+            assert!(
+                RESULT_TIER_GC_OUTCOMES.contains(lit),
+                "record_result_tier_gc(\"{lit}\") is recorded but not pinned"
+            );
+        }
+        assert!(
+            found.contains(&"skipped_unparseable"),
+            "the wrapped literal must be found — if it is not, the extraction \
+             regressed to same-line matching; got {found:?}"
+        );
     }
 
     /// A correctness signal that reads as absent when nothing is wrong cannot

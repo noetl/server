@@ -763,6 +763,7 @@ async fn main() -> anyhow::Result<()> {
     noetl_server::metrics::init_nonconvergence_sweep_series();
     noetl_server::metrics::init_orphan_sweep_series();
     noetl_server::metrics::init_parity_and_dedup_series();
+    noetl_server::metrics::init_result_tier_gc_series();
     noetl_server::handlers::auth_verify::init_verify_series();
 
     // Load configuration
