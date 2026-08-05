@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.66.0](https://github.com/noetl/server/compare/v3.65.0...v3.66.0) (2026-08-05)
+
+### Features
+
+* **metrics:** pin the publish-failure series at 0 so they exist before firing ([26fbff9](https://github.com/noetl/server/commit/26fbff909ccfe8affb146ba08c84335845cd778d)), closes [server#313](https://github.com/noetl/server/issues/313) [server#309](https://github.com/noetl/server/issues/309) [noetl/ai-meta#238](https://github.com/noetl/ai-meta/issues/238)
+
 ## [3.65.0](https://github.com/noetl/server/compare/v3.64.2...v3.65.0) (2026-08-05)
 
 ### Features
