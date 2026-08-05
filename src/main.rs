@@ -768,6 +768,7 @@ async fn main() -> anyhow::Result<()> {
     noetl_server::metrics::init_system_plugin_seed_series();
     noetl_server::metrics::init_secret_refresh_series();
     noetl_server::metrics::init_command_row_insert_series();
+    noetl_server::metrics::init_unlabelled_series();
     noetl_server::handlers::auth_verify::init_verify_series();
 
     // Load configuration
