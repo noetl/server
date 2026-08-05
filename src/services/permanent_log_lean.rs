@@ -369,6 +369,7 @@ async fn slim_command_context(
     let put = match result_store.put(execution_id, &body).await {
         Ok(p) => p,
         Err(e) => {
+            crate::metrics::record_permanent_log_lean_stage_failed();
             tracing::warn!(
                 execution_id,
                 error = %e,

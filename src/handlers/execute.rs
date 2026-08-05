@@ -973,6 +973,7 @@ pub(crate) async fn persist_engine_command(
     )
     .await
     {
+        crate::metrics::record_command_row_insert_failed("single");
         tracing::warn!(
             error = %e,
             execution_id,
@@ -1191,6 +1192,7 @@ pub(crate) async fn persist_engine_commands_batch(
             .push_bind(issuing_event);
     });
     if let Err(e) = cqb.build().execute(pool).await {
+        crate::metrics::record_command_row_insert_failed("batch");
         tracing::warn!(
             error = %e,
             execution_id,

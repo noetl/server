@@ -767,6 +767,7 @@ async fn main() -> anyhow::Result<()> {
     noetl_server::metrics::init_credential_seal_series();
     noetl_server::metrics::init_system_plugin_seed_series();
     noetl_server::metrics::init_secret_refresh_series();
+    noetl_server::metrics::init_command_row_insert_series();
     noetl_server::handlers::auth_verify::init_verify_series();
 
     // Load configuration
@@ -798,13 +799,23 @@ async fn main() -> anyhow::Result<()> {
     // (today's default), DbPoolMap::new short-circuits to a
     // single-pool fallback that wraps `db_pool` itself —
     // behaviour bit-identical to pre-R4 single-host deployments.
-    let sharding_config = ShardingConfig::from_env().unwrap_or_else(|e| {
-        tracing::warn!(
-            error = %e,
-            "Failed to parse NOETL_SHARDS / NOETL_CLUSTER_DSN; falling back to single-pool mode"
-        );
-        ShardingConfig::default()
-    });
+    let sharding_config = match ShardingConfig::from_env() {
+        Ok(c) => {
+            noetl_server::metrics::set_sharding_config_parse_failed(false);
+            c
+        }
+        Err(e) => {
+            // The fallback is safe but SILENT: an operator who configured
+            // sharding gets none of it.  The gauge survives the boot this
+            // warning describes (noetl/ai-meta#238).
+            noetl_server::metrics::set_sharding_config_parse_failed(true);
+            tracing::warn!(
+                error = %e,
+                "Failed to parse NOETL_SHARDS / NOETL_CLUSTER_DSN; falling back to single-pool mode"
+            );
+            ShardingConfig::default()
+        }
+    };
     let pools = if sharding_config.is_disabled() {
         DbPoolMap::from_single_pool(db_pool.clone())
     } else {
