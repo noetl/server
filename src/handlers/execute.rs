@@ -1717,15 +1717,18 @@ async fn publish_command_notification(
                     if matches!(mode, crate::command_bus::CommandBusMode::Ehdb) {
                         return Err(AppError::Internal(format!("EHDB command publish: {e}")));
                     }
+                    crate::metrics::record_ehdb_command_publish_failed("shadow_failed");
                     tracing::warn!(
                         execution_id,
                         event_id,
                         error = %e,
-                        "EHDB shadow command publish failed (NATS authoritative)"
+                        "EHDB shadow command publish failed; the authoritative path is unaffected \
+                         (this said \"NATS authoritative\" until noetl/ai-meta#212 removed NATS)"
                     );
                 }
             },
             None if matches!(mode, crate::command_bus::CommandBusMode::Ehdb) => {
+                crate::metrics::record_ehdb_command_publish_failed("no_writers");
                 tracing::warn!(
                     execution_id,
                     event_id,
