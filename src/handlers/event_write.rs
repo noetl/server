@@ -224,10 +224,27 @@ fn is_system_path(path: &str) -> bool {
 /// the gate is on, NATS is connected, AND the execution is not a system-pool
 /// playbook (those drain the stream — see [`is_system_execution`]).  This is the
 /// single decision the chokepoint and the relocated trigger both consult.
+///
+/// Every `false` also records **which** condition produced it
+/// (`noetl_event_ingest_publish_skipped_total{reason}`).  The publish counter
+/// alone cannot express this: it has no series until the first publish, so a
+/// server that publishes nothing looks identical whether the gate is off, the
+/// transport is missing (noetl/ai-meta#212), or it is simply carrying only
+/// system traffic — and only the middle one is a fault.
 pub async fn should_publish(state: &AppState, catalog_id: i64) -> bool {
-    state.config.event_ingest_publish_only
-        && has_event_transport(state)
-        && !is_system_execution(state, catalog_id).await
+    if !state.config.event_ingest_publish_only {
+        crate::metrics::record_event_ingest_publish_skipped("gate_off");
+        return false;
+    }
+    if !has_event_transport(state) {
+        crate::metrics::record_event_ingest_publish_skipped("no_transport");
+        return false;
+    }
+    if is_system_execution(state, catalog_id).await {
+        crate::metrics::record_event_ingest_publish_skipped("system_execution");
+        return false;
+    }
+    true
 }
 
 /// Is *some* event transport available to publish on?

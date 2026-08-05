@@ -351,6 +351,70 @@ pub fn record_ehdb_command_publish_failed(reason: &str) {
         .inc();
 }
 
+/// `noetl_event_ingest_publish_skipped_total{reason}` — events that took the
+/// INSERT path instead of the publish path, and which of `should_publish`'s
+/// three conditions sent them there.
+///
+/// `noetl_event_ingest_published_total` counts only the publish side, so a
+/// server that publishes nothing exposes no series at all — and post-T5 the
+/// EHDB events feed is the sole writer of the durable log, which makes "zero
+/// publishes" the single most consequential state to be unable to read.
+///
+/// Absent, that zero has three very different causes and no way to tell them
+/// apart from `/metrics`:
+///
+/// - `gate_off` — `NOETL_EVENT_INGEST_PUBLISH_ONLY` is unset. Expected.
+/// - `no_transport` — the gate is on but there is no usable publisher, which
+///   is the noetl/ai-meta#212 shape: nothing errors, executions still
+///   complete, and the events feed sits at a flat cursor.
+/// - `system_execution` — system-pool playbooks are deliberately exempt
+///   (see [`is_system_execution`]), so a server carrying only system traffic
+///   publishes nothing and is perfectly healthy.
+///
+/// Reading which of the three applies on production took a source dive, three
+/// env lookups and a label inspection; it is one scrape with this counter.
+///
+/// [`is_system_execution`]: crate::handlers::event_write
+pub fn event_ingest_publish_skipped_total() -> &'static IntCounterVec {
+    static M: OnceLock<IntCounterVec> = OnceLock::new();
+    M.get_or_init(|| {
+        let counter = IntCounterVec::new(
+            Opts::new(
+                "noetl_event_ingest_publish_skipped_total",
+                "Events routed to INSERT instead of publish, by which should_publish condition failed (noetl/ai-meta#238)",
+            ),
+            &["reason"],
+        )
+        .expect("static counter spec must be valid");
+        registry()
+            .register(Box::new(counter.clone()))
+            .expect("counter registration must succeed");
+        counter
+    })
+}
+
+/// Materialise all three `reason` series at 0 so they exist before the first skip.
+///
+/// Same argument as [`init_ehdb_command_publish_failed_series`]: a labelled
+/// counter is ABSENT until incremented, and absent cannot be distinguished
+/// from "the binary predates this metric". `reason` has exactly three known
+/// values, so all three can be pinned and the absence question disappears.
+pub fn init_event_ingest_publish_skipped_series() {
+    for reason in ["gate_off", "no_transport", "system_execution"] {
+        event_ingest_publish_skipped_total()
+            .with_label_values(&[reason])
+            .inc_by(0);
+    }
+}
+
+/// Record one event that skipped the publish path
+/// (see [`event_ingest_publish_skipped_total`]).
+pub fn record_event_ingest_publish_skipped(reason: &str) {
+    event_ingest_publish_skipped_total()
+        .with_label_values(&[reason])
+        .inc();
+}
+
 /// `noetl_ehdb_event_publisher_configured` — 1 when the server has a usable
 /// EHDB events publisher, 0 when `NOETL_EVENT_BUS` selects EHDB but
 /// `NOETL_EVENT_BUS_WRITER_ADDRS` resolved to no routes.
@@ -2506,5 +2570,51 @@ mod tests {
                 "{reason} series must exist before any failure; got {lines:?}"
             );
         }
+    }
+
+    /// The publish-skip reasons carry the same absent-until-fired problem, and
+    /// on this path the zero is the *normal* reading: a server carrying only
+    /// system-pool traffic never publishes, and must be distinguishable from
+    /// one whose transport is missing.
+    #[test]
+    fn publish_skip_series_exist_at_zero_before_any_skip() {
+        init_event_ingest_publish_skipped_series();
+        let text = gather_text().expect("gather metrics text");
+        let lines: Vec<&str> = text
+            .lines()
+            .filter(|l| l.starts_with("noetl_event_ingest_publish_skipped_total{"))
+            .collect();
+        for reason in ["gate_off", "no_transport", "system_execution"] {
+            assert!(
+                lines.iter().any(|l| l.contains(&format!("reason=\"{reason}\""))),
+                "{reason} series must exist before any skip; got {lines:?}"
+            );
+        }
+    }
+
+    /// A recorded skip must land on its own `reason` series, not merge into a
+    /// neighbouring one — the three are only useful because they separate a
+    /// fault (`no_transport`) from two healthy states.
+    #[test]
+    fn recorded_skip_increments_only_its_own_reason() {
+        init_event_ingest_publish_skipped_series();
+        let before = event_ingest_publish_skipped_total()
+            .with_label_values(&["no_transport"])
+            .get();
+        record_event_ingest_publish_skipped("system_execution");
+        assert_eq!(
+            event_ingest_publish_skipped_total()
+                .with_label_values(&["no_transport"])
+                .get(),
+            before,
+            "recording one reason must not move another"
+        );
+        assert!(
+            event_ingest_publish_skipped_total()
+                .with_label_values(&["system_execution"])
+                .get()
+                > 0,
+            "the recorded reason must have moved"
+        );
     }
 }
