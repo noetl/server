@@ -435,14 +435,47 @@ mod tests {
 
     // ----- ShardingConfig from_env ------------------------------------------
 
-    // NOTE: these tests mutate process-wide env vars.  Run with
-    // `cargo test -- --test-threads=1` if you add more, or guard
-    // with a mutex.  The shape today is deliberately small so the
-    // serial cost is negligible.
+    /// Serialises the env-mutating sharding tests against each other.
+    ///
+    /// `cargo test` runs tests on a thread pool; env vars are process-wide. An
+    /// earlier note here said to pass `--test-threads=1` "if you add more, or
+    /// guard with a mutex" — the tests already raced without either.
+    /// `sharding_config_disabled_when_env_unset` asserts `NOETL_SHARDS` is
+    /// absent while its three siblings are setting it, so it failed on
+    /// `cfg.cluster.is_none()` in **22 of 40** filtered runs.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Restores the two env vars on drop, so a panicking test body cannot leak
+    /// its values into whichever test acquires the lock next — which would turn
+    /// one failure into a cascade.
+    struct EnvRestore {
+        shards: Option<String>,
+        cluster: Option<String>,
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            match &self.shards {
+                Some(v) => std::env::set_var("NOETL_SHARDS", v),
+                None => std::env::remove_var("NOETL_SHARDS"),
+            }
+            match &self.cluster {
+                Some(v) => std::env::set_var("NOETL_CLUSTER_DSN", v),
+                None => std::env::remove_var("NOETL_CLUSTER_DSN"),
+            }
+        }
+    }
 
     fn with_env<F: FnOnce() -> R, R>(shards: Option<&str>, cluster: Option<&str>, f: F) -> R {
-        let prev_shards = std::env::var("NOETL_SHARDS").ok();
-        let prev_cluster = std::env::var("NOETL_CLUSTER_DSN").ok();
+        // A poisoned lock means a previous test panicked; its EnvRestore still
+        // ran, so recover rather than cascade a second failure.
+        let guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = EnvRestore {
+            shards: std::env::var("NOETL_SHARDS").ok(),
+            cluster: std::env::var("NOETL_CLUSTER_DSN").ok(),
+            _guard: guard,
+        };
 
         match shards {
             Some(v) => std::env::set_var("NOETL_SHARDS", v),
@@ -453,18 +486,7 @@ mod tests {
             None => std::env::remove_var("NOETL_CLUSTER_DSN"),
         }
 
-        let out = f();
-
-        match prev_shards {
-            Some(v) => std::env::set_var("NOETL_SHARDS", v),
-            None => std::env::remove_var("NOETL_SHARDS"),
-        }
-        match prev_cluster {
-            Some(v) => std::env::set_var("NOETL_CLUSTER_DSN", v),
-            None => std::env::remove_var("NOETL_CLUSTER_DSN"),
-        }
-
-        out
+        f()
     }
 
     #[test]
