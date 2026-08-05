@@ -774,15 +774,37 @@ impl WorkflowOrchestrator {
             });
         }
 
+        // noetl/ai-meta#186 — `call.done` is a completion event for a step that
+        // parked on an async callback, and ONLY for one.
+        //
+        // On the callback path the usual order inverts: `command.completed`
+        // arrives first carrying only the external handle (and does not complete
+        // the step — see `state::is_parked_on_callback`), and the terminal
+        // `call.done` arrives later from the callback endpoint.  Without
+        // admitting it here the resume would complete the step in state and
+        // never re-evaluate the DAG, so no successor would ever dispatch.
+        //
+        // Gated on the execution having actually parked at some point rather
+        // than admitted outright.  Every ordinary step emits a `call.done`
+        // mid-flight, so accepting it unconditionally would add a whole
+        // orchestration pass per step to every execution on the platform — a
+        // hot-path cost for a feature only the container tool uses.  With the
+        // gate, a playbook that never parks does exactly what it did before,
+        // and the check itself is a scan of an already-resident map.
+        let callback_resume_trigger = matches!(trigger_event_type, Some("call.done"))
+            && state.steps.values().any(|s| s.uses_callback);
+
         // Only process transitions on completion events
-        if !matches!(
-            trigger_event_type,
-            Some("command.completed")
-                | Some("action_completed")
-                | Some("step.exit")
-                | Some("step_completed")
-                | Some("iterator_completed")
-        ) {
+        if !callback_resume_trigger
+            && !matches!(
+                trigger_event_type,
+                Some("command.completed")
+                    | Some("action_completed")
+                    | Some("step.exit")
+                    | Some("step_completed")
+                    | Some("iterator_completed")
+            )
+        {
             return Ok(OrchestrationResult {
                 state: ExecutionState::InProgress,
                 commands,
