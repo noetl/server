@@ -3581,6 +3581,8 @@ async fn apply_worker_orchestration(
     // (`NOETL_EVENT_RESULT_CONTEXT_MAX_BYTES`, default 100KB) and rides the
     // `call.done` payload as an `output_b64` string.
     let mut decoded = decode_orchestration_result(find_output_b64(payload));
+    // noetl/ai-meta#154 Leg A — set when the miss was specifically an absent ref.
+    let mut orchestrate_ref_missing = false;
 
     // Offloaded path (noetl/ai-meta#113): a large drive result (≈ the full
     // execution context — e.g. http_to_postgres, save_edge_cases) exceeds the
@@ -3620,10 +3622,22 @@ async fn apply_worker_orchestration(
                             );
                         }
                     }
-                    Ok(None) => warn!(
-                        execution_id,
-                        ref_uri, "worker-driven: orchestrate result ref not found in store"
-                    ),
+                    Ok(None) => {
+                        // noetl/ai-meta#154 Leg A. A ref that is ABSENT from the
+                        // store is a different failure from a payload that will
+                        // not decode, and until now both landed on the same
+                        // `decode_error` label. That mattered: the fall-through
+                        // below returns Ok(0) — no commands, no terminal event —
+                        // so the execution stays RUNNING and the 8s reconciler
+                        // re-drives it forever. A loop that is indistinguishable
+                        // in metrics from a one-off decode failure is a loop
+                        // nobody can see.
+                        orchestrate_ref_missing = true;
+                        warn!(
+                            execution_id,
+                            ref_uri, "worker-driven: orchestrate result ref not found in store"
+                        )
+                    }
                     Err(e) => warn!(
                         execution_id,
                         ref_uri, %e,
@@ -3678,7 +3692,16 @@ async fn apply_worker_orchestration(
             "worker-driven: could not decode OrchestrationResult from orchestrate completion \
              (missing output_b64, bad base64, or an error envelope)"
         );
-        crate::metrics::record_orchestrate_drive("decode_error");
+        // noetl/ai-meta#154 Leg A: separate the two causes. `ref_not_found`
+        // means the drive result was offloaded and its object is gone — which
+        // re-drives forever because this returns Ok(0) with no terminal event.
+        // `decode_error` is a malformed payload. Same outcome today, different
+        // cause, and only one of them loops.
+        crate::metrics::record_orchestrate_drive(if orchestrate_ref_missing {
+            "ref_not_found"
+        } else {
+            "decode_error"
+        });
         return Ok(0);
     };
 
