@@ -133,8 +133,16 @@ impl TemplateRenderer {
             }
         }
 
-        // Try to parse as primitive values
-        if let Ok(b) = trimmed.parse::<bool>() {
+        // Try to parse as primitive values.
+        //
+        // noetl/ai-meta#231 — `str::parse::<bool>()` accepts ONLY lowercase
+        // `"true"` / `"false"`.  The template engine renders a boolean
+        // Python-style, so a JSON `true` in the context came back out as
+        // `"True"`, matched nothing here, and fell through to a plain String.
+        // `test_issue_89_scalar_renders_unaffected` asserts the intended
+        // contract ("a number stays a number, a bool stays a bool") and has been
+        // RED on main for exactly that reason.
+        if let Some(b) = parse_engine_bool(trimmed) {
             return Ok(serde_json::Value::Bool(b));
         }
         if let Ok(i) = trimmed.parse::<i64>() {
@@ -392,6 +400,26 @@ impl TemplateRenderer {
 }
 
 /// Check if a string contains Jinja2 template syntax.
+/// Parse the boolean spellings the template engine actually emits.
+///
+/// minijinja renders a boolean Python-style (`True` / `False`); Rust's
+/// `str::parse::<bool>()` accepts only `true` / `false`.  Accept both, and
+/// nothing else.
+///
+/// Deliberately narrower than the truthiness rule in
+/// [`TemplateRenderer::evaluate_condition`], which decides whether a `when:`
+/// guard fires and treats `no` / `off` / `{}` / `[]` as falsy.  These are two
+/// different questions — *what type is this value* versus *does this value mean
+/// yes* — and conflating them here would re-type `"1"` away from the number 1
+/// and `"off"` away from the string it is.
+fn parse_engine_bool(s: &str) -> Option<bool> {
+    match s {
+        "true" | "True" => Some(true),
+        "false" | "False" => Some(false),
+        _ => None,
+    }
+}
+
 fn contains_template_syntax(s: &str) -> bool {
     (s.contains("{{") && s.contains("}}")) || (s.contains("{%") && s.contains("%}"))
 }
@@ -1057,6 +1085,51 @@ mod tests {
     }
 
     #[test]
+    /// noetl/ai-meta#231. The FALSE direction is the one that matters: a
+    /// `String("False")` is a non-empty string, so anything doing a bare
+    /// truthiness check on it reads it as YES — silently running work that
+    /// should have been skipped. The `true` case merely looked odd; this one
+    /// flips a branch.
+    #[test]
+    fn a_python_style_bool_types_back_to_a_json_bool() {
+        let renderer = TemplateRenderer::new();
+        let mut ctx = HashMap::new();
+        ctx.insert("yes".to_string(), serde_json::json!(true));
+        ctx.insert("no".to_string(), serde_json::json!(false));
+        assert_eq!(
+            renderer.render_to_value("{{ yes }}", &ctx).unwrap(),
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            renderer.render_to_value("{{ no }}", &ctx).unwrap(),
+            serde_json::json!(false),
+            "a false bool must not survive as the truthy string \"False\""
+        );
+    }
+
+    /// The control. Widening the bool parse must NOT swallow values that are
+    /// legitimately something else — `render_to_value` types config and loop
+    /// values, where `"1"` is the number 1 and `"on"` is a string. This is why
+    /// the helper matches two exact spellings rather than lower-casing and
+    /// reusing `evaluate_condition`'s much wider falsy set.
+    #[test]
+    fn only_the_two_bool_spellings_are_re_typed() {
+        let renderer = TemplateRenderer::new();
+        let mut ctx = HashMap::new();
+        for (k, v) in [("one", "1"), ("on", "on"), ("yes", "yes"), ("tru", "TRUE")] {
+            ctx.insert(k.to_string(), serde_json::json!(v));
+        }
+        assert_eq!(
+            renderer.render_to_value("{{ one }}", &ctx).unwrap(),
+            serde_json::json!(1),
+            "a numeric string stays a number, not a bool"
+        );
+        for k in ["on", "yes", "tru"] {
+            let got = renderer.render_to_value(&format!("{{{{ {k} }}}}"), &ctx).unwrap();
+            assert!(got.is_string(), "{k} must stay a string, got {got:?}");
+        }
+    }
+
     fn test_issue_89_scalar_renders_unaffected() {
         // The retry only fires for container-shaped output; scalars keep
         // their existing typed parsing (number stays a number, etc.).
