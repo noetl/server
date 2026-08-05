@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.77.0](https://github.com/noetl/server/compare/v3.76.0...v3.77.0) (2026-08-05)
+
+### Features
+
+* **metrics:** the last three P2 server signals ([4448681](https://github.com/noetl/server/commit/44486814bb4ea7396bda3666411a99a4d2f9f047))
+
 ## [3.76.0](https://github.com/noetl/server/compare/v3.75.0...v3.76.0) (2026-08-05)
 
 ### Features
