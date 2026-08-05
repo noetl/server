@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.67.0](https://github.com/noetl/server/compare/v3.66.0...v3.67.0) (2026-08-05)
+
+### Features
+
+* **metrics:** count why events skip the publish path, by reason ([d9dfcf0](https://github.com/noetl/server/commit/d9dfcf0f0e234750b9d1b6f276487f0349cac66b)), closes [noetl/ai-meta#212](https://github.com/noetl/ai-meta/issues/212) [#212](https://github.com/noetl/server/issues/212) [#314](https://github.com/noetl/server/issues/314) [noetl/ai-meta#238](https://github.com/noetl/ai-meta/issues/238)
+
 ## [3.66.0](https://github.com/noetl/server/compare/v3.65.0...v3.66.0) (2026-08-05)
 
 ### Features
