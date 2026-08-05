@@ -54,7 +54,7 @@
 use std::sync::OnceLock;
 
 use prometheus::{
-    Histogram, HistogramOpts, HistogramVec, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry, TextEncoder,
+    Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry, TextEncoder,
 };
 
 /// Bucket boundaries for the event-ingest histogram (seconds).
@@ -1560,6 +1560,112 @@ pub fn credentials_sealed_total() -> &'static IntCounterVec {
     })
 }
 
+/// `noetl_sharding_config_parse_failed` — 1 when `NOETL_SHARDS` /
+/// `NOETL_CLUSTER_DSN` failed to parse and the server fell back to single-pool.
+///
+/// The fallback is deliberate and safe, but it is also SILENT: an operator who
+/// configured sharding gets none of it, and the only trace is one startup
+/// `tracing::warn!` on a workload whose /metrics is what anyone actually
+/// queries.  A gauge survives the boot it describes; a log line scrolls away.
+///
+/// Unlabelled, so it reads 0 on a healthy server rather than being absent.
+pub fn sharding_config_parse_failed() -> &'static IntGauge {
+    static M: OnceLock<IntGauge> = OnceLock::new();
+    M.get_or_init(|| {
+        let g = IntGauge::new(
+            "noetl_sharding_config_parse_failed",
+            "1 when sharding config failed to parse and single-pool fallback was used (noetl/ai-meta#238).",
+        )
+        .expect("static gauge spec must be valid");
+        registry()
+            .register(Box::new(g.clone()))
+            .expect("gauge registration must succeed");
+        g
+    })
+}
+
+/// Record whether the sharding config parsed.  Call once at startup, with
+/// `false` on the healthy path so the gauge exists either way.
+pub fn set_sharding_config_parse_failed(failed: bool) {
+    sharding_config_parse_failed().set(i64::from(failed));
+}
+
+/// `noetl_permanent_log_lean_stage_failed_total` — command-context stages that
+/// failed, leaving the context inline.
+///
+/// Not a correctness failure: the context is still carried, just not staged out
+/// of the event.  But it means the lean-log strip silently did not apply, so
+/// the saving it exists for is not happening and nothing said so.
+pub fn permanent_log_lean_stage_failed_total() -> &'static IntCounter {
+    static M: OnceLock<IntCounter> = OnceLock::new();
+    M.get_or_init(|| {
+        let c = IntCounter::new(
+            "noetl_permanent_log_lean_stage_failed_total",
+            "Command-context stages that failed, leaving context inline (noetl/ai-meta#238).",
+        )
+        .expect("static counter spec must be valid");
+        registry()
+            .register(Box::new(c.clone()))
+            .expect("counter registration must succeed");
+        c
+    })
+}
+
+/// Record one failed command-context stage.
+pub fn record_permanent_log_lean_stage_failed() {
+    permanent_log_lean_stage_failed_total().inc();
+}
+
+/// `noetl_command_row_insert_failed_total{mode}` — `noetl.command` rows the
+/// server failed to write, by whether it was a single or batch insert.
+///
+/// Both sites call this "non-fatal — event log is source of truth", which is
+/// right about REPLAY and understates the rest: `noetl.command` is read on
+/// live paths.  `handlers/container_callback.rs` resolves `catalog_id` from it
+/// to route a container's resume, and `handlers/events.rs` does five further
+/// lookups.  A missing row therefore does not corrupt state, but it can make a
+/// later callback unable to find its catalog entry — on the same resume path
+/// noetl/ai-meta#227 is about.
+///
+/// It is emphatically not a reason to fail the request; it is a reason to be
+/// able to see that it happened, which until now nothing could.
+pub fn command_row_insert_failed_total() -> &'static IntCounterVec {
+    static M: OnceLock<IntCounterVec> = OnceLock::new();
+    M.get_or_init(|| {
+        let counter = IntCounterVec::new(
+            Opts::new(
+                "noetl_command_row_insert_failed_total",
+                "noetl.command rows that failed to insert, by mode (noetl/ai-meta#238).",
+            ),
+            &["mode"],
+        )
+        .expect("static counter spec must be valid");
+        registry()
+            .register(Box::new(counter.clone()))
+            .expect("counter registration must succeed");
+        counter
+    })
+}
+
+/// The two insert shapes.
+pub const COMMAND_ROW_INSERT_MODES: [&str; 2] = ["single", "batch"];
+
+/// Materialise every [`COMMAND_ROW_INSERT_MODES`] series at 0.
+pub fn init_command_row_insert_series() {
+    for mode in COMMAND_ROW_INSERT_MODES {
+        command_row_insert_failed_total()
+            .with_label_values(&[mode])
+            .inc_by(0);
+    }
+}
+
+/// Record one failed `noetl.command` insert.
+pub fn record_command_row_insert_failed(mode: &str) {
+    command_row_insert_failed_total()
+        .with_label_values(&[mode])
+        .inc();
+}
+
 /// `noetl_system_plugin_seed_total{outcome}` — built-in wasm plug-ins seeded
 /// into the catalog at startup, and the ones that were skipped.
 ///
@@ -2829,6 +2935,49 @@ mod tests {
                 "{reason} series must exist before any skip; got {lines:?}"
             );
         }
+    }
+
+    /// The remaining P2 server signals must all be readable with no activity.
+    ///
+    /// Two are unlabelled on purpose.  `sharding_config_parse_failed` is set on
+    /// BOTH startup arms so it reads 0 on a healthy server rather than being
+    /// absent — a silent single-pool fallback is precisely the case where an
+    /// absent gauge and a healthy one must not look alike.
+    #[test]
+    fn p2_server_signals_are_present_at_zero() {
+        init_command_row_insert_series();
+        set_sharding_config_parse_failed(false);
+        // Touch the counter's registration without incrementing it.
+        permanent_log_lean_stage_failed_total();
+        let text = gather_text().expect("gather metrics text");
+
+        for mode in COMMAND_ROW_INSERT_MODES {
+            assert!(
+                text.lines().any(|l| l
+                    .starts_with("noetl_command_row_insert_failed_total{")
+                    && l.contains(&format!("mode=\"{mode}\""))),
+                "{mode} must be pinned at 0"
+            );
+        }
+        let g = text
+            .lines()
+            .find(|l| l.starts_with("noetl_sharding_config_parse_failed "))
+            .expect("the sharding gauge must be present even when parsing succeeded");
+        assert!(g.ends_with(" 0"), "healthy startup must read 0; got {g:?}");
+        assert!(
+            text.lines()
+                .any(|l| l.starts_with("noetl_permanent_log_lean_stage_failed_total ")),
+            "the unlabelled lean-log counter must be present at 0"
+        );
+
+        // Both startup arms must set the gauge, or the healthy path leaves it
+        // absent and the fallback stays as invisible as it was.
+        let main_rs = include_str!("main.rs");
+        assert_eq!(
+            main_rs.matches("set_sharding_config_parse_failed(").count(),
+            2,
+            "both the ok and err arms must set the gauge"
+        );
     }
 
     /// Every way a command fails to reach the EHDB bus must be counted, and all
