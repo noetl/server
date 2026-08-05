@@ -243,66 +243,85 @@ mod tests {
         assert!(r.broker_for("us-east-1").is_none());
     }
 
-    #[test]
-    fn registry_from_env_parses_json() {
-        // Restore env after the test to avoid poisoning siblings.
-        let saved = std::env::var("NOETL_SECRET_BROKER_REGISTRY").ok();
-        unsafe {
-            std::env::set_var(
-                "NOETL_SECRET_BROKER_REGISTRY",
-                r#"{"eu":"https://eu.example","ap":"https://ap.example"}"#,
-            )
+    /// Serialises the four tests that mutate `NOETL_SECRET_BROKER_REGISTRY`.
+    ///
+    /// `cargo test` runs tests on a thread pool and env vars are process-wide.
+    /// Each test previously saved and restored the variable inline, which keeps
+    /// it tidy in isolation and does nothing about a sibling writing between the
+    /// `set_var` and the `from_env` — `registry_drops_empty_values` and
+    /// `registry_from_env_parses_json` failed together in 5 of 15 runs.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Restores on drop, so a failing assertion cannot leave the variable set
+    /// for whichever test takes the lock next.
+    struct RegistryEnv {
+        saved: Option<String>,
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Drop for RegistryEnv {
+        fn drop(&mut self) {
+            match &self.saved {
+                Some(v) => unsafe { std::env::set_var("NOETL_SECRET_BROKER_REGISTRY", v) },
+                None => unsafe { std::env::remove_var("NOETL_SECRET_BROKER_REGISTRY") },
+            }
+        }
+    }
+
+    /// Run `f` with `NOETL_SECRET_BROKER_REGISTRY` set to `value` (or unset),
+    /// holding the lock for the whole body.
+    fn with_registry_env<F: FnOnce() -> R, R>(value: Option<&str>, f: F) -> R {
+        // A poisoned lock means a previous test panicked; its RegistryEnv still
+        // ran, so recover rather than cascade a second failure.
+        let guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = RegistryEnv {
+            saved: std::env::var("NOETL_SECRET_BROKER_REGISTRY").ok(),
+            _guard: guard,
         };
-        let r = BrokerRegistry::from_env();
-        assert_eq!(r.len(), 2);
-        assert_eq!(r.broker_for("eu"), Some("https://eu.example"));
-        match saved {
+        match value {
             Some(v) => unsafe { std::env::set_var("NOETL_SECRET_BROKER_REGISTRY", v) },
             None => unsafe { std::env::remove_var("NOETL_SECRET_BROKER_REGISTRY") },
         }
+        f()
+    }
+
+    #[test]
+    fn registry_from_env_parses_json() {
+        with_registry_env(
+            Some(r#"{"eu":"https://eu.example","ap":"https://ap.example"}"#),
+            || {
+                let r = BrokerRegistry::from_env();
+                assert_eq!(r.len(), 2);
+                assert_eq!(r.broker_for("eu"), Some("https://eu.example"));
+            },
+        );
     }
 
     #[test]
     fn registry_from_env_empty_when_unset() {
-        let saved = std::env::var("NOETL_SECRET_BROKER_REGISTRY").ok();
-        unsafe { std::env::remove_var("NOETL_SECRET_BROKER_REGISTRY") };
-        let r = BrokerRegistry::from_env();
-        assert_eq!(r.len(), 0);
-        if let Some(v) = saved {
-            unsafe { std::env::set_var("NOETL_SECRET_BROKER_REGISTRY", v) };
-        }
+        with_registry_env(None, || {
+            let r = BrokerRegistry::from_env();
+            assert_eq!(r.len(), 0);
+        });
     }
 
     #[test]
     fn registry_from_env_empty_when_invalid_json() {
-        let saved = std::env::var("NOETL_SECRET_BROKER_REGISTRY").ok();
-        unsafe { std::env::set_var("NOETL_SECRET_BROKER_REGISTRY", "not-json") };
-        let r = BrokerRegistry::from_env();
-        assert_eq!(r.len(), 0);
-        match saved {
-            Some(v) => unsafe { std::env::set_var("NOETL_SECRET_BROKER_REGISTRY", v) },
-            None => unsafe { std::env::remove_var("NOETL_SECRET_BROKER_REGISTRY") },
-        }
+        with_registry_env(Some("not-json"), || {
+            let r = BrokerRegistry::from_env();
+            assert_eq!(r.len(), 0);
+        });
     }
 
     #[test]
     fn registry_drops_empty_values() {
-        let saved = std::env::var("NOETL_SECRET_BROKER_REGISTRY").ok();
-        unsafe {
-            std::env::set_var(
-                "NOETL_SECRET_BROKER_REGISTRY",
-                r#"{"eu":"","ap":"https://ap.example"}"#,
-            )
-        };
-        let r = BrokerRegistry::from_env();
-        // Empty value for `eu` filtered out; only `ap` survives.
-        assert_eq!(r.len(), 1);
-        assert!(r.broker_for("eu").is_none());
-        assert_eq!(r.broker_for("ap"), Some("https://ap.example"));
-        match saved {
-            Some(v) => unsafe { std::env::set_var("NOETL_SECRET_BROKER_REGISTRY", v) },
-            None => unsafe { std::env::remove_var("NOETL_SECRET_BROKER_REGISTRY") },
-        }
+        with_registry_env(Some(r#"{"eu":"","ap":"https://ap.example"}"#), || {
+            let r = BrokerRegistry::from_env();
+            // Empty value for `eu` filtered out; only `ap` survives.
+            assert_eq!(r.len(), 1);
+            assert!(r.broker_for("eu").is_none());
+            assert_eq!(r.broker_for("ap"), Some("https://ap.example"));
+        });
     }
 
     #[test]
