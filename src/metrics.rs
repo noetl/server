@@ -181,6 +181,34 @@ pub fn record_orphan_sweep(outcome: &str) {
     orphan_sweep_total().with_label_values(&[outcome]).inc();
 }
 
+/// The five `outcome` values, kept in sync with the `record_orphan_sweep`
+/// call sites in [`crate::handlers::orphan_sweep`] (all string literals).
+pub const ORPHAN_SWEEP_OUTCOMES: [&str; 5] = [
+    "candidate",
+    "terminated",
+    "skipped_live",
+    "capped",
+    "error",
+];
+
+/// Materialise every [`ORPHAN_SWEEP_OUTCOMES`] series at 0.
+///
+/// Same reasoning as [`init_nonconvergence_sweep_series`], and it lands on the
+/// same operational question.  This guardrail also emits `playbook.failed`, and
+/// noetl/ai-meta#227 describes it re-issuing against permanently stalled
+/// executions on an otherwise idle cluster — a loop that was detected only by
+/// watching `ehdb_feed_shard_committed` climb, because these counters were
+/// absent rather than zero.  "Is the guardrail doing anything, and is it
+/// terminating things?" should be one scrape, not an inference from a shard
+/// cursor.
+pub fn init_orphan_sweep_series() {
+    for outcome in ORPHAN_SWEEP_OUTCOMES {
+        orphan_sweep_total()
+            .with_label_values(&[outcome])
+            .inc_by(0);
+    }
+}
+
 // ── Systemic non-convergence sweep (noetl/ai-meta#227 part B) ────────────────
 
 /// `noetl_nonconvergence_sweep_total{outcome}` — outcomes of the systemic
@@ -2618,6 +2646,27 @@ mod tests {
             assert!(
                 lines.iter().any(|l| l.contains(&format!("reason=\"{reason}\""))),
                 "{reason} series must exist before any skip; got {lines:?}"
+            );
+        }
+    }
+
+    /// The orphan guardrail also emits `playbook.failed`, and noetl/ai-meta#227
+    /// describes it looping against stalled executions while these counters were
+    /// absent — so the loop was found by watching a shard cursor climb.
+    #[test]
+    fn orphan_sweep_outcome_series_exist_at_zero() {
+        init_orphan_sweep_series();
+        let text = gather_text().expect("gather metrics text");
+        let lines: Vec<&str> = text
+            .lines()
+            .filter(|l| l.starts_with("noetl_orphan_sweep_total{"))
+            .collect();
+        for outcome in ORPHAN_SWEEP_OUTCOMES {
+            assert!(
+                lines
+                    .iter()
+                    .any(|l| l.contains(&format!("outcome=\"{outcome}\""))),
+                "{outcome} series must exist before any sweep; got {lines:?}"
             );
         }
     }
