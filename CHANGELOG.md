@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.70.0](https://github.com/noetl/server/compare/v3.69.0...v3.70.0) (2026-08-05)
+
+### Features
+
+* **metrics:** pin the orphan-guardrail outcome series ([edf9e13](https://github.com/noetl/server/commit/edf9e13cd78139b1416ae9ead7ffcc86edf4f58c)), closes [noetl/ai-meta#227](https://github.com/noetl/ai-meta/issues/227) [#227](https://github.com/noetl/server/issues/227) [noetl/ai-meta#238](https://github.com/noetl/ai-meta/issues/238) [noetl/ai-meta#227](https://github.com/noetl/ai-meta/issues/227)
+
 ## [3.69.0](https://github.com/noetl/server/compare/v3.68.1...v3.69.0) (2026-08-05)
 
 ### Features
