@@ -764,6 +764,7 @@ async fn main() -> anyhow::Result<()> {
     noetl_server::metrics::init_orphan_sweep_series();
     noetl_server::metrics::init_parity_and_dedup_series();
     noetl_server::metrics::init_result_tier_gc_series();
+    noetl_server::metrics::init_credential_seal_series();
     noetl_server::handlers::auth_verify::init_verify_series();
 
     // Load configuration
