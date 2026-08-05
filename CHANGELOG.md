@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.65.0](https://github.com/noetl/server/compare/v3.64.2...v3.65.0) (2026-08-05)
+
+### Features
+
+* **metrics:** expose whether the EHDB events publisher is configured ([2eeaab8](https://github.com/noetl/server/commit/2eeaab8abedba4b958aeca1641c284ced6634f6e)), closes [noetl/ai-meta#238](https://github.com/noetl/ai-meta/issues/238) [noetl/ai-meta#238](https://github.com/noetl/ai-meta/issues/238)
+
 ## [3.64.2](https://github.com/noetl/server/compare/v3.64.1...v3.64.2) (2026-08-05)
 
 ### Bug Fixes
