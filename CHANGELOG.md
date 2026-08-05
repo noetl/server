@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.68.0](https://github.com/noetl/server/compare/v3.67.0...v3.68.0) (2026-08-05)
+
+### Features
+
+* **metrics:** publish build_info, and pin the label sets unconditionally ([9c487ea](https://github.com/noetl/server/commit/9c487eab81154d0ddd02672a6b29b5e0e757b1a6)), closes [noetl/ai-meta#238](https://github.com/noetl/ai-meta/issues/238)
+
 ## [3.67.0](https://github.com/noetl/server/compare/v3.66.0...v3.67.0) (2026-08-05)
 
 ### Features
