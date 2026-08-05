@@ -66,7 +66,7 @@ pub enum VerifyMode {
 }
 
 impl VerifyMode {
-    fn label(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
             VerifyMode::Off => "off",
             VerifyMode::Shadow => "shadow",
@@ -120,6 +120,53 @@ impl VerifyOutcome {
             VerifyOutcome::JwksUnavailable => "jwks_unavailable",
             VerifyOutcome::NoDomain => "no_domain",
         }
+    }
+
+    /// Every variant, so the metric series can be materialised before the first
+    /// login.  Adding a variant without adding it here is caught by
+    /// `all_outcomes_covers_every_variant`.
+    pub const ALL: [VerifyOutcome; 7] = [
+        VerifyOutcome::Success,
+        VerifyOutcome::BadSignature,
+        VerifyOutcome::BadClaims,
+        VerifyOutcome::UnknownKid,
+        VerifyOutcome::Malformed,
+        VerifyOutcome::JwksUnavailable,
+        VerifyOutcome::NoDomain,
+    ];
+}
+
+/// Materialise `noetl_auth_jwt_verify_total` for the **currently configured**
+/// mode, all outcomes at 0.  Call once at startup.
+///
+/// `noetl/ai-meta#169` shipped signature verification in `shadow` — it observes
+/// and never rejects — and the decision to move to `enforce` waits on evidence
+/// that real logins verify cleanly.  That evidence was unreadable: a labelled
+/// counter has no series until it is incremented and `Registry::gather` prunes
+/// empty families, so a shadow deployment with no logins yet and a deployment
+/// where verification is not running at all both rendered as **nothing**.
+///
+/// Pinning the configured mode's outcomes makes three things readable from one
+/// scrape:
+///
+/// - **which mode is active** — the `mode` label on the pinned series, rather
+///   than reading `NOETL_AUTH_VERIFY_SIGNATURE` off the Deployment, which is a
+///   different representation and can disagree with the running process;
+/// - **whether any login has been verified yet** — `success` moving off 0,
+///   which is precisely #169's blocker;
+/// - **whether failures are occurring** — and of which kind, so `bad_claims`
+///   (an `aud` that is not set yet) is distinguishable from `bad_signature`
+///   (a real rejection) before enforce is switched on.
+///
+/// Only the configured mode is pinned.  Pinning all three would emit 21 series
+/// of which 14 can never move, and would lose the "which mode is active"
+/// signal that comes from exactly one mode being present.
+pub fn init_verify_series() {
+    let mode = verify_mode();
+    for outcome in VerifyOutcome::ALL {
+        crate::metrics::auth_jwt_verify_total()
+            .with_label_values(&[mode.label(), outcome.label()])
+            .inc_by(0);
     }
 }
 
@@ -435,6 +482,59 @@ mod tests {
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
     use jsonwebtoken::{encode, EncodingKey, Header};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// `VerifyOutcome::ALL` must list every variant.  The inner match is
+    /// exhaustive, so adding a variant fails to **compile** here — stronger
+    /// than a runtime count, which fails only if someone runs the test.
+    #[test]
+    fn all_outcomes_covers_every_variant() {
+        fn covered(o: VerifyOutcome) -> bool {
+            match o {
+                VerifyOutcome::Success
+                | VerifyOutcome::BadSignature
+                | VerifyOutcome::BadClaims
+                | VerifyOutcome::UnknownKid
+                | VerifyOutcome::Malformed
+                | VerifyOutcome::JwksUnavailable
+                | VerifyOutcome::NoDomain => true,
+            }
+        }
+        for o in VerifyOutcome::ALL {
+            assert!(covered(o));
+        }
+        let mut labels: Vec<&str> = VerifyOutcome::ALL.iter().map(|o| o.label()).collect();
+        let before = labels.len();
+        labels.sort_unstable();
+        labels.dedup();
+        assert_eq!(labels.len(), before, "ALL must not repeat a variant; got {labels:?}");
+    }
+
+    /// After init the metric must carry one series per outcome, all for a
+    /// single mode — the point being that a shadow deployment with no logins
+    /// yet reads as seven zeros rather than as nothing at all.
+    ///
+    /// Deliberately does not set `NOETL_AUTH_VERIFY_SIGNATURE`: whichever mode
+    /// is configured the asserted shape holds, and mutating process env from a
+    /// test races every other test in the binary.
+    #[test]
+    fn init_pins_one_series_per_outcome_for_a_single_mode() {
+        init_verify_series();
+        let text = crate::metrics::gather_text().expect("gather metrics text");
+        let lines: Vec<&str> = text
+            .lines()
+            .filter(|l| l.starts_with("noetl_auth_jwt_verify_total{"))
+            .collect();
+        for outcome in VerifyOutcome::ALL {
+            let want = format!("outcome=\"{}\"", outcome.label());
+            assert!(lines.iter().any(|l| l.contains(&want)), "{want} must be pinned; got {lines:?}");
+        }
+        let modes: std::collections::BTreeSet<&str> = lines
+            .iter()
+            .filter_map(|l| l.split("mode=\"").nth(1))
+            .filter_map(|r| r.split('"').next())
+            .collect();
+        assert_eq!(modes.len(), 1, "exactly one mode should be pinned; got {modes:?}");
+    }
 
     // Throwaway RSA-2048 keypair generated offline for these tests ONLY. It is
     // not a secret and guards no real resource — it exists so a token can be
