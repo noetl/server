@@ -232,6 +232,7 @@ impl EhdbCommandPublisher {
                 }
                 Err(e) => {
                     last_err = format!("EHDB publish failed: {e}");
+                    crate::metrics::record_ehdb_command_publish_failed("attempt");
                     // Drop the router so the next attempt redials (writer
                     // restarted, rolled, or a shard moved) — but only if it is
                     // still the one that failed, so a redial another task already
@@ -255,6 +256,10 @@ impl EhdbCommandPublisher {
                 }
             }
         }
+        // Countable, not just loggable: this is the dispatch path, and a command
+        // that is never published is never claimed — the execution stops with no
+        // terminal event to notice it (noetl/ai-meta#208).
+        crate::metrics::record_ehdb_command_publish_failed("gave_up");
         tracing::error!(
             execution_id,
             event_id,

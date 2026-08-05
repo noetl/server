@@ -292,6 +292,46 @@ pub fn record_command_publish(route: &str, pool: &str) {
         .inc();
 }
 
+/// `noetl_ehdb_command_publish_failed_total{reason}` — command notifications the
+/// server **gave up** publishing to the EHDB writer after exhausting its retry
+/// window, and per-attempt failures that were retried.
+///
+/// `noetl_command_publish_total` counts only successes, so before this there was
+/// no failure rate and a total give-up was visible in the log and nowhere else.
+/// That matters on this path specifically: post-T5 the EHDB writer is the only
+/// transport carrying command notifications, and a command that is never
+/// published is never claimed — the execution simply stops, with no terminal
+/// event to notice. noetl/ai-meta#208 was exactly that shape and ran unnoticed
+/// in production for ~2.4 days.
+///
+/// `reason` is `gave_up` (retry window exhausted; the dispatch is lost) or
+/// `attempt` (one publish attempt failed and will be retried — expected during
+/// a writer restart, and only interesting as a rate).
+pub fn ehdb_command_publish_failed_total() -> &'static IntCounterVec {
+    static M: OnceLock<IntCounterVec> = OnceLock::new();
+    M.get_or_init(|| {
+        let counter = IntCounterVec::new(
+            Opts::new(
+                "noetl_ehdb_command_publish_failed_total",
+                "Command notifications the server failed to publish to the EHDB writer, by reason (noetl/ai-meta#208).",
+            ),
+            &["reason"],
+        )
+        .expect("static counter spec must be valid");
+        registry()
+            .register(Box::new(counter.clone()))
+            .expect("counter registration must succeed");
+        counter
+    })
+}
+
+/// Record a failed EHDB command publish (see [`ehdb_command_publish_failed_total`]).
+pub fn record_ehdb_command_publish_failed(reason: &str) {
+    ehdb_command_publish_failed_total()
+        .with_label_values(&[reason])
+        .inc();
+}
+
 // ── Off-server tail-attach accelerator (noetl/ai-meta#156) ───────────────────
 
 /// `noetl_offserver_tail_attached_total{outcome}` — off-server drive dispatches
@@ -2339,5 +2379,36 @@ mod tests {
             names.len()
         );
         assert!(names.iter().all(|n| !n.is_empty()));
+    }
+
+    /// noetl/ai-meta#208 — a publish that gives up must be COUNTABLE, not only
+    /// loggable.  `noetl_command_publish_total` counts successes, so without
+    /// this counter there is no failure rate and a total give-up is invisible
+    /// outside the log.
+    #[test]
+    fn ehdb_publish_failures_are_counted_by_reason() {
+        record_ehdb_command_publish_failed("gave_up");
+        record_ehdb_command_publish_failed("attempt");
+        record_ehdb_command_publish_failed("attempt");
+
+        let text = gather_text().expect("gather metrics text");
+        assert!(
+            text.contains("noetl_ehdb_command_publish_failed_total"),
+            "the counter must appear in /metrics output"
+        );
+        // Scoped to this metric's own lines so the assertion cannot pass on
+        // some other metric that happens to carry the same label.
+        let lines: Vec<&str> = text
+            .lines()
+            .filter(|l| l.starts_with("noetl_ehdb_command_publish_failed_total{"))
+            .collect();
+        assert!(
+            lines.iter().any(|l| l.contains("reason=\"gave_up\"")),
+            "gave_up series missing; got {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("reason=\"attempt\"")),
+            "attempt series missing; got {lines:?}"
+        );
     }
 }
