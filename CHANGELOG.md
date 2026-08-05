@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.76.0](https://github.com/noetl/server/compare/v3.75.0...v3.76.0) (2026-08-05)
+
+### Features
+
+* **metrics:** count the two ways an EHDB command is never delivered ([d4e36b0](https://github.com/noetl/server/commit/d4e36b0a9e8b1b6ca3de7656118546b20522ba6b))
+
 ## [3.75.0](https://github.com/noetl/server/compare/v3.74.0...v3.75.0) (2026-08-05)
 
 ### Features
