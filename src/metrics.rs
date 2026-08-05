@@ -1382,7 +1382,7 @@ pub fn record_jwks_event(event: &str) {
 ///   label (`provider_build_error`, `provider_fetch_error`, `template_error`).
 ///
 /// `execution_id` is NOT a label (cardinality) — it lives on the matching
-/// span per [`agents/rules/observability.md`].  Region IS a label by design:
+/// span per [`agents/rules/observability.md`](https://github.com/noetl/ai-meta/blob/main/agents/rules/observability.md).  Region IS a label by design:
 /// the cardinality is bounded (operators don't deploy into hundreds of
 /// regions in practice), and per-region breakdown is exactly what an
 /// operator queries when troubleshooting a residency-related outage.
@@ -1458,7 +1458,7 @@ pub fn record_secret_provider_build(provider: &str, region: &str, status: &str) 
 /// where cloud secret managers and Vault clusters actually live.
 ///
 /// `execution_id` is NOT a label — it lives on the matching `secret.resolve`
-/// span per [`agents/rules/observability.md`] Principle 4.
+/// span per [`agents/rules/observability.md`](https://github.com/noetl/ai-meta/blob/main/agents/rules/observability.md) Principle 4.
 pub fn secret_resolve_duration_seconds() -> &'static HistogramVec {
     static M: OnceLock<HistogramVec> = OnceLock::new();
     M.get_or_init(|| {
@@ -1806,7 +1806,7 @@ pub fn record_secret_refresh(outcome: &str) {
 /// `status` ∈ { `ok`, `error` }.
 /// `execution_id` is NOT a label (cardinality) — it lives on the
 /// `result_store.put` tracing span per
-/// [`agents/rules/observability.md`] Principle 4.
+/// [`agents/rules/observability.md`](https://github.com/noetl/ai-meta/blob/main/agents/rules/observability.md) Principle 4.
 pub fn result_store_put_total() -> &'static IntCounterVec {
     static M: OnceLock<IntCounterVec> = OnceLock::new();
     M.get_or_init(|| {

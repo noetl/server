@@ -10,7 +10,7 @@
 //!
 //! Internal-only surface, gated by `RequireInternalApiToken` like the sibling
 //! `/api/internal/result-tier/gc` route — workers write through the API, never
-//! directly to `noetl.*` ([`data-access-boundary.md`]). Both endpoints are
+//! directly to `noetl.*` ([`data-access-boundary.md`](https://github.com/noetl/ai-meta/blob/main/agents/rules/data-access-boundary.md)). Both endpoints are
 //! idempotent, so a worker retry / redelivery never corrupts the set.
 //!
 //! - `POST /api/internal/sink-state/mark` — record an execution pending-sink.
