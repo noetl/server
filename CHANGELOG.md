@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.64.1](https://github.com/noetl/server/compare/v3.64.0...v3.64.1) (2026-08-05)
+
+### Bug Fixes
+
+* **orchestrate-core:** read the parked-callback marker from the wire shape ([93e2211](https://github.com/noetl/server/commit/93e221186dc0be1bbae58c3befbec8ec6eff890e)), closes [noetl/ai-meta#186](https://github.com/noetl/ai-meta/issues/186)
+
 ## [3.64.0](https://github.com/noetl/server/compare/v3.63.0...v3.64.0) (2026-08-05)
 
 ### Features
