@@ -5,6 +5,7 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use crate::db::models::{
     CatalogEntries, CatalogEntry, CatalogEntryRequest, CatalogEntryResponse,
     CatalogRegisterRequest, CatalogRegisterResponse,
+    CatalogDeleteRequest, CatalogDeleteResponse, DeletedCatalogEntry,
 };
 use crate::db::queries::catalog as queries;
 use crate::db::DbPool;
@@ -102,6 +103,73 @@ impl CatalogService {
     }
 
     /// List catalog entries.
+    /// Delete catalog entries for a path (noetl/ai-meta#237).
+    ///
+    /// Routed through the service like every other catalog mutation so the
+    /// data-access boundary holds: `noetl.catalog` is server-owned, and the
+    /// only supported way to remove a row is this API. Before it existed the
+    /// alternative was a raw `DELETE FROM noetl.catalog`, which bypasses the
+    /// boundary and leaves no audit trail.
+    ///
+    /// `version: None` removes every version of the path.
+    ///
+    /// Returns what was removed rather than a bare count: `noetl.catalog` is
+    /// not event-sourced and has no replay, so the response is the only record
+    /// of what a delete actually took.
+    pub async fn delete(
+        &self,
+        request: CatalogDeleteRequest,
+    ) -> AppResult<CatalogDeleteResponse> {
+        let path = request.path.trim().to_string();
+        if path.is_empty() {
+            return Err(AppError::Validation(
+                "catalog delete requires a non-empty 'path'".to_string(),
+            ));
+        }
+
+        let removed =
+            queries::delete_catalog_entries(&self.pool, &path, request.version).await?;
+
+        let deleted: Vec<DeletedCatalogEntry> = removed
+            .iter()
+            .map(|(id, v)| DeletedCatalogEntry {
+                catalog_id: id.to_string(),
+                version: *v,
+            })
+            .collect();
+
+        crate::metrics::record_catalog_delete(if deleted.is_empty() {
+            "no_match"
+        } else {
+            "deleted"
+        });
+
+        // Deliberately INFO, not debug: this is a destructive operation on a
+        // table with no replay, and the log line is part of the audit trail.
+        tracing::info!(
+            path = %path,
+            version = ?request.version,
+            removed = deleted.len(),
+            catalog_ids = ?deleted.iter().map(|d| d.catalog_id.as_str()).collect::<Vec<_>>(),
+            "catalog delete"
+        );
+
+        let message = match (deleted.len(), request.version) {
+            (0, Some(v)) => format!("No catalog entry '{path}' version {v}; nothing removed."),
+            (0, None) => format!("No catalog entries for '{path}'; nothing removed."),
+            (n, Some(v)) => format!("Removed catalog entry '{path}' version {v} ({n} row)."),
+            (n, None) => format!("Removed {n} version(s) of catalog entry '{path}'."),
+        };
+
+        Ok(CatalogDeleteResponse {
+            status: "success".to_string(),
+            message,
+            path,
+            count: deleted.len(),
+            deleted,
+        })
+    }
+
     pub async fn list(&self, resource_type: Option<&str>) -> AppResult<CatalogEntries> {
         let entries = queries::list_catalog_entries(&self.pool, resource_type).await?;
 

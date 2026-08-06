@@ -169,3 +169,35 @@ pub struct CatalogEntryRequest {
     #[serde(default)]
     pub version: Option<String>,
 }
+
+/// `POST /api/catalog/delete` body (noetl/ai-meta#237).
+#[derive(Debug, Clone, Deserialize)]
+pub struct CatalogDeleteRequest {
+    /// Catalog path to remove.
+    pub path: String,
+    /// When present, remove only this version; when absent, remove every
+    /// version of `path`. Required to be explicit — there is deliberately no
+    /// "delete the latest" shorthand, because the latest version is the one
+    /// executions resolve to.
+    #[serde(default)]
+    pub version: Option<i16>,
+}
+
+/// One removed row, echoed back so the caller can audit what went.
+#[derive(Debug, Clone, Serialize)]
+pub struct DeletedCatalogEntry {
+    pub catalog_id: String,
+    pub version: i16,
+}
+
+/// `POST /api/catalog/delete` response.
+#[derive(Debug, Clone, Serialize)]
+pub struct CatalogDeleteResponse {
+    pub status: String,
+    pub message: String,
+    pub path: String,
+    /// Every row removed. Empty when nothing matched — deleting an absent
+    /// entry is a no-op, not an error.
+    pub deleted: Vec<DeletedCatalogEntry>,
+    pub count: usize,
+}

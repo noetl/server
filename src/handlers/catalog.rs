@@ -14,6 +14,7 @@ use serde::Deserialize;
 use crate::db::models::{
     CatalogEntries, CatalogEntriesRequest, CatalogEntryRequest, CatalogEntryResponse,
     CatalogRegisterRequest, CatalogRegisterResponse,
+    CatalogDeleteRequest, CatalogDeleteResponse,
 };
 use crate::error::{AppError, AppResult};
 use crate::services::ui_schema::{infer_ui_schema, UiSchemaResponse};
@@ -64,6 +65,71 @@ async fn register_inner(
     Json(request): Json<CatalogRegisterRequest>,
 ) -> AppResult<(StatusCode, Json<CatalogRegisterResponse>)> {
     let response = service.register(request).await?;
+    Ok((StatusCode::OK, Json(response)))
+}
+
+/// Delete catalog entries.
+///
+/// `POST /api/catalog/delete`
+///
+/// # Auth
+///
+/// Gated by [`RequireInternalApiToken`] — the same bearer the other privileged
+/// mutating surfaces use, which fails **closed**: 503 when
+/// `NOETL_INTERNAL_API_TOKEN` is unset on the server, 403 on a missing or
+/// mismatched token.
+///
+/// Deliberately stricter than `register` on the same router, which is
+/// currently ungated. Registering is additive and reversible; deleting is
+/// neither, and `noetl.catalog` has no replay to reconstruct a removed row
+/// from. Matching `register`'s posture here would have made an unauthenticated
+/// caller able to destroy catalog content.
+///
+/// # Request Body
+///
+/// ```json
+/// { "path": "tests/fixtures/foo", "version": 3 }
+/// ```
+///
+/// `version` is optional; omitting it removes **every** version of the path.
+/// There is no "delete the latest" shorthand — the latest version is the one
+/// executions resolve to, so removing it must be spelled out.
+///
+/// # Response
+///
+/// ```json
+/// {
+///   "status": "success",
+///   "message": "Removed 2 version(s) of catalog entry 'tests/fixtures/foo'.",
+///   "path": "tests/fixtures/foo",
+///   "deleted": [{"catalog_id": "123", "version": 2}, {"catalog_id": "122", "version": 1}],
+///   "count": 2
+/// }
+/// ```
+///
+/// Idempotent: deleting an absent path or version returns 200 with
+/// `count: 0` rather than 404, so a cleanup run is safe to repeat.
+pub async fn delete(
+    service: State<CatalogService>,
+    _token: crate::handlers::internal::RequireInternalApiToken,
+    request: Json<CatalogDeleteRequest>,
+) -> AppResult<(StatusCode, Json<CatalogDeleteResponse>)> {
+    let started_at = std::time::Instant::now();
+    let result = delete_inner(service, request).await;
+    let status_label = if result.is_ok() { "ok" } else { "error" };
+    crate::metrics::record_write_request(
+        crate::metrics::endpoint::CATALOG_DELETE,
+        status_label,
+        started_at.elapsed().as_secs_f64(),
+    );
+    result
+}
+
+async fn delete_inner(
+    State(service): State<CatalogService>,
+    Json(request): Json<CatalogDeleteRequest>,
+) -> AppResult<(StatusCode, Json<CatalogDeleteResponse>)> {
+    let response = service.delete(request).await?;
     Ok((StatusCode::OK, Json(response)))
 }
 
