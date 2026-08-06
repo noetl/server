@@ -2612,6 +2612,28 @@ pub fn sink_state_total() -> &'static IntCounterVec {
 }
 
 /// Record one sink-state feed operation (`mark` / `confirm` / `gc_consult`).
+/// Every `op` value `noetl_sink_state_total` can take (noetl/ai-meta#248).
+///
+/// `release` was added with the endpoint that clears a mark WITHOUT claiming the
+/// context was sunk.  Pinning matters more than usual here: the whole point of
+/// the feed is that a *retained* execution is visible, so an operator asking
+/// "did anything give up on a sink?" must be able to read a 0 rather than an
+/// absent series.
+pub const SINK_STATE_OPS: [&str; 5] = [
+    "mark",
+    "confirm",
+    "release",
+    "gc_consult",
+    "gc_feed_truncated",
+];
+
+/// Materialise every [`SINK_STATE_OPS`] series at 0.
+pub fn init_sink_state_series() {
+    for op in SINK_STATE_OPS {
+        sink_state_total().with_label_values(&[op]).inc_by(0);
+    }
+}
+
 pub fn record_sink_state(op: &str) {
     sink_state_total().with_label_values(&[op]).inc();
 }
@@ -2782,6 +2804,23 @@ pub fn record_container_callback_stale(state: &str) {
 
 #[cfg(test)]
 mod tests {
+
+    /// Serialises the tests that mutate PROCESS-GLOBAL gauges.
+    ///
+    /// `cargo test` runs tests on a thread pool and does **not** serialise them,
+    /// so two tests that both `set_ehdb_event_publisher_configured` race: one
+    /// sets it false while the other is asserting it reads 1. That produced a
+    /// flake on roughly one run in three — green often enough to look like noise
+    /// and to survive review, which is the worst frequency for a failing test.
+    ///
+    /// The lock is poison-tolerant: a panic in one test must fail that test, not
+    /// cascade into every other test that takes this lock.
+    static GLOBAL_GAUGE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_global_gauges() -> std::sync::MutexGuard<'static, ()> {
+        GLOBAL_GAUGE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     use super::*;
     // The registry is process-global, so all tests share state.
     // We assert on the rendered text after at least one observation
@@ -2936,6 +2975,7 @@ mod tests {
     /// away while a gauge survives.
     #[test]
     fn the_event_publisher_configured_gauge_tracks_both_states() {
+        let _guard = lock_global_gauges();
         set_ehdb_event_publisher_configured(false);
         let text = gather_text().expect("gather metrics text");
         let line = text
@@ -3006,6 +3046,7 @@ mod tests {
     /// and then asks what a scrape would show.
     #[test]
     fn startup_inits_alone_register_every_unlabelled_metric() {
+        let _guard = lock_global_gauges();
         init_unlabelled_series();
         set_sharding_config_parse_failed(false);
         set_ehdb_event_publisher_configured(false);
@@ -3277,6 +3318,66 @@ mod tests {
                     .iter()
                     .any(|l| l.contains(&format!("outcome=\"{outcome}\""))),
                 "{outcome} series must exist before any sweep; got {lines:?}"
+            );
+        }
+    }
+
+    /// noetl/ai-meta#248 — every `op` the code actually records must be pinned.
+    ///
+    /// An op that is recorded but not pinned is absent from `/metrics` until it
+    /// first fires, so "nothing has given up on a sink" and "this build cannot
+    /// tell you" look identical. Scans the non-test source of every call site so
+    /// the guard cannot match its own literals.
+    #[test]
+    fn sink_state_pinned_ops_cover_every_call_site() {
+        fn non_test(src: &str) -> &str {
+            src.split_once("\n#[cfg(test)]").map_or(src, |(b, _)| b)
+        }
+        let sources = [
+            non_test(include_str!("handlers/sink_state.rs")),
+            non_test(include_str!("handlers/result_tier.rs")),
+            non_test(include_str!("services/result_tier_gc.rs")),
+        ];
+        let mut found = std::collections::BTreeSet::new();
+        for src in sources {
+            let mut rest = src;
+            while let Some(k) = rest.find("record_sink_state(\"") {
+                rest = &rest[k + "record_sink_state(\"".len()..];
+                if let Some(end) = rest.find('"') {
+                    found.insert(rest[..end].to_string());
+                }
+            }
+        }
+        assert!(!found.is_empty(), "the scan found no call sites at all");
+        for op in &found {
+            assert!(
+                SINK_STATE_OPS.contains(&op.as_str()),
+                "op {op:?} is recorded but not in SINK_STATE_OPS, so it is absent \
+                 from /metrics until it first fires"
+            );
+        }
+        for pinned in SINK_STATE_OPS {
+            assert!(
+                found.contains(pinned),
+                "op {pinned:?} is pinned but nothing records it"
+            );
+        }
+    }
+
+    /// The pinned ops must be SERVED at 0 without touching a recorder.
+    #[test]
+    fn sink_state_ops_are_served_at_zero() {
+        init_sink_state_series();
+        let text = gather_text().expect("gather metrics text");
+        for op in SINK_STATE_OPS {
+            let want = format!("noetl_sink_state_total{{op=\"{op}\"}}");
+            let line = text
+                .lines()
+                .find(|l| l.starts_with(&want))
+                .unwrap_or_else(|| panic!("{want} must be pinned"));
+            assert!(
+                line.trim_end().ends_with(" 0"),
+                "{want} must read 0 before anything happens; got {line:?}"
             );
         }
     }

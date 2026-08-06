@@ -590,6 +590,10 @@ fn build_router(
             "/api/internal/sink-state/confirm",
             post(handlers::sink_state::confirm),
         )
+        .route(
+            "/api/internal/sink-state/release",
+            post(handlers::sink_state::release),
+        )
         .with_state(handlers::sink_state::SinkStateDeps {
             pool: db_pool.clone(),
         });
@@ -762,6 +766,7 @@ async fn main() -> anyhow::Result<()> {
     noetl_server::metrics::init_event_ingest_publish_skipped_series();
     noetl_server::metrics::init_nonconvergence_sweep_series();
     noetl_server::metrics::init_orphan_sweep_series();
+    noetl_server::metrics::init_sink_state_series();
     noetl_server::metrics::init_parity_and_dedup_series();
     noetl_server::metrics::init_result_tier_gc_series();
     noetl_server::metrics::init_credential_seal_series();
