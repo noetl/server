@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.78.1](https://github.com/noetl/server/compare/v3.78.0...v3.78.1) (2026-08-06)
+
+### Bug Fixes
+
+* **catalog:** a delete blocked by execution history is 409, not 500 ([067abee](https://github.com/noetl/server/commit/067abee0c99f8b8d90ea040f3454e674c56eb115)), closes [noetl/ai-meta#237](https://github.com/noetl/ai-meta/issues/237) [noetl/ai-meta#237](https://github.com/noetl/ai-meta/issues/237)
+
 ## [3.78.0](https://github.com/noetl/server/compare/v3.77.5...v3.78.0) (2026-08-06)
 
 ### Features
