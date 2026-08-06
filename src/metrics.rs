@@ -2660,7 +2660,7 @@ pub fn catalog_delete_total() -> &'static IntCounterVec {
 }
 
 /// Every `outcome` value `catalog_delete_total` can take.
-pub const CATALOG_DELETE_OUTCOMES: [&str; 2] = ["deleted", "no_match"];
+pub const CATALOG_DELETE_OUTCOMES: [&str; 3] = ["deleted", "no_match", "has_history"];
 
 /// Materialise both [`CATALOG_DELETE_OUTCOMES`] series at 0.
 ///
@@ -3364,6 +3364,45 @@ mod tests {
                 "{outcome} series must exist before any sweep; got {lines:?}"
             );
         }
+    }
+
+    /// noetl/ai-meta#237 — a foreign-key violation is a 409, not a 500.
+    ///
+    /// `noetl.event` carries an FK onto `noetl.catalog`, so any entry that has
+    /// ever been EXECUTED is pinned by its event rows, and the event log is
+    /// append-only so those rows are never removed to release it. Attempting to
+    /// hard-delete such an entry is therefore a well-formed request with a
+    /// legitimate refusal — not a server fault.
+    ///
+    /// Before this, prod returned a bare 500 whose only explanation was in the
+    /// server log. The condition was found exactly that way: the kind
+    /// validation passed because the probe entry had never been executed and so
+    /// had no FK reference — the one case that CAN be deleted.
+    ///
+    /// Asserts the mapping exists at the call site; the sqlx error type cannot
+    /// be constructed in a unit test without a live database.
+    #[test]
+    fn catalog_delete_maps_fk_violation_to_conflict() {
+        let full = include_str!("services/catalog.rs");
+        let src = full.split_once("\n#[cfg(test)]").map_or(full, |(b, _)| b);
+        assert!(
+            src.contains("Some(\"23503\")"),
+            "the FK violation SQLSTATE must be matched explicitly"
+        );
+        assert!(
+            src.contains("AppError::Conflict"),
+            "a foreign-key violation must map to Conflict (409), not fall through to 500"
+        );
+        assert!(
+            src.contains("has_history"),
+            "the refusal must be counted under its own outcome"
+        );
+        // The message has to name WHY, or a 409 is only marginally better than
+        // a 500 — the caller still cannot tell what to do about it.
+        assert!(
+            src.contains("append-only"),
+            "the 409 message must explain the append-only event FK"
+        );
     }
 
     /// noetl/ai-meta#237 — both catalog-delete outcomes must be SERVED at 0.

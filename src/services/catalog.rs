@@ -127,8 +127,37 @@ impl CatalogService {
             ));
         }
 
-        let removed =
-            queries::delete_catalog_entries(&self.pool, &path, request.version).await?;
+        let removed = match queries::delete_catalog_entries(&self.pool, &path, request.version)
+            .await
+        {
+            Ok(rows) => rows,
+            // Postgres 23503 = foreign_key_violation. `noetl.event` carries an FK
+            // onto `noetl.catalog`, so any entry that has ever been EXECUTED is
+            // pinned by its event rows — and `noetl.event` is append-only, so
+            // those rows are never removed to release it.
+            //
+            // That is a legitimate, expected outcome of a well-formed request,
+            // not a server fault: 409, naming the constraint, rather than a bare
+            // 500 that tells the caller nothing about why.
+            Err(AppError::Database(sqlx::Error::Database(db)))
+                if db.code().as_deref() == Some("23503") =>
+            {
+                crate::metrics::record_catalog_delete("has_history");
+                tracing::info!(
+                    path = %path,
+                    version = ?request.version,
+                    constraint = ?db.constraint(),
+                    "catalog delete refused: entry has execution history"
+                );
+                return Err(AppError::Conflict(format!(
+                    "Catalog entry '{path}' has execution history and cannot be hard-deleted: \
+                     noetl.event holds a foreign key onto noetl.catalog, and the event log is \
+                     append-only. Only an entry that has never been executed can be removed. \
+                     Retiring an executed entry needs a soft delete (noetl/ai-meta#237)."
+                )));
+            }
+            Err(e) => return Err(e),
+        };
 
         let deleted: Vec<DeletedCatalogEntry> = removed
             .iter()
