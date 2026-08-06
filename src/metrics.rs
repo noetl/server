@@ -1465,6 +1465,7 @@ pub fn record_permanent_log_slimmed(count: u64, bytes: u64) {
 /// (and only here) when instrumenting future write endpoints.
 pub mod endpoint {
     pub const CATALOG_REGISTER: &str = "catalog_register";
+    pub const CATALOG_DELETE: &str = "catalog_delete";
     pub const CREDENTIALS_UPSERT: &str = "credentials_upsert";
     pub const KEYCHAIN_SET: &str = "keychain_set";
     pub const RUNTIME_REGISTER: &str = "runtime_register";
@@ -2634,6 +2635,49 @@ pub fn init_sink_state_series() {
     }
 }
 
+/// `noetl_catalog_delete_total{outcome}` — catalog rows removed via
+/// `POST /api/catalog/delete` (noetl/ai-meta#237).
+///
+/// `noetl.catalog` is not event-sourced and has no replay, so a delete leaves
+/// no trace anywhere else.  This counter plus the INFO log at the call site are
+/// the audit trail.
+pub fn catalog_delete_total() -> &'static IntCounterVec {
+    static M: std::sync::OnceLock<IntCounterVec> = std::sync::OnceLock::new();
+    M.get_or_init(|| {
+        let m = IntCounterVec::new(
+            prometheus::Opts::new(
+                "noetl_catalog_delete_total",
+                "Catalog delete operations by outcome (noetl/ai-meta#237).",
+            ),
+            &["outcome"],
+        )
+        .expect("catalog_delete_total metric");
+        registry()
+            .register(Box::new(m.clone()))
+            .expect("register catalog_delete_total");
+        m
+    })
+}
+
+/// Every `outcome` value `catalog_delete_total` can take.
+pub const CATALOG_DELETE_OUTCOMES: [&str; 2] = ["deleted", "no_match"];
+
+/// Materialise both [`CATALOG_DELETE_OUTCOMES`] series at 0.
+///
+/// A destructive endpoint whose counter is absent until the first delete cannot
+/// answer "has anything been removed from the catalog?" — the question an
+/// operator asks first, and the one where absent must not read as zero.
+pub fn init_catalog_delete_series() {
+    for outcome in CATALOG_DELETE_OUTCOMES {
+        catalog_delete_total().with_label_values(&[outcome]).inc_by(0);
+    }
+}
+
+/// Record one catalog delete outcome.
+pub fn record_catalog_delete(outcome: &str) {
+    catalog_delete_total().with_label_values(&[outcome]).inc();
+}
+
 pub fn record_sink_state(op: &str) {
     sink_state_total().with_label_values(&[op]).inc();
 }
@@ -3320,6 +3364,127 @@ mod tests {
                 "{outcome} series must exist before any sweep; got {lines:?}"
             );
         }
+    }
+
+    /// noetl/ai-meta#237 — both catalog-delete outcomes must be SERVED at 0.
+    ///
+    /// A destructive endpoint whose counter appears only after the first delete
+    /// cannot answer "has anything been removed from the catalog?", and
+    /// `noetl.catalog` has no replay, so that counter plus the INFO log are the
+    /// entire audit trail. Absent must not read as zero here.
+    ///
+    /// Touches no recorder — calling one would create the series and mask the
+    /// defect.
+    #[test]
+    fn catalog_delete_outcomes_are_served_at_zero() {
+        init_catalog_delete_series();
+        let text = gather_text().expect("gather metrics text");
+        for outcome in CATALOG_DELETE_OUTCOMES {
+            let want = format!("noetl_catalog_delete_total{{outcome=\"{outcome}\"}}");
+            let line = text
+                .lines()
+                .find(|l| l.starts_with(&want))
+                .unwrap_or_else(|| panic!("{want} must be pinned"));
+            assert!(
+                line.trim_end().ends_with(" 0"),
+                "{want} must read 0 before any delete; got {line:?}"
+            );
+        }
+    }
+
+    /// The pinned set must cover the outcomes the service actually records.
+    #[test]
+    fn catalog_delete_pinned_outcomes_match_the_call_site() {
+        let full = include_str!("services/catalog.rs");
+        let src = full.split_once("\n#[cfg(test)]").map_or(full, |(b, _)| b);
+
+        // Direction 1: everything pinned is actually recorded.
+        for outcome in CATALOG_DELETE_OUTCOMES {
+            assert!(
+                src.contains(&format!("\"{outcome}\"")),
+                "{outcome} is pinned but the service never records it"
+            );
+        }
+
+        // Direction 2 — the one that matters, and the one a set-iterating test
+        // cannot check: every literal the service passes to
+        // `record_catalog_delete` must be pinned. Shrinking the pinned array
+        // also shrinks a test that loops over it, so without this a dropped
+        // outcome reintroduces the absent-series bug for that value alone while
+        // the rest read 0 and look complete.
+        let call = src
+            .find("record_catalog_delete(")
+            .expect("the service must record a delete outcome");
+        let region = &src[call..call + 200];
+        let recorded: Vec<&str> = region
+            .match_indices('"')
+            .collect::<Vec<_>>()
+            .chunks(2)
+            .filter_map(|c| match c {
+                [(a, _), (b, _)] => Some(&region[a + 1..*b]),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !recorded.is_empty(),
+            "could not extract the recorded outcome literals from {region:?}"
+        );
+        for r in &recorded {
+            assert!(
+                CATALOG_DELETE_OUTCOMES.contains(r),
+                "the service records {r:?} but it is not in CATALOG_DELETE_OUTCOMES, \
+                 so that series is absent from /metrics until it first fires"
+            );
+        }
+    }
+
+    /// noetl/ai-meta#237 — the delete endpoint must be auth-gated.
+    ///
+    /// `register` on the same router is ungated, so "match the neighbours" would
+    /// have shipped an unauthenticated destructive endpoint. This asserts the
+    /// handler takes the internal-token extractor, which fails closed (503 when
+    /// the server has no token, 403 on a bad one).
+    ///
+    /// Fails on any refactor that drops the extractor — which would compile
+    /// perfectly well and silently open the surface.
+    #[test]
+    fn catalog_delete_handler_requires_the_internal_token() {
+        let full = include_str!("handlers/catalog.rs");
+        let src = full.split_once("\n#[cfg(test)]").map_or(full, |(b, _)| b);
+        let start = src.find("pub async fn delete(").expect("delete handler exists");
+        let sig = &src[start..start + 400];
+        assert!(
+            sig.contains("RequireInternalApiToken"),
+            "the delete handler must take the internal-token extractor; signature was:\n{sig}"
+        );
+    }
+
+    /// The only `DELETE FROM noetl.catalog` in the crate must be the one the
+    /// service calls — the data-access boundary this endpoint exists to honour.
+    ///
+    /// If a second raw delete appears anywhere, the endpoint stops being the
+    /// single supported removal path and the audit trail has a hole.
+    #[test]
+    fn catalog_delete_has_exactly_one_raw_sql_site() {
+        let q = include_str!("db/queries/catalog.rs");
+        // Two statements live inside `delete_catalog_entries` — the
+        // version-scoped delete and the whole-path delete. What matters is that
+        // NONE live outside it: everything before that function must be free of
+        // raw catalog deletes, or the endpoint is no longer the single removal
+        // path and the audit trail has a hole.
+        let before = q
+            .split_once("pub async fn delete_catalog_entries")
+            .map(|(b, _)| b)
+            .expect("delete_catalog_entries exists");
+        assert_eq!(
+            before.matches("DELETE FROM noetl.catalog").count(),
+            0,
+            "a raw catalog DELETE exists outside delete_catalog_entries"
+        );
+        assert!(
+            q.matches("DELETE FROM noetl.catalog").count() >= 1,
+            "delete_catalog_entries must actually delete"
+        );
     }
 
     /// noetl/ai-meta#248 — every `op` the code actually records must be pinned.

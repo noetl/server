@@ -85,6 +85,7 @@ fn build_router(
     // Catalog routes
     let catalog_routes = Router::new()
         .route("/api/catalog/register", post(handlers::catalog::register))
+            .route("/api/catalog/delete", post(handlers::catalog::delete))
         .route("/api/catalog/list", post(handlers::catalog::list))
         .route(
             "/api/catalog/resource",
@@ -767,6 +768,7 @@ async fn main() -> anyhow::Result<()> {
     noetl_server::metrics::init_nonconvergence_sweep_series();
     noetl_server::metrics::init_orphan_sweep_series();
     noetl_server::metrics::init_sink_state_series();
+    noetl_server::metrics::init_catalog_delete_series();
     noetl_server::metrics::init_parity_and_dedup_series();
     noetl_server::metrics::init_result_tier_gc_series();
     noetl_server::metrics::init_credential_seal_series();

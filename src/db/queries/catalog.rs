@@ -199,3 +199,51 @@ pub async fn get_catalog_all_versions(pool: &DbPool, path: &str) -> AppResult<Ve
 
     Ok(entries)
 }
+
+/// Delete catalog entries for `path`, optionally narrowed to one `version`.
+///
+/// Returns the `(catalog_id, version)` of every row removed, so the caller can
+/// report exactly what went — a delete that reports only a count cannot be
+/// audited afterwards, and this table has no replay to reconstruct from.
+///
+/// `RETURNING` makes the read and the delete one statement: a
+/// select-then-delete would race a concurrent `register`, which mints a new
+/// version for the same path (`get_next_version`), and could report a row it
+/// did not remove.
+///
+/// Idempotent: deleting an absent path or version removes nothing and returns
+/// an empty vector rather than erroring.
+pub async fn delete_catalog_entries(
+    pool: &DbPool,
+    path: &str,
+    version: Option<i16>,
+) -> AppResult<Vec<(i64, i16)>> {
+    let rows: Vec<(i64, i16)> = match version {
+        Some(v) => {
+            sqlx::query_as(
+                r#"
+                DELETE FROM noetl.catalog
+                WHERE path = $1 AND version = $2
+                RETURNING catalog_id, version
+                "#,
+            )
+            .bind(path)
+            .bind(v)
+            .fetch_all(pool)
+            .await?
+        }
+        None => {
+            sqlx::query_as(
+                r#"
+                DELETE FROM noetl.catalog
+                WHERE path = $1
+                RETURNING catalog_id, version
+                "#,
+            )
+            .bind(path)
+            .fetch_all(pool)
+            .await?
+        }
+    };
+    Ok(rows)
+}
