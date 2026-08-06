@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.77.5](https://github.com/noetl/server/compare/v3.77.4...v3.77.5) (2026-08-06)
+
+### Bug Fixes
+
+* add the sink-state release endpoint, pin its ops, deflake the gauge test ([6aa7d56](https://github.com/noetl/server/commit/6aa7d569479e081c9c305d120036372881dd4b95)), closes [noetl/ai-meta#232](https://github.com/noetl/ai-meta/issues/232) [noetl/ai-meta#248](https://github.com/noetl/ai-meta/issues/248)
+
 ## [3.77.4](https://github.com/noetl/server/compare/v3.77.3...v3.77.4) (2026-08-05)
 
 ### Bug Fixes
