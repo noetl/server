@@ -15,6 +15,8 @@
 //!
 //! - `POST /api/internal/sink-state/mark` — record an execution pending-sink.
 //! - `POST /api/internal/sink-state/confirm` — clear it (context sunk).
+//! - `POST /api/internal/sink-state/release` — clear it WITHOUT claiming the
+//!   context was sunk (the sink attempt failed or moved to an async callback).
 
 use axum::{extract::State, Json};
 use serde::{Deserialize, Serialize};
@@ -45,7 +47,18 @@ pub struct SinkConfirmRequest {
     pub execution_id: i64,
 }
 
-/// Response for both endpoints.
+/// `POST /api/internal/sink-state/release` body (noetl/ai-meta#248).
+#[derive(Debug, Clone, Deserialize)]
+pub struct SinkReleaseRequest {
+    pub execution_id: i64,
+    /// Why the mark is being cleared without a sink having happened —
+    /// `released_failed` / `released_pending_callback` / `released_error`.
+    /// Diagnostic only; the row is cleared either way.
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// Response for these endpoints.
 #[derive(Debug, Clone, Serialize)]
 pub struct SinkStateResponse {
     pub execution_id: i64,
@@ -80,6 +93,45 @@ pub async fn confirm(
 ) -> AppResult<Json<SinkStateResponse>> {
     let changed = sink_pending::confirm(&deps.pool, req.execution_id).await?;
     crate::metrics::record_sink_state("confirm");
+    Ok(Json(SinkStateResponse {
+        execution_id: req.execution_id,
+        changed,
+    }))
+}
+
+/// `POST /api/internal/sink-state/release` — clear an execution's pending-sink
+/// state WITHOUT asserting its context was sunk (noetl/ai-meta#248).
+///
+/// The worker marks an execution for the duration of a sink attempt. When that
+/// attempt ends any way other than clean success — a non-success result, an
+/// error, or a hand-off to an async callback the reporting process never
+/// observes — the mark must still be cleared on this feed, or the row is
+/// retained forever and the result-tier GC never reclaims that execution's
+/// objects.
+///
+/// Deliberately a separate endpoint rather than reusing `confirm`. The DB effect
+/// is identical (the row goes away), but `confirm` is a claim that the
+/// customer's system of record has the data, and a failed sink has not earned
+/// that claim. Keeping them distinct means `noetl_sink_state_total{op}`
+/// distinguishes "sunk" from "gave up", which is the difference an operator
+/// actually needs.
+///
+/// Idempotent: releasing an absent row is a no-op.
+#[tracing::instrument(skip(deps, _token, req), fields(execution_id = req.execution_id))]
+pub async fn release(
+    State(deps): State<SinkStateDeps>,
+    _token: RequireInternalApiToken,
+    Json(req): Json<SinkReleaseRequest>,
+) -> AppResult<Json<SinkStateResponse>> {
+    let changed = sink_pending::confirm(&deps.pool, req.execution_id).await?;
+    crate::metrics::record_sink_state("release");
+    if changed {
+        tracing::debug!(
+            execution_id = req.execution_id,
+            reason = req.reason.as_deref().unwrap_or("unspecified"),
+            "sink-state released without a sink confirmation"
+        );
+    }
     Ok(Json(SinkStateResponse {
         execution_id: req.execution_id,
         changed,
