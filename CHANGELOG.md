@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.78.0](https://github.com/noetl/server/compare/v3.77.5...v3.78.0) (2026-08-06)
+
+### Features
+
+* **catalog:** add an auth-gated delete endpoint ([beeb278](https://github.com/noetl/server/commit/beeb278521851260cc59c2e883cba2594937aad3)), closes [noetl/ai-meta#237](https://github.com/noetl/ai-meta/issues/237) [worker#246](https://github.com/noetl/worker/issues/246)
+
 ## [3.77.5](https://github.com/noetl/server/compare/v3.77.4...v3.77.5) (2026-08-06)
 
 ### Bug Fixes
