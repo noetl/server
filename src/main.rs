@@ -927,7 +927,27 @@ async fn main() -> anyhow::Result<()> {
     // with execution history be retired without violating the append-only
     // event FK that makes a hard delete impossible.  Additive, nullable,
     // defaults NULL, so it is a no-op for every existing row.
-    noetl_server::db::queries::catalog::ensure_archived_column(&db_pool).await?;
+    //
+    // ⚠ NON-FATAL by design.  `noetl.catalog` is NOT owned by the role the
+    // server connects as (kind: owner `demo`, connection `noetl`), and Postgres
+    // requires ownership to ALTER a table.  Making this fatal crash-looped the
+    // server on first boot — caught in kind before it reached production.
+    //
+    // A server that cannot add an OPTIONAL column must still start: the column
+    // only enables soft delete, and every other code path is unaffected by its
+    // absence.  Same shape as `seed_system_plugins` below, which is non-fatal
+    // for the same reason.
+    //
+    // When the column is missing, the archive path reports a clear, actionable
+    // error rather than a 500 (see `services::catalog::archive`).  Adding it
+    // needs a privileged role and is an operator action.
+    if let Err(e) = noetl_server::db::queries::catalog::ensure_archived_column(&db_pool).await {
+        tracing::warn!(
+            error = %e,
+            "could not ensure noetl.catalog.archived_at (needs table ownership); \
+             soft delete will report it is unavailable until an operator adds the column"
+        );
+    }
     // Seed built-in system plug-ins (noetl/ai-meta#108 slice 3) — the
     // server-owned `system/orchestrate` (+ future built-ins) compiled to wasm32
     // and baked into the image are registered into noetl.plugin_module on boot,
