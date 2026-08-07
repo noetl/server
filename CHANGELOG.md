@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.79.0](https://github.com/noetl/server/compare/v3.78.1...v3.79.0) (2026-08-07)
+
+### Features
+
+* **catalog:** soft delete — retire an entry the append-only FK pins ([461662d](https://github.com/noetl/server/commit/461662d6daae8b3089826f9d0f66a2484204f384)), closes [noetl/ai-meta#237](https://github.com/noetl/ai-meta/issues/237)
+
 ## [3.78.1](https://github.com/noetl/server/compare/v3.78.0...v3.78.1) (2026-08-06)
 
 ### Bug Fixes
