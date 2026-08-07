@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.79.2](https://github.com/noetl/server/compare/v3.79.1...v3.79.2) (2026-08-07)
+
+### Bug Fixes
+
+* **catalog:** the archived filter must be conditional on the column existing ([85fb66d](https://github.com/noetl/server/commit/85fb66d9eb136e2f2b91e7edcfa511ac5b95c116))
+
 ## [3.79.1](https://github.com/noetl/server/compare/v3.79.0...v3.79.1) (2026-08-07)
 
 ### Bug Fixes
