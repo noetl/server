@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.79.1](https://github.com/noetl/server/compare/v3.79.0...v3.79.1) (2026-08-07)
+
+### Bug Fixes
+
+* **catalog:** the archived_at DDL must not crash-loop the server ([0aa0ed1](https://github.com/noetl/server/commit/0aa0ed1ac29d1773eb94f44507acff4f97a90582))
+
 ## [3.79.0](https://github.com/noetl/server/compare/v3.78.1...v3.79.0) (2026-08-07)
 
 ### Features
