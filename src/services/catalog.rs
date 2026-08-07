@@ -142,19 +142,58 @@ impl CatalogService {
             Err(AppError::Database(sqlx::Error::Database(db)))
                 if db.code().as_deref() == Some("23503") =>
             {
-                crate::metrics::record_catalog_delete("has_history");
+                // noetl/ai-meta#237 — the entry has execution history, so a hard
+                // delete is impossible by construction. SOFT-delete instead:
+                // mark it archived, which retires it (it stops resolving by
+                // path and drops out of `list`) while destroying nothing and
+                // leaving the event FK intact.
+                //
+                // Falling back rather than erroring is the point of this
+                // endpoint: the caller asked for the entry to go away, and it
+                // does — reversibly, via `restore`.
+                let archived =
+                    queries::archive_catalog_entries(&self.pool, &path, request.version).await?;
+                let entries: Vec<DeletedCatalogEntry> = archived
+                    .iter()
+                    .map(|(id, v)| DeletedCatalogEntry {
+                        catalog_id: id.to_string(),
+                        version: *v,
+                    })
+                    .collect();
+                crate::metrics::record_catalog_delete(if entries.is_empty() {
+                    "already_archived"
+                } else {
+                    "archived"
+                });
                 tracing::info!(
                     path = %path,
                     version = ?request.version,
                     constraint = ?db.constraint(),
-                    "catalog delete refused: entry has execution history"
+                    archived = entries.len(),
+                    "catalog entry archived (has execution history; hard delete impossible)"
                 );
-                return Err(AppError::Conflict(format!(
-                    "Catalog entry '{path}' has execution history and cannot be hard-deleted: \
-                     noetl.event holds a foreign key onto noetl.catalog, and the event log is \
-                     append-only. Only an entry that has never been executed can be removed. \
-                     Retiring an executed entry needs a soft delete (noetl/ai-meta#237)."
-                )));
+                let message = if entries.is_empty() {
+                    format!(
+                        "Catalog entry '{path}' has execution history and is already archived; \
+                         nothing changed."
+                    )
+                } else {
+                    format!(
+                        "Catalog entry '{path}': archived {} version(s). It has execution \
+                         history, so it cannot be hard-deleted (noetl.event holds a foreign key \
+                         onto noetl.catalog and the event log is append-only). It no longer \
+                         resolves by path and is hidden from list; restore with \
+                         POST /api/catalog/restore.",
+                        entries.len()
+                    )
+                };
+                return Ok(CatalogDeleteResponse {
+                    status: "success".to_string(),
+                    message,
+                    path,
+                    count: entries.len(),
+                    deleted: entries,
+                });
             }
             Err(e) => return Err(e),
         };
@@ -199,8 +238,61 @@ impl CatalogService {
         })
     }
 
-    pub async fn list(&self, resource_type: Option<&str>) -> AppResult<CatalogEntries> {
-        let entries = queries::list_catalog_entries(&self.pool, resource_type).await?;
+    /// Un-archive catalog entries (noetl/ai-meta#237).
+    ///
+    /// The reverse of the archive path, and the reason soft delete is the right
+    /// resolution for #237: retirement is a plain `UPDATE`, so it destroys
+    /// nothing and is undone by another `UPDATE`. Nothing else available on
+    /// this table has that property.
+    ///
+    /// Idempotent: restoring an entry that is not archived matches nothing and
+    /// reports 0.
+    pub async fn restore(
+        &self,
+        request: CatalogDeleteRequest,
+    ) -> AppResult<CatalogDeleteResponse> {
+        let path = request.path.trim().to_string();
+        if path.is_empty() {
+            return Err(AppError::Validation(
+                "catalog restore requires a non-empty 'path'".to_string(),
+            ));
+        }
+        let rows = queries::restore_catalog_entries(&self.pool, &path, request.version).await?;
+        let restored: Vec<DeletedCatalogEntry> = rows
+            .iter()
+            .map(|(id, v)| DeletedCatalogEntry {
+                catalog_id: id.to_string(),
+                version: *v,
+            })
+            .collect();
+        crate::metrics::record_catalog_delete("restored");
+        tracing::info!(
+            path = %path,
+            version = ?request.version,
+            restored = restored.len(),
+            "catalog restore"
+        );
+        let message = if restored.is_empty() {
+            format!("No archived entries for '{path}'; nothing restored.")
+        } else {
+            format!("Restored {} archived version(s) of '{path}'.", restored.len())
+        };
+        Ok(CatalogDeleteResponse {
+            status: "success".to_string(),
+            message,
+            path,
+            count: restored.len(),
+            deleted: restored,
+        })
+    }
+
+    pub async fn list(
+        &self,
+        resource_type: Option<&str>,
+        include_archived: bool,
+    ) -> AppResult<CatalogEntries> {
+        let entries =
+            queries::list_catalog_entries(&self.pool, resource_type, include_archived).await?;
 
         let responses: Vec<CatalogEntryResponse> = entries.into_iter().map(|e| e.into()).collect();
 

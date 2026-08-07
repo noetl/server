@@ -2660,7 +2660,13 @@ pub fn catalog_delete_total() -> &'static IntCounterVec {
 }
 
 /// Every `outcome` value `catalog_delete_total` can take.
-pub const CATALOG_DELETE_OUTCOMES: [&str; 3] = ["deleted", "no_match", "has_history"];
+pub const CATALOG_DELETE_OUTCOMES: [&str; 5] = [
+    "deleted",
+    "no_match",
+    "archived",
+    "already_archived",
+    "restored",
+];
 
 /// Materialise both [`CATALOG_DELETE_OUTCOMES`] series at 0.
 ///
@@ -3366,42 +3372,84 @@ mod tests {
         }
     }
 
-    /// noetl/ai-meta#237 — a foreign-key violation is a 409, not a 500.
+    /// noetl/ai-meta#237 — a foreign-key violation SOFT-DELETES; it does not error.
     ///
-    /// `noetl.event` carries an FK onto `noetl.catalog`, so any entry that has
-    /// ever been EXECUTED is pinned by its event rows, and the event log is
-    /// append-only so those rows are never removed to release it. Attempting to
-    /// hard-delete such an entry is therefore a well-formed request with a
-    /// legitimate refusal — not a server fault.
+    /// `noetl.event` holds an FK onto `noetl.catalog` and the event log is
+    /// append-only, so an entry with execution history can never be hard
+    /// deleted. It used to surface as a bare 500, then briefly as a 409.
+    /// Neither did what the caller asked.
     ///
-    /// Before this, prod returned a bare 500 whose only explanation was in the
-    /// server log. The condition was found exactly that way: the kind
-    /// validation passed because the probe entry had never been executed and so
-    /// had no FK reference — the one case that CAN be deleted.
+    /// Now the FK violation is the *signal* to archive instead: the entry is
+    /// marked `archived_at`, stops resolving by path, drops out of `list`, and
+    /// is restorable with one call. The caller's intent — make this go away —
+    /// is satisfied, reversibly, without destroying anything.
     ///
-    /// Asserts the mapping exists at the call site; the sqlx error type cannot
-    /// be constructed in a unit test without a live database.
+    /// Asserts the mapping at the call site; the sqlx error type cannot be
+    /// constructed in a unit test without a live database.
     #[test]
-    fn catalog_delete_maps_fk_violation_to_conflict() {
+    fn catalog_delete_falls_back_to_archive_on_fk_violation() {
         let full = include_str!("services/catalog.rs");
         let src = full.split_once("\n#[cfg(test)]").map_or(full, |(b, _)| b);
         assert!(
             src.contains("Some(\"23503\")"),
-            "the FK violation SQLSTATE must be matched explicitly"
+            "the FK violation SQLSTATE must still be matched explicitly"
         );
         assert!(
-            src.contains("AppError::Conflict"),
-            "a foreign-key violation must map to Conflict (409), not fall through to 500"
+            src.contains("archive_catalog_entries"),
+            "an FK violation must fall back to archiving, not error out"
         );
         assert!(
-            src.contains("has_history"),
-            "the refusal must be counted under its own outcome"
+            !src.contains("AppError::Conflict"),
+            "the 409 path was replaced by the archive fallback; a Conflict here \
+             would mean the caller's request is refused again"
         );
-        // The message has to name WHY, or a 409 is only marginally better than
-        // a 500 — the caller still cannot tell what to do about it.
+        // Retirement must be undoable, or soft delete is just a slower hard delete.
         assert!(
-            src.contains("append-only"),
-            "the 409 message must explain the append-only event FK"
+            src.contains("restore_catalog_entries"),
+            "restore must exist for archive to be reversible"
+        );
+    }
+
+    /// Archiving must actually RETIRE the entry, not merely label it.
+    ///
+    /// The whole point is that an archived playbook stops being reachable. If
+    /// path resolution still found it, `delete` would report success while the
+    /// entry kept executing — worse than not archiving at all, because it would
+    /// look done.
+    ///
+    /// Deliberately does NOT require the filter on `get_next_version` (archived
+    /// versions must still count, or a re-register would reuse a version number
+    /// and collide), on `get_catalog_by_id` (explicit id is the documented
+    /// escape hatch), or on the delete itself (an archived never-executed row
+    /// must remain hard-deletable).
+    #[test]
+    fn archived_entries_stop_resolving_by_path() {
+        let q = include_str!("db/queries/catalog.rs");
+        let src = q.split_once("\n#[cfg(test)]").map_or(q, |(b, _)| b);
+        fn body<'a>(src: &'a str, name: &str) -> &'a str {
+            let s = src
+                .find(&format!("pub async fn {name}("))
+                .unwrap_or_else(|| panic!("{name} exists"));
+            let e = src[s..].find("\n}").map(|i| s + i).unwrap_or(src.len());
+            &src[s..e]
+        }
+        for name in ["get_catalog_latest", "get_catalog_by_path_version"] {
+            assert!(
+                body(src, name).contains("archived_at IS NULL"),
+                "{name} resolves a playbook for use and must skip archived rows"
+            );
+        }
+        assert!(
+            !body(src, "get_next_version").contains("archived_at IS NULL"),
+            "get_next_version must COUNT archived versions, or re-registering an \
+             archived path reuses a version number"
+        );
+        // And the execute path itself, which resolves by path directly.
+        let ex = include_str!("handlers/execute.rs");
+        let ex_src = ex.split_once("\n#[cfg(test)]").map_or(ex, |(b, _)| b);
+        assert!(
+            ex_src.contains("archived_at IS NULL"),
+            "resolve_catalog's by-path lookup must skip archived entries"
         );
     }
 

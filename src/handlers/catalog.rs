@@ -133,6 +133,39 @@ async fn delete_inner(
     Ok((StatusCode::OK, Json(response)))
 }
 
+/// Restore (un-archive) catalog entries.
+///
+/// `POST /api/catalog/restore`
+///
+/// Auth-gated identically to `delete`. Takes the same `{path, version?}` body.
+/// Idempotent: restoring a non-archived entry returns 200 with `count: 0`.
+///
+/// This is what makes the archive path safe to use: retirement is reversible
+/// with one call, so nothing is ever destroyed.
+pub async fn restore(
+    service: State<CatalogService>,
+    _token: crate::handlers::internal::RequireInternalApiToken,
+    request: Json<CatalogDeleteRequest>,
+) -> AppResult<(StatusCode, Json<CatalogDeleteResponse>)> {
+    let started_at = std::time::Instant::now();
+    let result = restore_inner(service, request).await;
+    let status_label = if result.is_ok() { "ok" } else { "error" };
+    crate::metrics::record_write_request(
+        crate::metrics::endpoint::CATALOG_DELETE,
+        status_label,
+        started_at.elapsed().as_secs_f64(),
+    );
+    result
+}
+
+async fn restore_inner(
+    State(service): State<CatalogService>,
+    Json(request): Json<CatalogDeleteRequest>,
+) -> AppResult<(StatusCode, Json<CatalogDeleteResponse>)> {
+    let response = service.restore(request).await?;
+    Ok((StatusCode::OK, Json(response)))
+}
+
 /// List all catalog resources.
 ///
 /// `POST /api/catalog/list`
@@ -164,7 +197,9 @@ pub async fn list(
     State(service): State<CatalogService>,
     Json(request): Json<CatalogEntriesRequest>,
 ) -> AppResult<Json<CatalogEntries>> {
-    let entries = service.list(request.resource_type.as_deref()).await?;
+    let entries = service
+        .list(request.resource_type.as_deref(), request.include_archived)
+        .await?;
     Ok(Json(entries))
 }
 
