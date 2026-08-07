@@ -151,8 +151,35 @@ impl CatalogService {
                 // Falling back rather than erroring is the point of this
                 // endpoint: the caller asked for the entry to go away, and it
                 // does — reversibly, via `restore`.
-                let archived =
-                    queries::archive_catalog_entries(&self.pool, &path, request.version).await?;
+                let archived = match queries::archive_catalog_entries(
+                    &self.pool,
+                    &path,
+                    request.version,
+                )
+                .await
+                {
+                    Ok(rows) => rows,
+                    // 42703 = undefined_column. The `archived_at` column could not
+                    // be added at startup because the server's role does not own
+                    // `noetl.catalog` (it is owned by a different role in every
+                    // deployment checked). Say so precisely — the alternative is a
+                    // 500 that looks like a server fault when it is a one-line
+                    // operator action.
+                    Err(AppError::Database(sqlx::Error::Database(d)))
+                        if d.code().as_deref() == Some("42703") =>
+                    {
+                        crate::metrics::record_catalog_delete("archive_unavailable");
+                        return Err(AppError::Conflict(format!(
+                            "Catalog entry '{path}' has execution history so it cannot be \
+                             hard-deleted, and soft delete is unavailable: the \
+                             noetl.catalog.archived_at column does not exist. The server \
+                             cannot add it because it does not own the table. An operator \
+                             with ownership must run: ALTER TABLE noetl.catalog ADD COLUMN \
+                             IF NOT EXISTS archived_at TIMESTAMPTZ NULL; (noetl/ai-meta#237)"
+                        )));
+                    }
+                    Err(e) => return Err(e),
+                };
                 let entries: Vec<DeletedCatalogEntry> = archived
                     .iter()
                     .map(|(id, v)| DeletedCatalogEntry {

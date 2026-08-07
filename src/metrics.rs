@@ -2660,12 +2660,13 @@ pub fn catalog_delete_total() -> &'static IntCounterVec {
 }
 
 /// Every `outcome` value `catalog_delete_total` can take.
-pub const CATALOG_DELETE_OUTCOMES: [&str; 5] = [
+pub const CATALOG_DELETE_OUTCOMES: [&str; 6] = [
     "deleted",
     "no_match",
     "archived",
     "already_archived",
     "restored",
+    "archive_unavailable",
 ];
 
 /// Materialise both [`CATALOG_DELETE_OUTCOMES`] series at 0.
@@ -3398,15 +3399,76 @@ mod tests {
             src.contains("archive_catalog_entries"),
             "an FK violation must fall back to archiving, not error out"
         );
+        // What the FK branch must DO, stated positively. An earlier version of
+        // this guard asserted "no AppError::Conflict in the branch", which was a
+        // proxy for the same idea — and it became wrong the moment the archive
+        // path grew a legitimate nested Conflict for the missing-column case.
+        // Assert the behaviour, not the absence of a symbol.
+        let fk = src.find("Some(\"23503\")").expect("the FK branch exists");
+        let fk_branch = &src[fk..];
+        let archive_at = fk_branch
+            .find("archive_catalog_entries")
+            .expect("the FK branch must archive");
+        let ok_at = fk_branch
+            .find("return Ok(CatalogDeleteResponse")
+            .expect("the FK branch must return success once archived");
         assert!(
-            !src.contains("AppError::Conflict"),
-            "the 409 path was replaced by the archive fallback; a Conflict here \
-             would mean the caller's request is refused again"
+            archive_at < ok_at,
+            "the FK branch must archive BEFORE reporting success"
         );
+
         // Retirement must be undoable, or soft delete is just a slower hard delete.
         assert!(
             src.contains("restore_catalog_entries"),
             "restore must exist for archive to be reversible"
+        );
+    }
+
+    /// noetl/ai-meta#237 — startup DDL that can fail on a PERMISSIONS boundary
+    /// must not be fatal.
+    ///
+    /// `noetl.catalog` is not owned by the role the server connects as (kind:
+    /// owner `demo`, connection `noetl`), and Postgres requires ownership to
+    /// ALTER. The first cut used `?`, so the server exited on boot and
+    /// crash-looped — caught in kind against the released image, before it
+    /// reached production, where it would have taken the control plane down.
+    ///
+    /// The column is OPTIONAL: it only enables soft delete, and nothing else
+    /// depends on it. A server that cannot add it must still start.
+    #[test]
+    fn optional_startup_ddl_is_not_fatal() {
+        let m = include_str!("main.rs");
+        let src = m.split_once("\n#[cfg(test)]").map_or(m, |(b, _)| b);
+        let i = src
+            .find("ensure_archived_column")
+            .expect("the archived_at DDL runs at startup");
+        // Look at the statement around the call, not the whole file.
+        let start = src[..i].rfind('\n').unwrap_or(0);
+        let end = src[i..].find(";\n").map(|j| i + j).unwrap_or(src.len());
+        let stmt = &src[start..end];
+        assert!(
+            !stmt.contains(".await?"),
+            "the archived_at DDL must not use `?` — a permissions failure would \
+             crash-loop the server on boot; statement was:\n{stmt}"
+        );
+        assert!(
+            src[start..].starts_with("\n    if let Err(") || stmt.contains("if let Err("),
+            "the DDL failure must be handled and logged, not propagated"
+        );
+    }
+
+    /// A missing `archived_at` must produce an ACTIONABLE error, not a 500.
+    #[test]
+    fn missing_archived_column_reports_the_operator_action() {
+        let full = include_str!("services/catalog.rs");
+        let src = full.split_once("\n#[cfg(test)]").map_or(full, |(b, _)| b);
+        assert!(
+            src.contains("Some(\"42703\")"),
+            "undefined_column must be matched so the message can be specific"
+        );
+        assert!(
+            src.contains("ALTER TABLE noetl.catalog ADD COLUMN"),
+            "the error must name the exact statement an operator has to run"
         );
     }
 
