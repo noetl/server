@@ -122,7 +122,7 @@ pub async fn get_catalog_by_path_version(
         r#"
         SELECT catalog_id AS id, path, kind, version, content, layout, payload, meta, created_at AT TIME ZONE 'UTC' as created_at
         FROM noetl.catalog
-        WHERE path = $1 AND version = $2
+        WHERE path = $1 AND version = $2 AND archived_at IS NULL
         "#,
     )
     .bind(path)
@@ -139,7 +139,7 @@ pub async fn get_catalog_latest(pool: &DbPool, path: &str) -> AppResult<Option<C
         r#"
         SELECT catalog_id AS id, path, kind, version, content, layout, payload, meta, created_at AT TIME ZONE 'UTC' as created_at
         FROM noetl.catalog
-        WHERE path = $1
+        WHERE path = $1 AND archived_at IS NULL
         ORDER BY version DESC
         LIMIT 1
         "#,
@@ -152,32 +152,29 @@ pub async fn get_catalog_latest(pool: &DbPool, path: &str) -> AppResult<Option<C
 }
 
 /// List all catalog entries, optionally filtered by kind.
+/// `include_archived` opts in to soft-deleted rows (noetl/ai-meta#237).
+///
+/// The default hides them: an archived entry is retired, and a listing that
+/// still showed it would defeat the point. The opt-in exists so an operator can
+/// see what was retired and restore it.
 pub async fn list_catalog_entries(
     pool: &DbPool,
     kind: Option<&str>,
+    include_archived: bool,
 ) -> AppResult<Vec<CatalogEntry>> {
+    const COLS: &str = "catalog_id AS id, path, kind, version, content, layout, payload, meta, created_at AT TIME ZONE 'UTC' as created_at";
+    let archived = if include_archived { "" } else { " AND archived_at IS NULL" };
     let entries = if let Some(k) = kind {
-        sqlx::query_as::<_, CatalogEntry>(
-            r#"
-            SELECT catalog_id AS id, path, kind, version, content, layout, payload, meta, created_at AT TIME ZONE 'UTC' as created_at
-            FROM noetl.catalog
-            WHERE kind = $1
-            ORDER BY created_at DESC
-            "#,
-        )
-        .bind(k)
-        .fetch_all(pool)
-        .await?
+        let sql = format!("SELECT {COLS} FROM noetl.catalog WHERE kind = $1{archived} ORDER BY created_at DESC");
+        sqlx::query_as::<_, CatalogEntry>(&sql)
+            .bind(k)
+            .fetch_all(pool)
+            .await?
     } else {
-        sqlx::query_as::<_, CatalogEntry>(
-            r#"
-            SELECT catalog_id AS id, path, kind, version, content, layout, payload, meta, created_at AT TIME ZONE 'UTC' as created_at
-            FROM noetl.catalog
-            ORDER BY created_at DESC
-            "#,
-        )
-        .fetch_all(pool)
-        .await?
+        let sql = format!("SELECT {COLS} FROM noetl.catalog WHERE 1 = 1{archived} ORDER BY created_at DESC");
+        sqlx::query_as::<_, CatalogEntry>(&sql)
+            .fetch_all(pool)
+            .await?
     };
 
     Ok(entries)
@@ -189,7 +186,7 @@ pub async fn get_catalog_all_versions(pool: &DbPool, path: &str) -> AppResult<Ve
         r#"
         SELECT catalog_id AS id, path, kind, version, content, layout, payload, meta, created_at AT TIME ZONE 'UTC' as created_at
         FROM noetl.catalog
-        WHERE path = $1
+        WHERE path = $1 AND archived_at IS NULL
         ORDER BY version DESC
         "#,
     )
@@ -237,6 +234,106 @@ pub async fn delete_catalog_entries(
                 r#"
                 DELETE FROM noetl.catalog
                 WHERE path = $1
+                RETURNING catalog_id, version
+                "#,
+            )
+            .bind(path)
+            .fetch_all(pool)
+            .await?
+        }
+    };
+    Ok(rows)
+}
+
+/// Add the soft-delete column if it is not already there (noetl/ai-meta#237).
+///
+/// Idempotent startup DDL, the same shape `secret_audit` / `result_store` /
+/// `plugin_module` use, so first boot lands the schema without an out-of-band
+/// migration step.
+///
+/// Purely additive: nullable, defaults NULL, and every existing row reads NULL
+/// (= not archived). A binary that predates this column is unaffected by its
+/// presence, so the rollout and rollback are both safe.
+pub async fn ensure_archived_column(pool: &DbPool) -> AppResult<()> {
+    sqlx::query("ALTER TABLE noetl.catalog ADD COLUMN IF NOT EXISTS archived_at TIMESTAMPTZ NULL")
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Mark catalog entries archived (noetl/ai-meta#237).
+///
+/// The soft-delete counterpart of [`delete_catalog_entries`], and the only
+/// retirement available to an entry that has execution history: `noetl.event`
+/// holds a foreign key onto `noetl.catalog` and the event log is append-only,
+/// so those rows can never be removed to release it.
+///
+/// Idempotent by construction — `archived_at IS NULL` in the predicate means
+/// re-archiving an already-archived entry matches nothing and reports 0.
+pub async fn archive_catalog_entries(
+    pool: &DbPool,
+    path: &str,
+    version: Option<i16>,
+) -> AppResult<Vec<(i64, i16)>> {
+    let rows: Vec<(i64, i16)> = match version {
+        Some(v) => {
+            sqlx::query_as(
+                r#"
+                UPDATE noetl.catalog SET archived_at = now()
+                WHERE path = $1 AND version = $2 AND archived_at IS NULL
+                RETURNING catalog_id, version
+                "#,
+            )
+            .bind(path)
+            .bind(v)
+            .fetch_all(pool)
+            .await?
+        }
+        None => {
+            sqlx::query_as(
+                r#"
+                UPDATE noetl.catalog SET archived_at = now()
+                WHERE path = $1 AND archived_at IS NULL
+                RETURNING catalog_id, version
+                "#,
+            )
+            .bind(path)
+            .fetch_all(pool)
+            .await?
+        }
+    };
+    Ok(rows)
+}
+
+/// Un-archive catalog entries — the reverse of [`archive_catalog_entries`].
+///
+/// This is why soft delete is the right answer for #237: retirement is a plain
+/// `UPDATE`, so it is fully reversible and destroys nothing. Nothing else in
+/// this table has that property.
+pub async fn restore_catalog_entries(
+    pool: &DbPool,
+    path: &str,
+    version: Option<i16>,
+) -> AppResult<Vec<(i64, i16)>> {
+    let rows: Vec<(i64, i16)> = match version {
+        Some(v) => {
+            sqlx::query_as(
+                r#"
+                UPDATE noetl.catalog SET archived_at = NULL
+                WHERE path = $1 AND version = $2 AND archived_at IS NOT NULL
+                RETURNING catalog_id, version
+                "#,
+            )
+            .bind(path)
+            .bind(v)
+            .fetch_all(pool)
+            .await?
+        }
+        None => {
+            sqlx::query_as(
+                r#"
+                UPDATE noetl.catalog SET archived_at = NULL
+                WHERE path = $1 AND archived_at IS NOT NULL
                 RETURNING catalog_id, version
                 "#,
             )

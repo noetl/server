@@ -572,7 +572,14 @@ async fn resolve_catalog(state: &AppState, request: &ExecuteRequest) -> AppResul
     } else if let Some(path) = &request.path {
         // Lookup by path (latest version; Phase F R4-3: cluster-wide)
         let entry = sqlx::query_as::<_, (i64, String)>(
-            "SELECT catalog_id, path FROM noetl.catalog WHERE path = $1 ORDER BY version DESC LIMIT 1",
+            // noetl/ai-meta#237 — an archived entry is retired: it must not
+                // resolve by PATH, which is how everything normally runs.
+                // Resolution by explicit `catalog_id` (above) deliberately still
+                // works, so a historical version can be re-run on purpose; that
+                // is the escape hatch, and it requires naming the row.
+                "SELECT catalog_id, path FROM noetl.catalog \
+                 WHERE path = $1 AND archived_at IS NULL \
+                 ORDER BY version DESC LIMIT 1",
         )
         .bind(path)
         .fetch_optional(state.pools.cluster())

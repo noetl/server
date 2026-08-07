@@ -89,6 +89,14 @@ pub struct CatalogEntriesRequest {
     /// Filter by resource type
     #[serde(default)]
     pub resource_type: Option<String>,
+
+    /// Include soft-deleted (archived) entries (noetl/ai-meta#237).
+    ///
+    /// Defaults to false: an archived entry is retired, so the ordinary listing
+    /// hides it. Set true to see what has been retired — the view an operator
+    /// needs before restoring something.
+    #[serde(default)]
+    pub include_archived: bool,
 }
 
 /// Response containing list of catalog entries.

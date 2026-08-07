@@ -87,6 +87,10 @@ fn build_router(
         .route("/api/catalog/register", post(handlers::catalog::register))
             .route("/api/catalog/delete", post(handlers::catalog::delete))
         .route("/api/catalog/list", post(handlers::catalog::list))
+            .route(
+                "/api/catalog/restore",
+                post(handlers::catalog::restore),
+            )
         .route(
             "/api/catalog/resource",
             post(handlers::catalog::get_resource),
@@ -919,6 +923,11 @@ async fn main() -> anyhow::Result<()> {
     // for the system worker pool's wasmtime PluginSource.  Same idempotent
     // startup-DDL pattern; server-owned end-to-end.
     noetl_server::db::queries::plugin_module::ensure_table(&db_pool).await?;
+    // Catalog soft delete (noetl/ai-meta#237) — `archived_at` lets an entry
+    // with execution history be retired without violating the append-only
+    // event FK that makes a hard delete impossible.  Additive, nullable,
+    // defaults NULL, so it is a no-op for every existing row.
+    noetl_server::db::queries::catalog::ensure_archived_column(&db_pool).await?;
     // Seed built-in system plug-ins (noetl/ai-meta#108 slice 3) — the
     // server-owned `system/orchestrate` (+ future built-ins) compiled to wasm32
     // and baked into the image are registered into noetl.plugin_module on boot,
