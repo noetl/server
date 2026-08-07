@@ -3472,46 +3472,94 @@ mod tests {
         );
     }
 
-    /// Archiving must actually RETIRE the entry, not merely label it.
+    /// noetl/ai-meta#237 — the archived predicate must be CONDITIONAL, never
+    /// hard-coded.
     ///
-    /// The whole point is that an archived playbook stops being reachable. If
-    /// path resolution still found it, `delete` would report success while the
-    /// entry kept executing — worse than not archiving at all, because it would
-    /// look done.
+    /// The server cannot create `archived_at` (the table is owned by another
+    /// role), so a database may legitimately not have it. Hard-coding
+    /// `archived_at IS NULL` into resolution took **production** down for ~90
+    /// seconds: every execute-by-path returned 500 with
+    /// `column "archived_at" does not exist`.
     ///
-    /// Deliberately does NOT require the filter on `get_next_version` (archived
-    /// versions must still count, or a re-register would reuse a version number
-    /// and collide), on `get_catalog_by_id` (explicit id is the documented
-    /// escape hatch), or on the delete itself (an archived never-executed row
-    /// must remain hard-deletable).
+    /// Feature degrading is fine. Resolution breaking is not. Every read path
+    /// that filters archived rows must interpolate `archived_filter()`, which is
+    /// the empty string when the column is absent — making the query
+    /// byte-identical to pre-soft-delete.
     #[test]
-    fn archived_entries_stop_resolving_by_path() {
-        let q = include_str!("db/queries/catalog.rs");
-        let src = q.split_once("\n#[cfg(test)]").map_or(q, |(b, _)| b);
+    fn archived_predicate_is_conditional_on_every_read_path() {
+        fn non_test(src: &str) -> &str {
+            src.split_once("\n#[cfg(test)]").map_or(src, |(b, _)| b)
+        }
+        let q = non_test(include_str!("db/queries/catalog.rs"));
+        let ex = non_test(include_str!("handlers/execute.rs"));
+
+        // The execute path is the one that broke prod.
+        assert!(
+            ex.contains("archived_filter()"),
+            "resolve_catalog must interpolate archived_filter(), not hard-code the predicate"
+        );
+        assert!(
+            !ex.contains("AND archived_at IS NULL \\"),
+            "resolve_catalog must not hard-code the predicate"
+        );
+
+        // Every SELECT in the queries module must go through the helper.  The
+        // remaining literal uses are the UPDATEs in archive/restore, which only
+        // run once the column exists.
         fn body<'a>(src: &'a str, name: &str) -> &'a str {
-            let s = src
-                .find(&format!("pub async fn {name}("))
-                .unwrap_or_else(|| panic!("{name} exists"));
+            let s = src.find(&format!("pub async fn {name}(")).unwrap_or_else(|| panic!("{name}"));
             let e = src[s..].find("\n}").map(|i| s + i).unwrap_or(src.len());
             &src[s..e]
         }
-        for name in ["get_catalog_latest", "get_catalog_by_path_version"] {
+        for name in [
+            "get_catalog_latest",
+            "get_catalog_by_path_version",
+            "get_catalog_all_versions",
+            "list_catalog_entries",
+        ] {
+            let b = body(q, name);
             assert!(
-                body(src, name).contains("archived_at IS NULL"),
-                "{name} resolves a playbook for use and must skip archived rows"
+                b.contains("archived_filter()"),
+                "{name} must use archived_filter(); a hard-coded predicate breaks it on a \
+                 database without the column"
+            );
+            assert!(
+                !b.contains("AND archived_at IS NULL"),
+                "{name} still hard-codes the predicate"
             );
         }
+
+        // And the invariant that survives from before: version numbering must
+        // still COUNT archived rows, so it must not filter at all.
         assert!(
-            !body(src, "get_next_version").contains("archived_at IS NULL"),
-            "get_next_version must COUNT archived versions, or re-registering an \
-             archived path reuses a version number"
+            !body(q, "get_next_version").contains("archived"),
+            "get_next_version must count archived versions, or re-registering reuses a version"
         );
-        // And the execute path itself, which resolves by path directly.
-        let ex = include_str!("handlers/execute.rs");
-        let ex_src = ex.split_once("\n#[cfg(test)]").map_or(ex, |(b, _)| b);
+    }
+
+    /// Detection must not depend on the ALTER succeeding.
+    ///
+    /// `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` fails with "must be owner" for
+    /// a non-owner **even when the column already exists**, so its result says
+    /// nothing about presence. If detection keyed off the ALTER, an operator
+    /// adding the column out of band would never turn the feature on.
+    #[test]
+    fn archived_column_detection_is_independent_of_the_alter() {
+        let q = include_str!("db/queries/catalog.rs");
+        let src = q.split_once("\n#[cfg(test)]").map_or(q, |(b, _)| b);
+        let f = src
+            .find("pub async fn ensure_archived_column")
+            .expect("ensure_archived_column exists");
+        let body = &src[f..];
         assert!(
-            ex_src.contains("archived_at IS NULL"),
-            "resolve_catalog's by-path lookup must skip archived entries"
+            body.contains("information_schema.columns"),
+            "presence must be detected from information_schema, not inferred from the ALTER"
+        );
+        let alter_at = body.find("ALTER TABLE").expect("attempts the ALTER");
+        let detect_at = body.find("information_schema").expect("detects");
+        assert!(
+            alter_at < detect_at,
+            "detect AFTER attempting the ALTER, so a successful add is seen too"
         );
     }
 

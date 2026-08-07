@@ -575,11 +575,19 @@ async fn resolve_catalog(state: &AppState, request: &ExecuteRequest) -> AppResul
             // noetl/ai-meta#237 — an archived entry is retired: it must not
                 // resolve by PATH, which is how everything normally runs.
                 // Resolution by explicit `catalog_id` (above) deliberately still
-                // works, so a historical version can be re-run on purpose; that
-                // is the escape hatch, and it requires naming the row.
-                "SELECT catalog_id, path FROM noetl.catalog \
-                 WHERE path = $1 AND archived_at IS NULL \
-                 ORDER BY version DESC LIMIT 1",
+                // works, so a historical version can be re-run on purpose.
+                //
+                // ⚠ The predicate is CONDITIONAL on the column existing. Hard-coding
+                // it took production down: the server cannot create the column
+                // (the table is owned by another role), so on a database without
+                // it every execute-by-path returned 500. When absent this is the
+                // empty string and the query is byte-identical to pre-soft-delete.
+                &format!(
+                    "SELECT catalog_id, path FROM noetl.catalog \
+                     WHERE path = $1{archived} \
+                     ORDER BY version DESC LIMIT 1",
+                    archived = crate::db::queries::catalog::archived_filter()
+                ),
         )
         .bind(path)
         .fetch_optional(state.pools.cluster())

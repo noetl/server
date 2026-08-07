@@ -118,35 +118,29 @@ pub async fn get_catalog_by_path_version(
     path: &str,
     version: i16,
 ) -> AppResult<Option<CatalogEntry>> {
-    let entry = sqlx::query_as::<_, CatalogEntry>(
-        r#"
-        SELECT catalog_id AS id, path, kind, version, content, layout, payload, meta, created_at AT TIME ZONE 'UTC' as created_at
-        FROM noetl.catalog
-        WHERE path = $1 AND version = $2 AND archived_at IS NULL
-        "#,
-    )
-    .bind(path)
-    .bind(version)
-    .fetch_optional(pool)
-    .await?;
+    let sql = format!(
+        "SELECT catalog_id AS id, path, kind, version, content, layout, payload, meta, created_at AT TIME ZONE 'UTC' as created_at FROM noetl.catalog WHERE path = $1 AND version = $2{archived}",
+        archived = archived_filter()
+    );
+    let entry = sqlx::query_as::<_, CatalogEntry>(&sql)
+        .bind(path)
+        .bind(version)
+        .fetch_optional(pool)
+        .await?;
 
     Ok(entry)
 }
 
 /// Get the latest catalog entry by path.
 pub async fn get_catalog_latest(pool: &DbPool, path: &str) -> AppResult<Option<CatalogEntry>> {
-    let entry = sqlx::query_as::<_, CatalogEntry>(
-        r#"
-        SELECT catalog_id AS id, path, kind, version, content, layout, payload, meta, created_at AT TIME ZONE 'UTC' as created_at
-        FROM noetl.catalog
-        WHERE path = $1 AND archived_at IS NULL
-        ORDER BY version DESC
-        LIMIT 1
-        "#,
-    )
-    .bind(path)
-    .fetch_optional(pool)
-    .await?;
+    let sql = format!(
+        "SELECT catalog_id AS id, path, kind, version, content, layout, payload, meta, created_at AT TIME ZONE 'UTC' as created_at FROM noetl.catalog WHERE path = $1{archived} ORDER BY version DESC LIMIT 1",
+        archived = archived_filter()
+    );
+    let entry = sqlx::query_as::<_, CatalogEntry>(&sql)
+        .bind(path)
+        .fetch_optional(pool)
+        .await?;
 
     Ok(entry)
 }
@@ -163,7 +157,9 @@ pub async fn list_catalog_entries(
     include_archived: bool,
 ) -> AppResult<Vec<CatalogEntry>> {
     const COLS: &str = "catalog_id AS id, path, kind, version, content, layout, payload, meta, created_at AT TIME ZONE 'UTC' as created_at";
-    let archived = if include_archived { "" } else { " AND archived_at IS NULL" };
+    // Absent column => no predicate at all, regardless of `include_archived`:
+    // there is nothing to filter and referencing it would break the query.
+    let archived = if include_archived { "" } else { archived_filter() };
     let entries = if let Some(k) = kind {
         let sql = format!("SELECT {COLS} FROM noetl.catalog WHERE kind = $1{archived} ORDER BY created_at DESC");
         sqlx::query_as::<_, CatalogEntry>(&sql)
@@ -182,17 +178,14 @@ pub async fn list_catalog_entries(
 
 /// Get all versions of a catalog entry by path.
 pub async fn get_catalog_all_versions(pool: &DbPool, path: &str) -> AppResult<Vec<CatalogEntry>> {
-    let entries = sqlx::query_as::<_, CatalogEntry>(
-        r#"
-        SELECT catalog_id AS id, path, kind, version, content, layout, payload, meta, created_at AT TIME ZONE 'UTC' as created_at
-        FROM noetl.catalog
-        WHERE path = $1 AND archived_at IS NULL
-        ORDER BY version DESC
-        "#,
-    )
-    .bind(path)
-    .fetch_all(pool)
-    .await?;
+    let sql = format!(
+        "SELECT catalog_id AS id, path, kind, version, content, layout, payload, meta, created_at AT TIME ZONE 'UTC' as created_at FROM noetl.catalog WHERE path = $1{archived} ORDER BY version DESC",
+        archived = archived_filter()
+    );
+    let entries = sqlx::query_as::<_, CatalogEntry>(&sql)
+        .bind(path)
+        .fetch_all(pool)
+        .await?;
 
     Ok(entries)
 }
@@ -245,20 +238,91 @@ pub async fn delete_catalog_entries(
     Ok(rows)
 }
 
-/// Add the soft-delete column if it is not already there (noetl/ai-meta#237).
+/// Whether `noetl.catalog.archived_at` exists in this database.
 ///
-/// Idempotent startup DDL, the same shape `secret_audit` / `result_store` /
-/// `plugin_module` use, so first boot lands the schema without an out-of-band
-/// migration step.
+/// Resolved once at startup by [`ensure_archived_column`] and read by every
+/// query that would otherwise reference the column.
 ///
-/// Purely additive: nullable, defaults NULL, and every existing row reads NULL
-/// (= not archived). A binary that predates this column is unaffected by its
-/// presence, so the rollout and rollback are both safe.
+/// This exists because the column is genuinely OPTIONAL: the server cannot
+/// create it (the table is owned by a different role in every deployment
+/// checked), so it may or may not be there, and **every read path must behave
+/// exactly as it did before soft delete when it is absent**.
+///
+/// Getting this wrong took production down for ~90 seconds: a predicate
+/// referencing a non-existent column made `resolve_catalog` return 500 on every
+/// execute-by-path.  The feature degrading is fine; resolution breaking is not.
+static ARCHIVED_COLUMN_PRESENT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// `" AND archived_at IS NULL"` when the column exists, `""` when it does not.
+///
+/// Every query that filters archived rows must interpolate this rather than
+/// hard-coding the predicate.
+pub fn archived_filter() -> &'static str {
+    if ARCHIVED_COLUMN_PRESENT.load(std::sync::atomic::Ordering::Relaxed) {
+        " AND archived_at IS NULL"
+    } else {
+        ""
+    }
+}
+
+/// True when soft delete is available in this database.
+pub fn archived_column_present() -> bool {
+    ARCHIVED_COLUMN_PRESENT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Best-effort add of the soft-delete column, then DETECT whether it is there
+/// (noetl/ai-meta#237).
+///
+/// The detection is deliberately independent of whether the `ALTER` succeeded.
+/// `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` fails with "must be owner of
+/// table" for a non-owner **even when the column already exists**, so the
+/// statement's result says nothing about the column's presence. Only
+/// `information_schema` does.
+///
+/// That also means an operator adding the column out of band turns the feature
+/// on at the next restart, with no code change.
 pub async fn ensure_archived_column(pool: &DbPool) -> AppResult<()> {
-    sqlx::query("ALTER TABLE noetl.catalog ADD COLUMN IF NOT EXISTS archived_at TIMESTAMPTZ NULL")
-        .execute(pool)
-        .await?;
+    // Best effort — a non-owner cannot ALTER, and that is expected.
+    let alter = sqlx::query(
+        "ALTER TABLE noetl.catalog ADD COLUMN IF NOT EXISTS archived_at TIMESTAMPTZ NULL",
+    )
+    .execute(pool)
+    .await;
+
+    let present: Option<(i32,)> = sqlx::query_as(
+        r#"
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'noetl' AND table_name = 'catalog'
+          AND column_name = 'archived_at'
+        "#,
+    )
+    .fetch_optional(pool)
+    .await?;
+
+    let found = present.is_some();
+    ARCHIVED_COLUMN_PRESENT.store(found, std::sync::atomic::Ordering::Relaxed);
+
+    match (alter, found) {
+        (Ok(_), _) => tracing::info!("noetl.catalog.archived_at present; soft delete enabled"),
+        (Err(_), true) => tracing::info!(
+            "noetl.catalog.archived_at already present (added out of band); soft delete enabled"
+        ),
+        (Err(e), false) => tracing::warn!(
+            error = %e,
+            "noetl.catalog.archived_at is ABSENT and cannot be added (table owned by another \
+             role). Soft delete is unavailable; every other catalog path behaves exactly as \
+             before. An owner can enable it with: ALTER TABLE noetl.catalog ADD COLUMN IF NOT \
+             EXISTS archived_at TIMESTAMPTZ NULL;"
+        ),
+    }
     Ok(())
+}
+
+/// Test-only override so the conditional behaviour can be exercised both ways.
+#[cfg(test)]
+pub fn set_archived_column_present_for_test(v: bool) {
+    ARCHIVED_COLUMN_PRESENT.store(v, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Mark catalog entries archived (noetl/ai-meta#237).
