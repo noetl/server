@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.79.4](https://github.com/noetl/server/compare/v3.79.3...v3.79.4) (2026-08-09)
+
+### Bug Fixes
+
+* **ci:** pass an explicit staging dir so publish-ar skips bucket discovery ([7fab3d7](https://github.com/noetl/server/commit/7fab3d718da67720c118bc24fe8a4363fa4b1865)), closes [#338](https://github.com/noetl/server/issues/338) [#338](https://github.com/noetl/server/issues/338) [noetl/ai-meta#211](https://github.com/noetl/ai-meta/issues/211)
+
 ## [3.79.3](https://github.com/noetl/server/compare/v3.79.2...v3.79.3) (2026-08-09)
 
 ### Bug Fixes
