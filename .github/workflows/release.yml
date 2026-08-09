@@ -211,6 +211,11 @@ jobs:
           PROJECT_ID: ${{ vars.GCP_PROJECT_ID || 'shastaratech-noetl-prod' }}
         run: |
           set -euo pipefail
+          # The WIF credential is an external account; gcloud checks
+          # serviceusage.services.use against the QUOTA project, which is unset
+          # by default.  The build SA holds roles/serviceusage.serviceUsageConsumer
+          # on PROJECT_ID, so pin the quota project to it.  See noetl/ai-meta#211.
+          gcloud config set billing/quota_project "${PROJECT_ID}"
           gcloud builds submit \
             --project="${PROJECT_ID}" \
             --region=us-central1 \
