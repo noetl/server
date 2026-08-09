@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.79.3](https://github.com/noetl/server/compare/v3.79.2...v3.79.3) (2026-08-09)
+
+### Bug Fixes
+
+* **ci:** pin the Cloud Build quota project so publish-ar can stage source ([eaa8966](https://github.com/noetl/server/commit/eaa896610193a5455602fad3b610877584b76f31)), closes [noetl/ai-meta#211](https://github.com/noetl/ai-meta/issues/211)
+
 ## [3.79.2](https://github.com/noetl/server/compare/v3.79.1...v3.79.2) (2026-08-07)
 
 ### Bug Fixes
