@@ -216,7 +216,22 @@ jobs:
           # by default.  The build SA holds roles/serviceusage.serviceUsageConsumer
           # on PROJECT_ID, so pin the quota project to it.  See noetl/ai-meta#211.
           gcloud config set billing/quota_project "${PROJECT_ID}"
+          # --- noetl/ai-meta#211 diagnostics -------------------------------
+          # Five IAM/policy theories are dead (storage roles, serviceUsageConsumer
+          # on the SA, quota project, the WIF principalSet, and an org policy --
+          # storage.restrictAuthTypes is effectively ALLOW).  Probe the exact call
+          # that 403s instead of guessing a sixth time.
+          echo "::group::211 probe"
+          gcloud auth list 2>&1 | head -5 || true
+          echo "-- bucket metadata (storage.buckets.get) --"
+          gcloud storage buckets describe "gs://${PROJECT_ID}_cloudbuild" \
+            --format="value(name,location,location_type)" 2>&1 | head -5 || true
+          echo "-- bucket listing (storage.objects.list) --"
+          gcloud storage ls "gs://${PROJECT_ID}_cloudbuild" 2>&1 | head -5 || true
+          echo "::endgroup::"
+          # ----------------------------------------------------------------
           gcloud builds submit \
+            --verbosity=debug \
             --project="${PROJECT_ID}" \
             --region=us-central1 \
             --config=cloudbuild.yaml \
