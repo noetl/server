@@ -163,21 +163,14 @@ pub fn should_refresh(
         // Already past the deadline — eviction path, not refresh path.
         return false;
     }
-    let window = chrono::Duration::from_std(refresh_window)
-        .unwrap_or_else(|_| chrono::Duration::seconds(0));
+    let window =
+        chrono::Duration::from_std(refresh_window).unwrap_or_else(|_| chrono::Duration::seconds(0));
     expires_at - window <= now
 }
 
 /// Convenience entry point that reads the refresh window from env.
-pub fn should_refresh_default(
-    expires_at: Option<DateTime<Utc>>,
-    now: DateTime<Utc>,
-) -> bool {
-    should_refresh(
-        expires_at,
-        Duration::from_secs(refresh_window_secs()),
-        now,
-    )
+pub fn should_refresh_default(expires_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool {
+    should_refresh(expires_at, Duration::from_secs(refresh_window_secs()), now)
 }
 
 #[cfg(test)]

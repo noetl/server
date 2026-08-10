@@ -295,7 +295,9 @@ impl ObjectBackend {
         bytes: &[u8],
     ) -> AppResult<()> {
         match self {
-            ObjectBackend::Postgres => object_store::put(pool, key, digest, media_type, bytes).await,
+            ObjectBackend::Postgres => {
+                object_store::put(pool, key, digest, media_type, bytes).await
+            }
             ObjectBackend::Gcs(g) => g.put(key, media_type, bytes).await,
         }
     }
@@ -427,7 +429,8 @@ impl GcsBackend {
                 break;
             }
             let max_results = remaining.min(1000).to_string();
-            let mut query: Vec<(&str, &str)> = vec![("prefix", prefix), ("maxResults", &max_results)];
+            let mut query: Vec<(&str, &str)> =
+                vec![("prefix", prefix), ("maxResults", &max_results)];
             if let Some(tok) = page_token.as_deref() {
                 query.push(("pageToken", tok));
             }

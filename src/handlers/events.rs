@@ -570,9 +570,15 @@ pub(crate) async fn normalize_event_to_row(
 
     let catalog_id = get_catalog_id(state, execution_id, "get_catalog_id_single").await?;
 
-    let mut meta = request.meta.clone().unwrap_or_else(|| serde_json::json!({}));
+    let mut meta = request
+        .meta
+        .clone()
+        .unwrap_or_else(|| serde_json::json!({}));
     if let serde_json::Value::Object(ref mut map) = meta {
-        map.insert("actionable".to_string(), serde_json::json!(request.actionable));
+        map.insert(
+            "actionable".to_string(),
+            serde_json::json!(request.actionable),
+        );
         map.insert(
             "informative".to_string(),
             serde_json::json!(request.informative),
@@ -670,12 +676,8 @@ async fn handle_event_inner(
         .with_node(row.node_name.clone())
         .with_result(row.result.clone())
         .with_meta(row.meta.clone());
-        crate::handlers::event_write::emit_event(
-            &state,
-            state.pools.pool_for(execution_id),
-            ev,
-        )
-        .await?;
+        crate::handlers::event_write::emit_event(&state, state.pools.pool_for(execution_id), ev)
+            .await?;
     } else {
         crate::metrics::record_orchestrate_drive("event_suppressed");
     }
@@ -800,8 +802,10 @@ async fn resolve_command_context_ref(
             return context;
         }
     };
-    let result_store =
-        ResultStoreService::new(state.pools.pool_for(parsed.execution_id).clone(), state.snowflake.clone());
+    let result_store = ResultStoreService::new(
+        state.pools.pool_for(parsed.execution_id).clone(),
+        state.snowflake.clone(),
+    );
     match result_store.resolve(&parsed).await {
         Ok(Some(data)) => {
             crate::metrics::record_orchestrate_drive("context_ref_resolved");
@@ -810,7 +814,8 @@ async fn resolve_command_context_ref(
         Ok(None) => {
             warn!(
                 execution_id = parsed.execution_id,
-                ref_uri, "command context reference not found in store; left as-is (noetl/ai-meta#114)"
+                ref_uri,
+                "command context reference not found in store; left as-is (noetl/ai-meta#114)"
             );
             context
         }
@@ -880,7 +885,10 @@ pub async fn get_command(
                 meta,
             }))
         }
-        None => Err(AppError::NotFound(format!("command not found: {}", event_id))),
+        None => Err(AppError::NotFound(format!(
+            "command not found: {}",
+            event_id
+        ))),
     }
 }
 
@@ -957,7 +965,10 @@ pub async fn claim_command(
     .await?;
 
     let Some(row) = cmd_row else {
-        return Err(AppError::NotFound(format!("command not found: {}", event_id)));
+        return Err(AppError::NotFound(format!(
+            "command not found: {}",
+            event_id
+        )));
     };
 
     let execution_id: i64 = row.try_get("execution_id")?;
@@ -1797,7 +1808,10 @@ async fn hydrate_result_references(
         let resolved = match result_store.resolve(&parsed).await {
             Ok(Some(data)) => data,
             Ok(None) => {
-                warn!(execution_id = ev.execution_id, ref_uri, "result reference not found in store; left as-is");
+                warn!(
+                    execution_id = ev.execution_id,
+                    ref_uri, "result reference not found in store; left as-is"
+                );
                 continue;
             }
             Err(e) => {
@@ -1956,7 +1970,10 @@ async fn resolve_cursor_claim_refs(
                         frame.claim_rows = rows;
                         frame.claim_ref = None;
                     }
-                    None => warn!(uri, "cursor claim reference resolved but no rows array found"),
+                    None => warn!(
+                        uri,
+                        "cursor claim reference resolved but no rows array found"
+                    ),
                 },
                 Ok(None) => warn!(uri, "cursor claim reference not found in store"),
                 Err(e) => warn!(uri, %e, "cursor claim reference resolve failed"),
@@ -2030,8 +2047,10 @@ async fn rebuild_state(
                 .await?,
             );
             hydrate_result_references(&mut all_events, result_store, keep_refs).await;
-            let state = crate::engine::state::WorkflowState::from_events(&all_events.iter().map(Into::into).collect::<Vec<_>>())
-                .ok_or_else(|| AppError::Validation("No events found for execution".to_string()))?;
+            let state = crate::engine::state::WorkflowState::from_events(
+                &all_events.iter().map(Into::into).collect::<Vec<_>>(),
+            )
+            .ok_or_else(|| AppError::Validation("No events found for execution".to_string()))?;
             let last_event_id = all_events.last().map(|e| e.event_id).unwrap_or(0);
             let routing_meta = all_events
                 .iter()
@@ -2146,7 +2165,10 @@ async fn rebuild_state_chain_walk(
     // Head from the in-memory watermark — no DB read.  Cold slot → fall back.
     let Some(head) = state.chain_heads.head(execution_id).await else {
         crate::metrics::record_state_build("chain_walk", "fallback_cold_head");
-        debug!(execution_id, "chain walk: cold head, falling back to event scan");
+        debug!(
+            execution_id,
+            "chain walk: cold head, falling back to event scan"
+        );
         return Ok(None);
     };
 
@@ -2282,7 +2304,10 @@ async fn run_parity_check(
             break;
         };
         let prev: Option<i64> = row.try_get("prev_event_id").ok().flatten();
-        let ev = parse_event_rows(vec![row]).into_iter().next().expect("one row");
+        let ev = parse_event_rows(vec![row])
+            .into_iter()
+            .next()
+            .expect("one row");
         cursor = prev;
         walk_events.push(ev);
     }
@@ -2388,7 +2413,10 @@ fn parity_check_states(
     match (a, b) {
         (Ok(a), Ok(b)) if a == b => {
             crate::metrics::record_state_build_parity("match");
-            debug!(execution_id, "state-build parity OK (chain-walk == event-scan)");
+            debug!(
+                execution_id,
+                "state-build parity OK (chain-walk == event-scan)"
+            );
         }
         (Ok(a), Ok(b)) => {
             crate::metrics::record_state_build_parity("mismatch");
@@ -2415,7 +2443,10 @@ fn parity_check_states(
         }
         _ => {
             crate::metrics::record_state_build_parity("mismatch");
-            warn!(execution_id, "state-build parity: a state failed to serialize");
+            warn!(
+                execution_id,
+                "state-build parity: a state failed to serialize"
+            );
         }
     }
 }
@@ -2452,7 +2483,13 @@ pub(crate) async fn advance_snapshot(
         pool.clone(),
         state.snowflake.clone(),
     );
-    let r = rebuild_state(pool, &result_store, execution_id, state.config.refs_in_state).await?;
+    let r = rebuild_state(
+        pool,
+        &result_store,
+        execution_id,
+        state.config.refs_in_state,
+    )
+    .await?;
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM noetl.event WHERE execution_id = $1")
         .bind(execution_id)
         .fetch_one(pool)
@@ -2516,7 +2553,11 @@ pub fn spawn_orchestrator_reconciler(state: AppState) {
                 // shortcut from firing on an already-applied event.
                 match trigger_orchestrator_inner(&state, execution_id, i64::MAX, true).await {
                     Ok(n) if n > 0 => {
-                        info!(execution_id, commands = n, "reconcile poller advanced a stuck execution")
+                        info!(
+                            execution_id,
+                            commands = n,
+                            "reconcile poller advanced a stuck execution"
+                        )
                     }
                     Ok(_) => {}
                     Err(e) => {
@@ -2577,7 +2618,10 @@ async fn dispatch_offserver_stateless_drive(
     let mut cache = cache_slot.lock().await;
     if cache.orchestrate_in_flight {
         crate::metrics::record_orchestrate_drive("skipped_in_flight");
-        debug!(execution_id, "stateless drive: orchestrate already in flight; skip");
+        debug!(
+            execution_id,
+            "stateless drive: orchestrate already in flight; skip"
+        );
         return Ok(0);
     }
 
@@ -2617,9 +2661,10 @@ async fn dispatch_offserver_stateless_drive(
     // (planner + MCP children).  Auth/login executions fall here with the master
     // flag on but no prefix match → empty tail → today's drain-served path, so the
     // 15s-gateway-timeout login regression cannot recur.
-    let tail_attach = state
-        .config
-        .tail_attach_applies(playbook.metadata.path.as_deref().unwrap_or(""), &playbook.metadata.name);
+    let tail_attach = state.config.tail_attach_applies(
+        playbook.metadata.path.as_deref().unwrap_or(""),
+        &playbook.metadata.name,
+    );
     let tail_events = if tail_attach {
         state.chain_tails.snapshot(execution_id)
     } else {
@@ -2850,133 +2895,144 @@ async fn trigger_orchestrator_inner(
 
     // ===== event-scan state construction (skipped when the chain walk built) ===
     if !chain_built {
+        // The consistency `COUNT(*)` over this execution's event partition is
+        // O(events) — ≈27ms at 60k events — and only detects a *non-triggering*
+        // straggler (an event type that doesn't fire the orchestrator, inserted
+        // below the high-water mark).  Running it on every trigger throttles the
+        // whole orchestrator on a large log.  So throttle it: a fresh `total` gates
+        // the mismatch→rebuild + snapshot paths; between checks the incremental
+        // apply + the immediate straggler handling below carry correctness.  Cold
+        // cache always counts (it needs `total` to seed `applied_count`).
+        const COUNT_THROTTLE: std::time::Duration = std::time::Duration::from_millis(1000);
+        let now = std::time::Instant::now();
+        let do_count = force_count
+            || cache.state.is_none()
+            || cache
+                .last_count_check
+                .is_none_or(|t| now.duration_since(t) >= COUNT_THROTTLE);
+        total = if do_count {
+            cache.last_count_check = Some(now);
+            Some(
+                sqlx::query_scalar("SELECT COUNT(*) FROM noetl.event WHERE execution_id = $1")
+                    .bind(execution_id)
+                    .fetch_one(pool)
+                    .await?,
+            )
+        } else {
+            None
+        };
 
-    // The consistency `COUNT(*)` over this execution's event partition is
-    // O(events) — ≈27ms at 60k events — and only detects a *non-triggering*
-    // straggler (an event type that doesn't fire the orchestrator, inserted
-    // below the high-water mark).  Running it on every trigger throttles the
-    // whole orchestrator on a large log.  So throttle it: a fresh `total` gates
-    // the mismatch→rebuild + snapshot paths; between checks the incremental
-    // apply + the immediate straggler handling below carry correctness.  Cold
-    // cache always counts (it needs `total` to seed `applied_count`).
-    const COUNT_THROTTLE: std::time::Duration = std::time::Duration::from_millis(1000);
-    let now = std::time::Instant::now();
-    let do_count = force_count
-        || cache.state.is_none()
-        || cache
-            .last_count_check
-            .is_none_or(|t| now.duration_since(t) >= COUNT_THROTTLE);
-    total = if do_count {
-        cache.last_count_check = Some(now);
-        Some(
-            sqlx::query_scalar("SELECT COUNT(*) FROM noetl.event WHERE execution_id = $1")
+        // Warm a cold cache from the latest snapshot + events-since (bounded), or
+        // the full (still-small) early log when no snapshot exists yet.
+        did_rebuild = false;
+        if cache.state.is_none() {
+            let r = rebuild_state(
+                pool,
+                &result_store,
+                execution_id,
+                state.config.refs_in_state,
+            )
+            .await?;
+            cache.state = Some(r.state);
+            cache.last_event_id = r.last_event_id;
+            cache.applied_count = total.unwrap_or(0);
+            cache.snapshot_version = r.snapshot_version;
+            cache.routing_meta = r.routing_meta;
+            did_rebuild = true;
+        }
+
+        // Immediate straggler: the event that fired this trigger is at/below the
+        // watermark (a late insert below the high-water mark — interleaved snowflake
+        // ids).  It is not in the `> watermark` load below, so apply it directly.
+        // `command.completed`/`failed` are the only types that trigger, so this
+        // catches the cursor-relevant stragglers (body completions) with no COUNT
+        // and no rebuild.  Idempotent: cursor counters are gated by the
+        // `cursor_issued`/`cursor_completed` id-sets.
+        straggler_applied = false;
+        if !did_rebuild && trigger_event_id <= cache.last_event_id {
+            let mut strag = parse_event_rows(
+                sqlx::query(&format!(
+                    "{ORCH_EVENT_COLS} WHERE execution_id = $1 AND event_id = $2"
+                ))
                 .bind(execution_id)
-                .fetch_one(pool)
+                .bind(trigger_event_id)
+                .fetch_all(pool)
                 .await?,
-        )
-    } else {
-        None
-    };
+            );
+            hydrate_result_references(&mut strag, &result_store, state.config.refs_in_state).await;
+            if let Some(ws) = cache.state.as_mut() {
+                for e in &strag {
+                    ws.apply_event(&e.into());
+                }
+            }
+            straggler_applied = !strag.is_empty();
+            // Count the straggler so the next consistency check matches and does NOT
+            // fire an (expensive) bounded rebuild for an event we already applied.
+            // The straggler is below the watermark, so it is never in the
+            // `> watermark` load — no double count.  A rare double-trigger overcount
+            // self-heals: the next check mismatches once and the rebuild resets
+            // `applied_count = total`.
+            cache.applied_count += strag.len() as i64;
+        }
 
-    // Warm a cold cache from the latest snapshot + events-since (bounded), or
-    // the full (still-small) early log when no snapshot exists yet.
-    did_rebuild = false;
-    if cache.state.is_none() {
-        let r = rebuild_state(pool, &result_store, execution_id, state.config.refs_in_state).await?;
-        cache.state = Some(r.state);
-        cache.last_event_id = r.last_event_id;
-        cache.applied_count = total.unwrap_or(0);
-        cache.snapshot_version = r.snapshot_version;
-        cache.routing_meta = r.routing_meta;
-        did_rebuild = true;
-    }
-
-    // Immediate straggler: the event that fired this trigger is at/below the
-    // watermark (a late insert below the high-water mark — interleaved snowflake
-    // ids).  It is not in the `> watermark` load below, so apply it directly.
-    // `command.completed`/`failed` are the only types that trigger, so this
-    // catches the cursor-relevant stragglers (body completions) with no COUNT
-    // and no rebuild.  Idempotent: cursor counters are gated by the
-    // `cursor_issued`/`cursor_completed` id-sets.
-    straggler_applied = false;
-    if !did_rebuild && trigger_event_id <= cache.last_event_id {
-        let mut strag = parse_event_rows(
+        // Events newer than what's applied.
+        new_events = parse_event_rows(
             sqlx::query(&format!(
-                "{ORCH_EVENT_COLS} WHERE execution_id = $1 AND event_id = $2"
+                "{ORCH_EVENT_COLS} WHERE execution_id = $1 AND event_id > $2 ORDER BY event_id ASC"
             ))
             .bind(execution_id)
-            .bind(trigger_event_id)
+            .bind(cache.last_event_id)
             .fetch_all(pool)
             .await?,
         );
-        hydrate_result_references(&mut strag, &result_store, state.config.refs_in_state).await;
-        if let Some(ws) = cache.state.as_mut() {
-            for e in &strag {
+        hydrate_result_references(&mut new_events, &result_store, state.config.refs_in_state).await;
+
+        // Trigger type + drain timestamp.  The trigger event is normally among the
+        // new events; after a cold rebuild / straggler apply that already folded it
+        // in, fall back to a default type (and a None drain timestamp).
+        trigger_event_type = new_events
+            .iter()
+            .find(|e| e.event_id == trigger_event_id)
+            .map(|e| e.event_type.clone())
+            .unwrap_or_else(|| "command.completed".to_string());
+        latest_ts = new_events.last().map(|e| e.created_at);
+
+        // Consistency.  With a fresh `total`, applying the new events should account
+        // for ALL events; a shortfall means a straggler is below the watermark — and
+        // crucially it may be a *non-triggering* one (the cursor claim's `call.done`
+        // carrying the row batch), which would otherwise leave the cursor unable to
+        // fan out and stop emitting events entirely.  A bounded rebuild re-scans the
+        // recent window and folds it in.  This check runs whether or not there are
+        // new events, so the reconcile poller (no new events, fresh count) still
+        // catches a stuck execution.  Without a fresh `total` (throttled), trust the
+        // incremental apply.
+        let mismatch =
+            matches!(total, Some(t) if cache.applied_count + new_events.len() as i64 != t);
+        if mismatch {
+            let r = rebuild_state(
+                pool,
+                &result_store,
+                execution_id,
+                state.config.refs_in_state,
+            )
+            .await?;
+            cache.state = Some(r.state);
+            cache.last_event_id = r.last_event_id;
+            cache.applied_count = total.unwrap_or(cache.applied_count);
+            cache.snapshot_version = r.snapshot_version;
+            cache.routing_meta = r.routing_meta;
+            did_rebuild = true;
+        } else if !new_events.is_empty() {
+            let ws = cache.state.as_mut().unwrap();
+            for e in &new_events {
                 ws.apply_event(&e.into());
             }
+            cache.applied_count += new_events.len() as i64;
+            cache.last_event_id = new_events
+                .last()
+                .map(|e| e.event_id)
+                .unwrap_or(cache.last_event_id);
         }
-        straggler_applied = !strag.is_empty();
-        // Count the straggler so the next consistency check matches and does NOT
-        // fire an (expensive) bounded rebuild for an event we already applied.
-        // The straggler is below the watermark, so it is never in the
-        // `> watermark` load — no double count.  A rare double-trigger overcount
-        // self-heals: the next check mismatches once and the rebuild resets
-        // `applied_count = total`.
-        cache.applied_count += strag.len() as i64;
-    }
-
-    // Events newer than what's applied.
-    new_events = parse_event_rows(
-        sqlx::query(&format!(
-            "{ORCH_EVENT_COLS} WHERE execution_id = $1 AND event_id > $2 ORDER BY event_id ASC"
-        ))
-        .bind(execution_id)
-        .bind(cache.last_event_id)
-        .fetch_all(pool)
-        .await?,
-    );
-    hydrate_result_references(&mut new_events, &result_store, state.config.refs_in_state).await;
-
-    // Trigger type + drain timestamp.  The trigger event is normally among the
-    // new events; after a cold rebuild / straggler apply that already folded it
-    // in, fall back to a default type (and a None drain timestamp).
-    trigger_event_type = new_events
-        .iter()
-        .find(|e| e.event_id == trigger_event_id)
-        .map(|e| e.event_type.clone())
-        .unwrap_or_else(|| "command.completed".to_string());
-    latest_ts = new_events.last().map(|e| e.created_at);
-
-    // Consistency.  With a fresh `total`, applying the new events should account
-    // for ALL events; a shortfall means a straggler is below the watermark — and
-    // crucially it may be a *non-triggering* one (the cursor claim's `call.done`
-    // carrying the row batch), which would otherwise leave the cursor unable to
-    // fan out and stop emitting events entirely.  A bounded rebuild re-scans the
-    // recent window and folds it in.  This check runs whether or not there are
-    // new events, so the reconcile poller (no new events, fresh count) still
-    // catches a stuck execution.  Without a fresh `total` (throttled), trust the
-    // incremental apply.
-    let mismatch = matches!(total, Some(t) if cache.applied_count + new_events.len() as i64 != t);
-    if mismatch {
-        let r = rebuild_state(pool, &result_store, execution_id, state.config.refs_in_state).await?;
-        cache.state = Some(r.state);
-        cache.last_event_id = r.last_event_id;
-        cache.applied_count = total.unwrap_or(cache.applied_count);
-        cache.snapshot_version = r.snapshot_version;
-        cache.routing_meta = r.routing_meta;
-        did_rebuild = true;
-    } else if !new_events.is_empty() {
-        let ws = cache.state.as_mut().unwrap();
-        for e in &new_events {
-            ws.apply_event(&e.into());
-        }
-        cache.applied_count += new_events.len() as i64;
-        cache.last_event_id = new_events
-            .last()
-            .map(|e| e.event_id)
-            .unwrap_or(cache.last_event_id);
-    }
-
     } // end event-scan state construction (`if !chain_built`)
 
     // Terminal-state guard (noetl/ai-meta#113 facet 2).  A cancel
@@ -2991,7 +3047,11 @@ async fn trigger_orchestrator_inner(
     // `active_executions()`, so the reconcile poller stops re-visiting it.  This
     // runs ahead of the early-exit below so the forced-reconcile path is caught
     // even when no new events arrived this pass.
-    if cache.state.as_ref().is_some_and(|ws| ws.state.is_terminal()) {
+    if cache
+        .state
+        .as_ref()
+        .is_some_and(|ws| ws.state.is_terminal())
+    {
         let st = cache.state.as_ref().map(|ws| ws.state);
         drop(cache);
         state.orch_cache.evict(execution_id);
@@ -3009,7 +3069,10 @@ async fn trigger_orchestrator_inner(
     // Nothing changed and this is not a forced reconcile → exit early.  A forced
     // reconcile still evaluates (to drive a cursor that may now advance).
     if new_events.is_empty() && !did_rebuild && !straggler_applied && !force_count {
-        debug!(execution_id, "No new events to evaluate — orchestrator exit early");
+        debug!(
+            execution_id,
+            "No new events to evaluate — orchestrator exit early"
+        );
         return Ok(0);
     }
 
@@ -3105,7 +3168,10 @@ async fn trigger_orchestrator_inner(
         // would otherwise produce two orchestrate commands → duplicate work).
         if cache.orchestrate_in_flight {
             crate::metrics::record_orchestrate_drive("skipped_in_flight");
-            debug!(execution_id, "worker-driven: orchestrate already in flight; skip");
+            debug!(
+                execution_id,
+                "worker-driven: orchestrate already in flight; skip"
+            );
             return Ok(0);
         }
         let routing = cache
@@ -3757,7 +3823,13 @@ async fn apply_worker_orchestration(
                 pool.clone(),
                 state.snowflake.clone(),
             );
-            match rebuild_state(pool, &result_store, execution_id, state.config.refs_in_state).await
+            match rebuild_state(
+                pool,
+                &result_store,
+                execution_id,
+                state.config.refs_in_state,
+            )
+            .await
             {
                 Ok(r) => {
                     let total: i64 = sqlx::query_scalar(
@@ -3956,7 +4028,8 @@ mod tests {
         });
         assert_eq!(find_reference_uri(&result), None);
         // A non-`noetl://` `uri` (e.g. an http response field) is ignored.
-        let other = serde_json::json!({ "context": { "data": { "uri": "https://example.com/x" } } });
+        let other =
+            serde_json::json!({ "context": { "data": { "uri": "https://example.com/x" } } });
         assert_eq!(find_reference_uri(&other), None);
     }
 
@@ -3974,7 +4047,11 @@ mod tests {
         let after = crate::metrics::result_uri_accept_total()
             .with_label_values(&["canonical"])
             .get();
-        assert_eq!(after, before + 1, "canonical accept must increment the counter");
+        assert_eq!(
+            after,
+            before + 1,
+            "canonical accept must increment the counter"
+        );
     }
 
     /// A malformed `reference.uri` is counted `malformed` and does NOT panic /
@@ -3992,7 +4069,11 @@ mod tests {
         let after = crate::metrics::result_uri_accept_total()
             .with_label_values(&["malformed"])
             .get();
-        assert_eq!(after, before + 1, "malformed accept must increment the counter");
+        assert_eq!(
+            after,
+            before + 1,
+            "malformed accept must increment the counter"
+        );
     }
 
     // ── RFC #115 Phase 3 — chain-walk state builder ──────────────────────────
@@ -4026,11 +4107,17 @@ mod tests {
 
     #[test]
     fn chain_has_genesis_detects_playbook_started() {
-        let with = vec![ev(1, None, "playbook_started"), ev(2, Some(1), "command.issued")];
+        let with = vec![
+            ev(1, None, "playbook_started"),
+            ev(2, Some(1), "command.issued"),
+        ];
         assert!(chain_has_genesis(&with));
         // A restart-spanning tail (no genesis) must be rejected so the builder
         // falls back to event-scan rather than building a partial state.
-        let tail = vec![ev(5, None, "command.completed"), ev(6, Some(5), "command.issued")];
+        let tail = vec![
+            ev(5, None, "command.completed"),
+            ev(6, Some(5), "command.issued"),
+        ];
         assert!(!chain_has_genesis(&tail));
     }
 
@@ -4086,10 +4173,12 @@ mod tests {
         );
 
         // And the states `from_events` produces from each ordering are identical.
-        let scan_state =
-            crate::engine::state::WorkflowState::from_events(&scan_order.iter().map(Into::into).collect::<Vec<_>>());
-        let walk_state =
-            crate::engine::state::WorkflowState::from_events(&walk_collected.iter().map(Into::into).collect::<Vec<_>>());
+        let scan_state = crate::engine::state::WorkflowState::from_events(
+            &scan_order.iter().map(Into::into).collect::<Vec<_>>(),
+        );
+        let walk_state = crate::engine::state::WorkflowState::from_events(
+            &walk_collected.iter().map(Into::into).collect::<Vec<_>>(),
+        );
         assert_eq!(
             serde_json::to_value(&scan_state).unwrap(),
             serde_json::to_value(&walk_state).unwrap(),
@@ -4109,9 +4198,15 @@ mod tests {
             "extracted": {},
         });
         let out = with_ref_accessors(extracted, Some(&reference));
-        assert_eq!(out["_ref"], serde_json::json!("noetl://execution/1/result/start/9"));
+        assert_eq!(
+            out["_ref"],
+            serde_json::json!("noetl://execution/1/result/start/9")
+        );
         assert_eq!(out["_store"], serde_json::json!("kv"));
-        assert_eq!(out["_uri"], serde_json::json!("noetl://t/p/results/1/start/0/0/1"));
+        assert_eq!(
+            out["_uri"],
+            serde_json::json!("noetl://t/p/results/1/start/0/0/1")
+        );
         // The summary scalars are preserved.
         assert_eq!(out["status"], serde_json::json!("ok"));
         assert_eq!(out["count"], serde_json::json!(500));
@@ -4662,8 +4757,8 @@ mod tests {
             "should_complete": true,
             "events_to_emit": []
         });
-        let b64 = base64::engine::general_purpose::STANDARD
-            .encode(serde_json::to_vec(&or_json).unwrap());
+        let b64 =
+            base64::engine::general_purpose::STANDARD.encode(serde_json::to_vec(&or_json).unwrap());
         let decoded = decode_orchestration_result(Some(&b64))
             .expect("valid base64 + JSON decodes to an OrchestrationResult");
         assert!(decoded.should_complete);
@@ -4700,8 +4795,8 @@ mod tests {
         let or_json = serde_json::json!({
             "state": "completed", "commands": [], "should_complete": true, "events_to_emit": []
         });
-        let or_b64 = base64::engine::general_purpose::STANDARD
-            .encode(serde_json::to_vec(&or_json).unwrap());
+        let or_b64 =
+            base64::engine::general_purpose::STANDARD.encode(serde_json::to_vec(&or_json).unwrap());
         assert!(decode_orchestrate_error(Some(&or_b64)).is_none());
 
         // Transient decode misses (None / bad base64 / empty error) stay on the

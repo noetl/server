@@ -170,13 +170,7 @@ mod tests {
         // versions (fixed seed); these values won't change
         // unless the twox-hash crate version moves AND a
         // breaking change to its hash output ships.
-        let cases: &[i64] = &[
-            1,
-            42,
-            320_816_801_799_737_344,
-            i64::MAX,
-            -1,
-        ];
+        let cases: &[i64] = &[1, 42, 320_816_801_799_737_344, i64::MAX, -1];
         for eid in cases {
             // The test doesn't assert a specific number — it
             // asserts the function call doesn't panic and the

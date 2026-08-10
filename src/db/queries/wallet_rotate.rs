@@ -153,12 +153,7 @@ pub async fn key_status_credential(pool: &DbPool) -> AppResult<Vec<(String, i64)
     .await?;
     Ok(rows
         .into_iter()
-        .map(|r| {
-            (
-                r.get::<String, _>("kek_version"),
-                r.get::<i64, _>("n"),
-            )
-        })
+        .map(|r| (r.get::<String, _>("kek_version"), r.get::<i64, _>("n")))
         .collect())
 }
 
@@ -181,11 +176,6 @@ pub async fn key_status_keychain(pool: &DbPool) -> AppResult<Vec<(String, i64)>>
     .await?;
     Ok(rows
         .into_iter()
-        .map(|r| {
-            (
-                r.get::<String, _>("kek_version"),
-                r.get::<i64, _>("n"),
-            )
-        })
+        .map(|r| (r.get::<String, _>("kek_version"), r.get::<i64, _>("n")))
         .collect())
 }

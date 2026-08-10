@@ -122,7 +122,10 @@ pub async fn get_ingress_config(
     let (catalog_path, spec) = resolve_subscription_by_listener(&deps.state, &listener)
         .await?
         .ok_or_else(|| {
-            AppError::NotFound(format!("No push subscription for ingress listener '{}'", listener))
+            AppError::NotFound(format!(
+                "No push subscription for ingress listener '{}'",
+                listener
+            ))
         })?;
 
     let ingress = spec
@@ -295,7 +298,10 @@ fn listener_matches(gateway_path: &str, listener: &str) -> bool {
 async fn resolve_secret_alias(credentials: &CredentialService, alias: &str) -> AppResult<String> {
     let resolved = credentials.get(alias, true, None).await?;
     let data = resolved.data.ok_or_else(|| {
-        AppError::Internal(format!("verify secret alias '{}' resolved with no data", alias))
+        AppError::Internal(format!(
+            "verify secret alias '{}' resolved with no data",
+            alias
+        ))
     })?;
 
     let value = match &data {

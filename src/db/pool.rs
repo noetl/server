@@ -457,9 +457,7 @@ mod tests {
     async fn for_each_shard_propagates_first_error() {
         let map = DbPoolMap::from_single_pool(dummy_pool());
         let err = map
-            .for_each_shard::<_, _, (), &'static str>(|_idx, _pool| async move {
-                Err("kaboom")
-            })
+            .for_each_shard::<_, _, (), &'static str>(|_idx, _pool| async move { Err("kaboom") })
             .await
             .unwrap_err();
         assert_eq!(err, "kaboom");
@@ -479,9 +477,9 @@ mod tests {
     async fn find_first_returns_first_match_with_shard_index() {
         let map = DbPoolMap::from_single_pool(dummy_pool());
         let out: Option<(u32, &'static str)> = map
-            .find_first::<_, _, &'static str, sqlx::Error>(|_idx, _pool| async move {
-                Ok(Some("hit"))
-            })
+            .find_first::<_, _, &'static str, sqlx::Error>(
+                |_idx, _pool| async move { Ok(Some("hit")) },
+            )
             .await
             .expect("ok");
         assert_eq!(out, Some((0, "hit")));

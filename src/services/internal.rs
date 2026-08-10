@@ -91,10 +91,7 @@ const SNOWFLAKE_TS_SHIFT: i64 = 22;
 /// This reclaims space instantly with no DELETE scan, dead tuples, or vacuum,
 /// which is the whole point of partitioning the event log for retention.
 /// `event_default` (the catch-all) is never dropped.
-async fn drop_old_event_partitions(
-    pool: &DbPool,
-    retention_days: i64,
-) -> AppResult<Vec<String>> {
+async fn drop_old_event_partitions(pool: &DbPool, retention_days: i64) -> AppResult<Vec<String>> {
     // cutoff snowflake id for "retention_days ago".
     let cutoff: i64 = sqlx::query_scalar(
         r#"
@@ -259,7 +256,18 @@ fn default_payload_codec() -> String {
 pub async fn claim_batch(pool: &DbPool, limit: i64) -> AppResult<Vec<OutboxRow>> {
     let limit = limit.clamp(1, 1000);
 
-    let rows = sqlx::query_as::<_, (i64, i64, Option<i64>, Option<String>, JsonValue, String, i32)>(
+    let rows = sqlx::query_as::<
+        _,
+        (
+            i64,
+            i64,
+            Option<i64>,
+            Option<String>,
+            JsonValue,
+            String,
+            i32,
+        ),
+    >(
         r#"
         WITH ready AS (
             SELECT outbox_id
@@ -612,10 +620,9 @@ mod tests {
     // misleading "premature end of input".
     #[test]
     fn envelope_accepts_timezone_less_timestamp() {
-        let env: EventEnvelope = serde_json::from_str(
-            r#"{"event_id":1,"timestamp":"2026-06-17T16:48:21.379403"}"#,
-        )
-        .expect("tz-less timestamp must deserialize (#106)");
+        let env: EventEnvelope =
+            serde_json::from_str(r#"{"event_id":1,"timestamp":"2026-06-17T16:48:21.379403"}"#)
+                .expect("tz-less timestamp must deserialize (#106)");
         let ts = env.timestamp.expect("timestamp parsed");
         assert_eq!(ts.to_rfc3339(), "2026-06-17T16:48:21.379403+00:00");
     }
@@ -661,7 +668,8 @@ mod tests {
             {"event_id":10,"event_type":"call.done","timestamp":"2026-06-17T16:48:21.379403"},
             {"event_id":11,"event_type":"command.completed","timestamp":"2026-06-17T16:48:22.001"}
         ]}"#;
-        let req: EventsProjectRequest = serde_json::from_str(body).expect("batch deserializes (#106)");
+        let req: EventsProjectRequest =
+            serde_json::from_str(body).expect("batch deserializes (#106)");
         assert_eq!(req.events.len(), 2);
         assert!(req.events[0].timestamp.is_some());
     }
@@ -709,8 +717,7 @@ mod tests {
 
     #[test]
     fn cleanup_event_retention_is_explicit_opt_in() {
-        let p: CleanupPolicy =
-            serde_json::from_str(r#"{"event_retention_days": 365}"#).unwrap();
+        let p: CleanupPolicy = serde_json::from_str(r#"{"event_retention_days": 365}"#).unwrap();
         assert_eq!(p.event_retention_days, 365);
         // Other fields still fall back to safe defaults.
         assert_eq!(p.command_retention_days, 7);

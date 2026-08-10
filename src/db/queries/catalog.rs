@@ -159,15 +159,23 @@ pub async fn list_catalog_entries(
     const COLS: &str = "catalog_id AS id, path, kind, version, content, layout, payload, meta, created_at AT TIME ZONE 'UTC' as created_at";
     // Absent column => no predicate at all, regardless of `include_archived`:
     // there is nothing to filter and referencing it would break the query.
-    let archived = if include_archived { "" } else { archived_filter() };
+    let archived = if include_archived {
+        ""
+    } else {
+        archived_filter()
+    };
     let entries = if let Some(k) = kind {
-        let sql = format!("SELECT {COLS} FROM noetl.catalog WHERE kind = $1{archived} ORDER BY created_at DESC");
+        let sql = format!(
+            "SELECT {COLS} FROM noetl.catalog WHERE kind = $1{archived} ORDER BY created_at DESC"
+        );
         sqlx::query_as::<_, CatalogEntry>(&sql)
             .bind(k)
             .fetch_all(pool)
             .await?
     } else {
-        let sql = format!("SELECT {COLS} FROM noetl.catalog WHERE 1 = 1{archived} ORDER BY created_at DESC");
+        let sql = format!(
+            "SELECT {COLS} FROM noetl.catalog WHERE 1 = 1{archived} ORDER BY created_at DESC"
+        );
         sqlx::query_as::<_, CatalogEntry>(&sql)
             .fetch_all(pool)
             .await?

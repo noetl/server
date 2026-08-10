@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 
 use crate::error::AppResult;
 use crate::metrics::record_secret_provider_build;
-use crate::secrets::{SecretProvider, build_secret_provider};
+use crate::secrets::{build_secret_provider, SecretProvider};
 
 /// Registry singleton — process-global, lock-protected.
 fn registry() -> &'static ProviderRegistry {

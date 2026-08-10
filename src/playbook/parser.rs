@@ -405,7 +405,13 @@ fn validate_loop_config(
                 step_name
             )));
         }
-    } else if loop_config.in_expr.as_deref().unwrap_or("").trim().is_empty() {
+    } else if loop_config
+        .in_expr
+        .as_deref()
+        .unwrap_or("")
+        .trim()
+        .is_empty()
+    {
         return Err(AppError::Validation(format!(
             "Step '{}': loop requires `in:` (the collection expression) for mode={:?}",
             step_name,
@@ -574,14 +580,23 @@ workflow:
         let start = playbook.get_step("start").expect("start step present");
         match &start.tool {
             crate::playbook::types::ToolDefinition::Single(spec) => {
-                assert_eq!(spec.kind, crate::playbook::types::ToolKind::Python,
-                    "workbook ref should be rewritten to the inline action's tool kind");
-                assert_eq!(spec.code.as_deref(), Some("result = {'is_hot': float(temperature_c) >= 25.0}"),
-                    "workbook ref should carry the inline action's code");
+                assert_eq!(
+                    spec.kind,
+                    crate::playbook::types::ToolKind::Python,
+                    "workbook ref should be rewritten to the inline action's tool kind"
+                );
+                assert_eq!(
+                    spec.code.as_deref(),
+                    Some("result = {'is_hot': float(temperature_c) >= 25.0}"),
+                    "workbook ref should carry the inline action's code"
+                );
                 let args = spec.args.as_ref().expect("merged input present");
                 let temp = args.get("temperature_c").and_then(|v| v.as_str());
-                assert_eq!(temp, Some("{{ temperature_c }}"),
-                    "step's input overrides workbook's default");
+                assert_eq!(
+                    temp,
+                    Some("{{ temperature_c }}"),
+                    "step's input overrides workbook's default"
+                );
             }
             other => panic!("expected ToolDefinition::Single, got {:?}", other),
         }
@@ -607,8 +622,16 @@ workflow:
 "#;
         let err = parse_playbook(yaml).expect_err("missing workbook action should be rejected");
         let msg = format!("{:?}", err);
-        assert!(msg.contains("missing_action"), "error must name the missing action: {}", msg);
-        assert!(msg.contains("compute_flag"), "error must list available actions: {}", msg);
+        assert!(
+            msg.contains("missing_action"),
+            "error must name the missing action: {}",
+            msg
+        );
+        assert!(
+            msg.contains("compute_flag"),
+            "error must list available actions: {}",
+            msg
+        );
     }
 
     #[test]

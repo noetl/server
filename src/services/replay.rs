@@ -67,9 +67,7 @@ impl ReplayCutoff {
     /// True if no cutoff is set — load every event for the
     /// execution.
     pub fn is_empty(&self) -> bool {
-        self.as_of_event_id.is_none()
-            && self.as_of_position.is_none()
-            && self.as_of_time.is_none()
+        self.as_of_event_id.is_none() && self.as_of_position.is_none() && self.as_of_time.is_none()
     }
 
     /// Count the number of fields set.  The endpoint rejects
@@ -1139,17 +1137,19 @@ fn populate_stage(
         Some(id) => id,
         None => return,
     };
-    let stage = stages.entry(stage_id.clone()).or_insert_with(|| ReplayStageState {
-        stage_id: stage_id.clone(),
-        status: "UNKNOWN".to_string(),
-        kind: meta_str(&event.meta, "kind"),
-        step_name: event
-            .node_name
-            .clone()
-            .or_else(|| meta_str(&event.meta, "step_name")),
-        parent_stage_id: meta_str(&event.meta, "parent_stage_id"),
-        ..Default::default()
-    });
+    let stage = stages
+        .entry(stage_id.clone())
+        .or_insert_with(|| ReplayStageState {
+            stage_id: stage_id.clone(),
+            status: "UNKNOWN".to_string(),
+            kind: meta_str(&event.meta, "kind"),
+            step_name: event
+                .node_name
+                .clone()
+                .or_else(|| meta_str(&event.meta, "step_name")),
+            parent_stage_id: meta_str(&event.meta, "parent_stage_id"),
+            ..Default::default()
+        });
     stage.last_event_id = Some(event.event_id);
     if let Some(parent) = meta_str(&event.meta, "parent_stage_id") {
         stage.parent_stage_id = Some(parent);
@@ -1199,14 +1199,16 @@ fn populate_frame(
     };
     let stage_id_now = extract_stage_id(event);
     let command_id_now = extract_command_id(event);
-    let frame = frames.entry(frame_id.clone()).or_insert_with(|| ReplayFrameState {
-        frame_id: frame_id.clone(),
-        stage_id: stage_id_now.clone(),
-        parent_frame_id: meta_str(&event.meta, "parent_frame_id"),
-        command_id: None,
-        status: "UNKNOWN".to_string(),
-        ..Default::default()
-    });
+    let frame = frames
+        .entry(frame_id.clone())
+        .or_insert_with(|| ReplayFrameState {
+            frame_id: frame_id.clone(),
+            stage_id: stage_id_now.clone(),
+            parent_frame_id: meta_str(&event.meta, "parent_frame_id"),
+            command_id: None,
+            status: "UNKNOWN".to_string(),
+            ..Default::default()
+        });
     frame.last_event_id = Some(event.event_id);
     if stage_id_now.is_some() {
         frame.stage_id = stage_id_now.clone();
@@ -1291,13 +1293,15 @@ fn populate_command(
     };
     let stage_id_now = extract_stage_id(event);
     let frame_id_now = extract_frame_id(event);
-    let command = commands.entry(command_id.clone()).or_insert_with(|| ReplayCommandState {
-        command_id: command_id.clone(),
-        stage_id: stage_id_now.clone(),
-        frame_id: frame_id_now.clone(),
-        status: "UNKNOWN".to_string(),
-        ..Default::default()
-    });
+    let command = commands
+        .entry(command_id.clone())
+        .or_insert_with(|| ReplayCommandState {
+            command_id: command_id.clone(),
+            stage_id: stage_id_now.clone(),
+            frame_id: frame_id_now.clone(),
+            status: "UNKNOWN".to_string(),
+            ..Default::default()
+        });
     command.last_event_id = Some(event.event_id);
     if stage_id_now.is_some() {
         command.stage_id = stage_id_now;
@@ -1497,8 +1501,9 @@ fn populate_loop(
         None => return,
     };
 
-    let loop_entry = loops.entry(loop_id.clone()).or_insert_with(|| {
-        ReplayLoopState {
+    let loop_entry = loops
+        .entry(loop_id.clone())
+        .or_insert_with(|| ReplayLoopState {
             loop_id: loop_id.clone(),
             step_name: event.node_name.clone(),
             total: meta_i64(&event.meta, "collection_size")
@@ -1507,8 +1512,7 @@ fn populate_loop(
             failed: 0,
             completed: false,
             last_event_id: None,
-        }
-    });
+        });
 
     loop_entry.last_event_id = Some(event.event_id);
 
@@ -1591,8 +1595,7 @@ fn populate_business_object(
             entry.attributes = state_obj.clone();
         }
     }
-    let patch_val = business_meta
-        .and_then(|m| m.get("patch").or_else(|| m.get("attributes")));
+    let patch_val = business_meta.and_then(|m| m.get("patch").or_else(|| m.get("attributes")));
     if let Some(patch_obj) = patch_val.and_then(|v| v.as_object()) {
         for (k, v) in patch_obj {
             entry.attributes.insert(k.clone(), v.clone());
@@ -1644,8 +1647,12 @@ pub fn payload_summary(reference: &serde_json::Value) -> PayloadSummary {
         None => return PayloadSummary::default(),
     };
     let rows_ref = obj.get("rows_ref").and_then(|v| v.as_object());
-    let rows_meta = rows_ref.and_then(|r| r.get("meta")).and_then(|v| v.as_object());
-    let rows_ipc = rows_ref.and_then(|r| r.get("ipc")).and_then(|v| v.as_object());
+    let rows_meta = rows_ref
+        .and_then(|r| r.get("meta"))
+        .and_then(|v| v.as_object());
+    let rows_ipc = rows_ref
+        .and_then(|r| r.get("ipc"))
+        .and_then(|v| v.as_object());
 
     // Lookup helper: try the top-level reference key first,
     // then meta, then ipc.
@@ -1670,9 +1677,8 @@ pub fn payload_summary(reference: &serde_json::Value) -> PayloadSummary {
             .or_else(|| rows_ipc.and_then(|i| i.get(key)).and_then(|v| v.as_i64()))
     };
 
-    let sha256 = lookup_str("sha256").or_else(|| {
-        obj.get("digest").and_then(|v| v.as_str().map(String::from))
-    });
+    let sha256 = lookup_str("sha256")
+        .or_else(|| obj.get("digest").and_then(|v| v.as_str().map(String::from)));
     let schema_digest = lookup_str("schema_digest");
     let row_count = lookup_i64("row_count");
     let media_type = lookup_str("media_type");
@@ -1790,10 +1796,7 @@ fn compute_checksums(state: &mut ReplayState) {
     // Per-projection hashes — each over the typed sub-state, so
     // BTreeMap ordering carries through to the SHA-256 input.
     let mut bundle = std::collections::BTreeMap::new();
-    bundle.insert(
-        "execution".to_string(),
-        Checksum::sha256(&state.execution),
-    );
+    bundle.insert("execution".to_string(), Checksum::sha256(&state.execution));
     bundle.insert("stage".to_string(), Checksum::sha256(&state.stages));
     bundle.insert("frame".to_string(), Checksum::sha256(&state.frames));
     bundle.insert("command".to_string(), Checksum::sha256(&state.commands));
@@ -1819,7 +1822,12 @@ fn compute_checksums(state: &mut ReplayState) {
 mod tests {
     use super::*;
 
-    fn ev(event_id: i64, event_type: &str, node_name: Option<&str>, status: &str) -> ReplayEventRow {
+    fn ev(
+        event_id: i64,
+        event_type: &str,
+        node_name: Option<&str>,
+        status: &str,
+    ) -> ReplayEventRow {
         ReplayEventRow {
             event_id,
             event_type: event_type.to_string(),
@@ -2267,13 +2275,7 @@ mod tests {
             e.meta = Some(serde_json::json!({"loop_id": "iter-1"}));
         });
 
-        let state = fold_replay_state(
-            &[e1, e2, e3, e4],
-            "t",
-            "o",
-            42,
-            ReplayProjection::All,
-        );
+        let state = fold_replay_state(&[e1, e2, e3, e4], "t", "o", 42, ReplayProjection::All);
 
         assert_eq!(state.loops.len(), 1);
         let entry = state.loops.get("iter-1").unwrap();
@@ -2431,13 +2433,7 @@ mod tests {
             }));
         });
 
-        let state = fold_replay_state(
-            &[e1, e2, e3],
-            "t",
-            "o",
-            42,
-            ReplayProjection::All,
-        );
+        let state = fold_replay_state(&[e1, e2, e3], "t", "o", 42, ReplayProjection::All);
 
         assert_eq!(state.business_objects.len(), 1);
         let bo = state.business_objects.get("customer/c-1").unwrap();
@@ -2508,7 +2504,7 @@ mod tests {
         let v = serde_json::to_value(&c).unwrap();
         assert_eq!(v["type"], serde_json::json!("sha256"));
         assert!(v["value"].as_str().unwrap().len() == 64); // SHA-256 hex
-        // Value is lowercase hex.
+                                                           // Value is lowercase hex.
         assert!(v["value"]
             .as_str()
             .unwrap()
@@ -2558,7 +2554,10 @@ mod tests {
         let state = fold_replay_state(&[], "default", "default", 1, ReplayProjection::All);
 
         // Top-level checksum present + lowercase hex.
-        let c = state.checksum.as_ref().expect("top-level checksum populated");
+        let c = state
+            .checksum
+            .as_ref()
+            .expect("top-level checksum populated");
         assert_eq!(c.algorithm, ChecksumType::Sha256);
         assert_eq!(c.value.len(), 64);
 
@@ -2635,13 +2634,7 @@ mod tests {
             e.node_name = Some("iterate".to_string());
             e.meta = Some(serde_json::json!({"loop_id": "L1"}));
         });
-        let with_loop = fold_replay_state(
-            &[loop_event],
-            "t",
-            "o",
-            42,
-            ReplayProjection::All,
-        );
+        let with_loop = fold_replay_state(&[loop_event], "t", "o", 42, ReplayProjection::All);
 
         // Loop projection hash MUST differ from the empty-fold
         // baseline (the loop entry changes the sub-state).
@@ -2783,7 +2776,10 @@ mod tests {
 
         assert_eq!(seeded.event_count, 4, "counters continue from base");
         assert_eq!(seeded.last_event_id, Some(4));
-        assert_eq!(seeded.last_event_type.as_deref(), Some("playbook.completed"));
+        assert_eq!(
+            seeded.last_event_type.as_deref(),
+            Some("playbook.completed")
+        );
         assert_eq!(seeded.execution.status, "COMPLETED");
     }
 
@@ -2857,7 +2853,10 @@ mod tests {
             },
         );
 
-        assert_eq!(seeded.upcaster_registry_digest.as_deref(), Some("v2-digest"));
+        assert_eq!(
+            seeded.upcaster_registry_digest.as_deref(),
+            Some("v2-digest")
+        );
     }
 
     #[test]
@@ -2879,7 +2878,10 @@ mod tests {
             },
         );
 
-        assert_eq!(seeded.upcaster_registry_digest.as_deref(), Some("v1-digest"));
+        assert_eq!(
+            seeded.upcaster_registry_digest.as_deref(),
+            Some("v1-digest")
+        );
     }
 
     // ----- R5 R6: payload resolver tests -----
@@ -3009,10 +3011,7 @@ mod tests {
             Some("h1"),
         );
         assert_eq!(state.execution.payload_refs[1].event_id, 12);
-        assert_eq!(
-            state.execution.payload_refs[1].summary.row_count,
-            Some(2),
-        );
+        assert_eq!(state.execution.payload_refs[1].summary.row_count, Some(2),);
     }
 
     #[test]
@@ -3055,12 +3054,7 @@ mod tests {
         assert_eq!(frame.status, "FAILED");
         assert!(frame.output_ref.is_some());
         assert_eq!(
-            frame
-                .output_ref_summary
-                .as_ref()
-                .unwrap()
-                .sha256
-                .as_deref(),
+            frame.output_ref_summary.as_ref().unwrap().sha256.as_deref(),
             Some("err-hash"),
         );
     }
@@ -3076,7 +3070,10 @@ mod tests {
         let state = fold_replay_state(&[e1], "t", "o", 42, ReplayProjection::All);
         let frame = state.frames.get("frame-y").expect("frame populated");
         assert!(frame.output_ref.is_none());
-        let summary = frame.output_ref_summary.as_ref().expect("summary set even when ref is None");
+        let summary = frame
+            .output_ref_summary
+            .as_ref()
+            .expect("summary set even when ref is None");
         assert!(summary.sha256.is_none());
         assert!(summary.row_count.is_none());
     }

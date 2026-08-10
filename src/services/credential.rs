@@ -11,13 +11,13 @@ use std::collections::HashMap;
 use chrono::Utc;
 
 use crate::crypto::EnvelopeCipher;
-use crate::db::DbPool;
 use crate::db::models::{
     CredentialCreateRequest, CredentialEntry, CredentialFilter, CredentialListResponse,
     CredentialResponse, KeychainSetRequest,
 };
 use crate::db::queries::catalog as catalog_queries;
 use crate::db::queries::credential as queries;
+use crate::db::DbPool;
 use crate::error::{AppError, AppResult};
 use crate::playbook::types::Playbook;
 use crate::secrets::{build_secret_provider, dynamic, resolve_keychain_entry_with_meta};

@@ -54,7 +54,8 @@
 use std::sync::OnceLock;
 
 use prometheus::{
-    Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry, TextEncoder,
+    Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts,
+    Registry, TextEncoder,
 };
 
 /// Bucket boundaries for the event-ingest histogram (seconds).
@@ -183,13 +184,8 @@ pub fn record_orphan_sweep(outcome: &str) {
 
 /// The five `outcome` values, kept in sync with the `record_orphan_sweep`
 /// call sites in [`crate::handlers::orphan_sweep`] (all string literals).
-pub const ORPHAN_SWEEP_OUTCOMES: [&str; 5] = [
-    "candidate",
-    "terminated",
-    "skipped_live",
-    "capped",
-    "error",
-];
+pub const ORPHAN_SWEEP_OUTCOMES: [&str; 5] =
+    ["candidate", "terminated", "skipped_live", "capped", "error"];
 
 /// Materialise every [`ORPHAN_SWEEP_OUTCOMES`] series at 0.
 ///
@@ -203,9 +199,7 @@ pub const ORPHAN_SWEEP_OUTCOMES: [&str; 5] = [
 /// cursor.
 pub fn init_orphan_sweep_series() {
     for outcome in ORPHAN_SWEEP_OUTCOMES {
-        orphan_sweep_total()
-            .with_label_values(&[outcome])
-            .inc_by(0);
+        orphan_sweep_total().with_label_values(&[outcome]).inc_by(0);
     }
 }
 
@@ -697,9 +691,13 @@ pub fn offserver_tail_size() -> &'static Histogram {
 /// only for a non-empty tail).
 pub fn record_offserver_tail_attached(n: usize) {
     if n == 0 {
-        offserver_tail_attached_total().with_label_values(&["empty"]).inc();
+        offserver_tail_attached_total()
+            .with_label_values(&["empty"])
+            .inc();
     } else {
-        offserver_tail_attached_total().with_label_values(&["attached"]).inc();
+        offserver_tail_attached_total()
+            .with_label_values(&["attached"])
+            .inc();
         offserver_tail_size().observe(n as f64);
     }
 }
@@ -710,7 +708,9 @@ pub fn record_offserver_tail_attached(n: usize) {
 /// carries no tail and keeps today's drain-served behavior; this counter makes
 /// the scoping observable (auth executions should land here, never in `attached`).
 pub fn record_offserver_tail_scoped_out() {
-    offserver_tail_attached_total().with_label_values(&["scoped_out"]).inc();
+    offserver_tail_attached_total()
+        .with_label_values(&["scoped_out"])
+        .inc();
 }
 
 // ── Terminal-event dedup (noetl/ai-meta#118) ─────────────────────────────────
@@ -844,7 +844,9 @@ pub fn state_build_total() -> &'static IntCounterVec {
 /// Record one state build (`mode` = `chain_walk`|`event_scan`; `outcome` = `ok`
 /// or a `fallback_*` reason).
 pub fn record_state_build(mode: &str, outcome: &str) {
-    state_build_total().with_label_values(&[mode, outcome]).inc();
+    state_build_total()
+        .with_label_values(&[mode, outcome])
+        .inc();
 }
 
 // ── Hot-path event reads (RFC noetl/ai-meta#115 Phase 6) ─────────────────────
@@ -1037,7 +1039,9 @@ pub fn state_build_chain_hops() -> &'static Histogram {
                 "noetl_state_build_chain_hops",
                 "Chain-walk depth (prev_event_id PK lookups) per state build (RFC #115 Phase 3).",
             )
-            .buckets(vec![1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0]),
+            .buckets(vec![
+                1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0,
+            ]),
         )
         .expect("static histogram spec must be valid");
         registry()
@@ -1076,7 +1080,9 @@ pub fn state_build_parity_total() -> &'static IntCounterVec {
 
 /// Record one parity-check result (`match` | `mismatch`).
 pub fn record_state_build_parity(result: &str) {
-    state_build_parity_total().with_label_values(&[result]).inc();
+    state_build_parity_total()
+        .with_label_values(&[result])
+        .inc();
 }
 
 // ── Replica coherence (RFC noetl/ai-meta#115 program-scale / #107) ───────────
@@ -2409,9 +2415,7 @@ pub fn result_store_put_duration_seconds() -> &'static HistogramVec {
 /// `bytes` is the stored payload size (0 on error paths).
 /// `status` is `"ok"` or `"error"`.
 pub fn record_result_store_put(duration_seconds: f64, bytes: usize, status: &str) {
-    result_store_put_total()
-        .with_label_values(&[status])
-        .inc();
+    result_store_put_total().with_label_values(&[status]).inc();
     result_store_put_duration_seconds()
         .with_label_values(&[status])
         .observe(duration_seconds);
@@ -2676,7 +2680,9 @@ pub const CATALOG_DELETE_OUTCOMES: [&str; 6] = [
 /// operator asks first, and the one where absent must not read as zero.
 pub fn init_catalog_delete_series() {
     for outcome in CATALOG_DELETE_OUTCOMES {
-        catalog_delete_total().with_label_values(&[outcome]).inc_by(0);
+        catalog_delete_total()
+            .with_label_values(&[outcome])
+            .inc_by(0);
     }
 }
 
@@ -2776,7 +2782,9 @@ pub fn record_execute_outcome(entry: &str, outcome: &str) {
 
 /// Observe one batch-dispatch request size.
 pub fn record_execute_batch_size(n: usize) {
-    execute_batch_size().with_label_values(&[]).observe(n as f64);
+    execute_batch_size()
+        .with_label_values(&[])
+        .observe(n as f64);
 }
 
 /// Render the global registry as Prometheus text-exposition
@@ -2817,9 +2825,7 @@ pub fn container_callback_total() -> &'static IntCounterVec {
 
 /// Increment [`container_callback_total`] by 1.
 pub fn record_container_callback(state: &str) {
-    container_callback_total()
-        .with_label_values(&[state])
-        .inc();
+    container_callback_total().with_label_values(&[state]).inc();
 }
 
 /// Counter for stale container-callback receives — Job terminations the
@@ -3033,7 +3039,10 @@ mod tests {
             .lines()
             .find(|l| l.starts_with("noetl_ehdb_event_publisher_configured "))
             .expect("gauge must appear in /metrics");
-        assert!(line.ends_with(" 0"), "unconfigured must read 0; got {line:?}");
+        assert!(
+            line.ends_with(" 0"),
+            "unconfigured must read 0; got {line:?}"
+        );
 
         set_ehdb_event_publisher_configured(true);
         let text = gather_text().expect("gather metrics text");
@@ -3057,7 +3066,9 @@ mod tests {
             .collect();
         for reason in ["gave_up", "attempt"] {
             assert!(
-                lines.iter().any(|l| l.contains(&format!("reason=\"{reason}\""))),
+                lines
+                    .iter()
+                    .any(|l| l.contains(&format!("reason=\"{reason}\""))),
                 "{reason} series must exist before any failure; got {lines:?}"
             );
         }
@@ -3077,7 +3088,9 @@ mod tests {
             .collect();
         for reason in ["gate_off", "no_transport", "system_execution"] {
             assert!(
-                lines.iter().any(|l| l.contains(&format!("reason=\"{reason}\""))),
+                lines
+                    .iter()
+                    .any(|l| l.contains(&format!("reason=\"{reason}\""))),
                 "{reason} series must exist before any skip; got {lines:?}"
             );
         }
@@ -3151,9 +3164,9 @@ mod tests {
 
         for mode in COMMAND_ROW_INSERT_MODES {
             assert!(
-                text.lines().any(|l| l
-                    .starts_with("noetl_command_row_insert_failed_total{")
-                    && l.contains(&format!("mode=\"{mode}\""))),
+                text.lines()
+                    .any(|l| l.starts_with("noetl_command_row_insert_failed_total{")
+                        && l.contains(&format!("mode=\"{mode}\""))),
                 "{mode} must be pinned at 0"
             );
         }
@@ -3186,9 +3199,10 @@ mod tests {
         let text = gather_text().expect("gather metrics text");
         for reason in EHDB_COMMAND_PUBLISH_FAILED_REASONS {
             assert!(
-                text.lines().any(|l| l
-                    .starts_with("noetl_ehdb_command_publish_failed_total{")
-                    && l.contains(&format!("reason=\"{reason}\""))),
+                text.lines().any(
+                    |l| l.starts_with("noetl_ehdb_command_publish_failed_total{")
+                        && l.contains(&format!("reason=\"{reason}\""))
+                ),
                 "{reason} must be pinned at 0"
             );
         }
@@ -3224,15 +3238,17 @@ mod tests {
         let text = gather_text().expect("gather metrics text");
         for outcome in SYSTEM_PLUGIN_SEED_OUTCOMES {
             assert!(
-                text.lines().any(|l| l.starts_with("noetl_system_plugin_seed_total{")
-                    && l.contains(&format!("outcome=\"{outcome}\""))),
+                text.lines()
+                    .any(|l| l.starts_with("noetl_system_plugin_seed_total{")
+                        && l.contains(&format!("outcome=\"{outcome}\""))),
                 "{outcome} must be pinned"
             );
         }
         for outcome in SECRET_REFRESH_OUTCOMES {
             assert!(
-                text.lines().any(|l| l.starts_with("noetl_secret_refresh_total{")
-                    && l.contains(&format!("outcome=\"{outcome}\""))),
+                text.lines()
+                    .any(|l| l.starts_with("noetl_secret_refresh_total{")
+                        && l.contains(&format!("outcome=\"{outcome}\""))),
                 "{outcome} must be pinned"
             );
         }
@@ -3507,7 +3523,9 @@ mod tests {
         // remaining literal uses are the UPDATEs in archive/restore, which only
         // run once the column exists.
         fn body<'a>(src: &'a str, name: &str) -> &'a str {
-            let s = src.find(&format!("pub async fn {name}(")).unwrap_or_else(|| panic!("{name}"));
+            let s = src
+                .find(&format!("pub async fn {name}("))
+                .unwrap_or_else(|| panic!("{name}"));
             let e = src[s..].find("\n}").map(|i| s + i).unwrap_or(src.len());
             &src[s..e]
         }
@@ -3648,7 +3666,9 @@ mod tests {
     fn catalog_delete_handler_requires_the_internal_token() {
         let full = include_str!("handlers/catalog.rs");
         let src = full.split_once("\n#[cfg(test)]").map_or(full, |(b, _)| b);
-        let start = src.find("pub async fn delete(").expect("delete handler exists");
+        let start = src
+            .find("pub async fn delete(")
+            .expect("delete handler exists");
         let sig = &src[start..start + 400];
         assert!(
             sig.contains("RequireInternalApiToken"),

@@ -598,7 +598,10 @@ mod tests {
     fn command_issued_over_floor_context_is_eligible() {
         let env = command_issued(big_command_context());
         let got = eligible_command_context(&env, 512);
-        assert!(got.is_some(), "an over-floor command.issued context is eligible");
+        assert!(
+            got.is_some(),
+            "an over-floor command.issued context is eligible"
+        );
         // The whole {tool_config, args, render_context} object is returned to stage.
         let ctx = got.unwrap();
         assert!(ctx.get("tool_config").is_some() && ctx.get("args").is_some());

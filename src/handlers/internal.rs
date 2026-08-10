@@ -105,9 +105,7 @@ where
         // 4. Constant-time comparison — never use == on secrets.
         let provided = token.as_bytes();
         let expected_bytes = expected.as_bytes();
-        if provided.len() != expected_bytes.len()
-            || !bool::from(provided.ct_eq(expected_bytes))
-        {
+        if provided.len() != expected_bytes.len() || !bool::from(provided.ct_eq(expected_bytes)) {
             return Err((
                 StatusCode::FORBIDDEN,
                 "Invalid service-account token for /api/internal/*.".to_string(),
@@ -370,9 +368,12 @@ pub async fn events_project(
             }
         }
         for (execution_id, trigger_event_id) in triggers {
-            if let Err(e) =
-                crate::handlers::events::trigger_orchestrator(&state, execution_id, trigger_event_id)
-                    .await
+            if let Err(e) = crate::handlers::events::trigger_orchestrator(
+                &state,
+                execution_id,
+                trigger_event_id,
+            )
+            .await
             {
                 warn!(execution_id, %e, "publish-only: post-materialize orchestrator trigger failed");
             }
@@ -560,11 +561,9 @@ mod tests {
         let req = builder.body(Body::empty()).unwrap();
         let (mut parts, _body) = req.into_parts();
 
-        let result = <RequireInternalApiToken as FromRequestParts<()>>::from_request_parts(
-            &mut parts,
-            &(),
-        )
-        .await;
+        let result =
+            <RequireInternalApiToken as FromRequestParts<()>>::from_request_parts(&mut parts, &())
+                .await;
 
         unsafe { env::remove_var(TOKEN_ENV) };
         result

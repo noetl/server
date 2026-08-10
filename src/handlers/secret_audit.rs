@@ -76,10 +76,9 @@ mod tests {
     fn query_params_round_trip_via_json() {
         // Lock against drift in the public field names — `axum`'s
         // querystring decoder uses the same serde derive surface.
-        let v: AuditQueryParams = serde_json::from_str(
-            r#"{"credential":"duffel_token","execution_id":42,"limit":50}"#,
-        )
-        .unwrap();
+        let v: AuditQueryParams =
+            serde_json::from_str(r#"{"credential":"duffel_token","execution_id":42,"limit":50}"#)
+                .unwrap();
         assert_eq!(v.credential.as_deref(), Some("duffel_token"));
         assert_eq!(v.execution_id, Some(42));
         assert_eq!(v.limit, Some(50));

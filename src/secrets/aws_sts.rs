@@ -190,12 +190,7 @@ impl AwsStsProvider {
     /// Build the form-urlencoded request body.  The token + role_arn are
     /// percent-encoded; everything else is plain ASCII so a single
     /// formatter suffices.
-    fn build_body(
-        role_arn: &str,
-        session_name: &str,
-        token: &str,
-        duration_secs: u32,
-    ) -> String {
+    fn build_body(role_arn: &str, session_name: &str, token: &str, duration_secs: u32) -> String {
         format!(
             "Action=AssumeRoleWithWebIdentity\
              &Version={ver}\
@@ -588,7 +583,10 @@ mod tests {
     #[test]
     fn endpoint_for_uses_region() {
         let p = provider_with_region("us-east-1");
-        assert_eq!(p.endpoint_for("eu-west-1"), "https://sts.eu-west-1.amazonaws.com/");
+        assert_eq!(
+            p.endpoint_for("eu-west-1"),
+            "https://sts.eu-west-1.amazonaws.com/"
+        );
     }
 
     #[test]
@@ -627,9 +625,15 @@ mod tests {
     fn parse_xml_extracts_credentials_and_expiration() {
         let r = parse_assume_role_response(XML_RESPONSE).expect("parse");
         assert_eq!(r.access_key_id, "ASIAEXAMPLEACCESSKEY");
-        assert_eq!(r.secret_access_key, "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY");
+        assert_eq!(
+            r.secret_access_key,
+            "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY"
+        );
         assert_eq!(r.session_token, "FwoGZXIvYXdzEAA");
-        assert_eq!(r.assumed_role_id.as_deref(), Some("AROAEXAMPLEID:eks-session"));
+        assert_eq!(
+            r.assumed_role_id.as_deref(),
+            Some("AROAEXAMPLEID:eks-session")
+        );
         // Expiration becomes a real DateTime<Utc>.
         assert_eq!(
             r.expiration,
@@ -713,10 +717,7 @@ mod tests {
 
     #[test]
     fn percent_encode_preserves_unreserved() {
-        assert_eq!(
-            percent_encode("ABCabc123-_.~"),
-            "ABCabc123-_.~"
-        );
+        assert_eq!(percent_encode("ABCabc123-_.~"), "ABCabc123-_.~");
     }
 
     #[test]

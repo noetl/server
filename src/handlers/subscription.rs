@@ -35,13 +35,7 @@ use crate::state::AppState;
 
 /// `(subscription_id, event_type, status, catalog_id, created_at)` — one
 /// subscription's latest lifecycle row, for the cross-shard list query.
-type ListRow = (
-    i64,
-    String,
-    String,
-    i64,
-    Option<chrono::NaiveDateTime>,
-);
+type ListRow = (i64, String, String, i64, Option<chrono::NaiveDateTime>);
 
 /// `(event_type, status, catalog_id, node_name, created_at)` — the latest
 /// lifecycle event for one subscription.
@@ -338,7 +332,9 @@ pub async fn list(State(state): State<AppState>) -> AppResult<Json<SubscriptionL
             .fetch_all(pool)
             .await?;
         for (sid, event_type, status, catalog_id, created_at) in rows {
-            let path = subscription_path(&state, catalog_id).await.unwrap_or_default();
+            let path = subscription_path(&state, catalog_id)
+                .await
+                .unwrap_or_default();
             subscriptions.push(SubscriptionStatus {
                 subscription_id: sid.to_string(),
                 path,
@@ -402,7 +398,11 @@ async fn latest_for_path(state: &AppState, path: &str) -> AppResult<Option<Lates
                     last_event_type: event_type,
                     updated_at: created_at.map(|t| t.and_utc().to_rfc3339()),
                 };
-                if best.as_ref().map(|(eid, _)| event_id > *eid).unwrap_or(true) {
+                if best
+                    .as_ref()
+                    .map(|(eid, _)| event_id > *eid)
+                    .unwrap_or(true)
+                {
                     best = Some((event_id, candidate));
                 }
             }
@@ -429,11 +429,15 @@ async fn load_latest(state: &AppState, subscription_id: i64) -> AppResult<Option
         return Ok(None);
     };
     let sub_state = SubState::from_status(&status).ok_or_else(|| {
-        AppError::Internal(format!("Subscription {subscription_id} has unknown status '{status}'"))
+        AppError::Internal(format!(
+            "Subscription {subscription_id} has unknown status '{status}'"
+        ))
     })?;
     let path = match node_name {
         Some(p) if !p.is_empty() => p,
-        _ => subscription_path(state, catalog_id).await.unwrap_or_default(),
+        _ => subscription_path(state, catalog_id)
+            .await
+            .unwrap_or_default(),
     };
     Ok(Some(LatestState {
         state: sub_state,

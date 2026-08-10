@@ -135,9 +135,9 @@ impl AzureKeyVaultProvider {
             .ok()
             .filter(|s| !s.is_empty());
         Ok(Self {
-            http: reqwest::Client::builder()
-                .build()
-                .map_err(|e| AppError::Config(format!("azure secret provider: build client: {e}")))?,
+            http: reqwest::Client::builder().build().map_err(|e| {
+                AppError::Config(format!("azure secret provider: build client: {e}"))
+            })?,
             default_vault,
             vault_dns_suffix: vault_dns_suffix.trim_matches('.').to_string(),
             api_version,
@@ -267,7 +267,10 @@ impl SecretProvider for AzureKeyVaultProvider {
         // Extract the concrete version from the response id when one is
         // present — KV returns `.../secrets/<name>/<version>`.
         let resolved_version = body.id.as_deref().and_then(|id| {
-            id.rsplit('/').next().map(|s| s.to_string()).filter(|s| !s.is_empty())
+            id.rsplit('/')
+                .next()
+                .map(|s| s.to_string())
+                .filter(|s| !s.is_empty())
         });
         Ok(SecretValue {
             value: body.value,

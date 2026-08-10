@@ -4,9 +4,9 @@
 //! handling workflow orchestration, catalog management, and event processing.
 
 use axum::{
-    Router,
     extract::DefaultBodyLimit,
     routing::{delete, get, post, put},
+    Router,
 };
 use std::net::SocketAddr;
 use tokio::net::TcpListener;
@@ -16,7 +16,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use noetl_server::{
     config::{AppConfig, DatabaseConfig, ShardingConfig},
-    db::{DbPool, DbPoolMap, create_pool},
+    db::{create_pool, DbPool, DbPoolMap},
     handlers,
     services::{
         CatalogService, CredentialService, ExecutionService, KeychainService, ReplayService,
@@ -64,8 +64,7 @@ fn build_router(
     // Object-store backend + cell endpoint registry (RFC noetl/ai-meta#104
     // Phase C).  Both are env-driven (default off → Postgres object backend,
     // single-cell seed), built once here and cloned into their route state.
-    let object_backend =
-        noetl_server::services::object_backend::ObjectBackend::from_env();
+    let object_backend = noetl_server::services::object_backend::ObjectBackend::from_env();
     let cell_registry =
         noetl_server::services::cell_registry::CellRegistry::from_env(&object_backend);
 
@@ -85,12 +84,9 @@ fn build_router(
     // Catalog routes
     let catalog_routes = Router::new()
         .route("/api/catalog/register", post(handlers::catalog::register))
-            .route("/api/catalog/delete", post(handlers::catalog::delete))
+        .route("/api/catalog/delete", post(handlers::catalog::delete))
         .route("/api/catalog/list", post(handlers::catalog::list))
-            .route(
-                "/api/catalog/restore",
-                post(handlers::catalog::restore),
-            )
+        .route("/api/catalog/restore", post(handlers::catalog::restore))
         .route(
             "/api/catalog/resource",
             post(handlers::catalog::get_resource),
@@ -293,10 +289,7 @@ fn build_router(
             "/api/subscriptions/register",
             post(handlers::subscription::register),
         )
-        .route(
-            "/api/subscriptions/{id}",
-            get(handlers::subscription::get),
-        )
+        .route("/api/subscriptions/{id}", get(handlers::subscription::get))
         .route(
             "/api/subscriptions/{id}/{action}",
             post(handlers::subscription::lifecycle),
@@ -356,7 +349,10 @@ fn build_router(
     // data-plane query port over HTTP (`NOETL_EHDB_WORKER_QUERY_URL`, the
     // worker-service :9090).  Reads do not ride the NATS drive.
     let ehdb_tier_routes = Router::new()
-        .route("/api/ehdb/tiers/{tier}", get(handlers::ehdb::raw_tier_query))
+        .route(
+            "/api/ehdb/tiers/{tier}",
+            get(handlers::ehdb::raw_tier_query),
+        )
         .with_state(handlers::ehdb::TierRelayState::from_env());
 
     // Replay engine routes (Phase D R5 of noetl/ai-meta#49 →
@@ -544,10 +540,7 @@ fn build_router(
                     "/api/internal/registry/register",
                     post(handlers::registry::register),
                 )
-                .route(
-                    "/api/internal/registry/list",
-                    get(handlers::registry::list),
-                )
+                .route("/api/internal/registry/list", get(handlers::registry::list))
                 .route(
                     "/api/internal/registry/resolve",
                     get(handlers::registry::resolve),
@@ -688,7 +681,6 @@ fn build_router(
 
     app.layer(TraceLayer::new_for_http()).layer(cors)
 }
-
 
 /// Resolve the at-rest encryption key (noetl/ai-meta#61, Phase 1a).
 ///
@@ -875,7 +867,6 @@ async fn main() -> anyhow::Result<()> {
     // ops flips it on.
     handlers::nonconvergence_sweep::spawn_nonconvergence_sweep(state.clone());
 
-
     // CQRS write-path cutover (noetl/ai-meta#103 phase 2d-3): when
     // `NOETL_EVENT_INGEST_PUBLISH_ONLY` is on, server-originated events publish to
     // `noetl_events` instead of INSERTing — the materializer is the sole writer.
@@ -1012,8 +1003,7 @@ async fn main() -> anyhow::Result<()> {
     // is a server-owned table — not per-execution-shard.  The
     // `execution_id` column is present for data locality but the
     // table itself is cluster-scoped in the MVP.
-    let result_store_service =
-        ResultStoreService::new(db_pool.clone(), state.snowflake.clone());
+    let result_store_service = ResultStoreService::new(db_pool.clone(), state.snowflake.clone());
 
     // Build the router
     let app = build_router(

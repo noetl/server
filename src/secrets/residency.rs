@@ -28,7 +28,6 @@
 //! a broker in B that re-seals to A's worker."  Until that ships, `strict`
 //! mode is a fail-closed boundary, not a routed-around constraint.
 
-
 use crate::error::{AppError, AppResult};
 use crate::metrics::record_secret_residency_check;
 use crate::playbook::types::KeychainDef;
@@ -38,7 +37,6 @@ use crate::secrets::server_region;
 /// `noetl-orchestrate-core` (noetl/ai-meta#108); re-exported here so this
 /// module's region-check logic and `KeychainDef.residency` keep using it.
 pub use noetl_orchestrate_core::playbook::Residency;
-
 
 /// Outcome of [`evaluate`] — used by the resolver to decide whether to
 /// proceed and which metric label to record.  Not `Clone`/`PartialEq`

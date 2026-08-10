@@ -506,7 +506,11 @@ mod tests {
         let before = labels.len();
         labels.sort_unstable();
         labels.dedup();
-        assert_eq!(labels.len(), before, "ALL must not repeat a variant; got {labels:?}");
+        assert_eq!(
+            labels.len(),
+            before,
+            "ALL must not repeat a variant; got {labels:?}"
+        );
     }
 
     /// After init the metric must carry one series per outcome, all for a
@@ -526,14 +530,21 @@ mod tests {
             .collect();
         for outcome in VerifyOutcome::ALL {
             let want = format!("outcome=\"{}\"", outcome.label());
-            assert!(lines.iter().any(|l| l.contains(&want)), "{want} must be pinned; got {lines:?}");
+            assert!(
+                lines.iter().any(|l| l.contains(&want)),
+                "{want} must be pinned; got {lines:?}"
+            );
         }
         let modes: std::collections::BTreeSet<&str> = lines
             .iter()
             .filter_map(|l| l.split("mode=\"").nth(1))
             .filter_map(|r| r.split('"').next())
             .collect();
-        assert_eq!(modes.len(), 1, "exactly one mode should be pinned; got {modes:?}");
+        assert_eq!(
+            modes.len(),
+            1,
+            "exactly one mode should be pinned; got {modes:?}"
+        );
     }
 
     // Throwaway RSA-2048 keypair generated offline for these tests ONLY. It is

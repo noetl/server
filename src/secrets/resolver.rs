@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 
 use super::residency;
-use super::{SecretProvider, SecretRef, server_region};
+use super::{server_region, SecretProvider, SecretRef};
 use crate::error::AppResult;
 use crate::metrics::{record_secret_resolve, record_secret_resolve_duration};
 use crate::playbook::types::KeychainDef;

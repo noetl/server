@@ -91,8 +91,9 @@ async fn resolve_auth_pool(cred: &CredentialService, credential: &str) -> AppRes
             .and_then(|v| v.as_str())
             .map(str::to_string)
     };
-    let host = str_field("host", "db_host")
-        .ok_or_else(|| AppError::Internal(format!("auth credential '{credential}' missing host")))?;
+    let host = str_field("host", "db_host").ok_or_else(|| {
+        AppError::Internal(format!("auth credential '{credential}' missing host"))
+    })?;
     let port: u16 = data
         .get("port")
         .or_else(|| data.get("db_port"))
@@ -102,8 +103,9 @@ async fn resolve_auth_pool(cred: &CredentialService, credential: &str) -> AppRes
                 .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
         })
         .unwrap_or(5432);
-    let user = str_field("user", "db_user")
-        .ok_or_else(|| AppError::Internal(format!("auth credential '{credential}' missing user")))?;
+    let user = str_field("user", "db_user").ok_or_else(|| {
+        AppError::Internal(format!("auth credential '{credential}' missing user"))
+    })?;
     let password = str_field("password", "db_password").unwrap_or_default();
     let database = str_field("database", "db_name").unwrap_or_else(|| "noetl".to_string());
 
@@ -161,10 +163,22 @@ pub struct ValidateSessionResponse {
 
 impl ValidateSessionResponse {
     fn invalid() -> Self {
-        Self { status: "ok".into(), valid: false, user: None, expires_at: None, error: None }
+        Self {
+            status: "ok".into(),
+            valid: false,
+            user: None,
+            expires_at: None,
+            error: None,
+        }
     }
     fn error(msg: String) -> Self {
-        Self { status: "error".into(), valid: false, user: None, expires_at: None, error: Some(msg) }
+        Self {
+            status: "error".into(),
+            valid: false,
+            user: None,
+            expires_at: None,
+            error: Some(msg),
+        }
     }
 }
 
@@ -332,7 +346,10 @@ fn decode_and_validate_token(token: &str, auth0_domain: &str) -> Result<TokenCla
     let claims: serde_json::Value =
         serde_json::from_slice(&decoded).map_err(|e| format!("Invalid JWT payload: {e}"))?;
 
-    let issuer = claims.get("iss").and_then(|v| v.as_str()).unwrap_or_default();
+    let issuer = claims
+        .get("iss")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
     if !auth0_domain.is_empty() && issuer != format!("https://{auth0_domain}/") {
         return Err("Invalid token issuer".to_string());
     }
@@ -350,12 +367,18 @@ fn decode_and_validate_token(token: &str, auth0_domain: &str) -> Result<TokenCla
         }
     }
 
-    let sub = claims.get("sub").and_then(|v| v.as_str()).unwrap_or_default();
+    let sub = claims
+        .get("sub")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
     if sub.is_empty() {
         return Err("Missing token subject".to_string());
     }
 
-    let email = claims.get("email").and_then(|v| v.as_str()).map(str::to_string);
+    let email = claims
+        .get("email")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
     // `name` defaults to email when absent (playbook: decoded.get("name", email)).
     let name = claims
         .get("name")
@@ -363,7 +386,11 @@ fn decode_and_validate_token(token: &str, auth0_domain: &str) -> Result<TokenCla
         .map(str::to_string)
         .or_else(|| email.clone());
 
-    Ok(TokenClaims { sub: sub.to_string(), email, name })
+    Ok(TokenClaims {
+        sub: sub.to_string(),
+        email,
+        name,
+    })
 }
 
 /// Authenticate an Auth0 token synchronously and create a NoETL session.
@@ -599,7 +626,10 @@ impl CheckAccessResponse {
         if let (true, Some(u)) = (allowed, user) {
             data.as_object_mut().unwrap().insert("user".to_string(), u);
         }
-        Self { status: "success".into(), data }
+        Self {
+            status: "success".into(),
+            data,
+        }
     }
 
     fn error(msg: String) -> Self {
@@ -626,7 +656,12 @@ pub async fn check_playbook_access(
     match check_playbook_access_inner(&cred, &req).await {
         Ok(resp) => {
             let outcome = if resp.status == "success" {
-                if resp.data.get("allowed").and_then(|v| v.as_bool()).unwrap_or(false) {
+                if resp
+                    .data
+                    .get("allowed")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
                     "granted"
                 } else {
                     "denied"
@@ -733,7 +768,11 @@ mod tests {
     }
 
     fn future_exp() -> i64 {
-        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64 + 3600
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+            + 3600
     }
 
     #[test]
@@ -816,7 +855,10 @@ mod tests {
         let user = serde_json::json!({"user_id": 7, "email": "a@b.com", "display_name": "Ann"});
         let resp = CheckAccessResponse::decided(true, Some(user.clone()), "execute");
         assert_eq!(resp.status, "success");
-        assert_eq!(resp.data.get("allowed").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(
+            resp.data.get("allowed").and_then(|v| v.as_bool()),
+            Some(true)
+        );
         assert_eq!(
             resp.data.get("message").and_then(|v| v.as_str()),
             Some("Access granted to execute playbook")
@@ -830,8 +872,14 @@ mod tests {
         // hard-coded "Access denied" (both denial branches send the same body).
         let resp = CheckAccessResponse::decided(false, None, "execute");
         assert_eq!(resp.status, "success");
-        assert_eq!(resp.data.get("allowed").and_then(|v| v.as_bool()), Some(false));
-        assert_eq!(resp.data.get("message").and_then(|v| v.as_str()), Some("Access denied"));
+        assert_eq!(
+            resp.data.get("allowed").and_then(|v| v.as_bool()),
+            Some(false)
+        );
+        assert_eq!(
+            resp.data.get("message").and_then(|v| v.as_str()),
+            Some("Access denied")
+        );
         assert!(resp.data.get("user").is_none());
     }
 

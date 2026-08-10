@@ -76,7 +76,10 @@ pub async fn put(
 
 /// `GET /api/internal/objects/{*key}` — serve the object bytes, content-typed by
 /// its media type with the digest as an ETag.
-pub async fn get(State(deps): State<ObjectStoreDeps>, Path(key): Path<String>) -> AppResult<Response> {
+pub async fn get(
+    State(deps): State<ObjectStoreDeps>,
+    Path(key): Path<String>,
+) -> AppResult<Response> {
     let fetched = deps.backend.get(&deps.pool, &key).await;
     crate::metrics::record_object_store_op(deps.backend.label(), "get", fetched.is_ok());
     let Some(row) = fetched? else {

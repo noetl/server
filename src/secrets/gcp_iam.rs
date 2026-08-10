@@ -186,8 +186,7 @@ impl GcpIamProvider {
             .json()
             .await
             .map_err(|e| AppError::Internal(format!("gcp_iam: parse metadata token: {e}")))?;
-        let expires_at =
-            Instant::now() + Duration::from_secs(parsed.expires_in.saturating_sub(60));
+        let expires_at = Instant::now() + Duration::from_secs(parsed.expires_in.saturating_sub(60));
         let value = parsed.access_token.clone();
         *guard = Some(CachedToken {
             value: value.clone(),
@@ -372,10 +371,8 @@ mod tests {
 
     #[test]
     fn build_body_wraps_scope_in_array_and_formats_lifetime() {
-        let body = GcpIamProvider::build_body(
-            "https://www.googleapis.com/auth/cloud-platform",
-            3600,
-        );
+        let body =
+            GcpIamProvider::build_body("https://www.googleapis.com/auth/cloud-platform", 3600);
         let scopes = body.get("scope").and_then(|v| v.as_array()).expect("array");
         assert_eq!(scopes.len(), 1);
         assert_eq!(

@@ -27,13 +27,13 @@
 //! plumbing and leaves the peer-cert PKI bootstrap to ops.
 
 use axum::{
-    Json,
     extract::State,
     http::StatusCode,
     response::{IntoResponse, Response},
+    Json,
 };
 
-use crate::crypto::{SealedEnvelope, sealed_seal};
+use crate::crypto::{sealed_seal, SealedEnvelope};
 use crate::error::{AppError, AppResult};
 use crate::secrets::broker::CrossRegionResolveRequest;
 use crate::secrets::server_region;

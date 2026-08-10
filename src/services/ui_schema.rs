@@ -125,10 +125,8 @@ pub struct UiSchemaResponse {
 fn directive_inline_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        Regex::new(
-            r"#\s*ui:(?P<key>[A-Za-z_][A-Za-z0-9_]*)(?:\s*=\s*(?P<value>[^\n#]*))?",
-        )
-        .expect("static regex must compile")
+        Regex::new(r"#\s*ui:(?P<key>[A-Za-z_][A-Za-z0-9_]*)(?:\s*=\s*(?P<value>[^\n#]*))?")
+            .expect("static regex must compile")
     })
 }
 
@@ -172,7 +170,10 @@ pub fn infer_ui_schema(yaml_text: &str) -> Vec<UiSchemaField> {
     for (key, value) in workload {
         let name = match key {
             serde_yaml::Value::String(s) => s.clone(),
-            other => serde_yaml::to_string(other).unwrap_or_default().trim().to_string(),
+            other => serde_yaml::to_string(other)
+                .unwrap_or_default()
+                .trim()
+                .to_string(),
         };
         let directive = directives.get(&name).cloned().unwrap_or_default();
         fields.push(field_from_value(&name, value, &directive));
@@ -284,10 +285,9 @@ fn extract_directives_from_line(line: &str) -> Directive {
                     d.credential = Some(strip_quotes(&raw_value));
                 }
             }
-            "description"
-                if !raw_value.is_empty() => {
-                    d.description = Some(strip_quotes(&raw_value));
-                }
+            "description" if !raw_value.is_empty() => {
+                d.description = Some(strip_quotes(&raw_value));
+            }
             _ => {
                 // Unknown directive — silently ignored to mirror Python.
             }
