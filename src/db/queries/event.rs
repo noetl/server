@@ -305,6 +305,47 @@ pub async fn is_playbook_failed(pool: &DbPool, execution_id: i64) -> AppResult<b
     has_event_type(pool, execution_id, "playbook.failed").await
 }
 
+/// noetl/ai-meta#251 — did any step of this execution record a failure?
+///
+/// The failure is always in the log: the pre-dispatch and tool paths write
+/// `command.completed` / `command.failed` / `call.error` with `status = 'error'`.
+/// Only the read boundary discarded it.
+pub async fn has_errored_step(pool: &DbPool, execution_id: i64) -> AppResult<bool> {
+    let row: Option<(i32,)> = sqlx::query_as(
+        r#"
+        SELECT 1
+        FROM noetl.event
+        WHERE execution_id = $1
+          AND event_type IN ('command.completed', 'command.failed', 'call.error')
+          AND status = 'error'
+        LIMIT 1
+        "#,
+    )
+    .bind(execution_id)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.is_some())
+}
+
+/// Is the step-derived execution status enabled?
+///
+/// Default OFF.  Turning this on changes what `COMPLETED` means to every
+/// consumer of `GET /api/executions/{id}`: an execution that finished its
+/// workflow but had a failing step flips COMPLETED -> FAILED.  That is a
+/// semantics change, so it must be a deliberate flip and not a side effect of
+/// deploying a new image.
+fn status_from_steps_enabled() -> bool {
+    matches!(
+        std::env::var("NOETL_EXECUTION_STATUS_FROM_STEPS")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
 /// Get execution status based on events.
 pub async fn get_execution_status(pool: &DbPool, execution_id: i64) -> AppResult<String> {
     // Check for terminal states first
@@ -312,6 +353,12 @@ pub async fn get_execution_status(pool: &DbPool, execution_id: i64) -> AppResult
         return Ok("FAILED".to_string());
     }
     if is_playbook_completed(pool, execution_id).await? {
+        // noetl/ai-meta#251 — a workflow can reach `playbook.completed` with a
+        // step that raised.  Reporting COMPLETED there loses the failure at the
+        // read boundary even though the event log recorded it.
+        if status_from_steps_enabled() && has_errored_step(pool, execution_id).await? {
+            return Ok("FAILED".to_string());
+        }
         return Ok("COMPLETED".to_string());
     }
 
@@ -392,4 +439,41 @@ pub async fn get_playbook_start_event(
     execution_id: i64,
 ) -> AppResult<Option<Event>> {
     get_latest_event(pool, execution_id, Some("playbook_started")).await
+}
+
+#[cfg(test)]
+mod tests {
+    /// noetl/ai-meta#251 — a playbook whose step failed reported COMPLETED.
+    ///
+    /// The failure was never lost: `command.completed` carries `status = 'error'`
+    /// and the payload holds the traceback.  It was dropped at the READ boundary,
+    /// where `get_execution_status` returned COMPLETED the moment a
+    /// `playbook.completed` event existed, without consulting step outcomes.
+    ///
+    /// This asserts the CALL SITE, not a helper in isolation.  A test that only
+    /// checked `has_errored_step` would keep passing with the call reverted —
+    /// the weakness the first noetl/ai-meta#250 guard had.
+    #[test]
+    fn completed_status_consults_step_outcomes() {
+        let src = include_str!("event.rs");
+        let non_test = src.split_once("\n#[cfg(test)]").map_or(src, |(b, _)| b);
+        assert!(
+            non_test.contains("has_errored_step"),
+            "get_execution_status must consult step outcomes before reporting \
+             COMPLETED (noetl/ai-meta#251)"
+        );
+        assert!(
+            non_test.contains("NOETL_EXECUTION_STATUS_FROM_STEPS"),
+            "the step-derived status must stay flag-gated so the semantics change \
+             is a deliberate flip, not a side effect of a deploy"
+        );
+        let after = non_test
+            .split_once("is_playbook_completed(pool, execution_id).await?")
+            .map(|(_, rest)| rest.chars().take(500).collect::<String>())
+            .unwrap_or_default();
+        assert!(
+            after.contains("has_errored_step"),
+            "the COMPLETED branch itself must consult step outcomes"
+        );
+    }
 }
