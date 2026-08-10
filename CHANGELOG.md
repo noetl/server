@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.79.5](https://github.com/noetl/server/compare/v3.79.4...v3.79.5) (2026-08-10)
+
+### Bug Fixes
+
+* **status:** derive execution status from step outcomes behind a flag ([73a4191](https://github.com/noetl/server/commit/73a419167ec832e7524ccb6b58b26bb6a768fd37)), closes [noetl/ai-meta#250](https://github.com/noetl/ai-meta/issues/250) [noetl/ai-meta#251](https://github.com/noetl/ai-meta/issues/251)
+
 ## [3.79.4](https://github.com/noetl/server/compare/v3.79.3...v3.79.4) (2026-08-09)
 
 ### Bug Fixes
