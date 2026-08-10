@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.79.6](https://github.com/noetl/server/compare/v3.79.5...v3.79.6) (2026-08-10)
+
+### Bug Fixes
+
+* **status:** make detail and list endpoints agree on step failures ([de63b7a](https://github.com/noetl/server/commit/de63b7a5ad4444ec316b8142c173d337beeef4e9)), closes [noetl/ai-meta#254](https://github.com/noetl/ai-meta/issues/254) [noetl/ai-meta#251](https://github.com/noetl/ai-meta/issues/251) [noetl/ai-meta#254](https://github.com/noetl/ai-meta/issues/254)
+
 ## [3.79.5](https://github.com/noetl/server/compare/v3.79.4...v3.79.5) (2026-08-10)
 
 ### Bug Fixes
