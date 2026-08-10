@@ -139,9 +139,12 @@ pub fn parse_noetl_ref(s: &str) -> Result<NoetlRef, String> {
         return Err(format!("URI missing result_id segment: {s:?}"));
     }
     let result_id_str = parts[parts.len() - 1];
-    let result_id = result_id_str
-        .parse::<i64>()
-        .map_err(|_| format!("result_id segment {:?} is not an i64 in {s:?}", result_id_str))?;
+    let result_id = result_id_str.parse::<i64>().map_err(|_| {
+        format!(
+            "result_id segment {:?} is not an i64 in {s:?}",
+            result_id_str
+        )
+    })?;
 
     // Name is everything between index 3 and the last segment.
     let name = parts[3..parts.len() - 1].join("/");
@@ -432,7 +435,8 @@ mod tests {
         // Byte-identical response shape to `put` (sans the row): minted ref on the
         // canonical coordinates, store label, real byte count + sha256.
         assert!(
-            resp.r#ref.starts_with("noetl://execution/42/result/my_step/"),
+            resp.r#ref
+                .starts_with("noetl://execution/42/result/my_step/"),
             "ref tail: {}",
             resp.r#ref
         );

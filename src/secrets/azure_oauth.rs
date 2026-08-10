@@ -147,10 +147,10 @@ impl AzureOAuthProvider {
                     .to_string(),
             )
         })?;
-        let default_scope = std::env::var("NOETL_AZURE_OAUTH_SCOPE")
-            .unwrap_or_else(|_| DEFAULT_SCOPE.to_string());
-        let aad_host = std::env::var("NOETL_AZURE_AAD_HOST")
-            .unwrap_or_else(|_| DEFAULT_AAD_HOST.to_string());
+        let default_scope =
+            std::env::var("NOETL_AZURE_OAUTH_SCOPE").unwrap_or_else(|_| DEFAULT_SCOPE.to_string());
+        let aad_host =
+            std::env::var("NOETL_AZURE_AAD_HOST").unwrap_or_else(|_| DEFAULT_AAD_HOST.to_string());
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(15))
             .build()
@@ -231,9 +231,8 @@ impl SecretProvider for AzureOAuthProvider {
             )));
         }
 
-        let parsed: TokenResponse = serde_json::from_str(&text).map_err(|e| {
-            AppError::Internal(format!("azure_oauth: parse AAD response: {e}"))
-        })?;
+        let parsed: TokenResponse = serde_json::from_str(&text)
+            .map_err(|e| AppError::Internal(format!("azure_oauth: parse AAD response: {e}")))?;
         let expires_at = Self::compute_expires_at(parsed.expires_in, chrono::Utc::now());
 
         Ok(SecretValue {
@@ -440,6 +439,9 @@ mod tests {
 
     #[test]
     fn percent_encode_escapes_specials() {
-        assert_eq!(percent_encode("https://x/.default"), "https%3A%2F%2Fx%2F.default");
+        assert_eq!(
+            percent_encode("https://x/.default"),
+            "https%3A%2F%2Fx%2F.default"
+        );
     }
 }

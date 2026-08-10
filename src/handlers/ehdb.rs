@@ -463,8 +463,8 @@ pub async fn raw_tier_query(
         .await
     {
         Ok(resp) => {
-            let status = StatusCode::from_u16(resp.status().as_u16())
-                .unwrap_or(StatusCode::BAD_GATEWAY);
+            let status =
+                StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
             match resp.json::<serde_json::Value>().await {
                 Ok(body) => (status, Json(body)),
                 Err(e) => (

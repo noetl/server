@@ -4,9 +4,9 @@
 //! for seamless integration with Axum handlers.
 
 use axum::{
-    Json,
     http::StatusCode,
     response::{IntoResponse, Response},
+    Json,
 };
 use serde_json::json;
 use thiserror::Error;
@@ -69,7 +69,6 @@ pub enum AppError {
     // NOTE: the `From<noetl_orchestrate_core::error::CoreError>` impl below maps
     // the drive core's errors into these variants at the boundary
     // (noetl/ai-meta#108).
-
     /// External service error
     #[error("External service error: {0}")]
     ExternalService(String),

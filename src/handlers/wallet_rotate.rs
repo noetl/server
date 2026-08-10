@@ -11,10 +11,7 @@
 //!   per-version row counts.  Operator confirms a rotation completed
 //!   before retiring the old KEK version in the KMS.
 
-use axum::{
-    extract::State,
-    Json,
-};
+use axum::{extract::State, Json};
 use serde::{Deserialize, Serialize};
 
 use crate::error::AppResult;
@@ -94,7 +91,10 @@ pub struct KeyStatusResponse {
 pub async fn key_status(
     State(deps): State<WalletRotateDeps>,
 ) -> AppResult<Json<KeyStatusResponse>> {
-    let credential = deps.service.key_status_table(WalletTable::Credential).await?;
+    let credential = deps
+        .service
+        .key_status_table(WalletTable::Credential)
+        .await?;
     let keychain = deps.service.key_status_table(WalletTable::Keychain).await?;
     Ok(Json(KeyStatusResponse {
         credential,
@@ -108,7 +108,8 @@ mod tests {
 
     #[test]
     fn rotate_request_round_trips_json() {
-        let req: RotateRequest = serde_json::from_str(r#"{"batch_size":50,"max_batches":10}"#).unwrap();
+        let req: RotateRequest =
+            serde_json::from_str(r#"{"batch_size":50,"max_batches":10}"#).unwrap();
         assert_eq!(req.batch_size, Some(50));
         assert_eq!(req.max_batches, Some(10));
     }

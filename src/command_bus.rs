@@ -343,7 +343,10 @@ mod tests {
     #[test]
     fn mode_parsing_is_required_and_every_failure_is_named() {
         // The two live transports.
-        assert_eq!(CommandBusMode::from_env_value("EHDB"), Ok(CommandBusMode::Ehdb));
+        assert_eq!(
+            CommandBusMode::from_env_value("EHDB"),
+            Ok(CommandBusMode::Ehdb)
+        );
         assert_eq!(
             CommandBusMode::from_env_value(" Shadow "),
             Ok(CommandBusMode::Shadow)

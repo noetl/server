@@ -174,15 +174,14 @@ pub fn parse_ref(
             ))
         }
     };
-    let version = if version_str.eq_ignore_ascii_case("latest") {
-        None
-    } else {
-        Some(
-            version_str
-                .parse::<i32>()
-                .map_err(|_| format!("version segment {version_str:?} is not an int or 'latest'"))?,
-        )
-    };
+    let version =
+        if version_str.eq_ignore_ascii_case("latest") {
+            None
+        } else {
+            Some(version_str.parse::<i32>().map_err(|_| {
+                format!("version segment {version_str:?} is not an int or 'latest'")
+            })?)
+        };
     Ok(RegistryRef {
         tenant,
         project,
@@ -408,8 +407,14 @@ mod tests {
 
     #[test]
     fn artifact_key_is_under_registry_root() {
-        let k =
-            RegistryService::artifact_key("default", "default", "model", "router", 2, "adapter.safetensors");
+        let k = RegistryService::artifact_key(
+            "default",
+            "default",
+            "model",
+            "router",
+            2,
+            "adapter.safetensors",
+        );
         assert_eq!(
             k,
             "noetl/registry/default/default/model/router/2/adapter.safetensors"

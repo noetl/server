@@ -15,9 +15,7 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
 use crate::error::AppError;
-use crate::services::replay::{
-    ReplayCutoff, ReplayProjection, ReplayService, ReplayState,
-};
+use crate::services::replay::{ReplayCutoff, ReplayProjection, ReplayService, ReplayState};
 
 /// Query parameters for `GET /api/replay/state`.
 ///

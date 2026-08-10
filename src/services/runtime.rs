@@ -250,10 +250,7 @@ impl RuntimeService {
     /// Returns `Ok(Some(pk))` when the lookup succeeds, `Ok(None)` when the
     /// worker exists but didn't register a key, and an error when the
     /// `worker_pool` runtime row doesn't exist or the key is malformed.
-    pub async fn get_worker_public_key(
-        &self,
-        worker_name: &str,
-    ) -> AppResult<Option<[u8; 32]>> {
+    pub async fn get_worker_public_key(&self, worker_name: &str) -> AppResult<Option<[u8; 32]>> {
         use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 
         let row: Option<(Option<serde_json::Value>,)> = sqlx::query_as(
@@ -271,15 +268,18 @@ impl RuntimeService {
                 return Ok(None);
             }
         };
-        let encoded = match runtime_json.get("worker_public_key").and_then(|v| v.as_str()) {
+        let encoded = match runtime_json
+            .get("worker_public_key")
+            .and_then(|v| v.as_str())
+        {
             Some(s) if !s.is_empty() => s,
             _ => return Ok(None),
         };
-        let bytes = B64
-            .decode(encoded)
-            .map_err(|e| AppError::BadRequest(format!(
+        let bytes = B64.decode(encoded).map_err(|e| {
+            AppError::BadRequest(format!(
                 "worker '{worker_name}' worker_public_key base64: {e}"
-            )))?;
+            ))
+        })?;
         let array: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
             AppError::BadRequest(format!(
                 "worker '{worker_name}' worker_public_key must be 32 bytes, got {}",

@@ -3,9 +3,8 @@
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 
 use crate::db::models::{
-    CatalogEntries, CatalogEntry, CatalogEntryRequest, CatalogEntryResponse,
-    CatalogRegisterRequest, CatalogRegisterResponse,
-    CatalogDeleteRequest, CatalogDeleteResponse, DeletedCatalogEntry,
+    CatalogDeleteRequest, CatalogDeleteResponse, CatalogEntries, CatalogEntry, CatalogEntryRequest,
+    CatalogEntryResponse, CatalogRegisterRequest, CatalogRegisterResponse, DeletedCatalogEntry,
 };
 use crate::db::queries::catalog as queries;
 use crate::db::DbPool;
@@ -116,10 +115,7 @@ impl CatalogService {
     /// Returns what was removed rather than a bare count: `noetl.catalog` is
     /// not event-sourced and has no replay, so the response is the only record
     /// of what a delete actually took.
-    pub async fn delete(
-        &self,
-        request: CatalogDeleteRequest,
-    ) -> AppResult<CatalogDeleteResponse> {
+    pub async fn delete(&self, request: CatalogDeleteRequest) -> AppResult<CatalogDeleteResponse> {
         let path = request.path.trim().to_string();
         if path.is_empty() {
             return Err(AppError::Validation(
@@ -127,103 +123,99 @@ impl CatalogService {
             ));
         }
 
-        let removed = match queries::delete_catalog_entries(&self.pool, &path, request.version)
-            .await
-        {
-            Ok(rows) => rows,
-            // Postgres 23503 = foreign_key_violation. `noetl.event` carries an FK
-            // onto `noetl.catalog`, so any entry that has ever been EXECUTED is
-            // pinned by its event rows — and `noetl.event` is append-only, so
-            // those rows are never removed to release it.
-            //
-            // That is a legitimate, expected outcome of a well-formed request,
-            // not a server fault: 409, naming the constraint, rather than a bare
-            // 500 that tells the caller nothing about why.
-            Err(AppError::Database(sqlx::Error::Database(db)))
-                if db.code().as_deref() == Some("23503") =>
-            {
-                // noetl/ai-meta#237 — the entry has execution history, so a hard
-                // delete is impossible by construction. SOFT-delete instead:
-                // mark it archived, which retires it (it stops resolving by
-                // path and drops out of `list`) while destroying nothing and
-                // leaving the event FK intact.
+        let removed =
+            match queries::delete_catalog_entries(&self.pool, &path, request.version).await {
+                Ok(rows) => rows,
+                // Postgres 23503 = foreign_key_violation. `noetl.event` carries an FK
+                // onto `noetl.catalog`, so any entry that has ever been EXECUTED is
+                // pinned by its event rows — and `noetl.event` is append-only, so
+                // those rows are never removed to release it.
                 //
-                // Falling back rather than erroring is the point of this
-                // endpoint: the caller asked for the entry to go away, and it
-                // does — reversibly, via `restore`.
-                let archived = match queries::archive_catalog_entries(
-                    &self.pool,
-                    &path,
-                    request.version,
-                )
-                .await
+                // That is a legitimate, expected outcome of a well-formed request,
+                // not a server fault: 409, naming the constraint, rather than a bare
+                // 500 that tells the caller nothing about why.
+                Err(AppError::Database(sqlx::Error::Database(db)))
+                    if db.code().as_deref() == Some("23503") =>
                 {
-                    Ok(rows) => rows,
-                    // 42703 = undefined_column. The `archived_at` column could not
-                    // be added at startup because the server's role does not own
-                    // `noetl.catalog` (it is owned by a different role in every
-                    // deployment checked). Say so precisely — the alternative is a
-                    // 500 that looks like a server fault when it is a one-line
-                    // operator action.
-                    Err(AppError::Database(sqlx::Error::Database(d)))
-                        if d.code().as_deref() == Some("42703") =>
-                    {
-                        crate::metrics::record_catalog_delete("archive_unavailable");
-                        return Err(AppError::Conflict(format!(
-                            "Catalog entry '{path}' has execution history so it cannot be \
+                    // noetl/ai-meta#237 — the entry has execution history, so a hard
+                    // delete is impossible by construction. SOFT-delete instead:
+                    // mark it archived, which retires it (it stops resolving by
+                    // path and drops out of `list`) while destroying nothing and
+                    // leaving the event FK intact.
+                    //
+                    // Falling back rather than erroring is the point of this
+                    // endpoint: the caller asked for the entry to go away, and it
+                    // does — reversibly, via `restore`.
+                    let archived =
+                        match queries::archive_catalog_entries(&self.pool, &path, request.version)
+                            .await
+                        {
+                            Ok(rows) => rows,
+                            // 42703 = undefined_column. The `archived_at` column could not
+                            // be added at startup because the server's role does not own
+                            // `noetl.catalog` (it is owned by a different role in every
+                            // deployment checked). Say so precisely — the alternative is a
+                            // 500 that looks like a server fault when it is a one-line
+                            // operator action.
+                            Err(AppError::Database(sqlx::Error::Database(d)))
+                                if d.code().as_deref() == Some("42703") =>
+                            {
+                                crate::metrics::record_catalog_delete("archive_unavailable");
+                                return Err(AppError::Conflict(format!(
+                                    "Catalog entry '{path}' has execution history so it cannot be \
                              hard-deleted, and soft delete is unavailable: the \
                              noetl.catalog.archived_at column does not exist. The server \
                              cannot add it because it does not own the table. An operator \
                              with ownership must run: ALTER TABLE noetl.catalog ADD COLUMN \
                              IF NOT EXISTS archived_at TIMESTAMPTZ NULL; (noetl/ai-meta#237)"
-                        )));
-                    }
-                    Err(e) => return Err(e),
-                };
-                let entries: Vec<DeletedCatalogEntry> = archived
-                    .iter()
-                    .map(|(id, v)| DeletedCatalogEntry {
-                        catalog_id: id.to_string(),
-                        version: *v,
-                    })
-                    .collect();
-                crate::metrics::record_catalog_delete(if entries.is_empty() {
-                    "already_archived"
-                } else {
-                    "archived"
-                });
-                tracing::info!(
-                    path = %path,
-                    version = ?request.version,
-                    constraint = ?db.constraint(),
-                    archived = entries.len(),
-                    "catalog entry archived (has execution history; hard delete impossible)"
-                );
-                let message = if entries.is_empty() {
-                    format!(
+                                )));
+                            }
+                            Err(e) => return Err(e),
+                        };
+                    let entries: Vec<DeletedCatalogEntry> = archived
+                        .iter()
+                        .map(|(id, v)| DeletedCatalogEntry {
+                            catalog_id: id.to_string(),
+                            version: *v,
+                        })
+                        .collect();
+                    crate::metrics::record_catalog_delete(if entries.is_empty() {
+                        "already_archived"
+                    } else {
+                        "archived"
+                    });
+                    tracing::info!(
+                        path = %path,
+                        version = ?request.version,
+                        constraint = ?db.constraint(),
+                        archived = entries.len(),
+                        "catalog entry archived (has execution history; hard delete impossible)"
+                    );
+                    let message = if entries.is_empty() {
+                        format!(
                         "Catalog entry '{path}' has execution history and is already archived; \
                          nothing changed."
                     )
-                } else {
-                    format!(
-                        "Catalog entry '{path}': archived {} version(s). It has execution \
+                    } else {
+                        format!(
+                            "Catalog entry '{path}': archived {} version(s). It has execution \
                          history, so it cannot be hard-deleted (noetl.event holds a foreign key \
                          onto noetl.catalog and the event log is append-only). It no longer \
                          resolves by path and is hidden from list; restore with \
                          POST /api/catalog/restore.",
-                        entries.len()
-                    )
-                };
-                return Ok(CatalogDeleteResponse {
-                    status: "success".to_string(),
-                    message,
-                    path,
-                    count: entries.len(),
-                    deleted: entries,
-                });
-            }
-            Err(e) => return Err(e),
-        };
+                            entries.len()
+                        )
+                    };
+                    return Ok(CatalogDeleteResponse {
+                        status: "success".to_string(),
+                        message,
+                        path,
+                        count: entries.len(),
+                        deleted: entries,
+                    });
+                }
+                Err(e) => return Err(e),
+            };
 
         let deleted: Vec<DeletedCatalogEntry> = removed
             .iter()
@@ -274,10 +266,7 @@ impl CatalogService {
     ///
     /// Idempotent: restoring an entry that is not archived matches nothing and
     /// reports 0.
-    pub async fn restore(
-        &self,
-        request: CatalogDeleteRequest,
-    ) -> AppResult<CatalogDeleteResponse> {
+    pub async fn restore(&self, request: CatalogDeleteRequest) -> AppResult<CatalogDeleteResponse> {
         let path = request.path.trim().to_string();
         if path.is_empty() {
             return Err(AppError::Validation(
@@ -302,7 +291,10 @@ impl CatalogService {
         let message = if restored.is_empty() {
             format!("No archived entries for '{path}'; nothing restored.")
         } else {
-            format!("Restored {} archived version(s) of '{path}'.", restored.len())
+            format!(
+                "Restored {} archived version(s) of '{path}'.",
+                restored.len()
+            )
         };
         Ok(CatalogDeleteResponse {
             status: "success".to_string(),
@@ -420,10 +412,9 @@ fn validate_subscription_spec(yaml: &serde_yaml::Value) -> AppResult<()> {
     }
 
     // mode — required, pull | push.
-    let mode = spec
-        .get("mode")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| AppError::Validation("subscription spec requires 'mode' (pull | push)".into()))?;
+    let mode = spec.get("mode").and_then(|v| v.as_str()).ok_or_else(|| {
+        AppError::Validation("subscription spec requires 'mode' (pull | push)".into())
+    })?;
     match mode {
         "pull" => {
             // activation defaults to continuous; validate if present.
@@ -453,9 +444,9 @@ fn validate_subscription_spec(yaml: &serde_yaml::Value) -> AppResult<()> {
     }
 
     // dispatch.playbook — required: the ordinary playbook run per message.
-    let dispatch = spec
-        .get("dispatch")
-        .ok_or_else(|| AppError::Validation("subscription spec requires a 'dispatch' block".into()))?;
+    let dispatch = spec.get("dispatch").ok_or_else(|| {
+        AppError::Validation("subscription spec requires a 'dispatch' block".into())
+    })?;
     dispatch
         .get("playbook")
         .and_then(|v| v.as_str())
@@ -562,7 +553,9 @@ const SPOOL_ORDERINGS: &[&str] = &["global", "per_key", "none"];
 /// out-of-cluster Cloud Run path (RFC #90 Phase 5, `execution-model.md`).
 fn validate_spool_config(spool: &serde_yaml::Value) -> AppResult<()> {
     if !spool.is_mapping() {
-        return Err(AppError::Validation("subscription 'spool' must be a mapping".into()));
+        return Err(AppError::Validation(
+            "subscription 'spool' must be a mapping".into(),
+        ));
     }
     let mode = spool.get("mode").and_then(|v| v.as_str()).unwrap_or("off");
     if !SPOOL_MODES.contains(&mode) {
@@ -602,12 +595,11 @@ fn validate_spool_config(spool: &serde_yaml::Value) -> AppResult<()> {
                 )));
             }
         }
-        "local_disk"
-            if !nonempty("path") => {
-                return Err(AppError::Validation(
-                    "subscription 'spool.backend' 'local_disk' requires a non-empty 'path'".into(),
-                ));
-            }
+        "local_disk" if !nonempty("path") => {
+            return Err(AppError::Validation(
+                "subscription 'spool.backend' 'local_disk' requires a non-empty 'path'".into(),
+            ));
+        }
         _ => {}
     }
     // `credential` is optional for gcs/s3 — absent means ADC / Workload
@@ -736,12 +728,13 @@ fn validate_push_ingress(spec: &serde_yaml::Value) -> AppResult<()> {
     }
 
     let verify = ingress.get("verify").ok_or_else(|| {
-        AppError::Validation("subscription 'ingress' requires a 'verify' block (push always verifies)".into())
+        AppError::Validation(
+            "subscription 'ingress' requires a 'verify' block (push always verifies)".into(),
+        )
     })?;
-    let vtype = verify
-        .get("type")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| AppError::Validation("subscription 'ingress.verify.type' is required".into()))?;
+    let vtype = verify.get("type").and_then(|v| v.as_str()).ok_or_else(|| {
+        AppError::Validation("subscription 'ingress.verify.type' is required".into())
+    })?;
     if !PUSH_VERIFY_TYPES.contains(&vtype) {
         return Err(AppError::Validation(format!(
             "subscription 'ingress.verify.type' must be one of {:?}, got '{}' \
@@ -1120,11 +1113,15 @@ spec:
         let zero = yaml(
             "kind: Subscription\nspec:\n  source: nats\n  mode: pull\n  stream: S\n  consumer: C\n  dispatch: { playbook: p, batch_max: 0 }\n",
         );
-        assert!(format!("{}", validate_subscription_spec(&zero).unwrap_err()).contains("batch_max"));
+        assert!(
+            format!("{}", validate_subscription_spec(&zero).unwrap_err()).contains("batch_max")
+        );
         let huge = yaml(
             "kind: Subscription\nspec:\n  source: nats\n  mode: pull\n  stream: S\n  consumer: C\n  dispatch: { playbook: p, batch_max: 5000 }\n",
         );
-        assert!(format!("{}", validate_subscription_spec(&huge).unwrap_err()).contains("batch_max"));
+        assert!(
+            format!("{}", validate_subscription_spec(&huge).unwrap_err()).contains("batch_max")
+        );
     }
 
     #[test]

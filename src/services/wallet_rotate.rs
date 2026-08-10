@@ -130,10 +130,7 @@ impl WalletRotateService {
                         match update_result {
                             Ok(()) => {
                                 summary.rewrapped += 1;
-                                crate::metrics::record_wallet_rotate(
-                                    table.as_label(),
-                                    "rewrapped",
-                                );
+                                crate::metrics::record_wallet_rotate(table.as_label(), "rewrapped");
                             }
                             Err(e) => {
                                 summary.failed += 1;

@@ -131,7 +131,11 @@ async fn hydrate_status_result(
     let resolved = match result_store.resolve(&parsed).await {
         Ok(Some(data)) => data,
         Ok(None) => {
-            tracing::warn!(execution_id, ref_uri, "status view: result reference not found in store; left as stored");
+            tracing::warn!(
+                execution_id,
+                ref_uri,
+                "status view: result reference not found in store; left as stored"
+            );
             return false;
         }
         Err(e) => {
@@ -164,7 +168,11 @@ fn find_result_reference(result: &serde_json::Value) -> Option<(bool, String)> {
 
 /// Splice a resolved payload over the reference placeholder and drop the
 /// `reference` block, so the event reads exactly like an inline one.
-fn splice_resolved(result: &mut serde_json::Value, is_nested: bool, resolved: serde_json::Value) -> bool {
+fn splice_resolved(
+    result: &mut serde_json::Value,
+    is_nested: bool,
+    resolved: serde_json::Value,
+) -> bool {
     if is_nested {
         if let Some(inner) = result
             .get_mut("context")
@@ -182,7 +190,6 @@ fn splice_resolved(result: &mut serde_json::Value, is_nested: bool, resolved: se
     }
     false
 }
-
 
 /// behaviour bit-identical to pre-R4.
 #[derive(Clone)]
@@ -395,6 +402,18 @@ impl ExecutionService {
                                 -- list-vs-detail status drift).  `bool_or` over a
                                 -- prioritized CASE picks the terminal state when present.
                                 CASE
+                                    -- noetl/ai-meta#251/#254 — flag-gated ($5): a step that
+                                    -- errored must not leave the execution reading COMPLETED.
+                                    -- Evaluated FIRST, because a failing run still emits
+                                    -- `playbook.completed`.  Step outcomes are written in
+                                    -- LOWERCASE (`command.completed` carries 'error' /
+                                    -- 'success') while lifecycle events are uppercase, so
+                                    -- normalise rather than add a third hand-maintained
+                                    -- case list.
+                                    WHEN $5::BOOL AND bool_or(
+                                        lower(e.status) IN ('failed', 'error')
+                                        OR e.event_type IN ('playbook.failed', 'playbook_failed')
+                                    ) THEN 'FAILED'
                                     WHEN bool_or(e.event_type IN ('playbook.completed', 'playbook_completed')) THEN 'COMPLETED'
                                     WHEN bool_or(e.event_type IN ('playbook.failed', 'playbook_failed') OR e.status = 'FAILED') THEN 'FAILED'
                                     -- noetl/ai-meta#227: `execution.cancelled` is the
@@ -428,6 +447,7 @@ impl ExecutionService {
                     .bind(&status)
                     .bind(fetch_cap)
                     .bind(candidate_cap)
+                    .bind(crate::db::queries::event::status_from_steps_enabled())
                     .fetch_all(&pool)
                     .await
                 }
@@ -833,12 +853,20 @@ impl ExecutionService {
                     WHEN event_type IN ('command.claimed', 'command.started')
                      AND status IN ('RUNNING', 'STARTED')
                     THEN node_name END) as running_steps,
-                COUNT(DISTINCT CASE WHEN status = 'FAILED' THEN node_name END) as failed_steps
+                -- noetl/ai-meta#251/#254 — step outcomes are LOWERCASE
+                -- (`command.completed` carries 'error'); the uppercase-only
+                -- test could never see a failed step.  Flag-gated ($2) so
+                -- flag-off behaviour is byte-identical.
+                COUNT(DISTINCT CASE
+                    WHEN status = 'FAILED'
+                      OR ($2::BOOL AND lower(status) IN ('failed', 'error'))
+                    THEN node_name END) as failed_steps
             FROM noetl.event
             WHERE execution_id = $1
             "#,
         )
         .bind(execution_id)
+        .bind(crate::db::queries::event::status_from_steps_enabled())
         .fetch_one(self.pool_for(execution_id))
         .await?;
 
@@ -910,7 +938,11 @@ impl ExecutionService {
         //   - Command-table signal alone could be misled by a stale
         //     noetl.command projection; requiring the event-log to also
         //     agree ("no more steps to start") makes the verdict robust.
-        let status = if let Some((evt,)) = &terminal {
+        let status = if crate::db::queries::event::status_from_steps_enabled() && stats.3 > 0 {
+            // noetl/ai-meta#251 — a failing run still emits `playbook.completed`,
+            // so the terminal event must not outrank a recorded step failure.
+            "FAILED".to_string()
+        } else if let Some((evt,)) = &terminal {
             match evt.as_str() {
                 "playbook.completed" | "playbook_completed" => "COMPLETED",
                 "playbook.failed" | "playbook_failed" => "FAILED",
@@ -1062,6 +1094,16 @@ impl ExecutionService {
 
     /// Determine execution status from events.
     fn determine_status(&self, events: &[ExecutionEvent]) -> String {
+        // noetl/ai-meta#251/#254 — checked BEFORE the terminal scan because a
+        // failing run still emits `playbook.completed`.  Step outcomes are
+        // lowercase ('error'), lifecycle events uppercase, so normalise.
+        if crate::db::queries::event::status_from_steps_enabled()
+            && events
+                .iter()
+                .any(|e| matches!(e.status.to_ascii_lowercase().as_str(), "failed" | "error"))
+        {
+            return "FAILED".to_string();
+        }
         for event in events.iter().rev() {
             match event.event_type.as_str() {
                 "playbook.completed" | "playbook_completed" => return "COMPLETED".to_string(),
@@ -1118,7 +1160,11 @@ mod tests {
             .pointer("/context/result/context/data/emit/rows")
             .and_then(|v| v.as_array())
             .expect("resolved payload spliced in");
-        assert_eq!(rows.len(), 3, "full payload must replace the extracted summary");
+        assert_eq!(
+            rows.len(),
+            3,
+            "full payload must replace the extracted summary"
+        );
         assert!(
             result.pointer("/context/result/reference").is_none(),
             "the reference block must be dropped so the event reads as inline"
@@ -1133,8 +1179,15 @@ mod tests {
         });
         let (is_nested, _) = find_result_reference(&result).expect("top-level reference");
         assert!(!is_nested);
-        assert!(splice_resolved(&mut result, is_nested, serde_json::json!({ "data": { "k": 1 } })));
-        assert_eq!(result.pointer("/context/data/k"), Some(&serde_json::json!(1)));
+        assert!(splice_resolved(
+            &mut result,
+            is_nested,
+            serde_json::json!({ "data": { "k": 1 } })
+        ));
+        assert_eq!(
+            result.pointer("/context/data/k"),
+            Some(&serde_json::json!(1))
+        );
         assert!(result.get("reference").is_none());
     }
 

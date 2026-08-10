@@ -86,17 +86,14 @@ pub async fn list(
     let limit = q.limit.unwrap_or(100).clamp(1, 1000);
     let outcome = deps
         .service
-        .list(
-            tenant,
-            project,
-            q.kind.as_deref(),
-            q.name.as_deref(),
-            limit,
-        )
+        .list(tenant, project, q.kind.as_deref(), q.name.as_deref(), limit)
         .await;
     crate::metrics::record_registry_op("list", outcome.is_ok());
     let entries = outcome?;
-    Ok((StatusCode::OK, Json(serde_json::json!({ "entries": entries }))))
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!({ "entries": entries })),
+    ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -121,7 +118,10 @@ pub async fn resolve(
         Ok(r) => r,
         Err(msg) => {
             crate::metrics::record_registry_op("resolve", false);
-            return Ok((StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": msg })))
+            return Ok((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": msg })),
+            )
                 .into_response());
         }
     };

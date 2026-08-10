@@ -270,10 +270,7 @@ mod tests {
         let mut prev = gen.generate().unwrap();
         for _ in 0..10_000 {
             let id = gen.generate().unwrap();
-            assert!(
-                id > prev,
-                "ids not monotonic: prev={prev} current={id}"
-            );
+            assert!(id > prev, "ids not monotonic: prev={prev} current={id}");
             prev = id;
         }
     }
@@ -296,7 +293,10 @@ mod tests {
         let mut seen = HashSet::with_capacity(10_000);
         for _ in 0..10_000 {
             let id = gen.generate().unwrap();
-            assert!(seen.insert(id), "id {id} repeated — sequence overflow not handled");
+            assert!(
+                seen.insert(id),
+                "id {id} repeated — sequence overflow not handled"
+            );
         }
     }
 
@@ -319,7 +319,10 @@ mod tests {
         let mut all = HashSet::new();
         for h in handles {
             for id in h.join().unwrap() {
-                assert!(all.insert(id), "duplicate id {id} from concurrent generators");
+                assert!(
+                    all.insert(id),
+                    "duplicate id {id} from concurrent generators"
+                );
             }
         }
         assert_eq!(all.len(), 8000);

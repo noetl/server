@@ -343,7 +343,10 @@ mod tests {
         let cfg = ShardConfig::default();
         assert_eq!(cfg.shard_count, 1);
         for eid in [0, 1, 320_816_801_799_737_344, i64::MAX, -1] {
-            assert!(cfg.owns(eid), "owns({eid}) should be true under no-sharding default");
+            assert!(
+                cfg.owns(eid),
+                "owns({eid}) should be true under no-sharding default"
+            );
         }
     }
 
@@ -351,13 +354,7 @@ mod tests {
     fn owns_matches_shard_for_when_shard_count_is_greater_than_one() {
         let n = 16;
         let cfg_for = |idx| ShardConfig::new(idx, n).unwrap();
-        let eids: &[i64] = &[
-            1,
-            42,
-            320_816_801_799_737_344,
-            i64::MAX,
-            -1,
-        ];
+        let eids: &[i64] = &[1, 42, 320_816_801_799_737_344, i64::MAX, -1];
         for eid in eids {
             let expected = shard_for(*eid, n);
             for idx in 0..n {

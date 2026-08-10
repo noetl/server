@@ -195,7 +195,11 @@ static SYSTEM_CATALOG: std::sync::LazyLock<
 /// could never bootstrap (the drainer would deadlock waiting for itself to
 /// drain). So they always write synchronously, even under the gate.
 async fn is_system_execution(state: &AppState, catalog_id: i64) -> bool {
-    if let Some(v) = SYSTEM_CATALOG.read().ok().and_then(|m| m.get(&catalog_id).copied()) {
+    if let Some(v) = SYSTEM_CATALOG
+        .read()
+        .ok()
+        .and_then(|m| m.get(&catalog_id).copied())
+    {
         return v;
     }
     let path: Option<String> =
@@ -502,7 +506,12 @@ mod tests {
         ] {
             assert!(is_terminal_event_type(t), "{t} must be terminal");
         }
-        for t in ["command.completed", "command.failed", "step.enter", "playbook_started"] {
+        for t in [
+            "command.completed",
+            "command.failed",
+            "step.enter",
+            "playbook_started",
+        ] {
             assert!(!is_terminal_event_type(t), "{t} must NOT be terminal");
         }
     }
@@ -515,7 +524,11 @@ mod tests {
         // predicate that whole chain turns on.  System paths drain the stream and
         // INSERT their events (never published to `noetl_events`), so they must
         // be detected; user paths publish and stay on the off-server path.
-        for p in ["system/scheduled_cleanup", "system/event_materializer", "system/projector"] {
+        for p in [
+            "system/scheduled_cleanup",
+            "system/event_materializer",
+            "system/projector",
+        ] {
             assert!(is_system_path(p), "{p} must be detected as a system path");
         }
         for p in [
@@ -524,7 +537,10 @@ mod tests {
             "systems/monitor",    // prefix is `system/`, not `system`
             "",
         ] {
-            assert!(!is_system_path(p), "{p} must NOT be detected as a system path");
+            assert!(
+                !is_system_path(p),
+                "{p} must NOT be detected as a system path"
+            );
         }
     }
 
@@ -562,7 +578,10 @@ mod tests {
         assert!(j["parent_event_id"].is_null());
         assert!(j["worker_id"].is_null());
         // RFC #115 §4: an unset chain link serializes as null (→ NULL / root).
-        assert!(j.get("prev_event_id").is_some(), "must carry prev_event_id key");
+        assert!(
+            j.get("prev_event_id").is_some(),
+            "must carry prev_event_id key"
+        );
         assert!(j["prev_event_id"].is_null());
     }
 

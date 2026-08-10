@@ -100,11 +100,7 @@ pub struct ExecutionAffinity {
 
 impl ExecutionAffinity {
     /// Construct the router from config + the shared shard map.
-    pub fn new(
-        enabled: bool,
-        peer_url_template: Option<String>,
-        shard: Arc<ShardConfig>,
-    ) -> Self {
+    pub fn new(enabled: bool, peer_url_template: Option<String>, shard: Arc<ShardConfig>) -> Self {
         // 4s connect+request budget: forwarding to an in-cluster pod is sub-ms in
         // the happy path; a longer hang means the owner is unhealthy and we'd
         // rather degrade to local than block the worker.
@@ -250,7 +246,12 @@ pub fn shard_index_from_hostname(hostname: &str) -> Option<u32> {
 mod tests {
     use super::*;
 
-    fn affinity(enabled: bool, template: Option<&str>, index: u32, count: u32) -> ExecutionAffinity {
+    fn affinity(
+        enabled: bool,
+        template: Option<&str>,
+        index: u32,
+        count: u32,
+    ) -> ExecutionAffinity {
         ExecutionAffinity::new(
             enabled,
             template.map(|s| s.to_string()),
@@ -312,7 +313,10 @@ mod tests {
         assert_eq!(shard_index_from_hostname("noetl-server-rust-1"), Some(1));
         assert_eq!(shard_index_from_hostname("noetl-server-rust-13"), Some(13));
         // No trailing ordinal (Deployment-style random suffix) → None.
-        assert_eq!(shard_index_from_hostname("noetl-server-rust-6cdb8b7b6"), None);
+        assert_eq!(
+            shard_index_from_hostname("noetl-server-rust-6cdb8b7b6"),
+            None
+        );
         assert_eq!(shard_index_from_hostname("plainhost"), None);
         assert_eq!(shard_index_from_hostname(""), None);
     }

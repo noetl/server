@@ -3,13 +3,13 @@
 //! Endpoints for managing encrypted credentials.
 
 use axum::{
-    Json,
     extract::{Path, Query, State},
     http::StatusCode,
+    Json,
 };
 use serde::Deserialize;
 
-use crate::crypto::{SealedEnvelope, sealed_seal};
+use crate::crypto::{sealed_seal, SealedEnvelope};
 use crate::db::models::{CredentialCreateRequest, CredentialListResponse, CredentialResponse};
 use crate::error::{AppError, AppResult};
 use crate::services::{CredentialService, RuntimeService};
@@ -390,7 +390,7 @@ mod tests {
     /// `sealed::tests` exercise, here pinned at the handler-payload layer).
     #[test]
     fn tampered_sealed_credential_is_rejected() {
-        use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
+        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 
         let recipient_sk = StaticSecret::random_from_rng(rand_core::OsRng);
         let recipient_pk = PublicKey::from(&recipient_sk);

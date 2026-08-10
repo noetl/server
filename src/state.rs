@@ -713,11 +713,7 @@ impl AppState {
     /// Panics if the configured `server_machine_id` exceeds the
     /// 10-bit max (1023).  The caller should validate at
     /// config-load time; this is the last-resort guard.
-    pub fn new(
-        db: DbPool,
-        pools: DbPoolMap,
-        config: AppConfig,
-    ) -> Self {
+    pub fn new(db: DbPool, pools: DbPoolMap, config: AppConfig) -> Self {
         let machine_id = config.server_machine_id.unwrap_or_else(|| {
             let hostname = std::env::var("HOSTNAME")
                 .or_else(|_| std::env::var("COMPUTERNAME"))
@@ -863,10 +859,7 @@ impl AppState {
             // left them absent on exactly the configuration whose `no_transport`
             // reason needed reading (noetl/ai-meta#238).
             if publisher.is_configured() {
-                tracing::info!(
-                    ?event_bus_mode,
-                    "EHDB events bus enabled"
-                );
+                tracing::info!(?event_bus_mode, "EHDB events bus enabled");
                 Some(Arc::new(publisher))
             } else {
                 // Loud, because in `ehdb` mode this is the difference between
@@ -921,7 +914,6 @@ impl AppState {
     pub fn uptime_seconds(&self) -> u64 {
         self.start_time.elapsed().as_secs()
     }
-
 }
 
 #[cfg(test)]

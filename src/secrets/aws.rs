@@ -591,12 +591,10 @@ mod tests {
             .map(|(_, v)| v.clone())
             .unwrap();
         assert!(auth.contains("x-amz-security-token"));
-        assert!(
-            signed
-                .headers
-                .iter()
-                .any(|(k, _)| k == "X-Amz-Security-Token")
-        );
+        assert!(signed
+            .headers
+            .iter()
+            .any(|(k, _)| k == "X-Amz-Security-Token"));
     }
 
     #[test]

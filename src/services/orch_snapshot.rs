@@ -117,8 +117,9 @@ pub async fn load_latest(pool: &DbPool, execution_id: i64) -> AppResult<Option<L
     };
 
     let version: i64 = row.try_get("version").unwrap_or(0);
-    let updated_at: chrono::DateTime<chrono::Utc> =
-        row.try_get("updated_at").unwrap_or_else(|_| chrono::Utc::now());
+    let updated_at: chrono::DateTime<chrono::Utc> = row
+        .try_get("updated_at")
+        .unwrap_or_else(|_| chrono::Utc::now());
     let snapshot: serde_json::Value = row
         .try_get("snapshot")
         .map_err(|e| AppError::Internal(format!("orch_snapshot.load_latest: snapshot col: {e}")))?;
@@ -127,10 +128,7 @@ pub async fn load_latest(pool: &DbPool, execution_id: i64) -> AppResult<Option<L
         .get("applied_count")
         .and_then(|v| v.as_i64())
         .unwrap_or(0);
-    let routing_meta = meta
-        .get("routing_meta")
-        .filter(|v| !v.is_null())
-        .cloned();
+    let routing_meta = meta.get("routing_meta").filter(|v| !v.is_null()).cloned();
 
     // A snapshot that fails to deserialise (e.g. a WorkflowState shape change
     // across a deploy) is treated as absent — the caller falls back to a full

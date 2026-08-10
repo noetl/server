@@ -253,7 +253,9 @@ pub async fn container_callback(
     // orchestrator looks them up from the prior step.enter event
     // for `(execution_id, step)`.
     let event_id = state.snowflake.generate().map_err(|e| {
-        AppError::Internal(format!("container-callback: snowflake generate failed: {e}"))
+        AppError::Internal(format!(
+            "container-callback: snowflake generate failed: {e}"
+        ))
     })?;
     let terminal_context = serde_json::json!({
         "terminal_state": request.state.as_str(),
@@ -286,7 +288,10 @@ pub async fn container_callback(
     // RFC #115 Phase 6: under `event_read_path=audit_only` a warm descriptor
     // carries catalog_id — ZERO `noetl.event` read; cold falls through to scan.
     let catalog_id: i64 = if descriptor_warm {
-        crate::metrics::record_event_hotpath_read("container_callback_catalog", "served_descriptor");
+        crate::metrics::record_event_hotpath_read(
+            "container_callback_catalog",
+            "served_descriptor",
+        );
         state
             .exec_descriptors
             .get(execution_id)
@@ -420,7 +425,10 @@ mod tests {
         let parsed: ContainerCallbackRequest = serde_json::from_str(raw).unwrap();
         assert_eq!(parsed.state, TerminalState::FailedOom);
         assert_eq!(parsed.exit_code, Some(137));
-        assert_eq!(parsed.reason.as_deref(), Some("Memory limit exceeded (256Mi)"));
+        assert_eq!(
+            parsed.reason.as_deref(),
+            Some("Memory limit exceeded (256Mi)")
+        );
         assert_eq!(
             parsed.completed_at,
             Some(
@@ -448,8 +456,14 @@ mod tests {
             event_id: Some("1234567890".to_string()),
         };
         let body = serde_json::to_value(&r).unwrap();
-        assert_eq!(body.get("status").and_then(|v| v.as_str()), Some("accepted_in_flight"));
-        assert_eq!(body.get("event_id").and_then(|v| v.as_str()), Some("1234567890"));
+        assert_eq!(
+            body.get("status").and_then(|v| v.as_str()),
+            Some("accepted_in_flight")
+        );
+        assert_eq!(
+            body.get("event_id").and_then(|v| v.as_str()),
+            Some("1234567890")
+        );
     }
 
     #[test]
@@ -459,7 +473,10 @@ mod tests {
             event_id: None,
         };
         let body = serde_json::to_value(&r).unwrap();
-        assert_eq!(body.get("status").and_then(|v| v.as_str()), Some("accepted_stale"));
+        assert_eq!(
+            body.get("status").and_then(|v| v.as_str()),
+            Some("accepted_stale")
+        );
         // skip_serializing_if elides the field on None.
         assert!(body.get("event_id").is_none());
     }

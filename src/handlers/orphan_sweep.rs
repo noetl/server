@@ -141,8 +141,7 @@ async fn run_orphan_sweep(state: &AppState) -> AppResult<()> {
         })
         .await?;
 
-    let mut candidates: Vec<OrphanCandidate> =
-        per_shard.into_iter().flat_map(|(_, v)| v).collect();
+    let mut candidates: Vec<OrphanCandidate> = per_shard.into_iter().flat_map(|(_, v)| v).collect();
 
     // Execution affinity (RFC #116): only the owner replica acts, mirroring the
     // reconcile poller.  Inert with a single replica / affinity off.  Filter
@@ -406,10 +405,7 @@ mod tests {
         ];
         let live = live_set(&["noetl-worker-rust-c95694c94-m7xvp"]);
         let plan = plan_dispositions(&cands, &live, 20);
-        assert_eq!(
-            plan,
-            vec![Disposition::SkippedLive, Disposition::Terminate]
-        );
+        assert_eq!(plan, vec![Disposition::SkippedLive, Disposition::Terminate]);
     }
 
     /// The per-tick cap bounds terminations; the excess dead-owned candidates

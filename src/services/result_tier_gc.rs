@@ -390,9 +390,7 @@ pub fn decide_object(
 ) -> Decision {
     let base = decide(execution_id, has_live_events, age_seconds, grace_seconds);
     // The state-shard guard only ever protects further; never promotes to Dead.
-    let verdict = if state_shard_guard
-        && class == ObjectClass::StateOpen
-        && base == Decision::Dead
+    let verdict = if state_shard_guard && class == ObjectClass::StateOpen && base == Decision::Dead
     {
         let mult = open_grace_multiplier.max(1);
         let extended = grace_seconds.saturating_mul(mult);
@@ -631,9 +629,15 @@ mod tests {
     #[test]
     fn unparseable_keys_yield_none() {
         // No execution= segment.
-        assert_eq!(parse_execution_id("noetl/env=dev/results/x/0/0/1.feather"), None);
+        assert_eq!(
+            parse_execution_id("noetl/env=dev/results/x/0/0/1.feather"),
+            None
+        );
         // Non-numeric execution.
-        assert_eq!(parse_execution_id("noetl/execution=abc/results/x.json"), None);
+        assert_eq!(
+            parse_execution_id("noetl/execution=abc/results/x.json"),
+            None
+        );
         assert_eq!(parse_execution_id(""), None);
     }
 
@@ -655,15 +659,24 @@ mod tests {
     #[test]
     fn dead_only_when_unreferenced_and_past_grace() {
         // Unreferenced + old enough → Dead.
-        assert_eq!(decide(Some(7), false, Some(100_000), 86_400), Decision::Dead);
+        assert_eq!(
+            decide(Some(7), false, Some(100_000), 86_400),
+            Decision::Dead
+        );
         // Unreferenced but too young → protected by grace.
-        assert_eq!(decide(Some(7), false, Some(10), 86_400), Decision::SkipGrace);
+        assert_eq!(
+            decide(Some(7), false, Some(10), 86_400),
+            Decision::SkipGrace
+        );
         // Unreferenced, age exactly at the grace boundary → Dead (>=).
         assert_eq!(decide(Some(7), false, Some(86_400), 86_400), Decision::Dead);
         // Unreferenced, undecodable age → treated as young, protected.
         assert_eq!(decide(Some(7), false, None, 86_400), Decision::SkipGrace);
         // Unparseable key → never deletable, regardless of liveness/age.
-        assert_eq!(decide(None, false, Some(100_000), 0), Decision::SkipUnparseable);
+        assert_eq!(
+            decide(None, false, Some(100_000), 0),
+            Decision::SkipUnparseable
+        );
     }
 
     #[test]
@@ -797,7 +810,11 @@ mod tests {
     #[test]
     fn guard_does_not_touch_sealed_or_result_or_live() {
         // Sealed shard + result object: guard on, but they follow the base policy.
-        for class in [ObjectClass::StateSealed, ObjectClass::Result, ObjectClass::Other] {
+        for class in [
+            ObjectClass::StateSealed,
+            ObjectClass::Result,
+            ObjectClass::Other,
+        ] {
             assert_eq!(
                 decide_object(class, Some(7), false, Some(100_000), 86_400, true, 7, false),
                 Decision::Dead,
@@ -807,7 +824,16 @@ mod tests {
         // Live is never weakened, even for an open shard with the guard on — and
         // the guard can NEVER promote a Skip to Dead.
         assert_eq!(
-            decide_object(ObjectClass::StateOpen, Some(7), true, Some(700_000), 86_400, true, 7, false),
+            decide_object(
+                ObjectClass::StateOpen,
+                Some(7),
+                true,
+                Some(700_000),
+                86_400,
+                true,
+                7,
+                false
+            ),
             Decision::SkipLive
         );
     }
@@ -818,7 +844,16 @@ mod tests {
         // (which would delete every aged-out open shard immediately). Clamped
         // to 1 → behaves like the base grace.
         assert_eq!(
-            decide_object(ObjectClass::StateOpen, Some(7), false, Some(100_000), 86_400, true, 0, false),
+            decide_object(
+                ObjectClass::StateOpen,
+                Some(7),
+                false,
+                Some(100_000),
+                86_400,
+                true,
+                0,
+                false
+            ),
             Decision::Dead
         );
     }
@@ -837,7 +872,16 @@ mod tests {
         ] {
             // Base verdict Dead...
             assert_eq!(
-                decide_object(class, Some(7), false, Some(100_000), 86_400, false, 7, false),
+                decide_object(
+                    class,
+                    Some(7),
+                    false,
+                    Some(100_000),
+                    86_400,
+                    false,
+                    7,
+                    false
+                ),
                 Decision::Dead,
                 "base is Dead (class={class:?})"
             );
@@ -856,17 +900,44 @@ mod tests {
         // SkipLive — same monotonic-protection contract as the state-shard guard.
         // Live stays live even when flagged un-sunk.
         assert_eq!(
-            decide_object(ObjectClass::Result, Some(7), true, Some(100_000), 86_400, false, 7, true),
+            decide_object(
+                ObjectClass::Result,
+                Some(7),
+                true,
+                Some(100_000),
+                86_400,
+                false,
+                7,
+                true
+            ),
             Decision::SkipLive
         );
         // A young (grace-protected) object stays SkipGrace, not converted.
         assert_eq!(
-            decide_object(ObjectClass::Result, Some(7), false, Some(10), 86_400, false, 7, true),
+            decide_object(
+                ObjectClass::Result,
+                Some(7),
+                false,
+                Some(10),
+                86_400,
+                false,
+                7,
+                true
+            ),
             Decision::SkipGrace
         );
         // An unparseable key is never reasoned about, un-sunk flag notwithstanding.
         assert_eq!(
-            decide_object(ObjectClass::Other, None, false, Some(100_000), 0, false, 7, true),
+            decide_object(
+                ObjectClass::Other,
+                None,
+                false,
+                Some(100_000),
+                0,
+                false,
+                7,
+                true
+            ),
             Decision::SkipUnparseable
         );
     }
@@ -886,8 +957,7 @@ mod tests {
                 for live in [true, false] {
                     for age in [Some(-1_i64), Some(10), Some(100_000), None] {
                         for guard in [true, false] {
-                            let v =
-                                decide_object(class, eid, live, age, 86_400, guard, 7, false);
+                            let v = decide_object(class, eid, live, age, 86_400, guard, 7, false);
                             assert_ne!(v, Decision::SkipUnsunk, "gate off must never SkipUnsunk");
                         }
                     }
@@ -931,8 +1001,14 @@ mod sink_feed_truncation_tests {
     #[test]
     fn a_complete_feed_still_discriminates() {
         let p = pending(&[1, 2]);
-        assert!(is_unsunk(true, true, &p, Some(1)), "a marked execution is un-sunk");
-        assert!(!is_unsunk(true, true, &p, Some(9)), "an unmarked one is reclaimable");
+        assert!(
+            is_unsunk(true, true, &p, Some(1)),
+            "a marked execution is un-sunk"
+        );
+        assert!(
+            !is_unsunk(true, true, &p, Some(9)),
+            "an unmarked one is reclaimable"
+        );
         assert!(
             !is_unsunk(true, true, &p, None),
             "an unparseable key is not un-sunk — it is handled by skipped_unparseable"

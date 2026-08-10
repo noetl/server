@@ -12,9 +12,8 @@ use chrono::Utc;
 use serde::Deserialize;
 
 use crate::db::models::{
-    CatalogEntries, CatalogEntriesRequest, CatalogEntryRequest, CatalogEntryResponse,
-    CatalogRegisterRequest, CatalogRegisterResponse,
-    CatalogDeleteRequest, CatalogDeleteResponse,
+    CatalogDeleteRequest, CatalogDeleteResponse, CatalogEntries, CatalogEntriesRequest,
+    CatalogEntryRequest, CatalogEntryResponse, CatalogRegisterRequest, CatalogRegisterResponse,
 };
 use crate::error::{AppError, AppResult};
 use crate::services::ui_schema::{infer_ui_schema, UiSchemaResponse};

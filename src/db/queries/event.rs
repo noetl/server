@@ -316,8 +316,11 @@ pub async fn has_errored_step(pool: &DbPool, execution_id: i64) -> AppResult<boo
         SELECT 1
         FROM noetl.event
         WHERE execution_id = $1
-          AND event_type IN ('command.completed', 'command.failed', 'call.error')
-          AND status = 'error'
+          AND (
+                event_type IN ('command.completed', 'command.failed', 'call.error')
+             OR event_type IN ('playbook.failed', 'playbook_failed')
+              )
+          AND lower(status) IN ('failed', 'error')
         LIMIT 1
         "#,
     )
@@ -335,7 +338,7 @@ pub async fn has_errored_step(pool: &DbPool, execution_id: i64) -> AppResult<boo
 /// workflow but had a failing step flips COMPLETED -> FAILED.  That is a
 /// semantics change, so it must be a deliberate flip and not a side effect of
 /// deploying a new image.
-fn status_from_steps_enabled() -> bool {
+pub fn status_from_steps_enabled() -> bool {
     matches!(
         std::env::var("NOETL_EXECUTION_STATUS_FROM_STEPS")
             .unwrap_or_default()
