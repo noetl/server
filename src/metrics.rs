@@ -2859,6 +2859,191 @@ pub fn record_container_callback_stale(state: &str) {
         .inc();
 }
 
+// ===========================================================================
+// EHDB cross-store parity (noetl/ai-meta#258).
+//
+// The signal that gates the first EHDB primary tier flip. Three families, and
+// the third is the one that makes the other two mean anything.
+// ===========================================================================
+
+/// Counter: one verdict per execution compared across `noetl.event` and the
+/// EHDB event-log tier.
+///
+/// `outcome` distinguishes agreement from every distinct way of *not knowing*
+/// (see [`crate::handlers::ehdb_parity::ParityOutcome`]). That distinction is
+/// the point of the metric: the signal it replaces
+/// (`noetl_ehdb_eventlog_ops_total{outcome="mirrored"}`) could not tell "the
+/// stores agree" from "the tier was never asked".
+pub fn ehdb_crossstore_parity_total() -> &'static IntCounterVec {
+    static M: OnceLock<IntCounterVec> = OnceLock::new();
+    M.get_or_init(|| {
+        let counter = IntCounterVec::new(
+            Opts::new(
+                "noetl_ehdb_crossstore_parity_total",
+                "Cross-store parity verdicts comparing the EHDB tier against the authoritative \
+                 noetl.event log, by tier and outcome (noetl/ai-meta#258).",
+            ),
+            &["tier", "outcome"],
+        )
+        .expect("static counter spec must be valid");
+        registry()
+            .register(Box::new(counter.clone()))
+            .expect("counter registration must succeed");
+        counter
+    })
+}
+
+/// Record one cross-store parity verdict.
+pub fn record_ehdb_crossstore_parity(tier: &str, outcome: &str) {
+    ehdb_crossstore_parity_total()
+        .with_label_values(&[tier, outcome])
+        .inc();
+}
+
+/// Counter: divergences found, by kind.
+///
+/// One increment per *kind* per execution, not per offending record — the
+/// question this answers is "at what rate do executions diverge, and how", and
+/// counting records would let a single badly-corrupted execution dominate the
+/// rate.
+pub fn ehdb_crossstore_divergence_total() -> &'static IntCounterVec {
+    static M: OnceLock<IntCounterVec> = OnceLock::new();
+    M.get_or_init(|| {
+        let counter = IntCounterVec::new(
+            Opts::new(
+                "noetl_ehdb_crossstore_divergence_total",
+                "Cross-store divergences between the EHDB tier and noetl.event, by tier and \
+                 kind (noetl/ai-meta#258).",
+            ),
+            &["tier", "kind"],
+        )
+        .expect("static counter spec must be valid");
+        registry()
+            .register(Box::new(counter.clone()))
+            .expect("counter registration must succeed");
+        counter
+    })
+}
+
+/// Record one divergence kind on one execution.
+pub fn record_ehdb_crossstore_divergence(tier: &str, kind: &str) {
+    ehdb_crossstore_divergence_total()
+        .with_label_values(&[tier, kind])
+        .inc();
+}
+
+/// Counter: events whose identifying fields matched across both stores.
+///
+/// The denominator. Without it a zero divergence rate has no scale — one
+/// execution compared and a million are the same reading.
+pub fn ehdb_crossstore_events_compared_total() -> &'static IntCounterVec {
+    static M: OnceLock<IntCounterVec> = OnceLock::new();
+    M.get_or_init(|| {
+        let counter = IntCounterVec::new(
+            Opts::new(
+                "noetl_ehdb_crossstore_events_compared_total",
+                "Events matched across the EHDB tier and noetl.event, by tier \
+                 (noetl/ai-meta#258).",
+            ),
+            &["tier"],
+        )
+        .expect("static counter spec must be valid");
+        registry()
+            .register(Box::new(counter.clone()))
+            .expect("counter registration must succeed");
+        counter
+    })
+}
+
+/// Add to the matched-event count.
+pub fn add_ehdb_crossstore_events_compared(tier: &str, n: u64) {
+    ehdb_crossstore_events_compared_total()
+        .with_label_values(&[tier])
+        .inc_by(n);
+}
+
+/// Counter: the comparator's own controls — the anti-vacuity signal.
+///
+/// `result="unexpected"` means the comparator failed to behave on a synthetic
+/// input whose answer is known: either it missed a deliberately planted
+/// divergence, or it invented one on a clean pair. Either way every zero it has
+/// published is void, which is a different and much worse situation than a
+/// divergence.
+///
+/// The reading an operator wants before a tier flip is
+/// `expected > 0 AND unexpected == 0` — that is what turns
+/// `noetl_ehdb_crossstore_divergence_total == 0` from an absence into evidence.
+pub fn ehdb_crossstore_control_total() -> &'static IntCounterVec {
+    static M: OnceLock<IntCounterVec> = OnceLock::new();
+    M.get_or_init(|| {
+        let counter = IntCounterVec::new(
+            Opts::new(
+                "noetl_ehdb_crossstore_control_total",
+                "Cross-store comparator self-controls: synthetic inputs with known answers, by \
+                 control and whether the comparator behaved (noetl/ai-meta#258).",
+            ),
+            &["control", "result"],
+        )
+        .expect("static counter spec must be valid");
+        registry()
+            .register(Box::new(counter.clone()))
+            .expect("counter registration must succeed");
+        counter
+    })
+}
+
+/// Record one control verdict (`expected` | `unexpected`).
+pub fn record_ehdb_crossstore_control(control: &str, result: &str) {
+    ehdb_crossstore_control_total()
+        .with_label_values(&[control, result])
+        .inc();
+}
+
+/// Materialise every cross-store parity series at 0.
+///
+/// `Registry::gather` prunes families with no children, so a labelled counter
+/// that has never been incremented is **absent** from `/metrics`, not zero. On
+/// this metric that is intolerable: absence would be equally consistent with
+/// "no divergence has ever been found", "the comparator is off", and "this
+/// binary predates the comparator". Pinning collapses the first two into a
+/// readable 0 and leaves absence to mean only the third — and
+/// `noetl_server_build_info{version}` answers that.
+///
+/// Pinned **unconditionally**, outside any config branch. A pin placed inside
+/// `if enabled` is not a pin: it would leave exactly the disabled server —
+/// the one an operator is checking before turning the comparator on — showing
+/// nothing.
+///
+/// Every label value comes from the call sites' own enums
+/// ([`crate::handlers::ehdb_parity::PARITY_OUTCOMES`], `DIVERGENCE_KINDS`,
+/// `CONTROL_NAMES`), not from a hand-maintained list in prose; the test below
+/// asserts the enums and the pinned set cannot drift apart.
+pub fn init_ehdb_crossstore_series() {
+    use crate::handlers::ehdb_parity::{
+        CONTROL_NAMES, DIVERGENCE_KINDS, PARITY_OUTCOMES, TIER,
+    };
+    for outcome in PARITY_OUTCOMES {
+        ehdb_crossstore_parity_total()
+            .with_label_values(&[TIER, outcome.as_str()])
+            .inc_by(0);
+    }
+    for kind in DIVERGENCE_KINDS {
+        ehdb_crossstore_divergence_total()
+            .with_label_values(&[TIER, kind.as_str()])
+            .inc_by(0);
+    }
+    ehdb_crossstore_events_compared_total()
+        .with_label_values(&[TIER])
+        .inc_by(0);
+    for control in CONTROL_NAMES {
+        for result in ["expected", "unexpected"] {
+            ehdb_crossstore_control_total()
+                .with_label_values(&[control, result])
+                .inc_by(0);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -3830,6 +4015,42 @@ mod tests {
                 .get()
                 > 0,
             "the recorded reason must have moved"
+        );
+    }
+
+    /// The pin must reach `/metrics`, not just the counter.
+    ///
+    /// This asserts the property that actually matters and that a
+    /// `.with_label_values(..).get()` check would *not* catch: `Registry::gather`
+    /// prunes empty families, so the question is whether the series survives
+    /// rendering. The negative half is the point — an unpinned label value must
+    /// be absent, or this test would pass on a build with no pinning at all.
+    #[test]
+    fn crossstore_series_are_pinned_into_the_rendered_output() {
+        init_ehdb_crossstore_series();
+        let text = gather_text().expect("gather must succeed");
+
+        for expected in [
+            "noetl_ehdb_crossstore_parity_total{outcome=\"match\",tier=\"eventlog\"} 0",
+            "noetl_ehdb_crossstore_parity_total{outcome=\"ehdb_unavailable\",tier=\"eventlog\"} 0",
+            "noetl_ehdb_crossstore_divergence_total{kind=\"missing_event\",tier=\"eventlog\"} 0",
+            "noetl_ehdb_crossstore_divergence_total{kind=\"unidentified\",tier=\"eventlog\"} 0",
+            "noetl_ehdb_crossstore_events_compared_total{tier=\"eventlog\"} 0",
+            "noetl_ehdb_crossstore_control_total{control=\"identical\",result=\"expected\"} 0",
+            "noetl_ehdb_crossstore_control_total{control=\"order\",result=\"unexpected\"} 0",
+        ] {
+            assert!(
+                text.contains(expected),
+                "pinned series missing from /metrics: {expected}"
+            );
+        }
+
+        // Positive control for the assertion itself: a label value nobody pins
+        // must NOT be present. Without this, the loop above would pass against
+        // an implementation that emitted every conceivable series.
+        assert!(
+            !text.contains("noetl_ehdb_crossstore_divergence_total{kind=\"not_a_kind\""),
+            "an unpinned label value must not appear — the check above proves nothing otherwise"
         );
     }
 }
