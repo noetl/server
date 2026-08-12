@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.80.0](https://github.com/noetl/server/compare/v3.79.6...v3.80.0) (2026-08-12)
+
+### Features
+
+* **ehdb:** compare the event-log tier against the authoritative log ([37aad5e](https://github.com/noetl/server/commit/37aad5ea71283e153f98ec19d68c442ae5a1580a)), closes [noetl/server#342](https://github.com/noetl/server/issues/342) [noetl/ai-meta#258](https://github.com/noetl/ai-meta/issues/258)
+
 ## [3.79.6](https://github.com/noetl/server/compare/v3.79.5...v3.79.6) (2026-08-10)
 
 ### Bug Fixes
