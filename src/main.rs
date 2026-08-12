@@ -355,6 +355,23 @@ fn build_router(
         )
         .with_state(handlers::ehdb::TierRelayState::from_env());
 
+    // Cross-store parity (noetl/ai-meta#258).  Carries `AppState` rather than
+    // the relay state because it reads BOTH sides — the authoritative
+    // `noetl.event` log through the pools, and the EHDB tier through the same
+    // worker relay the route above uses.  Default-off: with
+    // `NOETL_EHDB_CROSSSTORE_PARITY_ENABLED` unset both routes answer 501 with
+    // the reason.
+    let ehdb_parity_routes = Router::new()
+        .route(
+            "/api/ehdb/parity/executions/{execution_id}",
+            get(handlers::ehdb_parity::compare_execution_endpoint),
+        )
+        .route(
+            "/api/ehdb/parity/self-test",
+            get(handlers::ehdb_parity::self_test_endpoint),
+        )
+        .with_state(state.clone());
+
     // Replay engine routes (Phase D R5 of noetl/ai-meta#49 →
     // noetl/server#148).  Round 1 ships `GET /api/replay/state`
     // with the minimal `execution` projection.  Service uses
@@ -657,6 +674,7 @@ fn build_router(
         .merge(executions_routes)
         .merge(ehdb_routes)
         .merge(ehdb_tier_routes)
+        .merge(ehdb_parity_routes)
         .merge(subscription_routes)
         .merge(replay_routes)
         .merge(result_store_routes)
@@ -766,6 +784,7 @@ async fn main() -> anyhow::Result<()> {
     noetl_server::metrics::init_sink_state_series();
     noetl_server::metrics::init_catalog_delete_series();
     noetl_server::metrics::init_parity_and_dedup_series();
+    noetl_server::metrics::init_ehdb_crossstore_series();
     noetl_server::metrics::init_result_tier_gc_series();
     noetl_server::metrics::init_credential_seal_series();
     noetl_server::metrics::init_system_plugin_seed_series();
@@ -866,6 +885,11 @@ async fn main() -> anyhow::Result<()> {
     // Default OFF (NOETL_NONCONVERGENCE_SWEEP_ENABLED); behavior-neutral until
     // ops flips it on.
     handlers::nonconvergence_sweep::spawn_nonconvergence_sweep(state.clone());
+
+    // EHDB cross-store parity sampler (noetl/ai-meta#258).  Default-off; the
+    // task returns immediately unless NOETL_EHDB_CROSSSTORE_PARITY_ENABLED is
+    // set AND the interval is non-zero.
+    handlers::ehdb_parity::spawn_crossstore_parity_sampler(state.clone());
 
     // CQRS write-path cutover (noetl/ai-meta#103 phase 2d-3): when
     // `NOETL_EVENT_INGEST_PUBLISH_ONLY` is on, server-originated events publish to

@@ -731,6 +731,66 @@ pub struct AppConfig {
     /// per-command progress signal is the prerequisite for making this safe.
     #[serde(default)]
     pub nonconvergence_stuck_claim_secs: u64,
+
+    /// Arm the EHDB cross-store parity comparator.  Envy maps
+    /// `NOETL_EHDB_CROSSSTORE_PARITY_ENABLED`.
+    ///
+    /// The comparator ([`crate::handlers::ehdb_parity`]) reads BOTH stores — the
+    /// authoritative `noetl.event` log and the EHDB event-log tier — and reports
+    /// where they disagree.  It exists because the tier's existing parity signal
+    /// compares EHDB to itself: the worker's live mirror passes
+    /// `authoritative_sequence: None`, which reduces the check to the engine's
+    /// own count and its own ordering
+    /// ([noetl/ai-meta#258](https://github.com/noetl/ai-meta/issues/258)).
+    ///
+    /// **Default false.**  Off, the endpoints answer `501` with the reason, the
+    /// sampler task returns immediately, and no query runs — so a disabled
+    /// server does no work and reads no store it would not otherwise read.  The
+    /// metric families are pinned at 0 regardless (see
+    /// [`crate::metrics::init_ehdb_crossstore_series`]) so "off" is legible
+    /// rather than absent.
+    #[serde(default)]
+    pub ehdb_crossstore_parity_enabled: bool,
+
+    /// Seconds between background cross-store parity ticks.  Envy maps
+    /// `NOETL_EHDB_CROSSSTORE_PARITY_INTERVAL_SECS`.
+    ///
+    /// **0 disables the sampler while leaving the on-demand endpoints armed** —
+    /// the split exists so an operator can gather evidence by hand without
+    /// putting a recurring `GROUP BY execution_id` on the database.  Default 300.
+    #[serde(default = "default_ehdb_crossstore_parity_interval_secs")]
+    pub ehdb_crossstore_parity_interval_secs: u64,
+
+    /// Executions compared per sampler tick.  Envy maps
+    /// `NOETL_EHDB_CROSSSTORE_PARITY_SAMPLE_SIZE`.  Default 10 — each comparison
+    /// is one indexed read plus one relay round-trip, and the evidence this
+    /// produces is a *rate* over a soak, which does not need volume per tick.
+    #[serde(default = "default_ehdb_crossstore_parity_sample_size")]
+    pub ehdb_crossstore_parity_sample_size: usize,
+
+    /// How long an execution must have been quiet before it is eligible for
+    /// comparison, in seconds.  Envy maps
+    /// `NOETL_EHDB_CROSSSTORE_PARITY_SETTLE_SECS`.  Default 120.
+    ///
+    /// Load-bearing, not a tuning knob.  The mirror is best-effort and lands
+    /// *after* the authoritative write, so an execution that is still emitting
+    /// has a tier copy that is legitimately a few records behind.  Comparing it
+    /// reports a count divergence that is a race rather than a defect — and a
+    /// comparator that cries wolf on healthy executions gets ignored exactly
+    /// when it matters.
+    #[serde(default = "default_ehdb_crossstore_parity_settle_secs")]
+    pub ehdb_crossstore_parity_settle_secs: u64,
+
+    /// How far back the candidate scan looks, in seconds.  Envy maps
+    /// `NOETL_EHDB_CROSSSTORE_PARITY_LOOKBACK_SECS`.  Default 3600.
+    ///
+    /// Bounded on purpose: the tier's default backend is a pod-local log that is
+    /// reset on restart, so an execution older than the current pod's lifetime
+    /// would compare as wholly missing through no fault of the platform.  An
+    /// hour keeps the sample inside the window where a divergence means
+    /// something.
+    #[serde(default = "default_ehdb_crossstore_parity_lookback_secs")]
+    pub ehdb_crossstore_parity_lookback_secs: u64,
 }
 
 /// How the execution-lifecycle hot path reads `noetl.event` — see
@@ -851,6 +911,22 @@ fn default_orphan_sweep_lookback_secs() -> u64 {
 
 fn default_nonconvergence_sweep_interval_secs() -> u64 {
     300
+}
+
+fn default_ehdb_crossstore_parity_interval_secs() -> u64 {
+    300
+}
+
+fn default_ehdb_crossstore_parity_sample_size() -> usize {
+    10
+}
+
+fn default_ehdb_crossstore_parity_settle_secs() -> u64 {
+    120
+}
+
+fn default_ehdb_crossstore_parity_lookback_secs() -> u64 {
+    3600
 }
 
 fn default_nonconvergence_grace_secs() -> u64 {
@@ -1038,6 +1114,14 @@ impl Default for AppConfig {
             nonconvergence_sweep_max_per_tick: default_nonconvergence_sweep_max_per_tick(),
             nonconvergence_sweep_scan_limit: default_nonconvergence_sweep_scan_limit(),
             nonconvergence_stuck_claim_secs: 0,
+            // noetl/ai-meta#258 — the cross-store comparator lands inert.  Off,
+            // nothing queries either store on its behalf; the pinned metric
+            // families still render 0 so an operator can see it exists.
+            ehdb_crossstore_parity_enabled: false,
+            ehdb_crossstore_parity_interval_secs: default_ehdb_crossstore_parity_interval_secs(),
+            ehdb_crossstore_parity_sample_size: default_ehdb_crossstore_parity_sample_size(),
+            ehdb_crossstore_parity_settle_secs: default_ehdb_crossstore_parity_settle_secs(),
+            ehdb_crossstore_parity_lookback_secs: default_ehdb_crossstore_parity_lookback_secs(),
         }
     }
 }
