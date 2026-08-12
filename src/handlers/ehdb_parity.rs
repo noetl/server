@@ -932,6 +932,19 @@ async fn fetch_authoritative(
     state: &AppState,
     execution_id: i64,
 ) -> Result<Vec<AuthoritativeEvent>, sqlx::Error> {
+    // noetl/ai-meta#258 — the scope depends on WHO mirrors.
+    //
+    // With the worker mirroring (the default), only worker-emitted events can
+    // have a tier copy and the marker below is the boundary. With the server
+    // mirroring, the mirror sits on the chokepoint that writes `noetl.event`
+    // itself, so **every** authoritative event is expected in the tier and the
+    // marker would under-scope the comparison — it would pass while silently
+    // ignoring the seven events the whole exercise exists to capture.
+    //
+    // Derived from the same variable both mirrors read, so the comparator cannot
+    // hold a different opinion about the boundary than the producer does.
+    let server_mirrors = crate::handlers::ehdb_eventlog_mirror::server_mirrors();
+
     let rows = sqlx::query_as::<_, (i64, String, Option<String>, Option<String>, bool)>(
         r#"
         SELECT
@@ -939,8 +952,8 @@ async fn fetch_authoritative(
             event_type,
             node_name,
             status,
-            ((meta->>'worker_id') IS NOT NULL
-             AND event_type <> 'command.claimed') AS mirror_expected
+            ($3 OR ((meta->>'worker_id') IS NOT NULL
+                    AND event_type <> 'command.claimed')) AS mirror_expected
         FROM noetl.event
         WHERE execution_id = $1
         ORDER BY event_id ASC
@@ -949,6 +962,7 @@ async fn fetch_authoritative(
     )
     .bind(execution_id)
     .bind(MAX_COMPARE_EVENTS as i64 + 1)
+    .bind(server_mirrors)
     .fetch_all(state.pools.pool_for(execution_id))
     .await?;
 

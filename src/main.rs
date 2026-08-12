@@ -785,6 +785,7 @@ async fn main() -> anyhow::Result<()> {
     noetl_server::metrics::init_catalog_delete_series();
     noetl_server::metrics::init_parity_and_dedup_series();
     noetl_server::metrics::init_ehdb_crossstore_series();
+    noetl_server::metrics::init_ehdb_eventlog_mirror_series();
     noetl_server::metrics::init_result_tier_gc_series();
     noetl_server::metrics::init_credential_seal_series();
     noetl_server::metrics::init_system_plugin_seed_series();
