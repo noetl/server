@@ -3018,6 +3018,55 @@ pub fn record_ehdb_crossstore_control(control: &str, result: &str) {
 /// ([`crate::handlers::ehdb_parity::PARITY_OUTCOMES`], `DIVERGENCE_KINDS`,
 /// `CONTROL_NAMES`), not from a hand-maintained list in prose; the test below
 /// asserts the enums and the pinned set cannot drift apart.
+/// Counter: authoritative events the server mirrored into the event-log tier.
+///
+/// Labelled by outcome over a closed set, and counted in **events** rather than
+/// batches: the number an operator needs is "did the tier receive everything the
+/// log received", and a batch count cannot answer it.
+pub fn ehdb_eventlog_mirror_total() -> &'static IntCounterVec {
+    static M: OnceLock<IntCounterVec> = OnceLock::new();
+    M.get_or_init(|| {
+        let counter = IntCounterVec::new(
+            Opts::new(
+                "noetl_ehdb_eventlog_mirror_total",
+                "Authoritative events the SERVER mirrored into the EHDB event-log tier, by \
+                 outcome (noetl/ai-meta#258).",
+            ),
+            &["outcome"],
+        )
+        .expect("static counter spec must be valid");
+        registry()
+            .register(Box::new(counter.clone()))
+            .expect("counter registration must succeed");
+        counter
+    })
+}
+
+/// Every outcome label the server-side mirror can emit. Closed set, pinned at 0.
+pub const EHDB_EVENTLOG_MIRROR_OUTCOMES: [&str; 4] =
+    ["mirrored", "unconfigured", "unavailable", "degraded"];
+
+pub fn record_ehdb_eventlog_mirror(outcome: &str, events: usize) {
+    ehdb_eventlog_mirror_total()
+        .with_label_values(&[outcome])
+        .inc_by(events as u64);
+}
+
+/// Pin the server-side mirror's label set at 0.
+///
+/// `Registry::gather` prunes metric families with no children, so without this a
+/// server that has mirrored nothing and a server that cannot mirror at all
+/// produce byte-identical `/metrics` output. Pinned unconditionally — a pin
+/// placed behind the mirror-source check would be absent on exactly the
+/// configuration whose `unconfigured` count someone would be reading.
+pub fn init_ehdb_eventlog_mirror_series() {
+    for outcome in EHDB_EVENTLOG_MIRROR_OUTCOMES {
+        ehdb_eventlog_mirror_total()
+            .with_label_values(&[outcome])
+            .inc_by(0);
+    }
+}
+
 pub fn init_ehdb_crossstore_series() {
     use crate::handlers::ehdb_parity::{
         CONTROL_NAMES, DIVERGENCE_KINDS, PARITY_OUTCOMES, TIER,

@@ -384,6 +384,23 @@ pub async fn emit_events(state: &AppState, pool: &DbPool, rows: &[EventRow]) -> 
     }
     let rows = rows.as_slice();
 
+    // noetl/ai-meta#258 — mirror the COMPLETE authoritative set into the EHDB
+    // event-log tier.
+    //
+    // Placed here, and the position is the whole point. It is after terminal
+    // dedup and after chain stamping, so `rows` is exactly the set that becomes
+    // authoritative: a suppressed duplicate terminal is not mirrored, and a
+    // mirrored record carries the same `prev_event_id` the log will carry.
+    //
+    // It is also *before* the publish/insert fork, so both branches are covered
+    // by one call site. Mirroring inside the branches would have meant two
+    // implementations of the same guarantee, and the gate-off branch is the one
+    // nobody exercises in prod — the classic place for the second copy to rot.
+    //
+    // No-op unless `NOETL_EHDB_EVENTLOG_MIRROR_SOURCE=server`; best-effort and
+    // isolated, so no failure here can affect the authoritative write below.
+    crate::handlers::ehdb_eventlog_mirror::mirror_rows(state, rows).await;
+
     // All rows in a batch share the same execution + catalog, so one decision
     // covers the batch.
     if should_publish(state, rows[0].catalog_id).await {

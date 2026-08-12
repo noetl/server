@@ -858,6 +858,23 @@ pub struct ComparisonResult {
     pub outcome: ParityOutcome,
     pub report: Option<CrossStoreReport>,
     pub detail: Option<String>,
+    /// Which store on the far side of the relay actually answered — the worker's
+    /// own pod-local log (`local`), or the writer-fronted tier service
+    /// (`service`). Read out of the tier reply's `tier_query_source` field
+    /// (noetl/ai-meta#257 PR 4).
+    ///
+    /// **A verdict without this is not attributable.** The tier store is
+    /// pod-local, so with more than one worker replica a `local` read answers
+    /// from whichever replica the relay's Service happened to route to — a
+    /// fragment of the tier, in a body shaped exactly like the whole of it. A
+    /// full-set match read that way is a fact about one pod, not about the tier,
+    /// and there is no way to tell the two apart after the fact.
+    ///
+    /// `None` means the reply carried no such field, which is what a worker
+    /// older than PR 4 answers. That is reported as itself, not defaulted to
+    /// `local`: guessing here would put a confident wrong label on the exact
+    /// question this field exists to answer.
+    pub tier_query_source: Option<String>,
 }
 
 /// Parse the tier's `read_execution` body into records.
@@ -932,6 +949,19 @@ async fn fetch_authoritative(
     state: &AppState,
     execution_id: i64,
 ) -> Result<Vec<AuthoritativeEvent>, sqlx::Error> {
+    // noetl/ai-meta#258 — the scope depends on WHO mirrors.
+    //
+    // With the worker mirroring (the default), only worker-emitted events can
+    // have a tier copy and the marker below is the boundary. With the server
+    // mirroring, the mirror sits on the chokepoint that writes `noetl.event`
+    // itself, so **every** authoritative event is expected in the tier and the
+    // marker would under-scope the comparison — it would pass while silently
+    // ignoring the seven events the whole exercise exists to capture.
+    //
+    // Derived from the same variable both mirrors read, so the comparator cannot
+    // hold a different opinion about the boundary than the producer does.
+    let server_mirrors = crate::handlers::ehdb_eventlog_mirror::server_mirrors();
+
     let rows = sqlx::query_as::<_, (i64, String, Option<String>, Option<String>, bool)>(
         r#"
         SELECT
@@ -939,8 +969,8 @@ async fn fetch_authoritative(
             event_type,
             node_name,
             status,
-            ((meta->>'worker_id') IS NOT NULL
-             AND event_type <> 'command.claimed') AS mirror_expected
+            ($3 OR ((meta->>'worker_id') IS NOT NULL
+                    AND event_type <> 'command.claimed')) AS mirror_expected
         FROM noetl.event
         WHERE execution_id = $1
         ORDER BY event_id ASC
@@ -949,6 +979,7 @@ async fn fetch_authoritative(
     )
     .bind(execution_id)
     .bind(MAX_COMPARE_EVENTS as i64 + 1)
+    .bind(server_mirrors)
     .fetch_all(state.pools.pool_for(execution_id))
     .await?;
 
@@ -971,7 +1002,7 @@ async fn fetch_tier(
     http: &reqwest::Client,
     base: &str,
     execution_id: i64,
-) -> Result<Vec<MirroredRecord>, (ParityOutcome, String)> {
+) -> Result<(Vec<MirroredRecord>, Option<String>), (ParityOutcome, String)> {
     let url = format!("{}/ehdb/tiers/eventlog", base.trim_end_matches('/'));
     let resp = http
         .get(&url)
@@ -1004,16 +1035,37 @@ async fn fetch_tier(
         ));
     }
 
-    parse_tier_body(&body).map_err(|o| {
-        (
-            o,
-            format!(
-                "tier reply carried no comparable records (http {}, body {})",
-                status.as_u16(),
-                truncate(&body.to_string(), 400)
-            ),
-        )
-    })
+    // Read the label BEFORE the parse, so a body that fails to parse still says
+    // which store produced it. Attribution is most useful exactly when the
+    // answer is wrong.
+    let source = tier_source_of(&body);
+
+    parse_tier_body(&body)
+        .map(|recs| (recs, source))
+        .map_err(|o| {
+            (
+                o,
+                format!(
+                    "tier reply carried no comparable records (http {}, body {})",
+                    status.as_u16(),
+                    truncate(&body.to_string(), 400)
+                ),
+            )
+        })
+}
+
+/// Which store the worker says answered — `tier_query_source` off the tier
+/// reply (noetl/ai-meta#257 PR 4).
+///
+/// `None` is a real answer, not a default: a worker older than PR 4 sends no
+/// such field, and labelling that `local` would be a guess printed with the
+/// same confidence as a measurement. The comparator reports the absence.
+fn tier_source_of(body: &serde_json::Value) -> Option<String> {
+    body.get("tier_query_source")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
 }
 
 fn truncate(s: &str, n: usize) -> String {
@@ -1050,6 +1102,7 @@ pub async fn compare_execution(state: &AppState, execution_id: i64) -> Compariso
                 "NOETL_EHDB_WORKER_QUERY_URL is unset; the server cannot read the tier"
                     .to_string(),
             ),
+            tier_query_source: None,
         };
     };
 
@@ -1063,6 +1116,7 @@ pub async fn compare_execution(state: &AppState, execution_id: i64) -> Compariso
                 outcome: ParityOutcome::Error,
                 report: None,
                 detail: Some(format!("authoritative read failed: {e}")),
+            tier_query_source: None,
             };
         }
     };
@@ -1074,6 +1128,7 @@ pub async fn compare_execution(state: &AppState, execution_id: i64) -> Compariso
             detail: Some(format!(
                 "execution has more than {MAX_COMPARE_EVENTS} authoritative events; a truncated comparison is not a comparison"
             )),
+            tier_query_source: None,
         };
     }
     if authoritative.is_empty() {
@@ -1085,11 +1140,12 @@ pub async fn compare_execution(state: &AppState, execution_id: i64) -> Compariso
             outcome: ParityOutcome::AuthoritativeEmpty,
             report: None,
             detail: Some("no authoritative events for this execution".to_string()),
+        tier_query_source: None,
         };
     }
 
     // Tier side.
-    let mirrored = match fetch_tier(relay_client(), &base, execution_id).await {
+    let (mirrored, tier_query_source) = match fetch_tier(relay_client(), &base, execution_id).await {
         Ok(m) => m,
         Err((outcome, detail)) => {
             crate::metrics::record_ehdb_crossstore_parity(TIER, outcome.as_str());
@@ -1104,6 +1160,7 @@ pub async fn compare_execution(state: &AppState, execution_id: i64) -> Compariso
                 outcome,
                 report: None,
                 detail: Some(detail),
+                tier_query_source: None,
             };
         }
     };
@@ -1115,6 +1172,7 @@ pub async fn compare_execution(state: &AppState, execution_id: i64) -> Compariso
             detail: Some(format!(
                 "tier returned {MAX_COMPARE_EVENTS} records — the page cap; a truncated comparison is not a comparison"
             )),
+            tier_query_source,
         };
     }
 
@@ -1144,6 +1202,7 @@ pub async fn compare_execution(state: &AppState, execution_id: i64) -> Compariso
         outcome,
         report: Some(report),
         detail: None,
+        tier_query_source,
     }
 }
 
@@ -1212,6 +1271,10 @@ pub async fn compare_execution_endpoint(
         "outcome": result.outcome.as_str(),
         "detail": result.detail,
         "report": result.report,
+        // Which store this verdict is ABOUT (noetl/ai-meta#257 PR 4). Beside the
+        // verdict rather than inside `report`, because `report` comes out of the
+        // pure comparator the controls also drive, and a control has no store.
+        "tier_query_source": result.tier_query_source,
         "controls_ok": controls_ok,
     });
     if q.controls.unwrap_or(true) {
@@ -1540,6 +1603,28 @@ mod tests {
     /// wrapped one as zero records — a fabricated divergence, and one that would
     /// have looked like a genuine finding.
     #[test]
+    /// ai-meta#257 PR 4. The verdict must be attributable to a store, and the
+    /// absence of a label must read as absence — not as `local`.
+    #[test]
+    fn the_store_that_answered_is_read_off_the_reply() {
+        assert_eq!(
+            tier_source_of(&json!({"records": [], "tier_query_source": "service"})).as_deref(),
+            Some("service")
+        );
+        assert_eq!(
+            tier_source_of(&json!({"result": {"records": []}, "tier_query_source": "local"}))
+                .as_deref(),
+            Some("local")
+        );
+        // A worker older than PR 4 sends no label. Reporting that as `local`
+        // would put a guess where the whole point is a measurement — and `local`
+        // is precisely the answer that would be wrong to assume, because it is
+        // the one that is only a fragment under multiple replicas.
+        assert_eq!(tier_source_of(&json!({"records": []})), None);
+        assert_eq!(tier_source_of(&json!({"tier_query_source": "   "})), None);
+        assert_eq!(tier_source_of(&json!({"tier_query_source": 7})), None);
+    }
+
     fn both_real_reply_shapes_parse() {
         let bare = json!({
             "action": "eventlog-read-execution",
