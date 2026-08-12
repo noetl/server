@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.81.0](https://github.com/noetl/server/compare/v3.80.0...v3.81.0) (2026-08-12)
+
+### Features
+
+* **ehdb:** mirror the full authoritative event set from the server ([b97e3bf](https://github.com/noetl/server/commit/b97e3bfd29095191a0e7d3c5a27482e9e327e7e4)), closes [#343](https://github.com/noetl/server/issues/343) [noetl/ai-meta#257](https://github.com/noetl/ai-meta/issues/257) [#257](https://github.com/noetl/server/issues/257) [noetl/ai-meta#258](https://github.com/noetl/ai-meta/issues/258) [noetl/ai-meta#257](https://github.com/noetl/ai-meta/issues/257)
+* **ehdb:** the cross-store verdict names the store it compared ([2206728](https://github.com/noetl/server/commit/22067285db6664c1be4dcc7f6e507aabe3b8c4d8)), closes [noetl/ai-meta#257](https://github.com/noetl/ai-meta/issues/257) [noetl/ai-meta#257](https://github.com/noetl/ai-meta/issues/257)
+
 ## [3.80.0](https://github.com/noetl/server/compare/v3.79.6...v3.80.0) (2026-08-12)
 
 ### Features
