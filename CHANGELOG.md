@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.81.1](https://github.com/noetl/server/compare/v3.81.0...v3.81.1) (2026-08-13)
+
+### Bug Fixes
+
+* **ehdb:** system-pool events bypassed the mirror, so the serving tier was short ([0d3ebca](https://github.com/noetl/server/commit/0d3ebca64c9548fa87cd2698f9ea6528b0d9f242)), closes [server#348](https://github.com/noetl/server/issues/348) [#121](https://github.com/noetl/server/issues/121) [noetl/ai-meta#263](https://github.com/noetl/ai-meta/issues/263)
+
 ## [3.81.0](https://github.com/noetl/server/compare/v3.80.0...v3.81.0) (2026-08-12)
 
 ### Features
