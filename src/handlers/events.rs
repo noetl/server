@@ -1133,23 +1133,31 @@ pub async fn claim_command(
     // claim audit isn't lost.
     let publish_claim =
         crate::handlers::event_write::should_publish(&state, catalog_id.unwrap_or(0)).await;
+    let claim_created_at = chrono::Utc::now();
+    // Built once and used by BOTH branches, so the row the mirror sends and the
+    // row the INSERT binds cannot describe different events (noetl/ai-meta#263).
+    let claim_row = crate::handlers::event_write::EventRow::new(
+        claim_event_id,
+        execution_id,
+        catalog_id.unwrap_or(0),
+        "command.claimed",
+        "RUNNING",
+        claim_created_at,
+    )
+    .with_node(step.clone())
+    .with_result(claim_result)
+    .with_meta(claim_meta)
+    .with_worker_id(Some(request.worker_id.clone()));
     let mut claim_event_to_publish: Option<crate::handlers::event_write::EventRow> = None;
+    // noetl/ai-meta#263 — the gate-off branch below writes `noetl.event` itself,
+    // so it never reaches `event_write::emit_events` and therefore never reached
+    // the event-log-tier mirror that lives on that chokepoint.  Carried out of
+    // the transaction and mirrored after the commit, exactly like the gate-on
+    // branch's post-commit `emit_event`.
+    let mut claim_event_to_mirror: Option<crate::handlers::event_write::EventRow> = None;
     if step != noetl_orchestrate_core::state::WorkflowState::ORCHESTRATE_META_STEP {
         if publish_claim {
-            claim_event_to_publish = Some(
-                crate::handlers::event_write::EventRow::new(
-                    claim_event_id,
-                    execution_id,
-                    catalog_id.unwrap_or(0),
-                    "command.claimed",
-                    "RUNNING",
-                    chrono::Utc::now(),
-                )
-                .with_node(step.clone())
-                .with_result(claim_result.clone())
-                .with_meta(claim_meta.clone())
-                .with_worker_id(Some(request.worker_id.clone())),
-            );
+            claim_event_to_publish = Some(claim_row);
         } else {
             // One-level event chain (RFC #115 Phase 2): stamp `prev_event_id`
             // from the per-execution chain head + advance the head, EXACTLY as
@@ -1177,6 +1185,7 @@ pub async fn claim_command(
                 .into_iter()
                 .next()
                 .flatten();
+            let claim_row = claim_row.with_prev_event_id(prev_event_id);
             sqlx::query(
                 r#"
                 INSERT INTO noetl.event (
@@ -1190,20 +1199,25 @@ pub async fn claim_command(
                 )
                 "#,
             )
-            .bind(claim_event_id)
-            .bind(execution_id)
+            .bind(claim_row.event_id)
+            .bind(claim_row.execution_id)
+            // The original `Option<i64>` rather than the row's `unwrap_or(0)`:
+            // this column is NOT NULL in practice (`playbook_started` wrote one
+            // first) and binding the Option keeps the SQL byte-identical to what
+            // this site has always sent.
             .bind(catalog_id)
-            .bind("command.claimed")
-            .bind(&step)
-            .bind(&step)
-            .bind("RUNNING")
-            .bind(claim_result)
-            .bind(claim_meta)
-            .bind(&request.worker_id)
-            .bind(prev_event_id)
-            .bind(chrono::Utc::now())
+            .bind(&claim_row.event_type)
+            .bind(&claim_row.node_id)
+            .bind(&claim_row.node_name)
+            .bind(&claim_row.status)
+            .bind(&claim_row.result)
+            .bind(&claim_row.meta)
+            .bind(&claim_row.worker_id)
+            .bind(claim_row.prev_event_id)
+            .bind(claim_row.created_at)
             .execute(&mut *tx)
             .await?;
+            claim_event_to_mirror = Some(claim_row);
         }
     }
 
@@ -1212,6 +1226,28 @@ pub async fn claim_command(
     if let Some(ev) = claim_event_to_publish {
         crate::handlers::event_write::emit_event(&state, state.pools.pool_for(execution_id), ev)
             .await?;
+    }
+    // noetl/ai-meta#263 — the second mirror call site, and the only other place
+    // the server writes `noetl.event` for a live execution.
+    //
+    // `emit_events` mirrors before its publish/insert fork, which covers every
+    // event that reaches it.  This one does not reach it: `should_publish` is
+    // false for every **system-pool** execution by construction
+    // (`is_system_execution` — they drain the stream, so they cannot be fed by
+    // it), so `system/*` playbooks always took the in-tx branch and their
+    // `command.claimed` events were never mirrored.  The comparator called them
+    // `mirror_expected` — correctly, in server-mirror mode every authoritative
+    // event is — and reported two `missing_event`s per hourly
+    // `system/scheduled_cleanup` run, on a tier that is `primary` and serving.
+    //
+    // This does NOT reintroduce the two-producer ordering race that moved the
+    // mirror off the worker in the first place.  That race was between two
+    // *processes* appending independently; this is the same server process, and
+    // the append happens after the claim's commit and before the claim response
+    // returns — so the worker's next event for this execution cannot be emitted,
+    // let alone mirrored, until this record is already in the tier.
+    if let Some(ev) = claim_event_to_mirror {
+        crate::handlers::ehdb_eventlog_mirror::mirror_rows(&state, std::slice::from_ref(&ev)).await;
     }
 
     Ok(Json(ClaimResponse {
@@ -1313,24 +1349,26 @@ pub async fn handle_batch_events(
     // relocates to the materializer endpoint.
     let publish_batch =
         crate::handlers::event_write::should_publish(&state, catalog_id.unwrap_or(0)).await;
+    // Built once for both branches so the gate-off INSERT and the mirror send the
+    // same events (noetl/ai-meta#263).
+    let event_rows: Vec<crate::handlers::event_write::EventRow> = rows
+        .iter()
+        .map(|r| {
+            crate::handlers::event_write::EventRow::new(
+                r.event_id,
+                execution_id,
+                catalog_id.unwrap_or(0),
+                r.event_type.clone(),
+                r.status.clone(),
+                now,
+            )
+            .with_node(r.step.clone())
+            .with_result(r.result_obj.clone())
+            .with_meta(r.meta_obj.clone())
+            .with_worker_id(request.worker_id.clone())
+        })
+        .collect();
     if publish_batch {
-        let event_rows: Vec<crate::handlers::event_write::EventRow> = rows
-            .iter()
-            .map(|r| {
-                crate::handlers::event_write::EventRow::new(
-                    r.event_id,
-                    execution_id,
-                    catalog_id.unwrap_or(0),
-                    r.event_type.clone(),
-                    r.status.clone(),
-                    now,
-                )
-                .with_node(r.step.clone())
-                .with_result(r.result_obj.clone())
-                .with_meta(r.meta_obj.clone())
-                .with_worker_id(request.worker_id.clone())
-            })
-            .collect();
         // Commit the (possibly empty) claim tx first, then publish.
         tx.commit().await?;
         crate::handlers::event_write::emit_events(
@@ -1348,26 +1386,41 @@ pub async fn handle_batch_events(
         // a batch share one execution.
         let ids: Vec<i64> = rows.iter().map(|r| r.event_id).collect();
         let prevs = state.chain_heads.link_batch(execution_id, &ids).await;
+        let event_rows: Vec<crate::handlers::event_write::EventRow> = event_rows
+            .into_iter()
+            .zip(prevs.iter())
+            .map(|(r, prev)| r.with_prev_event_id(*prev))
+            .collect();
         let mut qb = sqlx::QueryBuilder::new(
             "INSERT INTO noetl.event (event_id, execution_id, catalog_id, event_type, \
              node_id, node_name, status, result, meta, worker_id, prev_event_id, created_at) ",
         );
-        qb.push_values(rows.iter().zip(prevs.iter()), |mut b, (r, prev)| {
+        qb.push_values(event_rows.iter(), |mut b, r| {
             b.push_bind(r.event_id)
-                .push_bind(execution_id)
+                .push_bind(r.execution_id)
+                // The original `Option<i64>`, not the row's `unwrap_or(0)` — same
+                // reason as the claim site above: keeps the SQL byte-identical.
                 .push_bind(catalog_id)
                 .push_bind(&r.event_type)
-                .push_bind(&r.step)
-                .push_bind(&r.step)
+                .push_bind(&r.node_id)
+                .push_bind(&r.node_name)
                 .push_bind(&r.status)
-                .push_bind(&r.result_obj)
-                .push_bind(&r.meta_obj)
-                .push_bind(&request.worker_id)
-                .push_bind(*prev)
-                .push_bind(now);
+                .push_bind(&r.result)
+                .push_bind(&r.meta)
+                .push_bind(&r.worker_id)
+                .push_bind(r.prev_event_id)
+                .push_bind(r.created_at);
         });
         qb.build().execute(&mut *tx).await?;
         tx.commit().await?;
+        // noetl/ai-meta#263 — same gap as the claim site: this in-tx batch INSERT
+        // bypasses `emit_events`, so without this the tier would silently miss
+        // every batched event on a system-pool execution.  `scheduled_cleanup`
+        // does not batch today, which is why the reported gap was exactly the two
+        // `command.claimed` rows — but the bypass is the same one and closing only
+        // half of it would leave the tier's completeness dependent on which
+        // ingest route a future system playbook happens to use.
+        crate::handlers::ehdb_eventlog_mirror::mirror_rows(&state, &event_rows).await;
     }
 
     // Trigger orchestrator for any command.completed in the batch,

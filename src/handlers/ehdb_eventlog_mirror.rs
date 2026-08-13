@@ -32,11 +32,11 @@
 //! no fix available from either side, and it would surface as an intermittent
 //! `order` divergence indistinguishable from a genuine one.
 //!
-//! So the mirror **moves** instead. `handlers::event_write::emit_events` is the
-//! one chokepoint every authoritative event passes through — including the
-//! worker's own, because a worker event only reaches `noetl.event` by way of
-//! `POST /api/events`, which lands in `handle_event` and calls this same
-//! chokepoint. Mirroring there gives, in one place:
+//! So the mirror **moves** instead. `handlers::event_write::emit_events` is
+//! *almost* the one chokepoint every authoritative event passes through —
+//! including the worker's own, because a worker event only reaches `noetl.event`
+//! by way of `POST /api/events`, which lands in `handle_event` and calls this
+//! same chokepoint. Mirroring there gives, in one place:
 //!
 //! * **completeness** — it is the code that produces the authoritative set, so
 //!   the mirrored set is that set. 13 of 13, not 6 plus a patch.
@@ -48,6 +48,32 @@
 //!   and is simply not needed here.
 //! * **payload identity** — the mirrored projection is built from the very row
 //!   about to become authoritative.
+//!
+//! # "Almost" — the two in-transaction writers (noetl/ai-meta#263)
+//!
+//! `emit_events` is where events go when the server has already decided to write
+//! them *outside* a transaction. Two sites in `handlers::events` — the command
+//! claim and the batch ingest — write `noetl.event` **inside** the same
+//! transaction that claims the command, and reach `emit_events` only on the
+//! branch where `should_publish` is true.
+//!
+//! `should_publish` is false for every **system-pool** execution by construction:
+//! `system/*` playbooks drain the event stream, so they cannot also be fed by it.
+//! That made the bypass exactly coextensive with the system pool. User-pool
+//! executions took the publish branch and mirrored completely — `test/simple_loop`
+//! at 29 of 29 — while every hourly `system/scheduled_cleanup` mirrored 11 of 13,
+//! missing precisely its two `command.claimed` events. The comparator called all
+//! 13 mirror-expected, which in server-mirror mode is correct, so it reported the
+//! two as `missing_event` with `unmirrored_by_design = 0`. It was right; the tier
+//! was incomplete, and `primary`.
+//!
+//! Both sites now call [`mirror_rows`] after their commit. That is three call
+//! sites rather than one, which is worth being uncomfortable about — but the
+//! ordering hazard that moved the mirror here does not apply: it was a race
+//! between two independent *processes*, and these are the same process appending
+//! before it answers the request that would let the next event exist.
+//! `tests::every_in_tx_event_insert_is_mirrored` counts INSERT sites against
+//! mirror sites so a fourth writer cannot be added silently.
 //!
 //! # The data-access boundary is not crossed
 //!
@@ -344,5 +370,60 @@ mod tests {
         // itself does not have.
         let p = mirror_payload(&row());
         assert_eq!(p["step"], p["node_name"]);
+    }
+
+    /// Every place the server writes `noetl.event` outside the chokepoint must
+    /// also mirror — the guard for noetl/ai-meta#263.
+    ///
+    /// The mirror lives in `event_write::emit_events`, described there as "the
+    /// one chokepoint every authoritative event passes through". It is not: two
+    /// sites in `handlers::events` write the table directly, in-transaction, on
+    /// the branch `should_publish` takes when it returns false. That branch is
+    /// the ONLY branch a **system-pool** execution can take (`is_system_execution`
+    /// is one of `should_publish`'s three false conditions), so `system/*`
+    /// playbooks mirrored every event except the ones written there — 11 of 13 on
+    /// every hourly `system/scheduled_cleanup`, on a tier that is `primary`.
+    ///
+    /// Counting `INSERT INTO noetl.event` rather than naming the two known sites:
+    /// a third one added later is the failure this is here to catch, and a test
+    /// that lists the sites it already knows about cannot catch it.
+    #[test]
+    fn every_in_tx_event_insert_is_mirrored() {
+        let events_rs = include_str!("events.rs");
+        let inserts = events_rs.matches("INSERT INTO noetl.event").count();
+        let mirrors = events_rs.matches("ehdb_eventlog_mirror::mirror_rows").count();
+        assert_eq!(
+            inserts, mirrors,
+            "handlers/events.rs has {inserts} direct `noetl.event` INSERT site(s) but \
+             {mirrors} mirror call(s). Every in-tx INSERT bypasses \
+             `event_write::emit_events` and therefore bypasses the mirror on it; \
+             each one owes the event-log tier a post-commit `mirror_rows` or the \
+             tier serves an incomplete log (noetl/ai-meta#263)."
+        );
+        assert!(
+            inserts >= 2,
+            "expected the claim + batch in-tx INSERT sites to still exist; if they \
+             were routed through `emit_events` instead, delete this test and say so"
+        );
+    }
+
+    /// The chokepoint still mirrors, and mirrors before the publish/insert fork.
+    ///
+    /// The #263 fix adds mirror call sites; it must not have moved or removed the
+    /// one that covers everything else.
+    #[test]
+    fn the_chokepoint_mirrors_before_it_forks() {
+        let ew = include_str!("event_write.rs");
+        let mirror_at = ew
+            .find("ehdb_eventlog_mirror::mirror_rows")
+            .expect("event_write::emit_events must still mirror");
+        let fork_at = ew
+            .find("if should_publish(state, rows[0].catalog_id)")
+            .expect("the publish/insert fork must still be here");
+        assert!(
+            mirror_at < fork_at,
+            "the mirror must sit BEFORE the publish/insert fork so one call site \
+             covers both branches"
+        );
     }
 }
