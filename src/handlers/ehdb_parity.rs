@@ -1595,14 +1595,6 @@ mod tests {
         }
     }
 
-    /// Both real reply shapes, verbatim from the two sources.
-    ///
-    /// The wrapped one is what the worker's `run_query` returns and what the
-    /// server sees by default; the bare one is the tier service's reply relayed
-    /// through untouched. A parser that handles only the bare shape reads the
-    /// wrapped one as zero records — a fabricated divergence, and one that would
-    /// have looked like a genuine finding.
-    #[test]
     /// ai-meta#257 PR 4. The verdict must be attributable to a store, and the
     /// absence of a label must read as absence — not as `local`.
     #[test]
@@ -1625,6 +1617,20 @@ mod tests {
         assert_eq!(tier_source_of(&json!({"tier_query_source": 7})), None);
     }
 
+    /// Both real reply shapes, verbatim from the two sources.
+    ///
+    /// The wrapped one is what the worker's `run_query` returns and what the
+    /// server sees by default; the bare one is the tier service's reply relayed
+    /// through untouched. A parser that handles only the bare shape reads the
+    /// wrapped one as zero records — a fabricated divergence, and one that would
+    /// have looked like a genuine finding.
+    ///
+    /// It had no `#[test]`: a doc comment landed between this function's
+    /// attribute and the function, so the attribute bound to the *next* item and
+    /// this one silently never ran. `cargo build --all-targets` said so twice —
+    /// `duplicated attribute` here and `never used` there — and both warnings
+    /// name the symptom rather than the cause (noetl/ai-meta#263 drive-by).
+    #[test]
     fn both_real_reply_shapes_parse() {
         let bare = json!({
             "action": "eventlog-read-execution",
