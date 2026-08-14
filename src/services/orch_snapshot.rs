@@ -90,6 +90,34 @@ pub async fn save(
     .await
     .map_err(|e| AppError::Internal(format!("orch_snapshot.save: upsert: {e}")))?;
 
+    // EHDB projection tier mirror (noetl/ai-meta#265 A3).
+    //
+    // **Inside the writer, not beside its callers.** This function is the only
+    // `INSERT INTO noetl.projection_snapshot` in the service, so a mirror here
+    // cannot be bypassed by a caller — which is exactly what happened to the
+    // event log, where `emit_events` was documented as the one chokepoint and
+    // two in-transaction writers went around it (ai-meta#263).
+    // `ehdb_projection_mirror::tests::the_snapshot_store_has_exactly_one_writer`
+    // counts INSERT sites so a second writer fails the build rather than
+    // silently halving the tier.
+    //
+    // **After the upsert, and only on success.** A snapshot that failed to
+    // become authoritative is never mirrored, so the tier cannot be ahead of the
+    // incumbent by way of a write that did not happen.
+    //
+    // Best-effort: this is auxiliary verification and must never be able to fail
+    // a read model the platform has already committed. Default-off behind
+    // `NOETL_EHDB_PROJECTION_MIRROR_SOURCE=server`; the call is a cheap env read
+    // and an immediate return when unset.
+    crate::handlers::ehdb_projection_mirror::mirror_snapshot(
+        execution_id,
+        version,
+        applied_count,
+        &checksum,
+        &snapshot,
+    )
+    .await;
+
     Ok(())
 }
 
