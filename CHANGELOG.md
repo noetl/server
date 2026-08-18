@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.82.0](https://github.com/noetl/server/compare/v3.81.2...v3.82.0) (2026-08-18)
+
+### Features
+
+* **metrics:** split POST /api/events into phases ([#155](https://github.com/noetl/server/issues/155)) ([82aa260](https://github.com/noetl/server/commit/82aa260aabc391c1c2cc17a25ed8ee81137d14e5))
+
 ## [3.81.2](https://github.com/noetl/server/compare/v3.81.1...v3.81.2) (2026-08-18)
 
 ### Bug Fixes
