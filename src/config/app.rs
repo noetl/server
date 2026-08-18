@@ -86,6 +86,25 @@ pub struct AppConfig {
     #[serde(default = "default_true")]
     pub orchestrate_plugin_drive: bool,
 
+    /// Re-drive immediately when the orchestrate in-flight guard clears, if a
+    /// trigger was dropped while it was held (noetl/ai-meta#155).
+    ///
+    /// `NOETL_ORCH_RETRIGGER_ON_CLEAR`.  Default **false** — the existing
+    /// behaviour is unchanged and recovery stays with the 8s reconcile poller.
+    ///
+    /// Why it exists: a `command.completed` that lands while a
+    /// `system/orchestrate` is in flight is dropped by the serialisation guard
+    /// (`skipped_in_flight`) and nothing records that a re-drive is owed.  The
+    /// in-flight drive was computed against the older head, so it does not cover
+    /// the dropped trigger, and the execution stalls for a full
+    /// `RECONCILE_INTERVAL` (8s).  Measured on a 10-hop kind flow: 6 drops in 53
+    /// dispatches, one of which cost 8316ms on a turn whose other hops were
+    /// ~1.3s.
+    ///
+    /// **Revert:** set to `false` — per-deployment, immediate, no rebuild.
+    #[serde(default)]
+    pub orch_retrigger_on_clear: bool,
+
     /// CQRS write-path cutover (noetl/ai-meta#103 phase 2d-3).  When true, every
     /// server-originated `noetl.event` write goes through the `emit_event`
     /// chokepoint as a **publish** to the `noetl_events` JetStream stream
@@ -1036,6 +1055,8 @@ impl Default for AppConfig {
             projector_owns_snapshot: false,
             // noetl/ai-meta#108 (c): worker-driven drive is the default.
             orchestrate_plugin_drive: true,
+            // noetl/ai-meta#155: opt-in; 8s-poller recovery stays the default.
+            orch_retrigger_on_clear: false,
             // noetl/ai-meta#103 2d-3: synchronous INSERT path by default.
             event_ingest_publish_only: false,
             auto_recreate_runtime: true,

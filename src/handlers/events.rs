@@ -2671,6 +2671,14 @@ async fn dispatch_offserver_stateless_drive(
     let mut cache = cache_slot.lock().await;
     if cache.orchestrate_in_flight {
         crate::metrics::record_orchestrate_drive("skipped_in_flight");
+        // noetl/ai-meta#155: the in-flight drive was computed against the head as
+        // it stood when it was dispatched, so it does not cover this trigger.
+        // Record that a re-drive is owed instead of dropping the wakeup and
+        // waiting out the 8s reconcile poller.
+        if state.config.orch_retrigger_on_clear {
+            cache.orchestrate_retrigger_pending = true;
+            crate::metrics::record_orchestrate_drive("retrigger_recorded");
+        }
         debug!(
             execution_id,
             "stateless drive: orchestrate already in flight; skip"
@@ -3221,6 +3229,11 @@ async fn trigger_orchestrator_inner(
         // would otherwise produce two orchestrate commands → duplicate work).
         if cache.orchestrate_in_flight {
             crate::metrics::record_orchestrate_drive("skipped_in_flight");
+            // noetl/ai-meta#155 — see the stateless site above.
+            if state.config.orch_retrigger_on_clear {
+                cache.orchestrate_retrigger_pending = true;
+                crate::metrics::record_orchestrate_drive("retrigger_recorded");
+            }
             debug!(
                 execution_id,
                 "worker-driven: orchestrate already in flight; skip"
@@ -3980,6 +3993,39 @@ async fn apply_worker_orchestration(
         state.chain_heads.evict(execution_id).await; // RFC #115 §4: drop the chain head too
         state.chain_tails.evict(execution_id); // noetl/ai-meta#156: drop the tail ring too
         state.exec_descriptors.evict(execution_id).await; // RFC #115 Phase 4 remainder
+        // Terminal: nothing left to re-drive, and the slot is gone.  Any pending
+        // flag dies with it.
+        return Ok(commands_generated);
+    }
+
+    // noetl/ai-meta#155 — a trigger was dropped while this drive held the
+    // in-flight guard.  The guard is now clear and this drive's result has been
+    // applied, so re-drive immediately rather than waiting out the 8s reconcile
+    // poller.  Taken (not just read) so one clear re-drives once; if the
+    // re-drive loses the guard race again it re-records the flag and the next
+    // clear picks it up, which terminates because each drive that wins the race
+    // advances the head.
+    let owed = state.config.orch_retrigger_on_clear
+        && std::mem::take(&mut cache.orchestrate_retrigger_pending);
+    drop(cache);
+    if owed {
+        crate::metrics::record_orchestrate_drive("retrigger_dispatched");
+        debug!(
+            execution_id,
+            "stateless drive: re-driving on in-flight clear (dropped trigger)"
+        );
+        // Spawned, not awaited: this runs on the `call.done` request path of the
+        // orchestrate command, and the re-drive must not extend that response.
+        // `i64::MAX` as the trigger id matches the reconcile poller — it keeps
+        // the immediate-straggler shortcut from firing on an already-applied
+        // event.  Not recursive: `trigger_orchestrator_inner` dispatches a
+        // command and returns; it never calls back into this function.
+        let st = state.clone();
+        tokio::spawn(async move {
+            if let Err(e) = trigger_orchestrator_inner(&st, execution_id, i64::MAX, false).await {
+                warn!(execution_id, %e, "re-drive on in-flight clear failed");
+            }
+        });
     }
     Ok(commands_generated)
 }
