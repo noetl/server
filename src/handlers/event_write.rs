@@ -399,11 +399,17 @@ pub async fn emit_events(state: &AppState, pool: &DbPool, rows: &[EventRow]) -> 
     //
     // No-op unless `NOETL_EHDB_EVENTLOG_MIRROR_SOURCE=server`; best-effort and
     // isolated, so no failure here can affect the authoritative write below.
+    // noetl/ai-meta#155 — timing only.  The mirror itself is untouched.
+    let __t = std::time::Instant::now();
     crate::handlers::ehdb_eventlog_mirror::mirror_rows(state, rows).await;
+    crate::metrics::record_event_ingest_phase("emit_mirror", __t.elapsed().as_secs_f64());
 
     // All rows in a batch share the same execution + catalog, so one decision
     // covers the batch.
-    if should_publish(state, rows[0].catalog_id).await {
+    let __t = std::time::Instant::now();
+    let __should_publish = should_publish(state, rows[0].catalog_id).await;
+    crate::metrics::record_event_ingest_phase("emit_should_publish", __t.elapsed().as_secs_f64());
+    if __should_publish {
         // noetl/ai-meta#212 L1 T3 — which transports are live for this batch.
         //
         // EHDB is the only transport. Resolved here (rather than assumed) so a
@@ -429,6 +435,7 @@ pub async fn emit_events(state: &AppState, pool: &DbPool, rows: &[EventRow]) -> 
                 // The SAME bytes as NATS gets, so shadow parity is a straight
                 // comparison rather than a schema translation.
                 if ehdb_live {
+                    let __t = std::time::Instant::now();
                     publish_event_to_ehdb(
                         state,
                         rows[0].execution_id,
@@ -437,6 +444,10 @@ pub async fn emit_events(state: &AppState, pool: &DbPool, rows: &[EventRow]) -> 
                         &bytes,
                     )
                     .await?;
+                    crate::metrics::record_event_ingest_phase(
+                        "emit_publish",
+                        __t.elapsed().as_secs_f64(),
+                    );
                 }
                 crate::metrics::record_event_published(&row.event_type);
                 if state.config.offserver_attach_tail {
@@ -455,7 +466,10 @@ pub async fn emit_events(state: &AppState, pool: &DbPool, rows: &[EventRow]) -> 
         // No transport available → fall through to INSERT.
     }
 
-    insert_rows(pool, rows).await
+    let __t = std::time::Instant::now();
+    let __r = insert_rows(pool, rows).await;
+    crate::metrics::record_event_ingest_phase("emit_insert", __t.elapsed().as_secs_f64());
+    __r
 }
 
 /// The canonical full-column-superset INSERT.  Single multi-row statement.

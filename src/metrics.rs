@@ -1202,6 +1202,81 @@ pub fn event_ingest_duration_seconds() -> &'static HistogramVec {
     })
 }
 
+/// Histogram: one PHASE of `POST /api/events`, so the handler's total can be
+/// attributed rather than guessed (noetl/ai-meta#155).
+///
+/// The total (`event_ingest_duration_seconds`) reads ~336ms for
+/// `command.started` / `command.completed` and ~1021ms for `call.done` on prod,
+/// against ~40ms in kind — three emits per playbook hop, which is most of the
+/// uniform ~0.9-1.4s per-transition cadence users see. Nothing recorded WHERE
+/// inside the handler that goes, and the components differ between environments
+/// (prod runs the GCS object store, kind runs the Postgres one), so the split
+/// has to be measured on prod rather than inferred from a kind run.
+///
+/// `phase` values, in execution order:
+///
+/// - `catalog_id`     — the `get_catalog_id` lookup.
+/// - `claim_check`    — `check_already_claimed` (claim events only).
+/// - `normalize`      — `normalize_event_to_row`.
+/// - `emit`           — the whole `emit_event` chokepoint (sum of the four below).
+/// - `emit_mirror`    — the EHDB event-log tier mirror (`mirror_rows`).
+/// - `emit_should_publish` — the publish gate's catalog lookup.
+/// - `emit_publish`   — publishing onto the EHDB events feed.
+/// - `emit_insert`    — the authoritative Postgres INSERT.
+/// - `trigger`        — `trigger_orchestrator` (dispatches the drive).
+///
+/// Measurement only: recording a duration changes no behaviour on this path.
+pub fn event_ingest_phase_seconds() -> &'static HistogramVec {
+    static M: OnceLock<HistogramVec> = OnceLock::new();
+    M.get_or_init(|| {
+        let hist = HistogramVec::new(
+            HistogramOpts::new(
+                "noetl_event_ingest_phase_seconds",
+                "Wall-clock time in one phase of POST /api/events.",
+            )
+            .buckets(vec![
+                0.001, 0.005, 0.010, 0.025, 0.050, 0.100, 0.250, 0.500, 1.0, 2.5, 5.0, 10.0,
+            ]),
+            &["phase"],
+        )
+        .expect("static histogram spec must be valid");
+        registry()
+            .register(Box::new(hist.clone()))
+            .expect("histogram registration must succeed");
+        hist
+    })
+}
+
+/// Record one `POST /api/events` phase (see [`event_ingest_phase_seconds`]).
+pub fn record_event_ingest_phase(phase: &str, seconds: f64) {
+    event_ingest_phase_seconds()
+        .with_label_values(&[phase])
+        .observe(seconds);
+}
+
+/// Pin the closed `phase` label set so every series exists from process start.
+///
+/// `Registry::gather` prunes empty families, so an un-exercised phase would be
+/// absent and indistinguishable from a binary too old to have the metric — the
+/// distinction that matters when reading a prod scrape for the first time.
+pub fn init_event_ingest_phase_series() {
+    for phase in [
+        "catalog_id",
+        "claim_check",
+        "normalize",
+        "emit",
+        "emit_mirror",
+        "emit_should_publish",
+        "emit_publish",
+        "emit_insert",
+        "trigger",
+    ] {
+        event_ingest_phase_seconds()
+            .with_label_values(&[phase])
+            .observe(0.0);
+    }
+}
+
 /// Record a single `POST /api/events` outcome.
 ///
 /// `event_type` is the wire event_type from the request
