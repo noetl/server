@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.81.2](https://github.com/noetl/server/compare/v3.81.1...v3.81.2) (2026-08-18)
+
+### Bug Fixes
+
+* **orchestrator:** re-drive on in-flight clear instead of waiting 8s ([#155](https://github.com/noetl/server/issues/155)) ([5aaa451](https://github.com/noetl/server/commit/5aaa451891efe2d2db0118f684dffdfb256c7b25))
+
 ## [3.81.1](https://github.com/noetl/server/compare/v3.81.0...v3.81.1) (2026-08-13)
 
 ### Bug Fixes
