@@ -568,7 +568,10 @@ pub(crate) async fn normalize_event_to_row(
         None => state.snowflake.generate()?,
     };
 
+    // noetl/ai-meta#155 — phase timing only; no behaviour change on this path.
+    let __t = std::time::Instant::now();
     let catalog_id = get_catalog_id(state, execution_id, "get_catalog_id_single").await?;
+    crate::metrics::record_event_ingest_phase("catalog_id", __t.elapsed().as_secs_f64());
 
     let mut meta = request
         .meta
@@ -630,7 +633,11 @@ async fn handle_event_inner(
     // For command.claimed, check if already claimed
     if request.event_type == "command.claimed" {
         if let Some(command_id) = get_command_id(&request) {
-            if check_already_claimed(&state, execution_id, &command_id, &request.worker_id).await? {
+            let __t = std::time::Instant::now();
+            let __already =
+                check_already_claimed(&state, execution_id, &command_id, &request.worker_id).await?;
+            crate::metrics::record_event_ingest_phase("claim_check", __t.elapsed().as_secs_f64());
+            if __already {
                 // Already claimed by same worker - idempotent success
                 return Ok(Json(EventResponse {
                     status: "ok".to_string(),
@@ -645,7 +652,9 @@ async fn handle_event_inner(
     // same one the CQRS materializer applies to native producer events,
     // #103 phase 2d) so the synchronous + materialized writes are
     // byte-identical.
+    let __t = std::time::Instant::now();
     let row = normalize_event_to_row(&state, &request).await?;
+    crate::metrics::record_event_ingest_phase("normalize", __t.elapsed().as_secs_f64());
     let event_id = row.event_id;
 
     // System meta-command events are NOT workflow events — they're the
@@ -676,8 +685,10 @@ async fn handle_event_inner(
         .with_node(row.node_name.clone())
         .with_result(row.result.clone())
         .with_meta(row.meta.clone());
+        let __t = std::time::Instant::now();
         crate::handlers::event_write::emit_event(&state, state.pools.pool_for(execution_id), ev)
             .await?;
+        crate::metrics::record_event_ingest_phase("emit", __t.elapsed().as_secs_f64());
     } else {
         crate::metrics::record_orchestrate_drive("event_suppressed");
     }
@@ -747,7 +758,10 @@ async fn handle_event_inner(
         // write endpoint (`handlers::internal::events_project`), which fires it AFTER
         // the row is durably inserted (read-your-writes). Gate off (default): trigger
         // inline exactly as today.
-        match trigger_orchestrator(&state, execution_id, event_id).await {
+        let __t = std::time::Instant::now();
+        let __trig = trigger_orchestrator(&state, execution_id, event_id).await;
+        crate::metrics::record_event_ingest_phase("trigger", __t.elapsed().as_secs_f64());
+        match __trig {
             Ok(cmds) => {
                 info!(
                     "Orchestrator generated {} commands for execution {}",
