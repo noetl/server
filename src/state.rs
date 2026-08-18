@@ -198,6 +198,22 @@ pub struct ExecOrchState {
     /// orchestrate commands → double-issue the same next commands.  In-memory
     /// only; a server restart re-derives the drive from the event log.
     pub orchestrate_in_flight: bool,
+    /// A trigger arrived while `orchestrate_in_flight` was set and was dropped
+    /// (noetl/ai-meta#155).
+    ///
+    /// The in-flight guard exists so two near-simultaneous triggers do not
+    /// double-issue a drive, and it returns `Ok(0)` on the loser.  But the
+    /// winning drive was computed against the head as it stood when it was
+    /// dispatched, so when the loser carried a *newer* head its work is simply
+    /// lost: no next command is issued, and no further real event fires a
+    /// trigger, so the execution sits until the 8s `RECONCILE_INTERVAL` poller
+    /// notices.  Measured: a single such drop cost 8316ms on an otherwise
+    /// ~1.3s/hop flow.
+    ///
+    /// Setting this on the drop, and re-driving when the guard clears, turns
+    /// that 8s wait into an immediate re-dispatch.  In-memory only, like the
+    /// guard it shadows; a server restart re-derives the drive from the log.
+    pub orchestrate_retrigger_pending: bool,
 }
 
 /// Per-execution chain head for the one-level event chain (RFC #115 Phase 2,
