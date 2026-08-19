@@ -788,6 +788,7 @@ async fn main() -> anyhow::Result<()> {
     noetl_server::metrics::init_parity_and_dedup_series();
     noetl_server::metrics::init_ehdb_crossstore_series();
     noetl_server::metrics::init_ehdb_eventlog_mirror_series();
+    noetl_server::metrics::init_ehdb_eventlog_mirror_queue_series();
     noetl_server::metrics::init_result_tier_gc_series();
     noetl_server::metrics::init_credential_seal_series();
     noetl_server::metrics::init_system_plugin_seed_series();
@@ -892,6 +893,10 @@ async fn main() -> anyhow::Result<()> {
     // EHDB cross-store parity sampler (noetl/ai-meta#258).  Default-off; the
     // task returns immediately unless NOETL_EHDB_CROSSSTORE_PARITY_ENABLED is
     // set AND the interval is non-zero.
+    // Arm the async mirror queue before the listener binds, so the gauge that
+    // says whether this process is async is true from the first scrape rather
+    // than from the first mirrored event.
+    handlers::ehdb_eventlog_mirror_queue::init();
     handlers::ehdb_parity::spawn_crossstore_parity_sampler(state.clone());
 
     // CQRS write-path cutover (noetl/ai-meta#103 phase 2d-3): when
@@ -1080,6 +1085,12 @@ async fn main() -> anyhow::Result<()> {
                 .await?;
         }
     }
+
+    // The mirror queue holds authoritative events that are not yet in the tier.
+    // Dropping them on SIGTERM would produce a permanent `missing_event`
+    // divergence on a `primary`-serving tier with nothing pointing at the cause
+    // (noetl/ai-meta#155). Bounded, and a no-op when the queue is disabled.
+    noetl_server::handlers::ehdb_eventlog_mirror_queue::flush_on_shutdown().await;
 
     tracing::info!("Server shutdown complete");
 
