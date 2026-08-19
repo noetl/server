@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.83.1](https://github.com/noetl/server/compare/v3.83.0...v3.83.1) (2026-08-19)
+
+### Bug Fixes
+
+* **parity:** a pending verdict must not publish divergence evidence ([#155](https://github.com/noetl/server/issues/155)) ([9961662](https://github.com/noetl/server/commit/996166243360eb9bf1a965c44465f1887feb680f)), closes [ops#257](https://github.com/noetl/ops/issues/257) [noetl/ai-meta#264](https://github.com/noetl/ai-meta/issues/264) [noetl/ai-meta#264](https://github.com/noetl/ai-meta/issues/264)
+
 ## [3.83.0](https://github.com/noetl/server/compare/v3.82.0...v3.83.0) (2026-08-19)
 
 ### Features
