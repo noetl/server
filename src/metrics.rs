@@ -3142,6 +3142,256 @@ pub fn init_ehdb_eventlog_mirror_series() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Async mirror queue (noetl/ai-meta#155 Option 3).
+// ---------------------------------------------------------------------------
+
+/// Counter: what happened to a batch when it was handed to the mirror queue.
+///
+/// Deliberately a **second** family rather than more labels on
+/// [`ehdb_eventlog_mirror_total`]. That one answers "did the tier receive
+/// everything the log received", counted in events at delivery time; an
+/// `enqueued` label on it would be counted twice for every event — once on
+/// enqueue and once on delivery — and quietly destroy the only number that
+/// answers the coverage question.
+///
+/// This family answers a different question: is the queue absorbing the load,
+/// or is it pushing back? Counted in **events** for the same reason.
+pub fn ehdb_eventlog_mirror_queue_total() -> &'static IntCounterVec {
+    static M: OnceLock<IntCounterVec> = OnceLock::new();
+    M.get_or_init(|| {
+        let counter = IntCounterVec::new(
+            Opts::new(
+                "noetl_ehdb_eventlog_mirror_queue_total",
+                "Authoritative events by how the async event-log mirror queue handled them \
+                 (noetl/ai-meta#155).",
+            ),
+            &["outcome"],
+        )
+        .expect("static counter spec must be valid");
+        registry()
+            .register(Box::new(counter.clone()))
+            .expect("counter registration must succeed");
+        counter
+    })
+}
+
+/// Every queue outcome. Closed set, pinned at 0.
+///
+/// * `enqueued` — accepted onto the queue immediately.
+/// * `enqueued_after_wait` — the queue was full and the emit path **waited**
+///   for room. This is backpressure working: no event was dropped and order is
+///   preserved. Its rate is the signal that the drain is falling behind.
+/// * `queue_full_inline` — the queue stayed full past the enqueue timeout, so
+///   the batch was mirrored inline on the emit path instead. Still no drop, but
+///   this is the one path that can deliver out of order relative to batches
+///   still queued for the same execution, so it is its own label and it is what
+///   the alert fires on.
+/// * `queue_closed_inline` — no drain task (queue disabled mid-flight, or the
+///   drainer is gone). Mirrored inline; the pre-Option-3 behaviour.
+/// * `drained` — delivered by the drain task. The terminal success label.
+/// * `shutdown_abandoned` — still queued when the process finished its
+///   shutdown flush. These events never reached the tier and WILL show up as a
+///   `missing_event` divergence; the label exists so the cause is attributable
+///   rather than a mystery an hour later.
+pub const EHDB_EVENTLOG_MIRROR_QUEUE_OUTCOMES: [&str; 6] = [
+    "enqueued",
+    "enqueued_after_wait",
+    "queue_full_inline",
+    "queue_closed_inline",
+    "drained",
+    "shutdown_abandoned",
+];
+
+pub fn record_ehdb_eventlog_mirror_queue(outcome: &str, events: usize) {
+    ehdb_eventlog_mirror_queue_total()
+        .with_label_values(&[outcome])
+        .inc_by(events as u64);
+}
+
+/// Histogram: seconds from enqueue to durable in the tier.
+///
+/// **This is the metric the comparator's lag tolerance is checked against.**
+/// The tolerance window (`NOETL_EHDB_CROSSSTORE_PARITY_LAG_TOLERANCE_SECS`)
+/// tells the comparator to ignore events younger than N seconds; that is a
+/// promise about how long the mirror can take, and without this histogram it
+/// would be an assumption. An operator compares this histogram's tail against
+/// the configured window, and the alert does it automatically.
+///
+/// Buckets run to 60s on purpose: the interesting readings are the slow ones,
+/// and a histogram that tops out below the tolerance window cannot show a
+/// breach of it.
+pub fn ehdb_eventlog_mirror_lag_seconds() -> &'static Histogram {
+    static M: OnceLock<Histogram> = OnceLock::new();
+    M.get_or_init(|| {
+        let hist = Histogram::with_opts(
+            HistogramOpts::new(
+                "noetl_ehdb_eventlog_mirror_lag_seconds",
+                "Seconds from an authoritative event being enqueued for the async event-log \
+                 mirror to it being durable in the tier (noetl/ai-meta#155).",
+            )
+            .buckets(vec![
+                0.005, 0.010, 0.025, 0.050, 0.100, 0.250, 0.500, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0,
+            ]),
+        )
+        .expect("static histogram spec must be valid");
+        registry()
+            .register(Box::new(hist.clone()))
+            .expect("histogram registration must succeed");
+        hist
+    })
+}
+
+pub fn observe_ehdb_eventlog_mirror_lag(seconds: f64) {
+    ehdb_eventlog_mirror_lag_seconds().observe(seconds);
+}
+
+/// Gauge: authoritative events enqueued for the mirror and not yet durable.
+///
+/// The coverage number. `mirror_lag_seconds` only records events that *made
+/// it*, so a queue that has stopped draining entirely publishes no lag
+/// observations at all — its histogram goes quiet, which reads exactly like an
+/// idle healthy system. This gauge is what distinguishes the two, and it is why
+/// the alert watches both.
+pub fn ehdb_eventlog_mirror_pending_events() -> &'static IntGauge {
+    static M: OnceLock<IntGauge> = OnceLock::new();
+    M.get_or_init(|| {
+        let g = IntGauge::new(
+            "noetl_ehdb_eventlog_mirror_pending_events",
+            "Authoritative events enqueued for the async event-log mirror and not yet durable \
+             in the tier (noetl/ai-meta#155).",
+        )
+        .expect("static gauge spec must be valid");
+        registry()
+            .register(Box::new(g.clone()))
+            .expect("gauge registration must succeed");
+        g
+    })
+}
+
+/// Gauge: batches sitting on the mirror queue.
+pub fn ehdb_eventlog_mirror_queue_depth() -> &'static IntGauge {
+    static M: OnceLock<IntGauge> = OnceLock::new();
+    M.get_or_init(|| {
+        let g = IntGauge::new(
+            "noetl_ehdb_eventlog_mirror_queue_depth",
+            "Batches currently on the async event-log mirror queue (noetl/ai-meta#155).",
+        )
+        .expect("static gauge spec must be valid");
+        registry()
+            .register(Box::new(g.clone()))
+            .expect("gauge registration must succeed");
+        g
+    })
+}
+
+/// Gauge: 1 when the async mirror queue is armed in this process, 0 otherwise.
+///
+/// Without it, "the flag is off" and "the flag is on but the drain task never
+/// started" produce the same scrape: an idle queue with zero depth. That is the
+/// inert-and-silent shape this codebase has shipped three times already
+/// (noetl/ai-meta#242, #266), so the arming is published rather than inferred.
+pub fn ehdb_eventlog_mirror_async_enabled() -> &'static IntGauge {
+    static M: OnceLock<IntGauge> = OnceLock::new();
+    M.get_or_init(|| {
+        let g = IntGauge::new(
+            "noetl_ehdb_eventlog_mirror_async_enabled",
+            "1 when the async event-log mirror queue is armed in this process, 0 when the \
+             mirror is inline (noetl/ai-meta#155).",
+        )
+        .expect("static gauge spec must be valid");
+        registry()
+            .register(Box::new(g.clone()))
+            .expect("gauge registration must succeed");
+        g
+    })
+}
+
+/// Pin the async-mirror label set and gauges at 0.
+///
+/// Unconditional, and not inside the flag check: a pin behind the flag would be
+/// absent on exactly the configuration whose `queue_full_inline` count someone
+/// would be reading during an incident.
+pub fn init_ehdb_eventlog_mirror_queue_series() {
+    for outcome in EHDB_EVENTLOG_MIRROR_QUEUE_OUTCOMES {
+        ehdb_eventlog_mirror_queue_total()
+            .with_label_values(&[outcome])
+            .inc_by(0);
+    }
+    ehdb_eventlog_mirror_pending_events().set(0);
+    ehdb_eventlog_mirror_queue_depth().set(0);
+    ehdb_eventlog_mirror_async_enabled().set(0);
+    // An unlabelled Histogram is still a family with one child, so it is not
+    // pruned — but observing nothing leaves every bucket at 0, which is what we
+    // want it to read as.
+    let _ = ehdb_eventlog_mirror_lag_seconds();
+}
+
+/// Counter: mirror-expected authoritative events the comparator held back
+/// because they were inside the lag tolerance window (noetl/ai-meta#155).
+///
+/// The window's cost, published. `divergence_total == 0` under a tolerance
+/// window means "the comparable events agreed" — this number says how much was
+/// not comparable, and it is the difference between a clean verdict and a
+/// comparator that has been taught to look away.
+pub fn ehdb_crossstore_pending_total() -> &'static IntCounterVec {
+    static M: OnceLock<IntCounterVec> = OnceLock::new();
+    M.get_or_init(|| {
+        let counter = IntCounterVec::new(
+            Opts::new(
+                "noetl_ehdb_crossstore_pending_total",
+                "Mirror-expected authoritative events held back by the cross-store parity lag \
+                 tolerance window (noetl/ai-meta#155).",
+            ),
+            &["tier"],
+        )
+        .expect("static counter spec must be valid");
+        registry()
+            .register(Box::new(counter.clone()))
+            .expect("counter registration must succeed");
+        counter
+    })
+}
+
+/// Gauge: the comparator's configured lag tolerance window, in seconds.
+///
+/// **Published so the alert does not have to hardcode it.** The rule that
+/// matters — "is the mirror's real lag inside the window the comparator was
+/// told to allow" — compares two numbers, and one of them lives in a
+/// deployment env var. A threshold copied into a PromQL expression is a
+/// representation of that env var (`agents/rules/representation-drift.md`),
+/// true only until someone tunes one side; publishing it makes the comparison
+/// read the value itself.
+///
+/// 0 means no tolerance, which is also the signal that the async mirror is not
+/// meant to be on — the alert uses that to stay silent rather than to divide by
+/// an implicit assumption.
+pub fn ehdb_crossstore_parity_lag_tolerance_seconds() -> &'static IntGauge {
+    static M: OnceLock<IntGauge> = OnceLock::new();
+    M.get_or_init(|| {
+        let g = IntGauge::new(
+            "noetl_ehdb_crossstore_parity_lag_tolerance_seconds",
+            "The cross-store parity comparator's configured lag tolerance window in seconds; 0 \
+             means no tolerance (noetl/ai-meta#155).",
+        )
+        .expect("static gauge spec must be valid");
+        registry()
+            .register(Box::new(g.clone()))
+            .expect("gauge registration must succeed");
+        g
+    })
+}
+
+pub fn set_ehdb_crossstore_parity_lag_tolerance(seconds: u64) {
+    ehdb_crossstore_parity_lag_tolerance_seconds().set(seconds as i64);
+}
+
+pub fn add_ehdb_crossstore_pending(tier: &str, n: u64) {
+    ehdb_crossstore_pending_total()
+        .with_label_values(&[tier])
+        .inc_by(n);
+}
+
 pub fn init_ehdb_crossstore_series() {
     use crate::handlers::ehdb_parity::{
         CONTROL_NAMES, DIVERGENCE_KINDS, PARITY_OUTCOMES, TIER,
@@ -3156,6 +3406,10 @@ pub fn init_ehdb_crossstore_series() {
             .with_label_values(&[TIER, kind.as_str()])
             .inc_by(0);
     }
+    ehdb_crossstore_pending_total()
+        .with_label_values(&[TIER])
+        .inc_by(0);
+    ehdb_crossstore_parity_lag_tolerance_seconds().set(0);
     ehdb_crossstore_events_compared_total()
         .with_label_values(&[TIER])
         .inc_by(0);
@@ -4142,6 +4396,42 @@ mod tests {
         );
     }
 
+    /// The async-mirror surface must reach `/metrics` before anything mirrors.
+    ///
+    /// The gauge is the load-bearing one. Without it, "the async flag is off"
+    /// and "the flag is on but the drain task never started" are the same
+    /// scrape — an idle queue at depth 0 — which is the inert-and-silent shape
+    /// this codebase has shipped three times (noetl/ai-meta#242, #266).
+    #[test]
+    fn async_mirror_series_are_pinned_into_the_rendered_output() {
+        init_ehdb_eventlog_mirror_queue_series();
+        let text = gather_text().expect("gather must succeed");
+        for expected in [
+            "noetl_ehdb_eventlog_mirror_queue_total{outcome=\"enqueued\"} 0",
+            "noetl_ehdb_eventlog_mirror_queue_total{outcome=\"queue_full_inline\"} 0",
+            "noetl_ehdb_eventlog_mirror_queue_total{outcome=\"drained\"} 0",
+            "noetl_ehdb_eventlog_mirror_queue_total{outcome=\"shutdown_abandoned\"} 0",
+            "noetl_ehdb_eventlog_mirror_pending_events 0",
+            "noetl_ehdb_eventlog_mirror_async_enabled 0",
+        ] {
+            assert!(
+                text.contains(expected),
+                "pinned async-mirror series missing from /metrics: {expected}"
+            );
+        }
+        // The lag histogram is unlabelled, so it is never pruned — but it must
+        // still be registered, and a bucket line is the proof.
+        assert!(
+            text.contains("noetl_ehdb_eventlog_mirror_lag_seconds_bucket"),
+            "the lag histogram must render; it is what the parity window is checked against"
+        );
+        assert!(
+            !text.contains("noetl_ehdb_eventlog_mirror_queue_total{outcome=\"dropped\""),
+            "positive control: an unpinned outcome must be absent — and `dropped` is not a \
+             policy this queue has (noetl/ai-meta#155)"
+        );
+    }
+
     /// The pin must reach `/metrics`, not just the counter.
     ///
     /// This asserts the property that actually matters and that a
@@ -4162,6 +4452,16 @@ mod tests {
             "noetl_ehdb_crossstore_events_compared_total{tier=\"eventlog\"} 0",
             "noetl_ehdb_crossstore_control_total{control=\"identical\",result=\"expected\"} 0",
             "noetl_ehdb_crossstore_control_total{control=\"order\",result=\"unexpected\"} 0",
+            // noetl/ai-meta#155 — the lag-tolerance surface. `pending_mirror`
+            // and the two lag controls are absent-by-default series on a
+            // deployment that never turns the window on, which is exactly the
+            // case where an operator needs to read them as 0 rather than as
+            // "this binary predates the window".
+            "noetl_ehdb_crossstore_parity_total{outcome=\"pending_mirror\",tier=\"eventlog\"} 0",
+            "noetl_ehdb_crossstore_pending_total{tier=\"eventlog\"} 0",
+            "noetl_ehdb_crossstore_parity_lag_tolerance_seconds 0",
+            "noetl_ehdb_crossstore_control_total{control=\"lag_within_window\",result=\"expected\"} 0",
+            "noetl_ehdb_crossstore_control_total{control=\"lag_beyond_window\",result=\"unexpected\"} 0",
         ] {
             assert!(
                 text.contains(expected),

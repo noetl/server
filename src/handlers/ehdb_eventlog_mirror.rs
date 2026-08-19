@@ -99,7 +99,7 @@
 //!
 //! Default-off behind `NOETL_EHDB_EVENTLOG_MIRROR_SOURCE=server`.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::json;
 use tracing::warn;
@@ -208,12 +208,32 @@ fn relay_client() -> &'static reqwest::Client {
     C.get_or_init(reqwest::Client::new)
 }
 
+/// One relay-ready mirror request: the records for one execution, in order.
+///
+/// Carries the relay base URL rather than re-reading it at delivery time so a
+/// batch enqueued under one configuration cannot be delivered under another —
+/// and carries `enqueued_at` because the lag it reports is the whole point of
+/// the async path being auditable.
+#[derive(Debug, Clone)]
+pub struct MirrorBatch {
+    pub base: String,
+    pub execution_id: i64,
+    pub records: Vec<String>,
+    pub enqueued_at: Instant,
+}
+
 /// Mirror a batch of authoritative rows into the event-log tier.
 ///
 /// Called from the `emit_events` chokepoint with the rows that are about to
 /// become authoritative — after terminal dedup and after chain stamping, so the
 /// mirrored set is exactly the set that lands in `noetl.event` and no row is
 /// mirrored that gets suppressed.
+///
+/// With `NOETL_EHDB_EVENTLOG_MIRROR_ASYNC` off this delivers inline, exactly as
+/// it always has. With it on the batch is handed to
+/// [`super::ehdb_eventlog_mirror_queue`] and this returns in microseconds; the
+/// delivery, its metrics and its failure posture are unchanged, they just happen
+/// on the drain task.
 ///
 /// Never returns an error. See the module note on failure posture.
 pub async fn mirror_rows(state: &AppState, rows: &[EventRow]) {
@@ -244,15 +264,34 @@ pub async fn mirror_rows(state: &AppState, rows: &[EventRow]) {
     // One request per batch, records in the order the chokepoint wrote them.
     // N concurrent single-record requests would not preserve that order, and
     // order is one of the properties the comparator checks.
-    let execution_id = rows[0].execution_id;
-    let records: Vec<String> = rows
-        .iter()
-        .map(|r| mirror_payload(r).to_string())
-        .collect();
-    let count = records.len();
+    let batch = MirrorBatch {
+        base,
+        execution_id: rows[0].execution_id,
+        records: rows.iter().map(|r| mirror_payload(r).to_string()).collect(),
+        enqueued_at: Instant::now(),
+    };
 
-    let url = format!("{}/ehdb/tiers/eventlog", base.trim_end_matches('/'));
-    let body = json!({ "execution_id": execution_id.to_string(), "records": records });
+    if super::ehdb_eventlog_mirror_queue::enabled() {
+        super::ehdb_eventlog_mirror_queue::submit(batch).await;
+    } else {
+        deliver(&batch).await;
+    }
+}
+
+/// POST one batch to the tier relay and meter the result.
+///
+/// The delivery half of [`mirror_rows`], split out so the queue's drain task
+/// runs **the same code** the inline path runs. Two deliverers would be two
+/// failure postures, two metric spellings, and one of them would drift.
+pub(crate) async fn deliver(batch: &MirrorBatch) {
+    let execution_id = batch.execution_id;
+    let count = batch.records.len();
+    if count == 0 {
+        return;
+    }
+
+    let url = format!("{}/ehdb/tiers/eventlog", batch.base.trim_end_matches('/'));
+    let body = json!({ "execution_id": execution_id.to_string(), "records": batch.records });
 
     let resp = relay_client()
         .post(&url)
@@ -411,6 +450,20 @@ mod tests {
     ///
     /// The #263 fix adds mirror call sites; it must not have moved or removed the
     /// one that covers everything else.
+    ///
+    /// # This guard was broken, and nothing said so
+    ///
+    /// It matched the literal `if should_publish(state, rows[0].catalog_id)`.
+    /// noetl/ai-meta#155's phase-attribution change (server#352) hoisted that
+    /// call into `let __should_publish = should_publish(…).await;` so it could be
+    /// timed — a correct edit that left the guard unable to find its landmark.
+    /// The guard has been `panic!`-ing ever since, and **no `cargo test` runs in
+    /// CI on any Rust repo** ([ai-meta#232](https://github.com/noetl/ai-meta/issues/232)),
+    /// so a red guard and a green one are the same observable.
+    ///
+    /// Rewritten to anchor on `should_publish(` — the call, which cannot be
+    /// hoisted away without ceasing to exist — rather than on one spelling of
+    /// the statement around it.
     #[test]
     fn the_chokepoint_mirrors_before_it_forks() {
         let ew = include_str!("event_write.rs");
@@ -418,12 +471,67 @@ mod tests {
             .find("ehdb_eventlog_mirror::mirror_rows")
             .expect("event_write::emit_events must still mirror");
         let fork_at = ew
-            .find("if should_publish(state, rows[0].catalog_id)")
+            .find("should_publish(state, rows[0].catalog_id)")
             .expect("the publish/insert fork must still be here");
         assert!(
             mirror_at < fork_at,
             "the mirror must sit BEFORE the publish/insert fork so one call site \
              covers both branches"
+        );
+    }
+
+    /// The async path and the inline path must deliver through the SAME code.
+    ///
+    /// `deliver` carries the whole failure posture — the 501/405 discrimination,
+    /// the four outcome labels, the timeout. A drain task with its own copy would
+    /// be a second posture that drifts, and the drift would only ever be visible
+    /// on the async configuration, i.e. the one with less operational history.
+    #[test]
+    fn there_is_exactly_one_deliverer() {
+        let me = include_str!("ehdb_eventlog_mirror.rs");
+        let queue = include_str!("ehdb_eventlog_mirror_queue.rs");
+        assert_eq!(
+            me.matches("relay_client()\n        .post(").count(),
+            1,
+            "the relay POST must exist once, in `deliver`"
+        );
+        assert!(
+            !queue.contains(".post("),
+            "the queue module must not POST — it calls `deliver`, or the two paths \
+             will report differently for the same failure"
+        );
+        assert!(
+            queue.contains("ehdb_eventlog_mirror::deliver"),
+            "the drain task must call the shared deliverer"
+        );
+    }
+
+    /// Enqueueing must not be able to become a drop.
+    ///
+    /// Counted rather than named: the hazard is a *new* early return added later
+    /// that skips both the queue and the inline path, and a test that lists the
+    /// returns it already knows about cannot catch that. Every early exit from
+    /// `mirror_rows` that is not a delivery has to be one of the two accounted
+    /// ones — "nothing to mirror" and "not the mirror source" — or this fails.
+    #[test]
+    fn mirror_rows_has_no_unaccounted_early_return() {
+        let me = include_str!("ehdb_eventlog_mirror.rs");
+        let body_start = me
+            .find("pub async fn mirror_rows")
+            .expect("mirror_rows must exist");
+        let body_end = me[body_start..]
+            .find("pub(crate) async fn deliver")
+            .expect("deliver must follow mirror_rows")
+            + body_start;
+        let body = &me[body_start..body_end];
+        // `return;` in the guard clause, in the unconfigured branch. Two.
+        assert_eq!(
+            body.matches("return;").count(),
+            2,
+            "mirror_rows grew an early return. Every path out of it either delivers \
+             the events or is one of the two accounted no-ops (empty batch / not the \
+             mirror source); a third would silently drop authoritative events on a \
+             `primary`-serving tier (noetl/ai-meta#155)."
         );
     }
 }

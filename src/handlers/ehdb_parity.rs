@@ -261,7 +261,9 @@ pub struct Divergence {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CrossStoreReport {
     pub execution_id: String,
-    /// Every authoritative event for this execution.
+    /// Authoritative events for this execution that the verdict is **about** —
+    /// i.e. every one of them, minus any held back by the lag tolerance window
+    /// (`pending_authoritative`). The two sum to the execution's total.
     pub authoritative_count: usize,
     /// The subset the tier is expected to hold — see
     /// [`AuthoritativeEvent::mirror_expected`]. This is the number the tier's
@@ -279,6 +281,20 @@ pub struct CrossStoreReport {
     /// the log (noetl/ai-meta#257 §3.4).
     pub unmirrored_by_design: usize,
     pub ehdb_count: usize,
+    /// Mirror-expected authoritative events held back by the lag tolerance
+    /// window — too recent to be comparable, because an async mirror may still
+    /// have them queued (noetl/ai-meta#155).
+    ///
+    /// Reported rather than silently subtracted. A tolerance that quietly grew
+    /// to cover a whole execution would report `match` on a comparison that did
+    /// not happen, and this is the number that makes that visible: if it is
+    /// consistently the whole log, the window is too wide or the mirror is too
+    /// slow, and both are things to act on.
+    pub pending_authoritative: usize,
+    /// Tier records excluded alongside them — events the mirror got to before
+    /// the window expired. Excluded from **both** sides, so a fast mirror is
+    /// not scored as holding extra records.
+    pub pending_tier: usize,
     /// Tier records that parsed and carried an `event_id`.
     pub identified: usize,
     /// Shared `event_id`s whose identifying fields agreed.
@@ -347,7 +363,69 @@ pub fn compare_cross_store(
     authoritative: &[AuthoritativeEvent],
     mirrored: &[MirroredRecord],
 ) -> CrossStoreReport {
+    compare_cross_store_with_horizon(execution_id, authoritative, mirrored, None)
+}
+
+/// [`compare_cross_store`], with a bounded **lag tolerance**.
+///
+/// # Why this exists (noetl/ai-meta#155)
+///
+/// The mirror used to be synchronous: an event was in the tier before
+/// `emit_events` returned, so comparing an execution the instant it was written
+/// was sound. Taking the mirror off the hot path breaks that. Any execution
+/// sampled while its newest events are still on the mirror queue has a tier copy
+/// that is legitimately a few records behind, and this comparator — which is
+/// what demotes a `primary`-serving tier — would call that `missing_event` and
+/// demote a healthy tier.
+///
+/// That is [#263](https://github.com/noetl/ai-meta/issues/263) inverted: #263
+/// was a tier reporting completeness it did not have; this would be a tier
+/// reporting divergence it does not have. Both end with an operator unable to
+/// trust the signal.
+///
+/// # What the tolerance does, and what it deliberately does not do
+///
+/// `horizon` is the largest authoritative `event_id` old enough to be
+/// comparable. Everything after it is **excluded from both sides** — the
+/// authoritative events are not counted missing, and any tier records the
+/// mirror already delivered for them are not counted extra.
+///
+/// Everything at or below the horizon is compared exactly as before. A
+/// genuinely lost event does not become invisible; it becomes invisible **for
+/// the length of the window** and then reports as `missing_event` forever, which
+/// is the same verdict at a bounded delay. The window is therefore a *latency*
+/// concession, never a *coverage* one, and the two controls
+/// `lag_within_window` / `lag_beyond_window` assert both halves of that on every
+/// tick.
+///
+/// The cut is a **prefix**, taken at the first event newer than the horizon
+/// rather than by filtering every event against it. `event_id` is a snowflake so
+/// the two orders agree, but a prefix cut cannot be wrong in the dangerous
+/// direction if they ever disagree: it can only exclude *more* than intended,
+/// never leave a still-queued event inside the compared set.
+///
+/// `None` restores the pre-#155 behaviour exactly, and is what the default
+/// configuration (`..._LAG_TOLERANCE_SECS=0`) produces.
+pub fn compare_cross_store_with_horizon(
+    execution_id: i64,
+    authoritative: &[AuthoritativeEvent],
+    mirrored: &[MirroredRecord],
+    horizon: Option<i64>,
+) -> CrossStoreReport {
     let mut divergences: Vec<Divergence> = Vec::new();
+
+    // Prefix cut. `cut` is the count of comparable authoritative events.
+    let cut = match horizon {
+        None => authoritative.len(),
+        Some(h) => authoritative
+            .iter()
+            .position(|e| e.event_id > h)
+            .unwrap_or(authoritative.len()),
+    };
+    let (comparable, held_back) = authoritative.split_at(cut);
+    let held_back_ids: BTreeSet<i64> = held_back.iter().map(|e| e.event_id).collect();
+    let pending_authoritative = held_back.iter().filter(|e| e.mirror_expected).count();
+    let authoritative = comparable;
 
     // --- parse the tier side -------------------------------------------------
     let mut parsed: Vec<MirroredEvent> = Vec::with_capacity(mirrored.len());
@@ -382,6 +460,17 @@ pub fn compare_cross_store(
         }
     }
 
+    // Drop tier records for events still inside the tolerance window. Doing it
+    // here, before every check, is what keeps the exclusion symmetric: the
+    // count, membership, ordering and payload checks all then run over one
+    // consistent pair of sets rather than each needing its own filter.
+    let pending_tier = parsed
+        .iter()
+        .filter(|m| held_back_ids.contains(&m.event_id))
+        .count();
+    parsed.retain(|m| !held_back_ids.contains(&m.event_id));
+    let ehdb_comparable = mirrored.len() - pending_tier;
+
     // The two authoritative views. `expected` scopes the count / missing checks
     // to events the tier should hold; `auth_by_id` covers the whole log so a
     // tier record matching a server-authored event is recognised rather than
@@ -393,14 +482,16 @@ pub fn compare_cross_store(
     let mirrored_ids: BTreeSet<i64> = parsed.iter().map(|m| m.event_id).collect();
 
     // --- presence ------------------------------------------------------------
-    if !expected.is_empty() && mirrored.is_empty() {
+    if !expected.is_empty() && ehdb_comparable == 0 {
         divergences.push(Divergence {
             kind: DivergenceKind::MissingExecution,
             detail: format!(
-                "authoritative log holds {} mirror-expected events for execution {execution_id} \
-                 (of {} total); the tier holds none",
+                "authoritative log holds {} mirror-expected comparable events for execution \
+                 {execution_id} (of {} comparable, {} held back by the lag tolerance); the tier \
+                 holds none",
                 expected.len(),
-                authoritative.len()
+                authoritative.len(),
+                pending_authoritative
             ),
         });
     }
@@ -409,13 +500,13 @@ pub fn compare_cross_store(
     // Suppressed when the tier is wholly absent: the missing_execution verdict
     // above already says it, and two lines for one fact makes the divergence
     // rate read double.
-    if expected.len() != mirrored.len() && !(mirrored.is_empty() && !expected.is_empty()) {
+    if expected.len() != ehdb_comparable && !(ehdb_comparable == 0 && !expected.is_empty()) {
         divergences.push(Divergence {
             kind: DivergenceKind::Count,
             detail: format!(
-                "authoritative(mirror-expected)={} ehdb={} (authoritative total {})",
+                "authoritative(mirror-expected)={} ehdb={} (authoritative comparable {})",
                 expected.len(),
-                mirrored.len(),
+                ehdb_comparable,
                 authoritative.len()
             ),
         });
@@ -549,7 +640,9 @@ pub fn compare_cross_store(
         authoritative_count: authoritative.len(),
         authoritative_expected: expected.len(),
         unmirrored_by_design: authoritative.len() - expected.len(),
-        ehdb_count: mirrored.len(),
+        ehdb_count: ehdb_comparable,
+        pending_authoritative,
+        pending_tier,
         identified: parsed.len(),
         matched,
         holds: divergences.is_empty(),
@@ -620,7 +713,7 @@ pub struct ControlResult {
 }
 
 /// Every control label value, for pinning.
-pub const CONTROL_NAMES: [&str; 8] = [
+pub const CONTROL_NAMES: [&str; 10] = [
     "identical",
     "missing_execution",
     "count",
@@ -629,6 +722,11 @@ pub const CONTROL_NAMES: [&str; 8] = [
     "order",
     "payload",
     "unidentified",
+    // The lag-tolerance pair (noetl/ai-meta#155). Two controls, not one,
+    // because the property being asserted is a *discrimination* and a single
+    // control can only ever prove half of it.
+    "lag_within_window",
+    "lag_beyond_window",
 ];
 
 fn auth_event(event_id: i64, event_type: &str, step: &str, status: &str) -> AuthoritativeEvent {
@@ -774,6 +872,64 @@ pub fn run_controls() -> Vec<ControlResult> {
         });
     }
 
+    // ---- the lag-tolerance pair (noetl/ai-meta#155) -----------------------
+    //
+    // ONE fixture — three authoritative events, the newest absent from the tier
+    // — driven through the comparator TWICE with only the horizon changed.
+    //
+    // That is the whole point. A tolerance window is dangerous in exactly one
+    // way: it can be a comparator that has been taught to ignore everything, and
+    // such a comparator passes a "clean parity under tolerance" test perfectly.
+    // The only check with teeth is that the *same missing event* is forgiven
+    // inside the window and reported outside it, so both controls run on
+    // identical inputs and their verdicts must differ.
+    {
+        let (auth, mut mirrored) = control_fixtures();
+        mirrored.pop(); // 9_003 is "still on the mirror queue"
+
+        // Inside the window: the horizon stops before 9_003, so its absence is
+        // in-flight, not divergence.
+        let inside = compare_cross_store_with_horizon(1, &auth, &mirrored, Some(9_002));
+        let ok_inside = inside.holds && inside.pending_authoritative == 1;
+        out.push(ControlResult {
+            control: "lag_within_window".to_string(),
+            expected: ok_inside,
+            detail: if ok_inside {
+                format!(
+                    "1 in-flight event held back, {} compared clean",
+                    inside.matched
+                )
+            } else {
+                format!(
+                    "in-flight event was NOT tolerated — kinds {:?}, holds={}, pending={}",
+                    inside.kinds(),
+                    inside.holds,
+                    inside.pending_authoritative
+                )
+            },
+        });
+
+        // Outside it: the same absent event, now old enough. Must still demote.
+        let outside = compare_cross_store_with_horizon(1, &auth, &mirrored, Some(9_003));
+        let ok_outside = outside
+            .kinds()
+            .contains(DivergenceKind::MissingEvent.as_str());
+        out.push(ControlResult {
+            control: "lag_beyond_window".to_string(),
+            expected: ok_outside,
+            detail: if ok_outside {
+                format!("still detected past the window; kinds {:?}", outside.kinds())
+            } else {
+                format!(
+                    "TOLERANCE SWALLOWED A REAL DIVERGENCE — kinds {:?}, holds={}, pending={}",
+                    outside.kinds(),
+                    outside.holds,
+                    outside.pending_authoritative
+                )
+            },
+        });
+    }
+
     out
 }
 
@@ -821,6 +977,15 @@ pub enum ParityOutcome {
     /// Either side hit [`MAX_COMPARE_EVENTS`]; a truncated comparison is not a
     /// comparison.
     SkippedTooLarge,
+    /// Every authoritative event for this execution is inside the mirror lag
+    /// tolerance window, so there was nothing old enough to compare
+    /// (noetl/ai-meta#155).
+    ///
+    /// Its own outcome, not `match`, for the reason the module header gives:
+    /// every way of *not knowing* is reported as itself. Scoring an untaken
+    /// comparison as agreement is precisely how a tolerance window turns into a
+    /// comparator that has been taught to ignore everything.
+    PendingMirror,
     /// The authoritative read failed.
     Error,
 }
@@ -835,13 +1000,14 @@ impl ParityOutcome {
             Self::EhdbUnavailable => "ehdb_unavailable",
             Self::EhdbDisabled => "ehdb_disabled",
             Self::SkippedTooLarge => "skipped_too_large",
+            Self::PendingMirror => "pending_mirror",
             Self::Error => "error",
         }
     }
 }
 
 /// Every [`ParityOutcome`] label value, for pinning.
-pub const PARITY_OUTCOMES: [ParityOutcome; 8] = [
+pub const PARITY_OUTCOMES: [ParityOutcome; 9] = [
     ParityOutcome::Match,
     ParityOutcome::Divergent,
     ParityOutcome::AuthoritativeEmpty,
@@ -849,6 +1015,7 @@ pub const PARITY_OUTCOMES: [ParityOutcome; 8] = [
     ParityOutcome::EhdbUnavailable,
     ParityOutcome::EhdbDisabled,
     ParityOutcome::SkippedTooLarge,
+    ParityOutcome::PendingMirror,
     ParityOutcome::Error,
 ];
 
@@ -1176,12 +1343,30 @@ pub async fn compare_execution(state: &AppState, execution_id: i64) -> Compariso
         };
     }
 
-    let report = compare_cross_store(execution_id, &authoritative, &mirrored);
-    let outcome = if report.holds {
-        ParityOutcome::Match
-    } else {
-        ParityOutcome::Divergent
+    // The lag tolerance. Default 0 ⇒ `None` ⇒ byte-identical behaviour to
+    // before noetl/ai-meta#155. A failure to compute it is NOT silently treated
+    // as "no tolerance": that would restore the false-demote hazard on exactly
+    // the configuration that asked for tolerance, so it is reported as `error`.
+    let tolerance = state.config.ehdb_crossstore_parity_lag_tolerance_secs;
+    let horizon = match mirror_lag_horizon(state, execution_id, tolerance).await {
+        Ok(h) => h,
+        Err(e) => {
+            crate::metrics::record_ehdb_crossstore_parity(TIER, ParityOutcome::Error.as_str());
+            return ComparisonResult {
+                outcome: ParityOutcome::Error,
+                report: None,
+                detail: Some(format!("mirror lag horizon read failed: {e}")),
+                tier_query_source,
+            };
+        }
     };
+
+    let report =
+        compare_cross_store_with_horizon(execution_id, &authoritative, &mirrored, horizon);
+    let outcome = outcome_for(&report);
+    if report.pending_authoritative > 0 {
+        crate::metrics::add_ehdb_crossstore_pending(TIER, report.pending_authoritative as u64);
+    }
     crate::metrics::record_ehdb_crossstore_parity(TIER, outcome.as_str());
     crate::metrics::add_ehdb_crossstore_events_compared(TIER, report.matched as u64);
     for kind in report.kinds() {
@@ -1203,6 +1388,61 @@ pub async fn compare_execution(state: &AppState, execution_id: i64) -> Compariso
         report: Some(report),
         detail: None,
         tier_query_source,
+    }
+}
+
+/// The largest authoritative `event_id` for this execution that is old enough
+/// to be compared, given a lag tolerance in seconds.
+///
+/// Computed as **`MIN(event_id) - 1` over the events newer than the cutoff**,
+/// not `MAX(event_id)` over the older ones. The two differ exactly when
+/// `event_id` order and `created_at` order disagree, and only the first is safe:
+/// it excludes every event at or after the first recent one, so a still-queued
+/// event can never end up inside the compared set. `MAX` over the old side
+/// would leave it there and report it missing — the false demote this whole
+/// mechanism exists to prevent.
+///
+/// `Ok(None)` means nothing is newer than the cutoff, so the whole execution is
+/// comparable.
+async fn mirror_lag_horizon(
+    state: &AppState,
+    execution_id: i64,
+    tolerance_secs: u64,
+) -> Result<Option<i64>, sqlx::Error> {
+    if tolerance_secs == 0 {
+        return Ok(None);
+    }
+    let row: (Option<i64>,) = sqlx::query_as(
+        r#"
+        SELECT MIN(event_id)
+        FROM noetl.event
+        WHERE execution_id = $1
+          AND created_at > NOW() - INTERVAL '1 second' * $2
+        "#,
+    )
+    .bind(execution_id)
+    .bind(tolerance_secs as i64)
+    .fetch_one(state.pools.pool_for(execution_id))
+    .await?;
+    // `- 1` because the horizon is inclusive: the newest COMPARABLE id.
+    Ok(row.0.map(|min_recent| min_recent - 1))
+}
+
+/// Score a report.
+///
+/// Split out from [`compare_execution`] so the one rule that a lag-tolerance
+/// window could silently break — **an untaken comparison is not agreement** —
+/// is assertable without a database. With the window wide enough, `holds` is
+/// trivially true on an empty comparable set, and scoring that `match` would
+/// publish a healthy parity rate for a comparator that compared nothing.
+fn outcome_for(report: &CrossStoreReport) -> ParityOutcome {
+    if report.authoritative_count == 0 && report.pending_authoritative > 0 {
+        return ParityOutcome::PendingMirror;
+    }
+    if report.holds {
+        ParityOutcome::Match
+    } else {
+        ParityOutcome::Divergent
     }
 }
 
@@ -1435,6 +1675,110 @@ mod tests {
         for r in run_controls() {
             assert!(r.expected, "control {} failed: {}", r.control, r.detail);
         }
+    }
+
+
+    // =======================================================================
+    // Lag tolerance (noetl/ai-meta#155)
+    // =======================================================================
+
+    /// `None` must be byte-identical to the pre-#155 comparator.
+    ///
+    /// The default configuration produces `None`, so this is the assertion that
+    /// the whole feature is genuinely inert until switched on — the property
+    /// every "default off" claim in this repo has at some point turned out not
+    /// to have.
+    #[test]
+    fn no_horizon_is_exactly_the_old_comparator() {
+        let (auth, mut mirrored) = control_fixtures();
+        mirrored.remove(1);
+        let old = compare_cross_store(1, &auth, &mirrored);
+        let new = compare_cross_store_with_horizon(1, &auth, &mirrored, None);
+        assert_eq!(old, new);
+        assert_eq!(new.pending_authoritative, 0);
+        assert_eq!(new.pending_tier, 0);
+        assert!(new.kinds().contains("missing_event"));
+    }
+
+    /// The window forgives an in-flight event and nothing else.
+    ///
+    /// The sharp case: TWO events are absent from the tier — one old, one still
+    /// queued. A window that merely suppressed `missing_event` would pass a
+    /// single-absence test and fail this one. The old id must still be named.
+    #[test]
+    fn the_window_forgives_only_what_is_inside_it() {
+        let auth = vec![
+            auth_event(9_001, "playbook.started", "start", "STARTED"),
+            auth_event(9_002, "step.enter", "fetch", "RUNNING"),
+            auth_event(9_003, "step.exit", "fetch", "COMPLETED"),
+            auth_event(9_004, "playbook.completed", "end", "COMPLETED"),
+        ];
+        // The tier is missing 9_002 (a real loss) and 9_004 (still queued).
+        let mirrored = vec![mirrored_of(1, &auth[0]), mirrored_of(2, &auth[2])];
+
+        let r = compare_cross_store_with_horizon(1, &auth, &mirrored, Some(9_003));
+        assert!(!r.holds, "a real loss inside the compared prefix must diverge");
+        let missing = r
+            .divergences
+            .iter()
+            .find(|d| d.kind == DivergenceKind::MissingEvent)
+            .expect("the old absent event must still be reported");
+        assert!(
+            missing.detail.contains("9002"),
+            "the pre-window loss must be named: {}",
+            missing.detail
+        );
+        assert!(
+            !missing.detail.contains("9004"),
+            "the in-flight event must not be named as missing: {}",
+            missing.detail
+        );
+        assert_eq!(r.pending_authoritative, 1);
+    }
+
+    /// The exclusion is symmetric.
+    ///
+    /// If the mirror is FAST — the record for an in-flight event is already in
+    /// the tier — that record must not be scored as an `extra_event` or as a
+    /// `count` mismatch. Excluding only the authoritative side would make the
+    /// window punish the mirror for being quick, which is a divergence alarm
+    /// that fires more often the healthier the system is.
+    #[test]
+    fn a_tier_record_inside_the_window_is_not_an_extra() {
+        let (auth, mirrored) = control_fixtures(); // tier holds all three
+        let r = compare_cross_store_with_horizon(1, &auth, &mirrored, Some(9_002));
+        assert!(r.holds, "{:?}", r.divergences);
+        assert_eq!(r.pending_authoritative, 1);
+        assert_eq!(r.pending_tier, 1, "the already-mirrored record must be excluded too");
+        assert_eq!(r.authoritative_count, 2);
+        assert_eq!(r.ehdb_count, 2);
+    }
+
+    /// An execution wholly inside the window yields no verdict — and that is
+    /// NOT `match`.
+    #[test]
+    fn nothing_comparable_is_pending_not_agreement() {
+        let (auth, mirrored) = control_fixtures();
+        // Horizon below every id: the entire execution is in flight.
+        let r = compare_cross_store_with_horizon(1, &auth, &mirrored, Some(9_000));
+        assert!(r.holds, "an empty comparison has no divergences by definition");
+        assert_eq!(r.authoritative_count, 0);
+        assert_eq!(r.pending_authoritative, 3);
+        assert_eq!(
+            outcome_for(&r).as_str(),
+            "pending_mirror",
+            "an untaken comparison scored as `match` would publish a healthy parity rate for a \
+             comparator that compared nothing"
+        );
+    }
+
+    /// A tier that is wholly empty still reports `missing_execution` when the
+    /// window does not cover the whole execution.
+    #[test]
+    fn the_window_does_not_hide_a_wholly_absent_tier() {
+        let (auth, _) = control_fixtures();
+        let r = compare_cross_store_with_horizon(1, &auth, &[], Some(9_002));
+        assert!(r.kinds().contains("missing_execution"), "{:?}", r.divergences);
     }
 
     #[test]

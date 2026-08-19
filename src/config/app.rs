@@ -810,6 +810,29 @@ pub struct AppConfig {
     /// something.
     #[serde(default = "default_ehdb_crossstore_parity_lookback_secs")]
     pub ehdb_crossstore_parity_lookback_secs: u64,
+
+    /// How recent an authoritative event may be before the comparator stops
+    /// counting its absence from the tier as divergence, in seconds.  Envy maps
+    /// `NOETL_EHDB_CROSSSTORE_PARITY_LAG_TOLERANCE_SECS`.  **Default 0 —
+    /// no tolerance, which is the pre-noetl/ai-meta#155 behaviour exactly.**
+    ///
+    /// Required by, and only by, the **async mirror**
+    /// (`NOETL_EHDB_EVENTLOG_MIRROR_ASYNC`).  With the mirror inline an event is
+    /// in the tier before `emit_events` returns, so an immediate comparison is
+    /// sound.  With it queued, an execution sampled mid-flight has a tier copy
+    /// that is legitimately behind — and this comparator is what demotes a
+    /// `primary`-serving tier, so without a window it would demote healthy
+    /// tiers on their own liveness.
+    ///
+    /// This is a **latency** concession, not a coverage one: a genuinely lost
+    /// event is invisible for the window and then reports `missing_event`
+    /// forever.  Set it above the mirror's observed
+    /// `noetl_ehdb_eventlog_mirror_lag_seconds` tail and no higher — a window
+    /// wider than the real lag buys nothing and blinds the comparator for
+    /// longer.  The `EhdbMirrorLagExceedsParityWindow` alert in noetl/ops is
+    /// what proves the two agree in production rather than on paper.
+    #[serde(default)]
+    pub ehdb_crossstore_parity_lag_tolerance_secs: u64,
 }
 
 /// How the execution-lifecycle hot path reads `noetl.event` — see
@@ -1143,6 +1166,7 @@ impl Default for AppConfig {
             ehdb_crossstore_parity_sample_size: default_ehdb_crossstore_parity_sample_size(),
             ehdb_crossstore_parity_settle_secs: default_ehdb_crossstore_parity_settle_secs(),
             ehdb_crossstore_parity_lookback_secs: default_ehdb_crossstore_parity_lookback_secs(),
+            ehdb_crossstore_parity_lag_tolerance_secs: 0,
         }
     }
 }
@@ -1172,6 +1196,29 @@ mod tests {
         // default so the gated build is behavior-neutral; only the explicit
         // operational flip (NOETL_RESULT_STORE_DUAL_WRITE=false) retires it.
         assert!(AppConfig::default().result_store_dual_write);
+    }
+
+    /// The parity lag tolerance is off by default, and its env name is the one
+    /// the wiki and the ops alert both quote.
+    ///
+    /// Asserted through `envy` rather than by reading the struct field, because
+    /// the failure mode is a **name** mismatch: a field renamed without the
+    /// deployment spec following it leaves prod setting a variable nothing
+    /// reads, which is the one inert flag of 77 that noetl/ai-meta#266 found.
+    #[test]
+    fn parity_lag_tolerance_defaults_to_zero_and_reads_its_documented_name() {
+        assert_eq!(
+            AppConfig::default().ehdb_crossstore_parity_lag_tolerance_secs,
+            0,
+            "default must be 0 — no tolerance is the pre-noetl/ai-meta#155 comparator exactly"
+        );
+        // `envy` derives the variable name from the field name; this pins the
+        // derivation so a rename cannot silently orphan the deployed value.
+        let name = format!(
+            "NOETL_{}",
+            stringify!(ehdb_crossstore_parity_lag_tolerance_secs).to_uppercase()
+        );
+        assert_eq!(name, "NOETL_EHDB_CROSSSTORE_PARITY_LAG_TOLERANCE_SECS");
     }
 
     #[test]
