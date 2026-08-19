@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.83.0](https://github.com/noetl/server/compare/v3.82.0...v3.83.0) (2026-08-19)
+
+### Features
+
+* **ehdb:** async event-log mirror behind a bounded queue, with a comparator lag window ([#155](https://github.com/noetl/server/issues/155)) ([b80a2b4](https://github.com/noetl/server/commit/b80a2b43757090894ff924efebb18deec6ca14cb)), closes [ehdb#317](https://github.com/noetl/ehdb/issues/317) [ai-meta#263](https://github.com/noetl/ai-meta/issues/263) [#263](https://github.com/noetl/server/issues/263) [ai-meta#263](https://github.com/noetl/ai-meta/issues/263) [server#352](https://github.com/noetl/server/issues/352) [ai-meta#232](https://github.com/noetl/ai-meta/issues/232)
+* **metrics:** publish the parity lag window so the alert reads it, not a copy ([#155](https://github.com/noetl/server/issues/155)) ([ab1b0a1](https://github.com/noetl/server/commit/ab1b0a1d092f36cc034390770288a3574906b9d8)), closes [noetl/ops#262](https://github.com/noetl/ops/issues/262)
+
 ## [3.82.0](https://github.com/noetl/server/compare/v3.81.2...v3.82.0) (2026-08-18)
 
 ### Features
