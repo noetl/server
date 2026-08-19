@@ -422,6 +422,13 @@ pub fn compare_cross_store_with_horizon(
             .position(|e| e.event_id > h)
             .unwrap_or(authoritative.len()),
     };
+    // Captured BEFORE the shadowing below: the read-skew bound needs the whole
+    // page's maximum id, not the comparable prefix's. When the window holds the
+    // entire execution back the prefix is EMPTY, and that is precisely the case
+    // the skew was observed in (`auth=0 ehdb=1` on prod) — taking the max from
+    // the prefix there would yield `None` and skip the fix exactly when it is
+    // needed.
+    let full_auth_max = authoritative.last().map(|e| e.event_id);
     let (comparable, held_back) = authoritative.split_at(cut);
     let held_back_ids: BTreeSet<i64> = held_back.iter().map(|e| e.event_id).collect();
     let pending_authoritative = held_back.iter().filter(|e| e.mirror_expected).count();
@@ -464,10 +471,38 @@ pub fn compare_cross_store_with_horizon(
     // here, before every check, is what keeps the exclusion symmetric: the
     // count, membership, ordering and payload checks all then run over one
     // consistent pair of sets rather than each needing its own filter.
+    //
+    // A second exclusion, and it is a **read-skew** fix rather than a tolerance
+    // one. The authoritative page and the tier page are two separate reads, and
+    // for an execution that is still emitting, events land between them — so
+    // the tier legitimately holds an `event_id` the authoritative page never
+    // saw. That reads as `extra_event` + `count` against a log that is
+    // perfectly consistent.
+    //
+    // Bounded by the authoritative page's own maximum id, which is sound
+    // because `noetl.event` is append-only and `event_id` is a snowflake: an id
+    // above that maximum cannot be an event the earlier read *should* have
+    // returned. It can only be one written after it.
+    //
+    // Applied only when a horizon is active, so the default (tolerance 0) path
+    // stays byte-identical to the pre-#155 comparator. Without a horizon the
+    // caller is the sampler, which only ever compares settled executions and
+    // therefore cannot hit this race.
+    let auth_max = full_auth_max;
+    let skewed_ahead = match (horizon, auth_max) {
+        (Some(_), Some(max_id)) => parsed.iter().filter(|m| m.event_id > max_id).count(),
+        _ => 0,
+    };
+    if skewed_ahead > 0 {
+        let max_id = auth_max.expect("checked above");
+        parsed.retain(|m| m.event_id <= max_id);
+    }
+
     let pending_tier = parsed
         .iter()
         .filter(|m| held_back_ids.contains(&m.event_id))
-        .count();
+        .count()
+        + skewed_ahead;
     parsed.retain(|m| !held_back_ids.contains(&m.event_id));
     let ehdb_comparable = mirrored.len() - pending_tier;
 
@@ -1369,8 +1404,23 @@ pub async fn compare_execution(state: &AppState, execution_id: i64) -> Compariso
     }
     crate::metrics::record_ehdb_crossstore_parity(TIER, outcome.as_str());
     crate::metrics::add_ehdb_crossstore_events_compared(TIER, report.matched as u64);
-    for kind in report.kinds() {
-        crate::metrics::record_ehdb_crossstore_divergence(TIER, kind);
+    // An untaken comparison publishes NO divergence evidence.
+    //
+    // `pending_mirror` means every comparable event was inside the lag window,
+    // so the report's `divergences` describe a comparison that did not happen.
+    // Recording them anyway moves `crossstore_divergence_total` — the counter
+    // ops#257's `EhdbCrossStoreDivergence` **pages** on — for a verdict that is
+    // explicitly not a divergence.
+    //
+    // Found on prod: probing an in-flight execution through the on-demand
+    // endpoint returned `pending_mirror` and left `{kind="count"} 1` and
+    // `{kind="extra_event"} 1` behind. That is noetl/ai-meta#264 exactly —
+    // investigating with the endpoint inflates the counter its own alert reads,
+    // invisibly.
+    if outcome == ParityOutcome::Divergent {
+        for kind in report.kinds() {
+            crate::metrics::record_ehdb_crossstore_divergence(TIER, kind);
+        }
     }
     if !report.holds {
         warn!(
@@ -1779,6 +1829,102 @@ mod tests {
         let (auth, _) = control_fixtures();
         let r = compare_cross_store_with_horizon(1, &auth, &[], Some(9_002));
         assert!(r.kinds().contains("missing_execution"), "{:?}", r.divergences);
+    }
+
+    /// The exact shape observed on prod 2026-08-19, reproduced.
+    ///
+    /// An in-flight execution probed through the on-demand endpoint: the whole
+    /// authoritative page is inside the lag window, and the tier — read a moment
+    /// later — already holds a record for an event written *after* that page was
+    /// fetched. Before the fix this reported `count` + `extra_event` and, worse,
+    /// `compare_execution` recorded those kinds into
+    /// `crossstore_divergence_total`, the counter ops#257 pages on.
+    ///
+    /// The two reads are not atomic and cannot be; the bound is that
+    /// `noetl.event` is append-only with snowflake ids, so an id above the
+    /// page's maximum provably could not have been in it.
+    #[test]
+    fn a_tier_record_written_after_the_authoritative_read_is_not_an_extra() {
+        let auth = vec![
+            auth_event(9_001, "playbook.started", "start", "STARTED"),
+            auth_event(9_002, "step.enter", "fetch", "RUNNING"),
+        ];
+        // The tier holds both, plus 9_003 — an event that landed between the
+        // authoritative read and the tier read.
+        let ahead = auth_event(9_003, "step.exit", "fetch", "COMPLETED");
+        let mirrored = vec![
+            mirrored_of(1, &auth[0]),
+            mirrored_of(2, &auth[1]),
+            mirrored_of(3, &ahead),
+        ];
+
+        // Whole execution inside the window — the prod case exactly.
+        let r = compare_cross_store_with_horizon(1, &auth, &mirrored, Some(9_000));
+        assert!(
+            r.holds,
+            "read skew must not manufacture divergence: {:?}",
+            r.divergences
+        );
+        assert_eq!(r.authoritative_count, 0);
+        assert_eq!(r.pending_authoritative, 2);
+        assert_eq!(r.pending_tier, 3, "all three tier records are excluded");
+        assert_eq!(outcome_for(&r).as_str(), "pending_mirror");
+
+        // And with a horizon that makes the page comparable, the skewed record
+        // still must not be an extra — but the real events must still compare.
+        let r2 = compare_cross_store_with_horizon(1, &auth, &mirrored, Some(9_002));
+        assert!(r2.holds, "{:?}", r2.divergences);
+        assert_eq!(r2.matched, 2);
+        assert_eq!(outcome_for(&r2).as_str(), "match");
+    }
+
+    /// The skew bound must NOT swallow a genuine extra event.
+    ///
+    /// The positive control for the fix above: an id with no authoritative row
+    /// that sits *below* the page maximum is a real `extra_event` and must still
+    /// be reported. Without this the fix could be "ignore anything unexplained".
+    #[test]
+    fn the_skew_bound_still_reports_a_real_extra_event() {
+        let auth = vec![
+            auth_event(9_001, "playbook.started", "start", "STARTED"),
+            auth_event(9_003, "playbook.completed", "end", "COMPLETED"),
+        ];
+        let ghost = auth_event(9_002, "step.enter", "ghost", "RUNNING");
+        let mirrored = vec![
+            mirrored_of(1, &auth[0]),
+            mirrored_of(2, &ghost), // invented, and BELOW the page max
+            mirrored_of(3, &auth[1]),
+        ];
+        let r = compare_cross_store_with_horizon(1, &auth, &mirrored, Some(9_999));
+        assert!(
+            r.kinds().contains("extra_event"),
+            "a tier record below the page max with no authoritative row is a real \
+             divergence and must survive the skew bound: {:?}",
+            r.divergences
+        );
+    }
+
+    /// An untaken comparison must publish no divergence evidence.
+    ///
+    /// Guards the recording site rather than the comparator: `compare_execution`
+    /// records `crossstore_divergence_total` only for `Divergent`. `Match`
+    /// carries no kinds anyway, so this is really about `PendingMirror` — and
+    /// that is the one that reached prod.
+    #[test]
+    fn only_a_divergent_verdict_publishes_divergence_kinds() {
+        let src = include_str!("ehdb_parity.rs");
+        let at = src
+            .find("for kind in report.kinds()")
+            .expect("the divergence recording loop must still exist");
+        let guard = src[..at]
+            .rfind("if outcome == ParityOutcome::Divergent")
+            .expect("the recording loop must be guarded on a Divergent verdict");
+        assert!(
+            at - guard < 400,
+            "the Divergent guard must immediately precede the divergence recording \
+             loop; if the loop moved out from under it, a `pending_mirror` verdict \
+             can page ops#257 again (noetl/ai-meta#264)"
+        );
     }
 
     #[test]
