@@ -897,6 +897,11 @@ async fn main() -> anyhow::Result<()> {
     // says whether this process is async is true from the first scrape rather
     // than from the first mirrored event.
     handlers::ehdb_eventlog_mirror_queue::init();
+    // Publish the comparator's window so the ops alert reads the configured
+    // value instead of a copy of it (noetl/ai-meta#155).
+    noetl_server::metrics::set_ehdb_crossstore_parity_lag_tolerance(
+        state.config.ehdb_crossstore_parity_lag_tolerance_secs,
+    );
     handlers::ehdb_parity::spawn_crossstore_parity_sampler(state.clone());
 
     // CQRS write-path cutover (noetl/ai-meta#103 phase 2d-3): when

@@ -3353,6 +3353,39 @@ pub fn ehdb_crossstore_pending_total() -> &'static IntCounterVec {
     })
 }
 
+/// Gauge: the comparator's configured lag tolerance window, in seconds.
+///
+/// **Published so the alert does not have to hardcode it.** The rule that
+/// matters — "is the mirror's real lag inside the window the comparator was
+/// told to allow" — compares two numbers, and one of them lives in a
+/// deployment env var. A threshold copied into a PromQL expression is a
+/// representation of that env var (`agents/rules/representation-drift.md`),
+/// true only until someone tunes one side; publishing it makes the comparison
+/// read the value itself.
+///
+/// 0 means no tolerance, which is also the signal that the async mirror is not
+/// meant to be on — the alert uses that to stay silent rather than to divide by
+/// an implicit assumption.
+pub fn ehdb_crossstore_parity_lag_tolerance_seconds() -> &'static IntGauge {
+    static M: OnceLock<IntGauge> = OnceLock::new();
+    M.get_or_init(|| {
+        let g = IntGauge::new(
+            "noetl_ehdb_crossstore_parity_lag_tolerance_seconds",
+            "The cross-store parity comparator's configured lag tolerance window in seconds; 0 \
+             means no tolerance (noetl/ai-meta#155).",
+        )
+        .expect("static gauge spec must be valid");
+        registry()
+            .register(Box::new(g.clone()))
+            .expect("gauge registration must succeed");
+        g
+    })
+}
+
+pub fn set_ehdb_crossstore_parity_lag_tolerance(seconds: u64) {
+    ehdb_crossstore_parity_lag_tolerance_seconds().set(seconds as i64);
+}
+
 pub fn add_ehdb_crossstore_pending(tier: &str, n: u64) {
     ehdb_crossstore_pending_total()
         .with_label_values(&[tier])
@@ -3376,6 +3409,7 @@ pub fn init_ehdb_crossstore_series() {
     ehdb_crossstore_pending_total()
         .with_label_values(&[TIER])
         .inc_by(0);
+    ehdb_crossstore_parity_lag_tolerance_seconds().set(0);
     ehdb_crossstore_events_compared_total()
         .with_label_values(&[TIER])
         .inc_by(0);
@@ -4425,6 +4459,7 @@ mod tests {
             // "this binary predates the window".
             "noetl_ehdb_crossstore_parity_total{outcome=\"pending_mirror\",tier=\"eventlog\"} 0",
             "noetl_ehdb_crossstore_pending_total{tier=\"eventlog\"} 0",
+            "noetl_ehdb_crossstore_parity_lag_tolerance_seconds 0",
             "noetl_ehdb_crossstore_control_total{control=\"lag_within_window\",result=\"expected\"} 0",
             "noetl_ehdb_crossstore_control_total{control=\"lag_beyond_window\",result=\"unexpected\"} 0",
         ] {
