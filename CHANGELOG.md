@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.84.0](https://github.com/noetl/server/compare/v3.83.1...v3.84.0) (2026-08-24)
+
+### Features
+
+* **ehdb:** mirror the orchestrator read model into the projection tier, and compare it ([f45f143](https://github.com/noetl/server/commit/f45f14357b4393fd68266f78ebf38caf6f260b06)), closes [ai-meta#265](https://github.com/noetl/ai-meta/issues/265) [#258](https://github.com/noetl/server/issues/258) [#235](https://github.com/noetl/server/issues/235) [#263](https://github.com/noetl/server/issues/263) [noetl/ai-meta#265](https://github.com/noetl/ai-meta/issues/265)
+
 ## [3.83.1](https://github.com/noetl/server/compare/v3.83.0...v3.83.1) (2026-08-19)
 
 ### Bug Fixes
