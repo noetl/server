@@ -3175,17 +3175,15 @@ async fn trigger_orchestrator_inner(
     //
     // The reasons are recorded in the order they are evaluated, and only one
     // fires per pass, so the labels sum to the number of passes.
-    let gate_outcome = if state.config.projector_owns_snapshot {
-        Some("skipped_projector_owns")
-    } else if total != Some(cache.applied_count) {
-        Some("skipped_unsettled")
-    } else if cache.last_event_id - cache.snapshot_version < SNAPSHOT_INTERVAL_EVENTS {
-        Some("skipped_interval")
-    } else if cache.state.is_none() {
-        Some("skipped_no_state")
-    } else {
-        None
-    };
+    let gate_outcome = snapshot_gate_outcome(
+        state.config.projector_owns_snapshot,
+        total,
+        cache.applied_count,
+        cache.last_event_id,
+        cache.snapshot_version,
+        SNAPSHOT_INTERVAL_EVENTS,
+        cache.state.is_some(),
+    );
     if let Some(outcome) = gate_outcome {
         crate::metrics::record_ehdb_projection_snapshot_gate(outcome);
     } else {
@@ -4944,5 +4942,120 @@ mod tests {
         assert!(decode_orchestrate_error(Some("not base64!!!")).is_none());
         let empty_err = base64::engine::general_purpose::STANDARD.encode(b"{\"error\":\"\"}");
         assert!(decode_orchestrate_error(Some(&empty_err)).is_none());
+    }
+}
+
+/// The orchestrator's snapshot-write gate, as a pure function
+/// (noetl/ai-meta#265 G4).
+///
+/// Extracted from `trigger_orchestrator_inner` so the coverage labels can be
+/// TESTED. The end-to-end path is not reachable in the kind gate — that cluster
+/// carries a large command backlog and its executions do not arrive here — and a
+/// counter that has never once fired is indistinguishable from a counter that
+/// cannot fire. Pinning the series at 0 proves it exists; these tests prove it
+/// would carry the right label.
+///
+/// `None` means the gate OPENS and a snapshot is written. Exactly one reason
+/// fires per pass, in evaluation order, so the labels sum to the number of
+/// passes and the ratio `written / total` is the tier's coverage denominator.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn snapshot_gate_outcome(
+    projector_owns_snapshot: bool,
+    total: Option<i64>,
+    applied_count: i64,
+    last_event_id: i64,
+    snapshot_version: i64,
+    interval: i64,
+    has_state: bool,
+) -> Option<&'static str> {
+    if projector_owns_snapshot {
+        Some("skipped_projector_owns")
+    } else if total != Some(applied_count) {
+        Some("skipped_unsettled")
+    } else if last_event_id - snapshot_version < interval {
+        Some("skipped_interval")
+    } else if !has_state {
+        Some("skipped_no_state")
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod snapshot_gate_tests {
+    use super::snapshot_gate_outcome;
+
+    /// The gate opens only when everything lines up.
+    ///
+    /// The positive control: without it every assertion below is satisfied by a
+    /// function that never opens, which would make the coverage denominator
+    /// read 0% forever and look like a finding about the platform.
+    #[test]
+    fn the_gate_opens_when_settled_and_past_the_interval() {
+        assert_eq!(
+            snapshot_gate_outcome(false, Some(10), 10, 1_000, 0, 500, true),
+            None
+        );
+    }
+
+    /// THE FINDING THIS COUNTER EXISTS FOR. A short execution never has its
+    /// throttled consistency COUNT land in the same pass, so `total` and
+    /// `applied_count` do not coincide and no snapshot is ever written — which
+    /// is why "0 divergences" over such a population means nothing.
+    #[test]
+    fn an_unsettled_pass_is_the_dominant_skip_on_short_executions() {
+        assert_eq!(
+            snapshot_gate_outcome(false, None, 13, 1_000, 0, 500, true),
+            Some("skipped_unsettled")
+        );
+        assert_eq!(
+            snapshot_gate_outcome(false, Some(12), 13, 1_000, 0, 500, true),
+            Some("skipped_unsettled")
+        );
+    }
+
+    #[test]
+    fn each_skip_reason_is_distinguishable() {
+        assert_eq!(
+            snapshot_gate_outcome(true, Some(10), 10, 1_000, 0, 500, true),
+            Some("skipped_projector_owns")
+        );
+        assert_eq!(
+            snapshot_gate_outcome(false, Some(10), 10, 100, 0, 500, true),
+            Some("skipped_interval")
+        );
+        assert_eq!(
+            snapshot_gate_outcome(false, Some(10), 10, 1_000, 0, 500, false),
+            Some("skipped_no_state")
+        );
+    }
+
+    /// Every label the gate can emit must be pinned, and nothing else.
+    ///
+    /// A pinned set that omits one value reintroduces the absent-series bug on
+    /// exactly that value while the rest read 0 and look complete.
+    #[test]
+    fn every_gate_label_is_pinned() {
+        let emitted = [
+            snapshot_gate_outcome(true, Some(1), 1, 1, 0, 1, true),
+            snapshot_gate_outcome(false, None, 1, 1, 0, 1, true),
+            snapshot_gate_outcome(false, Some(1), 1, 0, 0, 1, true),
+            snapshot_gate_outcome(false, Some(1), 1, 1, 0, 1, false),
+        ];
+        for e in emitted {
+            let label = e.expect("each of these inputs must skip");
+            assert!(
+                crate::metrics::EHDB_PROJECTION_SNAPSHOT_GATE_OUTCOMES.contains(&label),
+                "{label} is emitted by the gate but not pinned; its series would be \
+                 absent until it fires"
+            );
+        }
+        // …and `written`, the one the open path records.
+        assert!(crate::metrics::EHDB_PROJECTION_SNAPSHOT_GATE_OUTCOMES.contains(&"written"));
+        assert_eq!(
+            crate::metrics::EHDB_PROJECTION_SNAPSHOT_GATE_OUTCOMES.len(),
+            emitted.len() + 1,
+            "the pinned set must be exactly the four skips plus `written`"
+        );
     }
 }
