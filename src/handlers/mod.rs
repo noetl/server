@@ -15,6 +15,8 @@ pub mod ehdb;
 pub mod ehdb_eventlog_mirror;
 pub mod ehdb_eventlog_mirror_queue;
 pub mod ehdb_parity;
+pub mod ehdb_projection_mirror;
+pub mod ehdb_projection_parity;
 pub mod event_write;
 pub mod events;
 pub mod execute;

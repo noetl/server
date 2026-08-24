@@ -362,6 +362,19 @@ fn build_router(
     // `NOETL_EHDB_CROSSSTORE_PARITY_ENABLED` unset both routes answer 501 with
     // the reason.
     let ehdb_parity_routes = Router::new()
+        // ai-meta#265 — the projection tier's comparator. Its own paths rather
+        // than a `tier` path segment on the event log's: the two return
+        // different report shapes (versions and checksums, not events), and one
+        // endpoint that changed shape by segment would be a route a client has
+        // to branch on anyway.
+        .route(
+            "/api/ehdb/projection-parity/executions/{execution_id}",
+            get(handlers::ehdb_projection_parity::compare_execution_endpoint),
+        )
+        .route(
+            "/api/ehdb/projection-parity/self-test",
+            get(handlers::ehdb_projection_parity::self_test_endpoint),
+        )
         .route(
             "/api/ehdb/parity/executions/{execution_id}",
             get(handlers::ehdb_parity::compare_execution_endpoint),
@@ -789,6 +802,7 @@ async fn main() -> anyhow::Result<()> {
     noetl_server::metrics::init_ehdb_crossstore_series();
     noetl_server::metrics::init_ehdb_eventlog_mirror_series();
     noetl_server::metrics::init_ehdb_eventlog_mirror_queue_series();
+    noetl_server::metrics::init_ehdb_projection_series();
     noetl_server::metrics::init_result_tier_gc_series();
     noetl_server::metrics::init_credential_seal_series();
     noetl_server::metrics::init_system_plugin_seed_series();

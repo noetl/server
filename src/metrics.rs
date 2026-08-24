@@ -3392,6 +3392,114 @@ pub fn add_ehdb_crossstore_pending(tier: &str, n: u64) {
         .inc_by(n);
 }
 
+/// Counter: authoritative projection snapshots the server mirrored into the
+/// EHDB projection tier (noetl/ai-meta#265).
+///
+/// A separate family from the event log's, not a `tier` label on it: the two
+/// mirrors arm from different variables and cut over independently, and one
+/// family would make a dashboard panel for tier 1 silently start including
+/// tier 2.
+pub fn ehdb_projection_mirror_total() -> &'static IntCounterVec {
+    static M: OnceLock<IntCounterVec> = OnceLock::new();
+    M.get_or_init(|| {
+        let counter = IntCounterVec::new(
+            Opts::new(
+                "noetl_ehdb_projection_mirror_total",
+                "Authoritative orchestrator snapshots the SERVER mirrored into the EHDB \
+                 projection tier, by outcome (noetl/ai-meta#265).",
+            ),
+            &["outcome"],
+        )
+        .expect("static counter spec must be valid");
+        registry()
+            .register(Box::new(counter.clone()))
+            .expect("counter registration must succeed");
+        counter
+    })
+}
+
+/// Every outcome label the projection mirror can emit. Closed set, pinned at 0.
+pub const EHDB_PROJECTION_MIRROR_OUTCOMES: [&str; 4] =
+    ["mirrored", "unconfigured", "unavailable", "degraded"];
+
+pub fn record_ehdb_projection_mirror(outcome: &str) {
+    ehdb_projection_mirror_total()
+        .with_label_values(&[outcome])
+        .inc();
+}
+
+/// Counter: the projection comparator's own controls — its anti-vacuity signal.
+///
+/// A separate family from the event-log comparator's `control` counter because
+/// the two suites have different control names, and sharing would produce a
+/// family whose label set is the union of two closed sets — i.e. not closed, and
+/// half of it permanently 0 on each tier.
+pub fn ehdb_projection_control_total() -> &'static IntCounterVec {
+    static M: OnceLock<IntCounterVec> = OnceLock::new();
+    M.get_or_init(|| {
+        let counter = IntCounterVec::new(
+            Opts::new(
+                "noetl_ehdb_projection_control_total",
+                "Projection cross-store comparator self-controls: synthetic inputs with known \
+                 answers, by control and whether the comparator behaved (noetl/ai-meta#265).",
+            ),
+            &["control", "result"],
+        )
+        .expect("static counter spec must be valid");
+        registry()
+            .register(Box::new(counter.clone()))
+            .expect("counter registration must succeed");
+        counter
+    })
+}
+
+pub fn record_ehdb_projection_control(control: &str, result: &str) {
+    ehdb_projection_control_total()
+        .with_label_values(&[control, result])
+        .inc();
+}
+
+/// Materialise every projection-tier series at 0.
+///
+/// Unconditional, outside any config branch — a pin inside `if enabled` would
+/// leave exactly the disabled server, the one an operator checks before turning
+/// the mirror on, showing nothing.
+///
+/// The cross-store families are shared with the event log and already carry a
+/// `tier` label, so this seeds `tier="projection"` on each of them using the
+/// PROJECTION comparator's own enums. Reusing the event log's kind list would
+/// pin series this tier can never emit and leave its real ones absent.
+pub fn init_ehdb_projection_series() {
+    use crate::handlers::ehdb_projection_parity::{
+        CONTROL_NAMES, DIVERGENCE_KINDS, PARITY_OUTCOMES, TIER,
+    };
+    for outcome in EHDB_PROJECTION_MIRROR_OUTCOMES {
+        ehdb_projection_mirror_total()
+            .with_label_values(&[outcome])
+            .inc_by(0);
+    }
+    for outcome in PARITY_OUTCOMES {
+        ehdb_crossstore_parity_total()
+            .with_label_values(&[TIER, outcome.as_str()])
+            .inc_by(0);
+    }
+    for kind in DIVERGENCE_KINDS {
+        ehdb_crossstore_divergence_total()
+            .with_label_values(&[TIER, kind.as_str()])
+            .inc_by(0);
+    }
+    ehdb_crossstore_events_compared_total()
+        .with_label_values(&[TIER])
+        .inc_by(0);
+    for control in CONTROL_NAMES {
+        for result in ["expected", "unexpected"] {
+            ehdb_projection_control_total()
+                .with_label_values(&[control, result])
+                .inc_by(0);
+        }
+    }
+}
+
 pub fn init_ehdb_crossstore_series() {
     use crate::handlers::ehdb_parity::{
         CONTROL_NAMES, DIVERGENCE_KINDS, PARITY_OUTCOMES, TIER,
