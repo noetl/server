@@ -3163,29 +3163,55 @@ async fn trigger_orchestrator_inner(
     // it here and only reads it.  Default off → the orchestrator self-writes
     // exactly as block-b does.
     const SNAPSHOT_INTERVAL_EVENTS: i64 = 500;
-    if !state.config.projector_owns_snapshot
-        && total == Some(cache.applied_count)
-        && cache.last_event_id - cache.snapshot_version >= SNAPSHOT_INTERVAL_EVENTS
-    {
+    // noetl/ai-meta#265 G4 — the coverage denominator, recorded at the GATE.
+    //
+    // Measured: a 13-event execution completes and `noetl.projection_snapshot`
+    // gets no row, because `total == applied_count` requires a throttled
+    // consistency COUNT to have landed in this same pass and on a short
+    // execution the two never coincide. The projection tier can only hold what
+    // this gate lets through, so a shadow soak reporting "0 divergences" without
+    // knowing how often it opens is reporting about a population the mirror was
+    // never offered.
+    //
+    // The reasons are recorded in the order they are evaluated, and only one
+    // fires per pass, so the labels sum to the number of passes.
+    let gate_outcome = if state.config.projector_owns_snapshot {
+        Some("skipped_projector_owns")
+    } else if total != Some(cache.applied_count) {
+        Some("skipped_unsettled")
+    } else if cache.last_event_id - cache.snapshot_version < SNAPSHOT_INTERVAL_EVENTS {
+        Some("skipped_interval")
+    } else if cache.state.is_none() {
+        Some("skipped_no_state")
+    } else {
+        None
+    };
+    if let Some(outcome) = gate_outcome {
+        crate::metrics::record_ehdb_projection_snapshot_gate(outcome);
+    } else {
         let version = cache.last_event_id;
         let applied = cache.applied_count;
         let routing = cache.routing_meta.clone();
-        let saved = if let Some(ws) = cache.state.as_ref() {
-            crate::services::orch_snapshot::save(
-                pool,
-                execution_id,
-                version,
-                applied,
-                routing.as_ref(),
-                ws,
-            )
-            .await
-        } else {
-            Ok(())
-        };
+        let ws = cache.state.as_ref().expect("gate_outcome is None only with state");
+        let saved = crate::services::orch_snapshot::save(
+            pool,
+            execution_id,
+            version,
+            applied,
+            routing.as_ref(),
+            ws,
+        )
+        .await;
         match saved {
-            Ok(()) => cache.snapshot_version = version,
+            Ok(()) => {
+                cache.snapshot_version = version;
+                crate::metrics::record_ehdb_projection_snapshot_gate("written");
+            }
             Err(e) => {
+                // Not counted as `written`: the row does not exist, so the tier
+                // was never offered it either. Counting a failed save as
+                // coverage would inflate the denominator's numerator by exactly
+                // the executions most likely to diverge.
                 warn!(execution_id, %e, "orch_snapshot.save failed; continuing without snapshot")
             }
         }
