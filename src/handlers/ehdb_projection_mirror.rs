@@ -121,6 +121,8 @@ pub fn mirror_payload(
     applied_count: i64,
     checksum: &str,
     snapshot: &serde_json::Value,
+    updated_at: chrono::DateTime<chrono::Utc>,
+    routing_meta: Option<&serde_json::Value>,
 ) -> serde_json::Value {
     json!({
         // --- the comparator's identifying projection -------------------------
@@ -135,6 +137,25 @@ pub fn mirror_payload(
         "applied_count": applied_count,
         // --- the read model itself -------------------------------------------
         "snapshot": snapshot,
+        // --- what a READER needs that a comparator does not (#265 B1) --------
+        //
+        // `orch_snapshot::load_latest` returns both of these, and
+        // `handlers::events::rebuild_state` uses both. A tier record without
+        // them can be compared and cannot be served from, which is the
+        // difference #265 A4's `has_snapshot_body` was already tracking for the
+        // body itself.
+        //
+        // `updated_at` is the server's clock taken BEFORE the upsert, so it is
+        // at or before the `now()` Postgres stored. That direction is the safe
+        // one: the rebuild re-scans events with `created_at > updated_at -
+        // margin`, so an earlier timestamp WIDENS the straggler window. A later
+        // one would narrow it and could skip a straggler.
+        "updated_at": updated_at.to_rfc3339(),
+        // Carried because the `playbook_started` event predates every snapshot
+        // and is therefore never in the events-since window — a reader that
+        // lost it would lose pool-segment and trace routing for the whole
+        // execution.
+        "routing_meta": routing_meta,
         // Provenance. Without it, "the server mirror was rolled" and "something
         // else wrote this" are the same evidence after the fact.
         "mirror_source": "server",
@@ -156,12 +177,15 @@ fn relay_client() -> &'static reqwest::Client {
 /// write that did not happen.
 ///
 /// Never returns an error. See the module note on failure posture.
+#[allow(clippy::too_many_arguments)]
 pub async fn mirror_snapshot(
     execution_id: i64,
     version: i64,
     applied_count: i64,
     checksum: &str,
     snapshot: &serde_json::Value,
+    updated_at: chrono::DateTime<chrono::Utc>,
+    routing_meta: Option<&serde_json::Value>,
 ) {
     if !server_mirrors() {
         return;
@@ -189,7 +213,15 @@ pub async fn mirror_snapshot(
     // append does: writing where the comparator reads is then true by
     // construction rather than by two env vars agreeing.
     let url = format!("{}/ehdb/tiers/{TIER}", base.trim_end_matches('/'));
-    let record = mirror_payload(execution_id, version, applied_count, checksum, snapshot);
+    let record = mirror_payload(
+        execution_id,
+        version,
+        applied_count,
+        checksum,
+        snapshot,
+        updated_at,
+        routing_meta,
+    );
     let body = json!({
         "execution_id": execution_id.to_string(),
         "records": [record.to_string()],
@@ -265,7 +297,9 @@ mod tests {
         // over the wire rather than on the code that builds it. A record missing
         // `version` would be reported as a divergence on every healthy
         // execution, which is how a comparator teaches an operator to ignore it.
-        let p = mirror_payload(7, 991, 12, "abc123", &snap());
+        let when = chrono::Utc::now();
+        let routing = json!({"pool": "user"});
+        let p = mirror_payload(7, 991, 12, "abc123", &snap(), when, Some(&routing));
         assert_eq!(p["execution_id"], 7);
         assert_eq!(p["version"], 991);
         assert_eq!(p["checksum"], "abc123");
@@ -274,6 +308,11 @@ mod tests {
         assert_eq!(p["snapshot"], snap());
         assert_eq!(p["mirror_source"], "server");
         assert_eq!(p["aggregate_type"], "orchestrator_workflow_state");
+        // ...and what a READER needs on top of what a comparator needs (#265 B1).
+        // Without these two a record is comparable and unservable, and the
+        // difference is invisible until a read-serve arm demotes 100% of reads.
+        assert_eq!(p["updated_at"], when.to_rfc3339());
+        assert_eq!(p["routing_meta"], routing);
     }
 
     #[test]
@@ -282,7 +321,15 @@ mod tests {
         // the incumbent's, byte for byte. If a later edit recomputed it here,
         // the two sides would be derived by two code paths free to disagree —
         // and the comparator would then be checking this module against itself.
-        let p = mirror_payload(7, 1, 1, "not-a-real-sha-but-must-survive", &snap());
+        let p = mirror_payload(
+            7,
+            1,
+            1,
+            "not-a-real-sha-but-must-survive",
+            &snap(),
+            chrono::Utc::now(),
+            None,
+        );
         assert_eq!(p["checksum"], "not-a-real-sha-but-must-survive");
     }
 
@@ -320,9 +367,20 @@ mod tests {
     /// **Counting, not naming.** A test that listed the writers it already knew
     /// about is exactly the test that would have passed through #263. A second
     /// `INSERT` added anywhere in the service fails this instead.
+    /// Scans the **code half** of `orch_snapshot.rs`, excluding its test
+    /// module. That exclusion is not cosmetic: #265 B1 added a read-side guard
+    /// there whose own positive control asserts the real `INSERT` survives its
+    /// comment stripper — and that literal, sitting in the test module, made
+    /// this guard count two writers. One guard's positive control was another
+    /// guard's false positive, which is the fourth sighting of a source-counting
+    /// check counting text about code instead of code.
     #[test]
     fn the_snapshot_store_has_exactly_one_writer() {
-        let src = code_only(include_str!("../services/orch_snapshot.rs"));
+        let whole = include_str!("../services/orch_snapshot.rs");
+        let code_half = &whole[..whole
+            .find("mod tests {")
+            .expect("orch_snapshot.rs must still end with its test module")];
+        let src = code_only(code_half);
         // Positive control on the stripper: it must not have eaten the real
         // statement. Without this, a stripper bug would report 0 writers and the
         // assertion below would be satisfied by finding nothing.

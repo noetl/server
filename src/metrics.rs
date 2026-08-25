@@ -3498,6 +3498,120 @@ pub fn init_ehdb_projection_series() {
                 .inc_by(0);
         }
     }
+    // #265 B1 — the read path and the coverage denominator. Pinned from the
+    // modules' OWN enums, not from a copy of them, so a reason added there
+    // without a label here fails the guard test rather than going absent on
+    // exactly the value someone is checking.
+    for outcome in crate::handlers::ehdb_projection_read::READ_OUTCOMES {
+        ehdb_projection_read_total()
+            .with_label_values(&[outcome])
+            .inc_by(0);
+    }
+    for outcome in EHDB_PROJECTION_SNAPSHOT_GATE_OUTCOMES {
+        ehdb_projection_snapshot_gate_total()
+            .with_label_values(&[outcome])
+            .inc_by(0);
+    }
+}
+
+/// Counter: how each orchestrator snapshot read resolved (noetl/ai-meta#265 B1).
+///
+/// The read-serve counterpart of `ehdb_projection_mirror_total`. One label,
+/// `outcome`, whose closed set is `served_tier` + `disabled` + one value per
+/// demote reason.
+///
+/// **Every demote reason is its own label, deliberately.** A single `demoted`
+/// value would make the case that means "the tier is dangerous"
+/// (`version_ahead` — it claims to have folded an event that does not exist)
+/// indistinguishable from the case that means "nothing has been mirrored for
+/// this execution yet" (`missing`), which on a freshly armed mirror is every
+/// execution. Those two want opposite operator responses.
+pub fn ehdb_projection_read_total() -> &'static IntCounterVec {
+    static M: OnceLock<IntCounterVec> = OnceLock::new();
+    M.get_or_init(|| {
+        let counter = IntCounterVec::new(
+            Opts::new(
+                "noetl_ehdb_projection_read_total",
+                "Orchestrator snapshot reads by how they resolved: served from the EHDB \
+                 projection tier, or demoted to noetl.projection_snapshot with a reason \
+                 (noetl/ai-meta#265).",
+            ),
+            &["outcome"],
+        )
+        .expect("static counter spec must be valid");
+        registry()
+            .register(Box::new(counter.clone()))
+            .expect("counter registration must succeed");
+        counter
+    })
+}
+
+pub fn record_ehdb_projection_read(outcome: &str) {
+    ehdb_projection_read_total()
+        .with_label_values(&[outcome])
+        .inc();
+}
+
+/// Counter: what the orchestrator's snapshot-write gate decided
+/// (noetl/ai-meta#265 G4) — **the coverage denominator**.
+///
+/// This exists because of a measured finding: a 13-event execution completes
+/// and `noetl.projection_snapshot` gets **no row**. The orchestrator's
+/// self-write needs a throttled consistency COUNT to have landed in the same
+/// pass (`total == Some(applied_count)`), and on a short execution the two never
+/// coincide. So the projection tier can only ever hold what the incumbent
+/// wrote, and the incumbent writes sparsely.
+///
+/// Without a denominator, a shadow soak reporting "0 divergences" is reporting
+/// about a population the mirror was never offered — the vacuous pass this whole
+/// design was shaped to avoid. This counter is that denominator: `written`
+/// against the `skipped_*` reasons is the fraction of eligible passes that ever
+/// produced a row to mirror.
+///
+/// Counted at the **gate**, not at the writer, because the writer by definition
+/// only sees the passes that got through.
+pub fn ehdb_projection_snapshot_gate_total() -> &'static IntCounterVec {
+    static M: OnceLock<IntCounterVec> = OnceLock::new();
+    M.get_or_init(|| {
+        let counter = IntCounterVec::new(
+            Opts::new(
+                "noetl_ehdb_projection_snapshot_gate_total",
+                "Orchestrator snapshot-write decisions by outcome; `written` over the total is \
+                 the projection tier's coverage denominator (noetl/ai-meta#265).",
+            ),
+            &["outcome"],
+        )
+        .expect("static counter spec must be valid");
+        registry()
+            .register(Box::new(counter.clone()))
+            .expect("counter registration must succeed");
+        counter
+    })
+}
+
+/// Every snapshot-gate outcome. Closed set, pinned at 0.
+///
+/// * `written` — the gate passed and a row was upserted.
+/// * `skipped_unsettled` — the consistency COUNT had not landed in this pass
+///   (`total != applied_count`). **The dominant one on short executions**, and
+///   the finding that gates any soak.
+/// * `skipped_interval` — settled, but fewer than the snapshot interval's worth
+///   of ids since the last one.
+/// * `skipped_projector_owns` — the projector owns the snapshot in this
+///   deployment, so the orchestrator does not write it.
+/// * `skipped_no_state` — nothing folded to write.
+pub const EHDB_PROJECTION_SNAPSHOT_GATE_OUTCOMES: [&str; 5] = [
+    "written",
+    "skipped_unsettled",
+    "skipped_interval",
+    "skipped_projector_owns",
+    "skipped_no_state",
+];
+
+pub fn record_ehdb_projection_snapshot_gate(outcome: &str) {
+    ehdb_projection_snapshot_gate_total()
+        .with_label_values(&[outcome])
+        .inc();
 }
 
 pub fn init_ehdb_crossstore_series() {
