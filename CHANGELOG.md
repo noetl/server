@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.86.0](https://github.com/noetl/server/compare/v3.85.0...v3.86.0) (2026-08-25)
+
+### Features
+
+* **ehdb:** take the projection mirror off the write path, and pair it with the window that makes it safe ([16c489b](https://github.com/noetl/server/commit/16c489bc2722f21da4a996ff6e55fcab2ada890e)), closes [noetl/ai-meta#265](https://github.com/noetl/ai-meta/issues/265) [#155](https://github.com/noetl/server/issues/155) [#155](https://github.com/noetl/server/issues/155) [#155](https://github.com/noetl/server/issues/155) [server#354](https://github.com/noetl/server/issues/354) [ai-meta#264](https://github.com/noetl/ai-meta/issues/264) [noetl/ai-meta#265](https://github.com/noetl/ai-meta/issues/265)
+
 ## [3.85.0](https://github.com/noetl/server/compare/v3.84.0...v3.85.0) (2026-08-25)
 
 ### Features
