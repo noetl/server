@@ -169,12 +169,31 @@ fn relay_client() -> &'static reqwest::Client {
     C.get_or_init(reqwest::Client::new)
 }
 
+/// One snapshot on its way to the tier.
+///
+/// Carries the already-rendered record rather than its seven inputs, so the
+/// queue holds a value that cannot be re-derived differently later. `enqueued_at`
+/// is what the lag histogram measures against — the delay this module can be
+/// blamed for starts when the snapshot is accepted, not when it is built.
+#[derive(Debug, Clone)]
+pub struct SnapshotMirror {
+    pub execution_id: i64,
+    pub version: i64,
+    pub record: String,
+    pub enqueued_at: std::time::Instant,
+}
+
 /// Mirror one authoritative snapshot into the projection tier.
 ///
 /// Called from inside [`crate::services::orch_snapshot::save`], **after** its
 /// upsert has succeeded — so a snapshot that failed to become authoritative is
 /// never mirrored, and the tier can never be ahead of the incumbent by way of a
 /// write that did not happen.
+///
+/// With `NOETL_EHDB_PROJECTION_MIRROR_ASYNC` off this delivers inline, exactly
+/// as it did before ai-meta#265 G3. On, it hands the snapshot to the queue and
+/// returns — which is the whole point, since `save` is called from the
+/// orchestrator's own trigger path.
 ///
 /// Never returns an error. See the module note on failure posture.
 #[allow(clippy::too_many_arguments)]
@@ -190,6 +209,39 @@ pub async fn mirror_snapshot(
     if !server_mirrors() {
         return;
     }
+    let record = mirror_payload(
+        execution_id,
+        version,
+        applied_count,
+        checksum,
+        snapshot,
+        updated_at,
+        routing_meta,
+    )
+    .to_string();
+    let m = SnapshotMirror {
+        execution_id,
+        version,
+        record,
+        enqueued_at: std::time::Instant::now(),
+    };
+    if super::ehdb_projection_mirror_queue::enabled() {
+        super::ehdb_projection_mirror_queue::submit(m).await;
+    } else {
+        deliver(&m).await;
+    }
+}
+
+/// The relay POST itself.
+///
+/// Split out from [`mirror_snapshot`] so the queue's drain task delivers
+/// through the **same** code the inline path uses. Two delivery
+/// implementations — one inline, one drained — is how a queue quietly acquires
+/// a different failure taxonomy from the path it replaced, and then an operator
+/// reads the wrong runbook.
+pub(crate) async fn deliver(m: &SnapshotMirror) {
+    let execution_id = m.execution_id;
+    let version = m.version;
     let Some(base) = std::env::var(crate::handlers::ehdb::WORKER_QUERY_URL_ENV)
         .ok()
         .map(|s| s.trim().to_string())
@@ -213,18 +265,9 @@ pub async fn mirror_snapshot(
     // append does: writing where the comparator reads is then true by
     // construction rather than by two env vars agreeing.
     let url = format!("{}/ehdb/tiers/{TIER}", base.trim_end_matches('/'));
-    let record = mirror_payload(
-        execution_id,
-        version,
-        applied_count,
-        checksum,
-        snapshot,
-        updated_at,
-        routing_meta,
-    );
     let body = json!({
         "execution_id": execution_id.to_string(),
-        "records": [record.to_string()],
+        "records": [m.record],
     });
 
     let resp = relay_client()
@@ -269,6 +312,13 @@ pub async fn mirror_snapshot(
                 );
             } else if status.is_success() {
                 crate::metrics::record_ehdb_projection_mirror("mirrored");
+                // Seconds from acceptance to durable in the tier. THE number the
+                // comparator's lag tolerance is checked against: the window is a
+                // promise about how long this can take, and without the
+                // histogram it would be an assumption.
+                crate::metrics::observe_ehdb_projection_mirror_lag(
+                    m.enqueued_at.elapsed().as_secs_f64(),
+                );
             } else {
                 let detail = r.text().await.unwrap_or_default();
                 crate::metrics::record_ehdb_projection_mirror("degraded");

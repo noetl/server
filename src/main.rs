@@ -911,6 +911,16 @@ async fn main() -> anyhow::Result<()> {
     // says whether this process is async is true from the first scrape rather
     // than from the first mirrored event.
     handlers::ehdb_eventlog_mirror_queue::init();
+    // #265 G3 — the projection tier's own queue, with its own window. Passed
+    // the tolerance rather than reading it inside, so the pairing check is a
+    // pure function the tests can drive without a process. Publishing the
+    // window here too means the running value is readable off /metrics instead
+    // of off the Deployment spec, which is a different representation and can
+    // disagree with what the process actually parsed.
+    let projection_lag_tolerance =
+        handlers::ehdb_projection_parity::parity_lag_tolerance_secs();
+    noetl_server::metrics::set_ehdb_projection_parity_lag_tolerance(projection_lag_tolerance);
+    handlers::ehdb_projection_mirror_queue::init(projection_lag_tolerance);
     // Publish the comparator's window so the ops alert reads the configured
     // value instead of a copy of it (noetl/ai-meta#155).
     noetl_server::metrics::set_ehdb_crossstore_parity_lag_tolerance(
@@ -1110,6 +1120,9 @@ async fn main() -> anyhow::Result<()> {
     // divergence on a `primary`-serving tier with nothing pointing at the cause
     // (noetl/ai-meta#155). Bounded, and a no-op when the queue is disabled.
     noetl_server::handlers::ehdb_eventlog_mirror_queue::flush_on_shutdown().await;
+    // A snapshot still queued at exit never reaches the tier, and the
+    // comparator reports it as a divergence for as long as the row lives.
+    noetl_server::handlers::ehdb_projection_mirror_queue::flush().await;
 
     tracing::info!("Server shutdown complete");
 

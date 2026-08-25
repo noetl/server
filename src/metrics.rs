@@ -3512,6 +3512,30 @@ pub fn init_ehdb_projection_series() {
             .with_label_values(&[outcome])
             .inc_by(0);
     }
+    // #265 G3 — the async mirror queue. Pinned UNCONDITIONALLY, outside any
+    // config branch: server#315 pinned the event log's publish-skip reasons
+    // inside `if event_bus_mode.publishes_ehdb()` and left them absent on
+    // exactly the configuration whose reason someone would be reading. The
+    // configuration an operator checks before turning this on is the one with
+    // it off.
+    for outcome in EHDB_PROJECTION_MIRROR_QUEUE_OUTCOMES {
+        ehdb_projection_mirror_queue_total()
+            .with_label_values(&[outcome])
+            .inc_by(0);
+    }
+    ehdb_projection_mirror_pending().set(0);
+    ehdb_projection_mirror_queue_depth().set(0);
+    ehdb_projection_mirror_async_enabled().set(0);
+    // An unlabelled Histogram is a family with one child, so it is not pruned;
+    // observing nothing leaves every bucket at 0, which is what it should read.
+    let _ = ehdb_projection_mirror_lag_seconds();
+    // The pending counter is the shared cross-store family, so the projection
+    // tier's series must be seeded too — otherwise `{tier="projection"}` is
+    // absent until the first held-back verdict, and absent reads as "this build
+    // has no tolerance window".
+    ehdb_crossstore_pending_total()
+        .with_label_values(&[TIER])
+        .inc_by(0);
 }
 
 /// Counter: how each orchestrator snapshot read resolved (noetl/ai-meta#265 B1).
@@ -3612,6 +3636,184 @@ pub fn record_ehdb_projection_snapshot_gate(outcome: &str) {
     ehdb_projection_snapshot_gate_total()
         .with_label_values(&[outcome])
         .inc();
+}
+
+/// Counter: what happened to a snapshot when it was handed to the projection
+/// mirror queue (noetl/ai-meta#265 G3).
+///
+/// A **second** family rather than more labels on `ehdb_projection_mirror_total`.
+/// That one answers "did the tier receive what the incumbent stored", counted at
+/// delivery; an `enqueued` label on it would be counted twice for every snapshot
+/// — once on enqueue, once on delivery — and destroy the only number that
+/// answers the coverage question. This family answers a different one: is the
+/// queue absorbing the load, or pushing back?
+pub fn ehdb_projection_mirror_queue_total() -> &'static IntCounterVec {
+    static M: OnceLock<IntCounterVec> = OnceLock::new();
+    M.get_or_init(|| {
+        let counter = IntCounterVec::new(
+            Opts::new(
+                "noetl_ehdb_projection_mirror_queue_total",
+                "Authoritative snapshots by how the async projection mirror queue handled \
+                 them (noetl/ai-meta#265 G3).",
+            ),
+            &["outcome"],
+        )
+        .expect("static counter spec must be valid");
+        registry()
+            .register(Box::new(counter.clone()))
+            .expect("counter registration must succeed");
+        counter
+    })
+}
+
+/// Every queue outcome. Closed set, pinned at 0.
+///
+/// * `enqueued` — accepted immediately.
+/// * `enqueued_after_wait` — the queue was full and the writer **waited** for
+///   room. Backpressure working: nothing lost, order preserved. Its rate is the
+///   signal that the drain is falling behind.
+/// * `queue_full_inline` — full past the enqueue timeout, so the snapshot was
+///   mirrored inline. Still no drop, but this is the one path that can deliver
+///   out of order relative to snapshots still queued for the same execution, so
+///   it is its own label and it is what an alert fires on.
+/// * `queue_closed_inline` — no drain task. Mirrored inline; the pre-G3 path.
+/// * `drained` — delivered by the drain task. The terminal success label.
+/// * `shutdown_abandoned` — still queued when the process finished its flush.
+///   These never reached the tier and WILL show as a projection divergence; the
+///   label exists so the cause is attributable rather than a mystery an hour later.
+pub const EHDB_PROJECTION_MIRROR_QUEUE_OUTCOMES: [&str; 6] = [
+    "enqueued",
+    "enqueued_after_wait",
+    "queue_full_inline",
+    "queue_closed_inline",
+    "drained",
+    "shutdown_abandoned",
+];
+
+pub fn record_ehdb_projection_mirror_queue(outcome: &str) {
+    ehdb_projection_mirror_queue_total()
+        .with_label_values(&[outcome])
+        .inc();
+}
+
+/// Histogram: seconds from acceptance to durable in the projection tier.
+///
+/// **The metric the comparator's lag tolerance is checked against.** The window
+/// tells the comparator to forgive a tier that is behind by less than N seconds;
+/// that is a promise about how long this can take, and without the histogram it
+/// would be an assumption. Buckets run to 60 s so a breach of a large window is
+/// still visible — a histogram topping out below the tolerance cannot show one.
+pub fn ehdb_projection_mirror_lag_seconds() -> &'static Histogram {
+    static M: OnceLock<Histogram> = OnceLock::new();
+    M.get_or_init(|| {
+        let hist = Histogram::with_opts(
+            HistogramOpts::new(
+                "noetl_ehdb_projection_mirror_lag_seconds",
+                "Seconds from a snapshot being accepted for the projection mirror to it \
+                 being durable in the tier (noetl/ai-meta#265 G3).",
+            )
+            .buckets(vec![
+                0.005, 0.010, 0.025, 0.050, 0.100, 0.250, 0.500, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0,
+            ]),
+        )
+        .expect("static histogram spec must be valid");
+        registry()
+            .register(Box::new(hist.clone()))
+            .expect("histogram registration must succeed");
+        hist
+    })
+}
+
+pub fn observe_ehdb_projection_mirror_lag(seconds: f64) {
+    ehdb_projection_mirror_lag_seconds().observe(seconds);
+}
+
+/// Gauge: snapshots accepted for the mirror and not yet durable.
+///
+/// The coverage number for the queue. `mirror_lag_seconds` only records
+/// snapshots that MADE it, so a queue that has stopped draining publishes no
+/// observations at all — its histogram goes quiet, which reads exactly like an
+/// idle healthy system. This gauge is what distinguishes the two.
+pub fn ehdb_projection_mirror_pending() -> &'static IntGauge {
+    static M: OnceLock<IntGauge> = OnceLock::new();
+    M.get_or_init(|| {
+        let g = IntGauge::new(
+            "noetl_ehdb_projection_mirror_pending_snapshots",
+            "Snapshots accepted for the async projection mirror and not yet durable in the \
+             tier (noetl/ai-meta#265 G3).",
+        )
+        .expect("static gauge spec must be valid");
+        registry()
+            .register(Box::new(g.clone()))
+            .expect("gauge registration must succeed");
+        g
+    })
+}
+
+/// Gauge: snapshots sitting on the queue.
+pub fn ehdb_projection_mirror_queue_depth() -> &'static IntGauge {
+    static M: OnceLock<IntGauge> = OnceLock::new();
+    M.get_or_init(|| {
+        let g = IntGauge::new(
+            "noetl_ehdb_projection_mirror_queue_depth",
+            "Snapshots currently on the async projection mirror queue (noetl/ai-meta#265 G3).",
+        )
+        .expect("static gauge spec must be valid");
+        registry()
+            .register(Box::new(g.clone()))
+            .expect("gauge registration must succeed");
+        g
+    })
+}
+
+/// Gauge: 1 when the async projection mirror is ARMED in this process, 0 otherwise.
+///
+/// Reads 0 in three distinguishable-by-log situations: the flag is off, the flag
+/// is on but the drain never started, and the flag is on but the pairing check
+/// REFUSED it (async with a zero tolerance window). Without this gauge all three
+/// look like an idle queue, and the third — the one that means someone set half
+/// a pair — is the one worth finding.
+pub fn ehdb_projection_mirror_async_enabled() -> &'static IntGauge {
+    static M: OnceLock<IntGauge> = OnceLock::new();
+    M.get_or_init(|| {
+        let g = IntGauge::new(
+            "noetl_ehdb_projection_mirror_async_enabled",
+            "1 when the async projection mirror queue is armed in this process, 0 when the \
+             mirror is inline or the pairing check refused to arm it (noetl/ai-meta#265 G3).",
+        )
+        .expect("static gauge spec must be valid");
+        registry()
+            .register(Box::new(g.clone()))
+            .expect("gauge registration must succeed");
+        g
+    })
+}
+
+/// Gauge: the PROJECTION comparator's configured lag tolerance, in seconds.
+///
+/// Its own gauge rather than a reading of the event log's: the two windows are
+/// separate variables that cut over independently, and one gauge would make an
+/// alert for tier 1 silently start reading tier 2's tuning. Published so a rule
+/// does not have to hardcode the threshold — a number copied into PromQL is a
+/// representation of an env var, true until someone tunes one side.
+pub fn ehdb_projection_parity_lag_tolerance_seconds() -> &'static IntGauge {
+    static M: OnceLock<IntGauge> = OnceLock::new();
+    M.get_or_init(|| {
+        let g = IntGauge::new(
+            "noetl_ehdb_projection_parity_lag_tolerance_seconds",
+            "The projection cross-store comparator's configured lag tolerance in seconds; 0 \
+             means no tolerance (noetl/ai-meta#265 G3).",
+        )
+        .expect("static gauge spec must be valid");
+        registry()
+            .register(Box::new(g.clone()))
+            .expect("gauge registration must succeed");
+        g
+    })
+}
+
+pub fn set_ehdb_projection_parity_lag_tolerance(seconds: u64) {
+    ehdb_projection_parity_lag_tolerance_seconds().set(seconds as i64);
 }
 
 pub fn init_ehdb_crossstore_series() {

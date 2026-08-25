@@ -653,11 +653,22 @@ pub enum ParityOutcome {
     Truncated,
     /// The comparator is switched off.
     Disabled,
+    /// The tier is behind or absent, AND the incumbent row is younger than the
+    /// configured lag-tolerance window — so the async mirror has not had its
+    /// promised time yet and the comparison was **not taken**
+    /// (noetl/ai-meta#265 G3).
+    ///
+    /// A distinct outcome and not a `match`, because an untaken comparison is
+    /// not agreement: scoring it `match` would publish a healthy parity rate
+    /// for a comparator that compared nothing. And not a `divergent`, because
+    /// it names a state the async mirror is *supposed* to pass through.
+    PendingMirror,
 }
 
 impl ParityOutcome {
     pub fn as_str(&self) -> &'static str {
         match self {
+            Self::PendingMirror => "pending_mirror",
             Self::Match => "match",
             Self::Divergent => "divergent",
             Self::NoAuthoritative => "no_authoritative",
@@ -671,7 +682,8 @@ impl ParityOutcome {
     }
 }
 
-pub const PARITY_OUTCOMES: [ParityOutcome; 9] = [
+pub const PARITY_OUTCOMES: [ParityOutcome; 10] = [
+    ParityOutcome::PendingMirror,
     ParityOutcome::Match,
     ParityOutcome::Divergent,
     ParityOutcome::NoAuthoritative,
@@ -700,6 +712,51 @@ pub struct ComparisonResult {
     pub snapshot_age_seconds: Option<i64>,
     /// Which store answered the tier read, as the worker reported it.
     pub tier_source: Option<String>,
+}
+
+/// `NOETL_EHDB_PROJECTION_PARITY_LAG_TOLERANCE_SECS` — how long the comparator
+/// forgives a tier that is merely BEHIND (noetl/ai-meta#265 G3).
+///
+/// **Default 0**, i.e. no tolerance, which is correct for a synchronous mirror:
+/// with the mirror inline the tier is durable before `save` returns, so a tier
+/// that is behind is genuinely behind. The window exists for the async mirror,
+/// and the two are a pair — `ehdb_projection_mirror_queue::refusal_reason`
+/// refuses to arm the queue while this is 0, because an async mirror judged
+/// with no tolerance manufactures the exact alert the tier exists to make
+/// trustworthy.
+///
+/// The window forgives **only lateness**. A tier ahead of the event log, or one
+/// whose content disagrees at the same version, is divergent at any age — see
+/// [`tolerable`].
+pub const PARITY_LAG_TOLERANCE_ENV: &str = "NOETL_EHDB_PROJECTION_PARITY_LAG_TOLERANCE_SECS";
+
+pub fn parity_lag_tolerance_secs() -> u64 {
+    std::env::var(PARITY_LAG_TOLERANCE_ENV)
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
+/// Whether a report describes lateness ONLY, and is therefore forgivable inside
+/// the window.
+///
+/// **Pure, and the whole safety argument of the tolerance window.** A window
+/// that forgave any divergence would be a comparator taught to look away; this
+/// one forgives exactly the two shapes an in-flight snapshot produces — the tier
+/// has nothing for the execution yet, or it holds an older revision.
+///
+/// Every other kind stays divergent at any age. `ahead_version` in particular:
+/// a tier ahead of the incumbent cannot be explained by a mirror that has not
+/// caught up, so forgiving it inside the window would hide the one divergence
+/// class that means "serving this would be wrong".
+pub fn tolerable(report: &CrossStoreReport) -> bool {
+    !report.divergences.is_empty()
+        && report.divergences.iter().all(|d| {
+            matches!(
+                d.kind,
+                DivergenceKind::MissingExecution | DivergenceKind::StaleVersion
+            )
+        })
 }
 
 /// `NOETL_EHDB_PROJECTION_PARITY_ENABLED` — the comparator's own switch.
@@ -912,19 +969,46 @@ pub async fn compare_execution(state: &AppState, execution_id: i64) -> Compariso
     }
 
     let report = compare_cross_store(&auth, &records);
+    // The lag window (#265 G3). Applied to the SCORE, never to the comparison:
+    // the report is computed identically either way, so what the window changes
+    // is whether the verdict is taken, not what it would have said.
+    let tolerance = parity_lag_tolerance_secs();
+    let within_window = tolerance > 0
+        && auth.age_seconds >= 0
+        && (auth.age_seconds as u64) < tolerance;
     let outcome = if report.holds {
         ParityOutcome::Match
+    } else if within_window && tolerable(&report) {
+        ParityOutcome::PendingMirror
     } else {
         ParityOutcome::Divergent
     };
     crate::metrics::record_ehdb_crossstore_parity(TIER, outcome.as_str());
-    for kind in report.kinds() {
-        crate::metrics::record_ehdb_crossstore_divergence(TIER, kind);
+    // AN UNTAKEN COMPARISON PUBLISHES NO DIVERGENCE EVIDENCE.
+    //
+    // `pending_mirror` means the report describes a comparison that was not
+    // taken, so recording its kinds would move `crossstore_divergence_total` —
+    // the counter the paging rule reads — for a verdict that is explicitly not a
+    // divergence. server#354 is the record of this exact mistake on tier 1:
+    // probing an in-flight execution through the on-demand endpoint left
+    // `{kind="count"} 1` behind, which is ai-meta#264 — investigating with the
+    // endpoint inflates the counter its own alert reads, invisibly.
+    if outcome == ParityOutcome::Divergent {
+        for kind in report.kinds() {
+            crate::metrics::record_ehdb_crossstore_divergence(TIER, kind);
+        }
+    }
+    if outcome == ParityOutcome::PendingMirror {
+        // The window's COST, published. `divergence_total == 0` under a
+        // tolerance window means "the comparable executions agreed"; this says
+        // how much was not comparable, and it is the difference between a clean
+        // verdict and a comparator that has been taught to look away.
+        crate::metrics::add_ehdb_crossstore_pending(TIER, 1);
     }
     if report.holds {
         crate::metrics::add_ehdb_crossstore_events_compared(TIER, 1);
     }
-    if !report.holds {
+    if !report.holds && outcome == ParityOutcome::Divergent {
         warn!(
             target: "noetl_server::ehdb_projection_parity",
             execution_id,
@@ -997,6 +1081,94 @@ mod tests {
         assert_eq!(r.tier_records, 3);
     }
 
+
+    /// The lag window forgives LATENESS ONLY.
+    ///
+    /// This is the whole safety argument of #265 G3, so it is driven through
+    /// the same `compare_cross_store` the live path uses, on the same fixtures
+    /// the controls use — not against a hand-built report that could be shaped
+    /// to agree.
+    ///
+    /// Two-sided by construction: `tolerable` must be TRUE for the two shapes
+    /// an in-flight snapshot produces and FALSE for every other kind. A
+    /// `tolerable` that returned true unconditionally would be a comparator
+    /// taught to look away, and it would pass a one-sided test.
+    #[test]
+    fn the_lag_window_forgives_only_lateness() {
+        let (auth, base) = control_fixtures();
+
+        // Forgivable: the tier holds nothing for this execution yet.
+        let empty = compare_cross_store(&auth, &[]);
+        assert!(!empty.holds);
+        assert!(
+            tolerable(&empty),
+            "an empty tier is what an un-drained queue looks like: {:?}",
+            empty.kinds()
+        );
+
+        // Forgivable: the tier holds an older revision — the queue has the
+        // newest one and has not delivered it yet.
+        let mut behind = base.clone();
+        behind.pop();
+        let r = compare_cross_store(&auth, &behind);
+        assert!(!r.holds);
+        assert!(
+            tolerable(&r),
+            "a tier one revision behind is what an in-flight snapshot looks like: {:?}",
+            r.kinds()
+        );
+
+        // NOT forgivable at any age: a tier AHEAD of the incumbent. A mirror
+        // that has not caught up cannot produce this, and it is the one class
+        // that means serving would be wrong. Built with the SAME closure the
+        // control suite uses, so this cannot drift from what the comparator
+        // proves it can detect.
+        let mut ahead = base.clone();
+        ahead.push(control_record(4, 9_900, "dddd", 99));
+        let r = compare_cross_store(&auth, &ahead);
+        assert!(!r.holds);
+        assert!(
+            !tolerable(&r),
+            "an AHEAD tier must never be forgiven by a lag window: {:?}",
+            r.kinds()
+        );
+
+        // NOT forgivable: same version, different content.
+        let mut corrupt = base.clone();
+        let last = corrupt.len() - 1;
+        corrupt[last] = control_record(3, 9_003, "deadbeefdeadbeef", 12);
+        let r = compare_cross_store(&auth, &corrupt);
+        assert!(!r.holds);
+        assert!(
+            !tolerable(&r),
+            "a content disagreement is not lateness: {:?}",
+            r.kinds()
+        );
+
+        // And the degenerate case: a report with NO divergences is not
+        // "tolerable", it is a match. Without this, `tolerable` returning true
+        // on a clean report would turn every healthy comparison into
+        // `pending_mirror` and publish a parity rate of zero.
+        let clean = compare_cross_store(&auth, &base);
+        assert!(clean.holds);
+        assert!(!tolerable(&clean), "a clean report is a match, not a pending one");
+    }
+
+    /// The window is off by default, and reads the variable it documents.
+    #[test]
+    fn the_lag_tolerance_defaults_to_zero() {
+        // Zero is the correct default for a SYNCHRONOUS mirror: the tier is
+        // durable before `save` returns, so a tier that is behind is genuinely
+        // behind and nothing should be forgiven.
+        assert_eq!(PARITY_LAG_TOLERANCE_ENV, "NOETL_EHDB_PROJECTION_PARITY_LAG_TOLERANCE_SECS");
+        assert!(PARITY_OUTCOMES.iter().any(|o| o.as_str() == "pending_mirror"));
+        assert_eq!(
+            PARITY_OUTCOMES.len(),
+            10,
+            "pending_mirror must be pinned, or its series is absent until the first \
+             held-back verdict and absence reads as 'this build has no window'"
+        );
+    }
     #[test]
     fn every_control_discriminates() {
         // The anti-vacuity check, run as a test as well as in the binary: if a
