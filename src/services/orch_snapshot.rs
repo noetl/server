@@ -167,6 +167,7 @@ pub async fn load_latest(pool: &DbPool, execution_id: i64) -> AppResult<Option<L
         opt.as_ref().map(|s| tier_read::IncumbentFacts {
             version: s.version,
             checksum: s.checksum.clone(),
+            updated_at: s.updated_at,
         })
     });
 

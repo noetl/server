@@ -196,8 +196,22 @@ pub enum DemoteReason {
     /// The tier's version exceeds the highest `event_id` the execution has.
     /// **The dangerous case**: serving it would skip events.
     VersionAhead,
-    /// `verify` mode only: the tier is behind the incumbent.
+    /// `verify` mode only: the tier is behind the incumbent, and the incumbent
+    /// row is OLDER than the comparator's lag-tolerance window — so the async
+    /// mirror has had its promised time and has not caught up.
     StaleVersion,
+    /// `verify` mode only: the tier is behind, but the incumbent row is younger
+    /// than the lag-tolerance window (noetl/ai-meta#265 G3).
+    ///
+    /// **Not a fault**, and that distinction is what keeps "abort if any
+    /// fault-class counter moves" a usable cutover rule once the async mirror
+    /// is armed. With an async mirror a transiently-behind tier is the system
+    /// working, and folding it into `stale_version` would make the rule fire on
+    /// every rollout — which is how an abort condition gets ignored.
+    ///
+    /// The read still demotes. Serving is not the question; whether anyone
+    /// should be paged is.
+    StaleWithinWindow,
     /// `verify` mode only: same version, different checksum.
     Divergent,
     /// The snapshot body does not deserialise into a `WorkflowState`.
@@ -226,6 +240,7 @@ impl DemoteReason {
             Self::NoBody => "no_body",
             Self::VersionAhead => "version_ahead",
             Self::StaleVersion => "stale_version",
+            Self::StaleWithinWindow => "stale_within_window",
             Self::Divergent => "divergent",
             Self::Undeserialisable => "undeserialisable",
             Self::NoIncumbent => "no_incumbent",
@@ -240,7 +255,7 @@ impl DemoteReason {
     pub fn is_fault(self) -> bool {
         !matches!(
             self,
-            Self::Missing | Self::Unconfigured | Self::NoIncumbent
+            Self::Missing | Self::Unconfigured | Self::NoIncumbent | Self::StaleWithinWindow
         )
     }
 }
@@ -251,7 +266,7 @@ impl DemoteReason {
 /// as a set so an absent series means "this binary predates the metric" rather
 /// than "this case has not happened" — `Registry::gather` prunes empty families,
 /// so absence is the default state of every labelled metric here.
-pub const READ_OUTCOMES: [&str; 13] = [
+pub const READ_OUTCOMES: [&str; 14] = [
     "served_tier",
     "disabled",
     "unconfigured",
@@ -265,6 +280,7 @@ pub const READ_OUTCOMES: [&str; 13] = [
     "divergent",
     "undeserialisable",
     "no_incumbent",
+    "stale_within_window",
 ];
 
 /// The identifying facts of the incumbent row, for `verify` mode.
@@ -276,6 +292,10 @@ pub const READ_OUTCOMES: [&str; 13] = [
 pub struct IncumbentFacts {
     pub version: i64,
     pub checksum: Option<String>,
+    /// When the incumbent row was written. Used ONLY to decide whether a
+    /// behind-tier is inside the lag-tolerance window; never to decide whether
+    /// to serve.
+    pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// What the tier read produced.
@@ -323,6 +343,8 @@ fn decide(
     records: &[Candidate],
     max_event_id: Option<i64>,
     incumbent: Option<&IncumbentFacts>,
+    lag_tolerance_secs: u64,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> Result<Candidate, DemoteReason> {
     if records.is_empty() {
         return Err(DemoteReason::Missing);
@@ -360,7 +382,16 @@ fn decide(
     // `verify` mode: the incumbent is in hand, so compare against it too.
     if let Some(inc) = incumbent {
         if newest.version < inc.version {
-            return Err(DemoteReason::StaleVersion);
+            // Inside the window this is the async mirror doing its job, not a
+            // fault — see `StaleWithinWindow`. Outside it, the mirror has had
+            // its promised time. Same demote either way; different alerting.
+            let age = (now - inc.updated_at).num_seconds();
+            let inside = lag_tolerance_secs > 0 && age >= 0 && (age as u64) < lag_tolerance_secs;
+            return Err(if inside {
+                DemoteReason::StaleWithinWindow
+            } else {
+                DemoteReason::StaleVersion
+            });
         }
         if newest.version > inc.version {
             // Above the incumbent but at or below the event log's tip. The tier
@@ -514,7 +545,13 @@ pub async fn read(
         max_event_id(pool, execution_id).await
     };
 
-    let chosen = match decide(&candidates, max, incumbent) {
+    let chosen = match decide(
+        &candidates,
+        max,
+        incumbent,
+        crate::handlers::ehdb_projection_parity::parity_lag_tolerance_secs(),
+        chrono::Utc::now(),
+    ) {
         Ok(c) => c,
         Err(reason) => return TierRead::Demote(reason),
     };
@@ -574,7 +611,7 @@ mod tests {
     #[test]
     fn a_consistent_record_is_served() {
         let c = candidate(10, 1, Some(snap(10)), None);
-        let got = decide(&[c], Some(10), None).expect("must serve");
+        let got = decide(&[c], Some(10), None, 0, chrono::Utc::now()).expect("must serve");
         assert_eq!(got.version, 10);
     }
 
@@ -585,7 +622,7 @@ mod tests {
     fn a_version_above_the_event_tip_demotes() {
         let c = candidate(99, 1, Some(snap(99)), None);
         assert_eq!(
-            decide(&[c], Some(10), None).unwrap_err(),
+            decide(&[c], Some(10), None, 0, chrono::Utc::now()).unwrap_err(),
             DemoteReason::VersionAhead
         );
     }
@@ -595,7 +632,7 @@ mod tests {
     fn an_unknown_event_tip_demotes_rather_than_skipping_the_check() {
         let c = candidate(10, 1, Some(snap(10)), None);
         assert_eq!(
-            decide(&[c], None, None).unwrap_err(),
+            decide(&[c], None, None, 0, chrono::Utc::now()).unwrap_err(),
             DemoteReason::VersionAhead
         );
     }
@@ -609,7 +646,7 @@ mod tests {
         let mut c = candidate(10, 1, Some(snap(10)), None);
         c.snapshot = Some(snap(11)); // body swapped, digest left describing snap(10)
         assert_eq!(
-            decide(&[c], Some(10), None).unwrap_err(),
+            decide(&[c], Some(10), None, 0, chrono::Utc::now()).unwrap_err(),
             DemoteReason::Checksum
         );
     }
@@ -619,7 +656,7 @@ mod tests {
     fn a_record_with_no_snapshot_body_demotes() {
         let c = candidate(10, 1, None, Some("deadbeef".to_string()));
         assert_eq!(
-            decide(&[c], Some(10), None).unwrap_err(),
+            decide(&[c], Some(10), None, 0, chrono::Utc::now()).unwrap_err(),
             DemoteReason::NoBody
         );
     }
@@ -628,10 +665,11 @@ mod tests {
     /// answers this for every execution that predates it.
     #[test]
     fn an_empty_tier_is_missing_not_a_fault() {
-        assert_eq!(decide(&[], Some(10), None).unwrap_err(), DemoteReason::Missing);
+        assert_eq!(decide(&[], Some(10), None, 0, chrono::Utc::now()).unwrap_err(), DemoteReason::Missing);
         assert!(!DemoteReason::Missing.is_fault());
         assert!(!DemoteReason::Unconfigured.is_fault());
         assert!(!DemoteReason::NoIncumbent.is_fault());
+        assert!(!DemoteReason::StaleWithinWindow.is_fault());
         assert!(DemoteReason::VersionAhead.is_fault());
         assert!(DemoteReason::Checksum.is_fault());
     }
@@ -644,9 +682,10 @@ mod tests {
         let inc = IncumbentFacts {
             version: 10,
             checksum: None,
+            updated_at: chrono::Utc::now() - chrono::Duration::seconds(3600),
         };
         assert_eq!(
-            decide(&[c], Some(10), Some(&inc)).unwrap_err(),
+            decide(&[c], Some(10), Some(&inc), 0, chrono::Utc::now()).unwrap_err(),
             DemoteReason::StaleVersion
         );
     }
@@ -658,9 +697,10 @@ mod tests {
         let inc = IncumbentFacts {
             version: 10,
             checksum: Some("0000000000000000000000000000000000000000000000000000000000000000".into()),
+            updated_at: chrono::Utc::now() - chrono::Duration::seconds(3600),
         };
         assert_eq!(
-            decide(&[c], Some(10), Some(&inc)).unwrap_err(),
+            decide(&[c], Some(10), Some(&inc), 0, chrono::Utc::now()).unwrap_err(),
             DemoteReason::Divergent
         );
     }
@@ -675,8 +715,9 @@ mod tests {
         let inc = IncumbentFacts {
             version: 10,
             checksum: Some(sha256_of(&body)),
+            updated_at: chrono::Utc::now() - chrono::Duration::seconds(3600),
         };
-        assert!(decide(&[c], Some(10), Some(&inc)).is_ok());
+        assert!(decide(&[c], Some(10), Some(&inc), 0, chrono::Utc::now()).is_ok());
     }
 
     /// The newest record wins, and "newest" is by version then sequence — not
@@ -688,11 +729,11 @@ mod tests {
             candidate(4, 1, Some(snap(4)), None),
             candidate(7, 2, Some(snap(7)), None),
         ];
-        assert_eq!(decide(&recs, Some(10), None).unwrap().version, 10);
+        assert_eq!(decide(&recs, Some(10), None, 0, chrono::Utc::now()).unwrap().version, 10);
         // …and reversing the input does not change the answer.
         let mut rev = recs.clone();
         rev.reverse();
-        assert_eq!(decide(&rev, Some(10), None).unwrap().version, 10);
+        assert_eq!(decide(&rev, Some(10), None, 0, chrono::Utc::now()).unwrap().version, 10);
     }
 
     /// A typed refusal is `unreadable`, never `missing`.
@@ -730,6 +771,55 @@ mod tests {
         assert_eq!(sha256_of(&body), writer);
     }
 
+    /// Inside the lag window a behind-tier is NOT a fault — and outside it, it is.
+    ///
+    /// Two-sided on purpose: the only thing that differs between these two
+    /// assertions is the incumbent row's age, so a `decide` that ignored the
+    /// window (or one that forgave everything) fails one of them.
+    #[test]
+    fn a_behind_tier_is_a_fault_only_outside_the_window() {
+        let now = chrono::Utc::now();
+        let mk = |age_secs: i64| IncumbentFacts {
+            version: 10,
+            checksum: None,
+            updated_at: now - chrono::Duration::seconds(age_secs),
+        };
+        let c = || candidate(8, 1, Some(snap(8)), None);
+
+        let fresh = decide(&[c()], Some(10), Some(&mk(5)), 30, now).unwrap_err();
+        assert_eq!(fresh, DemoteReason::StaleWithinWindow);
+        assert!(!fresh.is_fault(), "an in-flight mirror must not read as a fault");
+
+        let old = decide(&[c()], Some(10), Some(&mk(120)), 30, now).unwrap_err();
+        assert_eq!(old, DemoteReason::StaleVersion);
+        assert!(old.is_fault(), "a mirror past its promised window IS a fault");
+
+        // …and with no window configured, age is irrelevant.
+        assert_eq!(
+            decide(&[c()], Some(10), Some(&mk(1)), 0, now).unwrap_err(),
+            DemoteReason::StaleVersion
+        );
+    }
+
+    /// The window forgives LATENESS ONLY. A tier ahead of the event log is
+    /// refused at any age, because "the mirror has not caught up" cannot explain
+    /// a record claiming an event that does not exist.
+    #[test]
+    fn the_window_never_forgives_the_dangerous_case() {
+        let now = chrono::Utc::now();
+        let inc = IncumbentFacts {
+            version: 10,
+            checksum: None,
+            updated_at: now,
+        };
+        let c = candidate(99, 1, Some(snap(99)), None);
+        assert_eq!(
+            decide(&[c], Some(10), Some(&inc), 3600, now).unwrap_err(),
+            DemoteReason::VersionAhead,
+            "an enormous window must not turn version_ahead into a tolerated state"
+        );
+    }
+
     /// Every [`DemoteReason`] has a label in [`READ_OUTCOMES`], and every label
     /// but `served_tier`/`disabled` has a reason.
     ///
@@ -750,6 +840,7 @@ mod tests {
             DemoteReason::Divergent,
             DemoteReason::Undeserialisable,
             DemoteReason::NoIncumbent,
+            DemoteReason::StaleWithinWindow,
         ];
         for r in reasons {
             assert!(
