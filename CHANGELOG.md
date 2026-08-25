@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.85.0](https://github.com/noetl/server/compare/v3.84.0...v3.85.0) (2026-08-25)
+
+### Features
+
+* **ehdb:** the projection tier gets a reader, and a read that refuses to serve a wrong snapshot ([bf824ce](https://github.com/noetl/server/commit/bf824ce207e61b8a13940e1326427b8e5ad38c7a)), closes [noetl/ai-meta#265](https://github.com/noetl/ai-meta/issues/265) [pre-#265](https://github.com/noetl/pre-/issues/265) [#243](https://github.com/noetl/server/issues/243) [#263](https://github.com/noetl/server/issues/263) [noetl/ai-meta#265](https://github.com/noetl/ai-meta/issues/265)
+
 ## [3.84.0](https://github.com/noetl/server/compare/v3.83.1...v3.84.0) (2026-08-24)
 
 ### Features
