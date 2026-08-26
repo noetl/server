@@ -299,11 +299,110 @@ fn event_from_tier_payload(p: &serde_json::Value) -> Option<crate::db::models::E
     })
 }
 
+/// As [`fold`], but also returns the serialised state body — for the field-level
+/// divergence diff. Kept separate so the hot path never pays the extra clone.
+
+/// Truncate an event's `created_at` to **microsecond** precision.
+///
+/// # Why the fold normalises this (ai-meta#265 Phase 3)
+///
+/// `noetl.event.created_at` is a Postgres `timestamp`, which stores
+/// **microseconds**. The EHDB event-bus envelope carries the original
+/// **nanosecond** timestamp. So the same event, read from the two stores, is the
+/// same instant at two precisions — and `WorkflowState::apply_event` propagates
+/// `event.timestamp` into `started_at` / `completed_at` / `entered_at`, which
+/// means the two folds produce states that differ in those fields and therefore
+/// digest differently.
+///
+/// Measured, three executions × three probes, 9/9 identical:
+///
+/// ```text
+/// /started_at: "2026-08-26T05:01:33.645451Z" != "2026-08-26T05:01:33.645451448Z"
+///                            └ µs (Postgres)              └ ns (WAL envelope)
+/// diff_fields=1  non_timestamp=0
+/// ```
+///
+/// **This is not a source-sufficiency problem.** Field presence was identical on
+/// both sides — events 4/4, `with_context` 2/2, `with_result` 2/2, `with_meta`
+/// 4/4, `with_attempt` 1/1, `distinct_created_at` 4/4 — unlike the event-log
+/// tier, which lacked `context` outright. The WAL spine carries everything the
+/// fold reads.
+///
+/// # Why microseconds, and why here
+///
+/// Microseconds is what the **system of record** can hold. Sub-microsecond
+/// precision is not durable anywhere in this platform, so a state that depends
+/// on it is depending on an artefact of which store it was read from. Normalise
+/// down to what survives a round trip, and the two sources agree on the value
+/// rather than merely on a hash of it.
+///
+/// Done on the fold's **input** rather than inside `canonical_state_digest` on
+/// purpose: normalising the digest alone would leave the folded *states*
+/// genuinely different, and the drive reads `entered_at` / `completed_at`
+/// directly. Equal digests over unequal states is precisely the kind of
+/// agreement-by-construction this effort keeps refusing.
+fn truncate_to_micros(ts: chrono::DateTime<chrono::Utc>) -> chrono::DateTime<chrono::Utc> {
+    use chrono::TimeZone;
+    // ROUND half-up, do not truncate.
+    //
+    // Postgres rounds a `timestamp` to the nearest microsecond; the first
+    // version of this function floored, and the two agreed only when the
+    // sub-microsecond remainder happened to be < 500 ns — measured at 1 of 4
+    // executions matching, with the residual diff exactly one microsecond:
+    //
+    //   /started_at: "…05:09:02.725065Z" != "…05:09:02.725064Z"
+    //                        └ Postgres rounded up   └ we floored
+    //
+    // Matching the system of record's rounding is the whole point: the goal is
+    // the value Postgres would have stored, not merely a coarser value.
+    let nanos = match ts.timestamp_nanos_opt() {
+        Some(n) => n,
+        // Outside the ~1677–2262 nanosecond-representable window. Leave it
+        // alone rather than silently mangling a timestamp we cannot reason
+        // about; such an event cannot come from this platform's clock.
+        None => return ts,
+    };
+    let micros = nanos.div_euclid(1_000);
+    let rem = nanos.rem_euclid(1_000);
+    let rounded = if rem >= 500 { micros + 1 } else { micros };
+    chrono::Utc.timestamp_micros(rounded).single().unwrap_or(ts)
+}
+
+/// Apply [`truncate_to_micros`] across an event set, in place.
+fn normalise_event_precision(events: &mut [crate::db::models::Event]) {
+    for e in events.iter_mut() {
+        e.created_at = truncate_to_micros(e.created_at);
+    }
+}
+
+fn fold_with_body(
+    source: FoldSource,
+    mut events: Vec<crate::db::models::Event>,
+) -> Result<(FoldedState, serde_json::Value), FoldRefusal> {
+    use noetl_orchestrate_core::state::{canonical_state_digest, WorkflowState};
+    normalise_event_precision(&mut events);
+    let version = events.iter().map(|e| e.event_id).max().unwrap_or(0);
+    let applied_count = events.len();
+    let core: Vec<noetl_orchestrate_core::event::Event> = events.iter().map(Into::into).collect();
+    let state = WorkflowState::from_events(&core).ok_or(FoldRefusal::FoldFailed)?;
+    let body = serde_json::to_value(&state).unwrap_or(serde_json::Value::Null);
+    Ok((
+        FoldedState {
+            source,
+            version,
+            applied_count,
+            digest: canonical_state_digest(&state),
+        },
+        body,
+    ))
+}
+
 fn fold(
     source: FoldSource,
-    events: Vec<crate::db::models::Event>,
+    mut events: Vec<crate::db::models::Event>,
 ) -> Result<FoldedState, FoldRefusal> {
     use noetl_orchestrate_core::state::{canonical_state_digest, WorkflowState};
+    normalise_event_precision(&mut events);
     let version = events.iter().map(|e| e.event_id).max().unwrap_or(0);
     let applied_count = events.len();
     let core: Vec<noetl_orchestrate_core::event::Event> =
@@ -335,10 +434,28 @@ fn fold(
 /// `head` pins the fold to a watermark. When supplied and the spine cannot
 /// reach it, this refuses with [`FoldRefusal::SpineIncomplete`] rather than
 /// folding what it has.
+/// Fetch and parse the WAL spine's events, without folding.
+/// Shared by [`fold_from_wal_spine`] and the field-level diff endpoint.
+pub async fn wal_spine_events(
+    execution_id: i64,
+    head: Option<i64>,
+) -> Result<Vec<crate::db::models::Event>, FoldRefusal> {
+    let inner = fold_spine_inner(execution_id, head).await?;
+    Ok(inner)
+}
+
 pub async fn fold_from_wal_spine(
     execution_id: i64,
     head: Option<i64>,
 ) -> Result<FoldedState, FoldRefusal> {
+    let events = fold_spine_inner(execution_id, head).await?;
+    fold(FoldSource::WalSpine, events)
+}
+
+async fn fold_spine_inner(
+    execution_id: i64,
+    head: Option<i64>,
+) -> Result<Vec<crate::db::models::Event>, FoldRefusal> {
     let base = std::env::var(super::ehdb::WORKER_QUERY_URL_ENV)
         .ok()
         .map(|s| s.trim().to_string())
@@ -404,7 +521,7 @@ pub async fn fold_from_wal_spine(
         ));
     }
     events.sort_by_key(|e| e.event_id);
-    fold(FoldSource::WalSpine, events)
+    Ok(events)
 }
 
 /// Why a comparison against a fresh WAL re-fold did not hold.
@@ -946,6 +1063,104 @@ mod tests {
         }
         assert_eq!(REFOLD_VERDICTS.len(), 6);
     }
+
+    /// Sub-microsecond precision is normalised away; everything coarser is kept.
+    ///
+    /// The negative half matters as much as the positive: a `truncate` that
+    /// zeroed the whole fractional part would also make the two sources agree,
+    /// and would silently destroy microsecond ordering the platform DOES
+    /// preserve.
+    #[test]
+    fn precision_is_normalised_to_microseconds_and_no_coarser() {
+        use chrono::TimeZone;
+        // 05:01:33.645451448 (ns, as the WAL envelope carries it)
+        let ns = chrono::Utc
+            .timestamp_opt(1_756_184_493, 645_451_448)
+            .single()
+            .expect("valid instant");
+        // 05:01:33.645451 (µs, as Postgres stores it)
+        let us = chrono::Utc
+            .timestamp_opt(1_756_184_493, 645_451_000)
+            .single()
+            .expect("valid instant");
+
+        assert_ne!(ns, us, "the fixture must actually differ, or this proves nothing");
+        assert_eq!(
+            truncate_to_micros(ns),
+            truncate_to_micros(us),
+            "the two representations of one instant must normalise to the same value"
+        );
+        // …and the microsecond component SURVIVES.
+        assert_eq!(
+            truncate_to_micros(ns).timestamp_subsec_micros(),
+            645_451,
+            "microsecond precision must be preserved; only sub-µs is resolved"
+        );
+        // ROUNDING, not flooring — this is what Postgres does, and the first
+        // version of this code got it wrong in a way that only showed on ~half
+        // of real executions.
+        let up = chrono::Utc
+            .timestamp_opt(1_756_184_493, 645_451_500)
+            .single()
+            .unwrap();
+        assert_eq!(
+            truncate_to_micros(up).timestamp_subsec_micros(),
+            645_452,
+            "a remainder >= 500ns must round UP, as Postgres does"
+        );
+        let down = chrono::Utc
+            .timestamp_opt(1_756_184_493, 645_451_499)
+            .single()
+            .unwrap();
+        assert_eq!(
+            truncate_to_micros(down).timestamp_subsec_micros(),
+            645_451,
+            "a remainder < 500ns must round DOWN"
+        );
+        // Two instants a microsecond apart stay distinct.
+        let next = chrono::Utc
+            .timestamp_opt(1_756_184_493, 645_452_000)
+            .single()
+            .unwrap();
+        assert_ne!(truncate_to_micros(us), truncate_to_micros(next));
+    }
+
+    /// The normalisation reaches every event the fold consumes.
+    #[test]
+    fn every_event_in_a_fold_is_normalised() {
+        use chrono::TimeZone;
+        let mk = |nanos: u32| {
+            let mut e = tier_event_fixture();
+            e.created_at = chrono::Utc
+                .timestamp_opt(1_756_184_493, nanos)
+                .single()
+                .unwrap();
+            e
+        };
+        // 645_451_448 rounds DOWN to 645451; 645_451_999 rounds UP to 645452.
+        let mut evs = vec![mk(645_451_448), mk(645_451_999), mk(645_452_001)];
+        normalise_event_precision(&mut evs);
+        assert_ne!(
+            evs[0].created_at, evs[1].created_at,
+            "these straddle the half-µs boundary and must NOT collapse together"
+        );
+        assert_eq!(
+            evs[1].created_at, evs[2].created_at,
+            "645_451_999 rounds up to the same µs as 645_452_001 rounds down to"
+        );
+        assert!(
+            evs.iter().all(|e| e.created_at.timestamp_subsec_nanos() % 1_000 == 0),
+            "no event may retain sub-microsecond precision after normalisation"
+        );
+    }
+
+    fn tier_event_fixture() -> crate::db::models::Event {
+        event_from_tier_payload(&serde_json::json!({
+            "event_id": 1, "execution_id": 2, "catalog_id": 3,
+            "event_type": "step.enter", "status": "ok"
+        }))
+        .expect("fixture parses")
+    }
     /// Two refusals are not a match.
     #[test]
     fn agreement_requires_two_folds_not_two_refusals() {
@@ -969,3 +1184,84 @@ mod tests {
 }
 
 
+
+/// `GET /api/ehdb/projection-fold/diff/{id}` — WHICH FIELDS diverge, and how.
+///
+/// The Phase-3 equivalence arm measured the WAL-spine fold and the incumbent
+/// fold producing different digests at the **same version and same event
+/// count**. A digest says *that* they differ; this says *where*, which is the
+/// difference between a named cause and a guess.
+///
+/// Both sides are folded here, in one request, from the same execution — so a
+/// difference cannot be attributed to the execution advancing between calls.
+/// The version equality is asserted and reported rather than assumed.
+pub async fn fold_diff_endpoint(
+    axum::extract::State(state): axum::extract::State<crate::state::AppState>,
+    axum::extract::Path(execution_id): axum::extract::Path<i64>,
+) -> AppResult<axum::Json<serde_json::Value>> {
+    let pool = state.pools.pool_for(execution_id);
+
+    // --- incumbent side -----------------------------------------------------
+    let rows = sqlx::query(
+        r#"
+        SELECT event_id, execution_id, catalog_id,
+               parent_event_id, parent_execution_id,
+               event_type, node_id, node_name, node_type, status,
+               context, meta, result, worker_id,
+               NULLIF(meta->>'attempt', '')::int AS attempt,
+               created_at
+        FROM noetl.event WHERE execution_id = $1 ORDER BY event_id ASC
+        "#,
+    )
+    .bind(execution_id)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+    let pg_events = super::events::parse_event_rows_for_fold(rows);
+    let pg = fold_with_body(FoldSource::Postgres, pg_events.clone());
+
+    // --- WAL spine side -----------------------------------------------------
+    let spine_events = wal_spine_events(execution_id, None).await;
+    let wal = match &spine_events {
+        Ok(evs) => fold_with_body(FoldSource::WalSpine, evs.clone()),
+        Err(r) => Err(r.clone()),
+    };
+
+    let mut diff: Vec<String> = Vec::new();
+    let mut same_version = false;
+    if let (Ok((pgs, pgb)), Ok((wals, walb))) = (&pg, &wal) {
+        same_version = pgs.version == wals.version;
+        if same_version {
+            json_diff_paths(pgb, walb, "", &mut diff);
+        }
+    }
+
+    // Per-event field presence, so a state difference can be traced to the
+    // INPUT rather than only observed in the output. Counts only — no values,
+    // because `context` is exactly the field under suspicion and it is the one
+    // that could carry sensitive material.
+    let field_presence = |evs: &[crate::db::models::Event]| {
+        serde_json::json!({
+            "events": evs.len(),
+            "with_context": evs.iter().filter(|e| e.context.is_some()).count(),
+            "with_result": evs.iter().filter(|e| e.result.is_some()).count(),
+            "with_meta": evs.iter().filter(|e| e.meta.is_some()).count(),
+            "with_attempt": evs.iter().filter(|e| e.attempt.is_some()).count(),
+            "with_node_name": evs.iter().filter(|e| e.node_name.is_some()).count(),
+            "distinct_created_at": evs.iter().map(|e| e.created_at).collect::<std::collections::BTreeSet<_>>().len(),
+        })
+    };
+
+    Ok(axum::Json(serde_json::json!({
+        "action": "ehdb.projection.fold.diff",
+        "execution_id": execution_id,
+        "same_version": same_version,
+        "postgres": pg.as_ref().ok().map(|(s, _)| s),
+        "postgres_refusal": pg.as_ref().err(),
+        "wal": wal.as_ref().ok().map(|(s, _)| s),
+        "wal_refusal": wal.as_ref().err(),
+        "diff_paths": diff,
+        "input_fields_postgres": field_presence(&pg_events),
+        "input_fields_wal": spine_events.as_ref().ok().map(|e| field_presence(e)),
+    })))
+}
