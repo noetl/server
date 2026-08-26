@@ -372,6 +372,14 @@ fn build_router(
             get(handlers::ehdb_projection_parity::compare_execution_endpoint),
         )
         .route(
+            "/api/ehdb/projection-fold/executions/{execution_id}",
+            get(handlers::ehdb_projection_fold::compare_sources_endpoint),
+        )
+        .route(
+            "/api/ehdb/projection-fold/determinism/{execution_id}",
+            get(handlers::ehdb_projection_fold::determinism_endpoint),
+        )
+        .route(
             "/api/ehdb/projection-parity/self-test",
             get(handlers::ehdb_projection_parity::self_test_endpoint),
         )

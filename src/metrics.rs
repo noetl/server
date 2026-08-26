@@ -3816,7 +3816,37 @@ pub fn set_ehdb_projection_parity_lag_tolerance(seconds: u64) {
     ehdb_projection_parity_lag_tolerance_seconds().set(seconds as i64);
 }
 
+/// Counter: event rows whose `created_at` decoded as neither `timestamptz` nor
+/// `timestamp`, so the loader substituted `Utc::now()` (ai-meta#265 Phase 1).
+///
+/// Pinned at 0 and published because the previous behaviour — an unconditional
+/// `unwrap_or_else(Utc::now)` — made an EVERY-ROW decode failure look exactly
+/// like normal operation for as long as it existed. A fallback nobody can count
+/// is a fallback nobody discovers.
+pub fn event_created_at_fallback_total() -> &'static IntCounter {
+    static M: OnceLock<IntCounter> = OnceLock::new();
+    M.get_or_init(|| {
+        let c = IntCounter::new(
+            "noetl_event_created_at_fallback_total",
+            "Event rows whose created_at decoded as neither timestamptz nor timestamp, so the \
+             loader used the current time instead (noetl/ai-meta#265).",
+        )
+        .expect("static counter spec must be valid");
+        registry()
+            .register(Box::new(c.clone()))
+            .expect("counter registration must succeed");
+        c
+    })
+}
+
+pub fn record_event_created_at_fallback() {
+    event_created_at_fallback_total().inc();
+}
+
 pub fn init_ehdb_crossstore_series() {
+    // Unconditional pin: absent and zero are different answers, and this one's
+    // whole value is being readable as 0 on a healthy binary.
+    event_created_at_fallback_total().inc_by(0);
     use crate::handlers::ehdb_parity::{
         CONTROL_NAMES, DIVERGENCE_KINDS, PARITY_OUTCOMES, TIER,
     };

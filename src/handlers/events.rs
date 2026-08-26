@@ -1945,6 +1945,138 @@ const ORCH_EVENT_COLS_WITH_PREV: &str = r#"
 
 /// Map rows selected via [`ORCH_EVENT_COLS`] into `Event`s.  `attempt` lives in
 /// `meta` JSONB (no dedicated column), sourced via the `NULLIF(...)::int` alias.
+/// Re-exported for the Phase-1 fold (ai-meta#265) so a fold from Postgres
+/// builds the SAME `Event` values the orchestrator's own rebuild path does.
+/// A second parser here would be a second definition of what an event IS.
+pub(crate) fn parse_event_rows_for_fold(rows: Vec<sqlx::postgres::PgRow>) -> Vec<crate::db::models::Event> {
+    parse_event_rows(rows)
+}
+
+
+/// Read `noetl.event.created_at`, coercing a tz-less column.
+///
+/// # The bug this fixes (ai-meta#265 Phase 1)
+///
+/// `noetl.event.created_at` is declared **`timestamp without time zone`**, and
+/// `models::Event.created_at` is `DateTime<Utc>`. sqlx decodes `timestamptz`
+/// into `DateTime<Utc>` and `timestamp` into `NaiveDateTime` — so
+/// `try_get::<DateTime<Utc>>("created_at")` fails on **every row**, and the
+/// previous `.unwrap_or_else(|_| Utc::now())` silently substituted the *current
+/// time* for the event's real one.
+///
+/// The consequence is not cosmetic. `WorkflowState::apply_event` propagates
+/// `event.timestamp` into `started_at`, `completed_at` and per-step
+/// `entered_at`/`completed_at`, so the reconstructed state embedded **the
+/// moment of the rebuild**. Measured with the determinism probe: folding one
+/// 13-event execution twice, 8 ms apart, differed in exactly five fields, all
+/// timestamps, all 8 ms apart — while folding the *same in-memory events* twice
+/// was byte-identical. The fold was deterministic; the loader was not.
+///
+/// Two things follow, and the second is the reason this is a defect rather than
+/// a curiosity:
+///
+/// 1. A re-fold can never reproduce a stored state's digest, which is the
+///    premise the event-sourced read model rests on.
+/// 2. **Two replicas rebuilding the same execution get different
+///    `entered_at`/`completed_at`.** Anything that compares or templates on
+///    those is reading fold time, not event time.
+///
+/// The codebase half-knew: `StepInfo::completed_event_id` and
+/// `ctx_set_marks` both carry doc comments saying `completed_at` "derives from
+/// the `Utc::now()` loader fallback and varies across reconstructions", and
+/// ai-meta#85 worked around it by keying on `event_id`. The workaround was
+/// correct; the cause was left in place. server#150 fixed the same class in
+/// `replay::load_events` ("coerce created_at TIMESTAMP → TIMESTAMPTZ") and this
+/// loader never got it.
+///
+/// # Why it still falls back rather than failing
+///
+/// A row whose timestamp decodes as neither type is a schema the binary does
+/// not understand, and refusing the whole rebuild for it would turn a column
+/// change into an outage. But the fallback is now **last**, not first, and it
+/// is counted — an unattributable `now()` is what made this invisible for so
+/// long.
+fn created_at_from_row(r: &sqlx::postgres::PgRow) -> chrono::DateTime<chrono::Utc> {
+    match created_at_of(
+        r.try_get::<chrono::DateTime<chrono::Utc>, _>("created_at").ok(),
+        r.try_get::<chrono::NaiveDateTime, _>("created_at").ok(),
+    ) {
+        Some(ts) => ts,
+        None => {
+            crate::metrics::record_event_created_at_fallback();
+            chrono::Utc::now()
+        }
+    }
+}
+
+/// The decision, as a pure function so it is testable without a database.
+///
+/// `timestamptz` wins when both decode — it is the unambiguous encoding. A
+/// tz-less value is interpreted as UTC, which is what the column means here:
+/// the writer stores `now()` on a UTC server and the tailer already treats it
+/// that way (`services::internal`, "noetl.event.created_at is tz-less").
+pub(crate) fn created_at_of(
+    tz_aware: Option<chrono::DateTime<chrono::Utc>>,
+    naive: Option<chrono::NaiveDateTime>,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    if let Some(ts) = tz_aware {
+        return Some(ts);
+    }
+    naive.map(|n| chrono::DateTime::from_naive_utc_and_offset(n, chrono::Utc))
+}
+
+#[cfg(test)]
+mod created_at_tests {
+    use super::created_at_of;
+    use chrono::{DateTime, NaiveDate, TimeZone, Utc};
+
+    fn naive() -> chrono::NaiveDateTime {
+        NaiveDate::from_ymd_opt(2026, 8, 26)
+            .unwrap()
+            .and_hms_milli_opt(3, 44, 48, 468)
+            .unwrap()
+    }
+
+    /// THE TEST THAT WOULD HAVE CAUGHT IT.
+    ///
+    /// A tz-less row — which is what `noetl.event.created_at` actually is —
+    /// must decode to the ROW'S value. Before the fix this path produced
+    /// `Utc::now()`, and every existing test passed because none of them
+    /// compared the result to the row.
+    #[test]
+    fn a_tz_less_row_decodes_to_the_rows_value_not_now() {
+        let got = created_at_of(None, Some(naive())).expect("a tz-less row must decode");
+        assert_eq!(
+            got,
+            Utc.with_ymd_and_hms(2026, 8, 26, 3, 44, 48).unwrap() + chrono::Duration::milliseconds(468),
+            "the tz-less column must be read as UTC, not replaced by the current time"
+        );
+        // …and emphatically not the current time.
+        assert!(
+            (Utc::now() - got).num_days() > 0 || got.timestamp() != Utc::now().timestamp(),
+            "decoded value must not be now()"
+        );
+    }
+
+    /// A tz-aware column still works — deployments differ, and a fix that broke
+    /// the other encoding would just move the outage.
+    #[test]
+    fn a_tz_aware_row_still_decodes_and_wins() {
+        let tz: DateTime<Utc> = Utc.with_ymd_and_hms(2020, 1, 2, 3, 4, 5).unwrap();
+        assert_eq!(created_at_of(Some(tz), None), Some(tz));
+        // Both present: the unambiguous encoding wins.
+        assert_eq!(created_at_of(Some(tz), Some(naive())), Some(tz));
+    }
+
+    /// Neither decodes ⇒ `None`, so the CALLER owns the fallback and can count
+    /// it. The old code buried the fallback inside the decode, which is why an
+    /// every-row failure looked like normal operation.
+    #[test]
+    fn neither_encoding_is_a_reported_absence_not_a_silent_now() {
+        assert_eq!(created_at_of(None, None), None);
+    }
+}
+
 fn parse_event_rows(rows: Vec<sqlx::postgres::PgRow>) -> Vec<crate::db::models::Event> {
     use sqlx::Row;
     rows.into_iter()
@@ -1965,9 +2097,7 @@ fn parse_event_rows(rows: Vec<sqlx::postgres::PgRow>) -> Vec<crate::db::models::
             result: r.try_get("result").ok(),
             worker_id: r.try_get("worker_id").ok(),
             attempt: r.try_get("attempt").ok(),
-            created_at: r
-                .try_get("created_at")
-                .unwrap_or_else(|_| chrono::Utc::now()),
+            created_at: created_at_from_row(&r),
         })
         .collect()
 }
