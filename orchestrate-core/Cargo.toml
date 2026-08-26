@@ -18,5 +18,12 @@ chrono = { version = "0.4", default-features = false, features = ["serde", "std"
 thiserror = "2.0"
 tracing = "0.1"
 
+# ai-meta#265 Phase 0: the canonical state digest.
+sha2 = "0.10"
+hex = "0.4"
+
 [dev-dependencies]
 serde_yaml = "0.9"
+# Phase 0 determinism probe (ai-meta#265): the digest under test.
+sha2 = "0.10"
+hex = "0.4"

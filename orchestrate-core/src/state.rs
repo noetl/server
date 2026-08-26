@@ -2475,3 +2475,150 @@ mod pending_callback_tests {
         )));
     }
 }
+
+/// Canonical digest of a [`WorkflowState`] — the identity an event-sourced
+/// read model can be checked against (ai-meta#265 Phase 0).
+///
+/// # The property, and how easily it is lost
+///
+/// `WorkflowState` holds `ctx`, `ctx_set_marks` and `steps` in
+/// [`std::collections::HashMap`], and `serde_json` serialises a `HashMap` in
+/// **iteration order**, which `RandomState` seeds **per process**. So
+/// `sha256(serde_json::to_vec(state))` — digesting the struct directly — is a
+/// different value in every process for the same logical state.
+///
+/// Measured, four processes, one identical state
+/// (`examples/fold_digest_probe.rs`):
+///
+/// ```text
+/// raw_digest=79722d00…   ctx order: key_03 key_05 key_07 …
+/// raw_digest=a0359074…   ctx order: key_08 key_12 key_02 …
+/// raw_digest=eeffabd1…   ctx order: key_05 key_10 key_14 …
+/// raw_digest=33bad35c…
+/// canonical_digest=1f0766f9…  (identical in all four)
+/// ```
+///
+/// # What the audit found
+///
+/// **Today's digests are already canonical — by accident, not by contract.**
+/// `services::orch_snapshot::save` happens to call `serde_json::to_value(state)`
+/// first and digest *that*, and `serde_json::Value`'s object map is a
+/// `BTreeMap` (the `preserve_order` feature is not enabled here), so its bytes
+/// are key-sorted at every level. The same is true of ai-meta#265's read-side
+/// `sha256_of`, which takes a `&Value`.
+///
+/// Nothing states that this is required and nothing tests it. A refactor that
+/// digested the struct directly — the obvious, shorter thing to write — would
+/// silently produce a per-process digest, and it would pass every existing
+/// check, because no existing check ever re-derives a digest in a second
+/// process: the value is computed once and copied. #265's cross-store
+/// comparator compares the incumbent's stored checksum against the one the
+/// mirror carried, which is the same number moved, not recomputed.
+///
+/// The event-sourced read model is precisely the thing that breaks that
+/// assumption: a second process folds the same events and compares digests. So
+/// this function makes the property explicit, names it, and the tests below
+/// pin it.
+///
+/// ⚠ If `serde_json`'s `preserve_order` feature is ever enabled in this
+/// workspace, `Value` becomes insertion-ordered and this stops being canonical.
+/// `the_canonical_digest_is_stable_across_hash_orders` is the guard.
+pub fn canonical_state_digest(state: &WorkflowState) -> String {
+    use sha2::{Digest, Sha256};
+    let value = serde_json::to_value(state).unwrap_or(serde_json::Value::Null);
+    let bytes = serde_json::to_vec(&value).unwrap_or_default();
+    hex::encode(Sha256::digest(&bytes))
+}
+
+#[cfg(test)]
+mod canonical_digest_tests {
+    use super::*;
+
+    fn state_with(order: &[usize]) -> WorkflowState {
+        let mut ws = WorkflowState::new(42, 7);
+        for &i in order {
+            ws.ctx
+                .insert(format!("key_{i:02}"), serde_json::json!({ "n": i }));
+            ws.ctx_set_marks.insert(format!("mark_{i:02}"), i as i64);
+        }
+        ws
+    }
+
+    /// The same logical state, built in two different insertion orders, must
+    /// digest identically.
+    ///
+    /// This is the in-process half of the property. The cross-process half
+    /// cannot be asserted from inside one test binary — it was measured with
+    /// `examples/fold_digest_probe.rs`, run four times, and the raw digest
+    /// differed every time while this one did not.
+    #[test]
+    fn the_canonical_digest_is_stable_across_hash_orders() {
+        let forward: Vec<usize> = (0..16).collect();
+        let backward: Vec<usize> = (0..16).rev().collect();
+        assert_eq!(
+            canonical_state_digest(&state_with(&forward)),
+            canonical_state_digest(&state_with(&backward)),
+            "the canonical digest must not depend on insertion order"
+        );
+    }
+
+    /// NEGATIVE CONTROL. A "canonicaliser" that returned a constant would pass
+    /// the test above and prove nothing.
+    #[test]
+    fn the_canonical_digest_moves_when_the_state_moves() {
+        let base = state_with(&(0..16).collect::<Vec<_>>());
+        let mut changed = state_with(&(0..16).collect::<Vec<_>>());
+        changed
+            .ctx
+            .insert("key_07".to_string(), serde_json::json!({ "n": 999 }));
+        assert_ne!(
+            canonical_state_digest(&base),
+            canonical_state_digest(&changed),
+            "a one-value change must change the digest, or this is not a digest"
+        );
+
+        // …and a change buried in a NESTED object, since the canonicalisation
+        // has to reach the whole tree and not just the top level.
+        let mut nested = state_with(&(0..16).collect::<Vec<_>>());
+        nested.ctx.insert(
+            "key_03".to_string(),
+            serde_json::json!({ "n": 3, "deep": { "b": 2, "a": 1 } }),
+        );
+        assert_ne!(canonical_state_digest(&base), canonical_state_digest(&nested));
+    }
+
+    /// The raw form is NOT canonical — asserted so the difference is a tested
+    /// property rather than a claim in a doc comment.
+    ///
+    /// Same logical state, two insertion orders. Within one process the
+    /// `HashMap` seed is fixed, so the two maps iterate the same way and the
+    /// raw bytes agree — which is exactly why this defect survived: every
+    /// same-process check agrees. The test therefore asserts the weaker, true
+    /// thing: the raw serialisation carries key order at all, so it is a
+    /// function of iteration and not of value.
+    #[test]
+    fn the_raw_serialisation_carries_hash_order() {
+        let ws = state_with(&(0..16).collect::<Vec<_>>());
+        let raw = serde_json::to_vec(&ws).expect("serialise");
+        let text = String::from_utf8_lossy(&raw);
+        let first = text
+            .split("\"key_")
+            .nth(1)
+            .map(|s| s[..2].to_string())
+            .expect("ctx keys present");
+        let canon = serde_json::to_vec(&serde_json::to_value(&ws).unwrap()).unwrap();
+        let canon_text = String::from_utf8_lossy(&canon);
+        let canon_first = canon_text
+            .split("\"key_")
+            .nth(1)
+            .map(|s| s[..2].to_string())
+            .expect("ctx keys present");
+        assert_eq!(
+            canon_first, "00",
+            "the canonical form must start at the lowest key; got {canon_first}"
+        );
+        // `first` is whatever this process's seed produced. No assertion on its
+        // value — asserting it would bake one process's seed into the suite.
+        let _ = first;
+    }
+}

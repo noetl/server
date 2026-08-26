@@ -3507,6 +3507,9 @@ pub fn init_ehdb_projection_series() {
             .with_label_values(&[outcome])
             .inc_by(0);
     }
+    for v in crate::handlers::ehdb_projection_fold::REFOLD_VERDICTS {
+        ehdb_projection_refold_total().with_label_values(&[v]).inc_by(0);
+    }
     for outcome in EHDB_PROJECTION_SNAPSHOT_GATE_OUTCOMES {
         ehdb_projection_snapshot_gate_total()
             .with_label_values(&[outcome])
@@ -3816,7 +3819,63 @@ pub fn set_ehdb_projection_parity_lag_tolerance(seconds: u64) {
     ehdb_projection_parity_lag_tolerance_seconds().set(seconds as i64);
 }
 
+/// Counter: event rows whose `created_at` decoded as neither `timestamptz` nor
+/// `timestamp`, so the loader substituted `Utc::now()` (ai-meta#265 Phase 1).
+///
+/// Pinned at 0 and published because the previous behaviour — an unconditional
+/// `unwrap_or_else(Utc::now)` — made an EVERY-ROW decode failure look exactly
+/// like normal operation for as long as it existed. A fallback nobody can count
+/// is a fallback nobody discovers.
+pub fn event_created_at_fallback_total() -> &'static IntCounter {
+    static M: OnceLock<IntCounter> = OnceLock::new();
+    M.get_or_init(|| {
+        let c = IntCounter::new(
+            "noetl_event_created_at_fallback_total",
+            "Event rows whose created_at decoded as neither timestamptz nor timestamp, so the \
+             loader used the current time instead (noetl/ai-meta#265).",
+        )
+        .expect("static counter spec must be valid");
+        registry()
+            .register(Box::new(c.clone()))
+            .expect("counter registration must succeed");
+        c
+    })
+}
+
+pub fn record_event_created_at_fallback() {
+    event_created_at_fallback_total().inc();
+}
+
+/// Counter: Phase-2 re-fold comparator verdicts (ai-meta#265).
+///
+/// Ground truth is a fresh fold of the WAL spine, not a Postgres row — so
+/// unlike the A4 comparator this counts a comparison that was actually
+/// recomputed rather than a stored number compared with itself.
+pub fn ehdb_projection_refold_total() -> &'static IntCounterVec {
+    static M: OnceLock<IntCounterVec> = OnceLock::new();
+    M.get_or_init(|| {
+        let c = IntCounterVec::new(
+            Opts::new(
+                "noetl_ehdb_projection_refold_total",
+                "Projection records compared against a fresh fold of the WAL spine, by verdict \
+                 (noetl/ai-meta#265).",
+            ),
+            &["verdict"],
+        )
+        .expect("static counter spec must be valid");
+        registry().register(Box::new(c.clone())).expect("counter registration must succeed");
+        c
+    })
+}
+
+pub fn record_ehdb_projection_refold(verdict: &str) {
+    ehdb_projection_refold_total().with_label_values(&[verdict]).inc();
+}
+
 pub fn init_ehdb_crossstore_series() {
+    // Unconditional pin: absent and zero are different answers, and this one's
+    // whole value is being readable as 0 on a healthy binary.
+    event_created_at_fallback_total().inc_by(0);
     use crate::handlers::ehdb_parity::{
         CONTROL_NAMES, DIVERGENCE_KINDS, PARITY_OUTCOMES, TIER,
     };
