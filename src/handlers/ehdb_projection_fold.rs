@@ -917,6 +917,178 @@ pub async fn refold_endpoint(
     })))
 }
 
+
+/// Materialise one **in-flight** execution's state into the projection tier,
+/// folded from the WAL spine (ai-meta#265 Phase 3).
+///
+/// # Why in-flight only
+///
+/// The state-builder index evicts an execution's chain on a terminal event, so
+/// a completed execution has no spine and this correctly refuses. That is the
+/// right shape rather than a limitation: control flow reads state to decide the
+/// *next* step, and a completed execution has none.
+///
+/// # What it writes
+///
+/// The folded state plus the digest of that fold, so a later reader can be
+/// checked against a **fresh re-fold** rather than against a second copy of the
+/// same number. That is the difference from #265 A3, which mirrored a Postgres
+/// row: there the digest compared was the same value moved, here it is
+/// recomputed.
+///
+/// Best-effort and non-fatal: this is a read model, and failing to materialise
+/// must never fail the execution that triggered it.
+pub async fn materialize_from_wal(execution_id: i64) -> Result<FoldedState, FoldRefusal> {
+    let (folded, body) = {
+        let events = fold_spine_inner(execution_id, None).await?;
+        fold_with_body(FoldSource::WalSpine, events)?
+    };
+    let base = std::env::var(super::ehdb::WORKER_QUERY_URL_ENV)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| FoldRefusal::SourceUnavailable("WORKER_QUERY_URL unset".into()))?;
+    let record = serde_json::json!({
+        "execution_id": execution_id,
+        "version": folded.version,
+        "applied_count": folded.applied_count,
+        // Both names: `digest` is what this tier's reader looks for, `checksum`
+        // is what #265's earlier readers look for. Writing one and not the
+        // other is how a record becomes unreadable to half its consumers.
+        "digest": folded.digest,
+        "checksum": folded.digest,
+        "snapshot": body,
+        "updated_at": chrono::Utc::now().to_rfc3339(),
+        "mirror_source": "wal_spine",
+        "aggregate_type": "orchestrator_workflow_state",
+    });
+    let url = format!("{}/ehdb/tiers/projection", base.trim_end_matches('/'));
+    let resp = reqwest::Client::new()
+        .post(&url)
+        .json(&serde_json::json!({
+            "execution_id": execution_id.to_string(),
+            "records": [record.to_string()],
+        }))
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+        .map_err(|e| FoldRefusal::SourceUnavailable(e.to_string()))?;
+    if !resp.status().is_success() {
+        return Err(FoldRefusal::SourceUnavailable(format!(
+            "projection append refused: {}",
+            resp.status()
+        )));
+    }
+    crate::metrics::record_ehdb_projection_materialize("materialized");
+    Ok(folded)
+}
+
+/// Resolve an execution's control-flow state from the **WAL-sourced projection**,
+/// verified against a fresh re-fold (ai-meta#265 Phase 3 — the flag-ON path).
+///
+/// The loop is: materialise → read back → re-fold → [`verdict_for`] → serve
+/// **only** on [`ReFoldVerdict::Match`].
+///
+/// # Fail-closed
+///
+/// Every non-`Match` verdict returns `None`, and `None` here means *do not
+/// advance this execution on this pass* — not *fall back to Postgres*. A
+/// fallback that silently reads a different store on error re-establishes the
+/// second source of truth this whole effort removes. The reconciler re-drives.
+///
+/// The six verdicts are the ones already proven to fire in kind, one live
+/// execution per arm.
+pub async fn wal_projection_state(
+    execution_id: i64,
+) -> (Option<serde_json::Value>, ReFoldVerdict) {
+    // Materialise first so an in-flight execution has a record to verify. A
+    // failure here is not fatal: the read below simply finds nothing and the
+    // verdict says so.
+    let _ = materialize_from_wal(execution_id).await;
+
+    let spine = fold_from_wal_spine(execution_id, None).await;
+    let stored = stored_projection_full(execution_id).await;
+    let pair = stored
+        .as_ref()
+        .ok()
+        .and_then(|o| o.as_ref())
+        .map(|(v, d, _)| (*v, d.as_str()));
+    let verdict = verdict_for(pair, &spine);
+    crate::metrics::record_ehdb_projection_refold(verdict.as_str());
+    if verdict != ReFoldVerdict::Match {
+        return (None, verdict);
+    }
+    let body = stored
+        .ok()
+        .flatten()
+        .and_then(|(_, _, body)| body);
+    (body, verdict)
+}
+
+/// As [`stored_projection`], but also returning the stored snapshot body.
+pub async fn stored_projection_full(
+    execution_id: i64,
+) -> Result<Option<(i64, String, Option<serde_json::Value>)>, String> {
+    let base = std::env::var(super::ehdb::WORKER_QUERY_URL_ENV)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "WORKER_QUERY_URL unset".to_string())?;
+    let url = format!(
+        "{}/ehdb/tiers/projection?execution={execution_id}&limit=500",
+        base.trim_end_matches('/')
+    );
+    let body: serde_json::Value = reqwest::Client::new()
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(20))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .json()
+        .await
+        .map_err(|e| e.to_string())?;
+    if let Some(o) = body.get("outcome").and_then(|o| o.as_str()) {
+        if o != "ok" {
+            return Err(format!("tier outcome={o}"));
+        }
+    }
+    let records = body
+        .get("records")
+        .and_then(|r| r.as_array())
+        .ok_or_else(|| "no records array".to_string())?;
+    let mut best: Option<(i64, u64, String, Option<serde_json::Value>)> = None;
+    for r in records {
+        let seq = r.get("global_sequence").and_then(|s| s.as_u64()).unwrap_or(0);
+        let p = match r.get("payload").and_then(|p| p.as_str()) {
+            Some(s) => match serde_json::from_str::<serde_json::Value>(s) {
+                Ok(v) => v,
+                Err(_) => continue,
+            },
+            None => r.clone(),
+        };
+        let (Some(v), Some(d)) = (
+            p.get("version").and_then(|v| {
+                v.as_i64()
+                    .or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()))
+            }),
+            p.get("digest")
+                .or_else(|| p.get("checksum"))
+                .and_then(|d| d.as_str()),
+        ) else {
+            continue;
+        };
+        if best.as_ref().is_none_or(|(bv, bs, _, _)| (v, seq) > (*bv, *bs)) {
+            best = Some((
+                v,
+                seq,
+                d.to_string(),
+                p.get("snapshot").filter(|s| !s.is_null()).cloned(),
+            ));
+        }
+    }
+    Ok(best.map(|(v, _, d, b)| (v, d, b)))
+}
+
 /// `GET /api/ehdb/projection-fold/diff/{id}` — WHICH FIELDS diverge, and how.
 ///
 /// The Phase-3 equivalence arm measured the WAL-spine fold and the incumbent
@@ -1265,3 +1437,15 @@ mod tests {
 
 
 
+
+
+/// `GET /api/ehdb/projection-recovery/{id}` — the re-scoped Phase 3 gate.
+pub async fn recovery_compare_endpoint(
+    axum::extract::State(state): axum::extract::State<crate::state::AppState>,
+    axum::extract::Path(execution_id): axum::extract::Path<i64>,
+) -> AppResult<axum::Json<serde_json::Value>> {
+    let pool = state.pools.pool_for(execution_id);
+    Ok(axum::Json(
+        crate::services::orch_snapshot::recovery_read_comparison(pool, execution_id).await,
+    ))
+}
