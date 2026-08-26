@@ -301,7 +301,6 @@ fn event_from_tier_payload(p: &serde_json::Value) -> Option<crate::db::models::E
 
 /// As [`fold`], but also returns the serialised state body — for the field-level
 /// divergence diff. Kept separate so the hot path never pays the extra clone.
-
 /// Truncate an event's `created_at` to **microsecond** precision.
 ///
 /// # Why the fold normalises this (ai-meta#265 Phase 3)
@@ -918,6 +917,87 @@ pub async fn refold_endpoint(
     })))
 }
 
+/// `GET /api/ehdb/projection-fold/diff/{id}` — WHICH FIELDS diverge, and how.
+///
+/// The Phase-3 equivalence arm measured the WAL-spine fold and the incumbent
+/// fold producing different digests at the **same version and same event
+/// count**. A digest says *that* they differ; this says *where*, which is the
+/// difference between a named cause and a guess.
+///
+/// Both sides are folded here, in one request, from the same execution — so a
+/// difference cannot be attributed to the execution advancing between calls.
+/// The version equality is asserted and reported rather than assumed.
+pub async fn fold_diff_endpoint(
+    axum::extract::State(state): axum::extract::State<crate::state::AppState>,
+    axum::extract::Path(execution_id): axum::extract::Path<i64>,
+) -> AppResult<axum::Json<serde_json::Value>> {
+    let pool = state.pools.pool_for(execution_id);
+
+    // --- incumbent side -----------------------------------------------------
+    let rows = sqlx::query(
+        r#"
+        SELECT event_id, execution_id, catalog_id,
+               parent_event_id, parent_execution_id,
+               event_type, node_id, node_name, node_type, status,
+               context, meta, result, worker_id,
+               NULLIF(meta->>'attempt', '')::int AS attempt,
+               created_at
+        FROM noetl.event WHERE execution_id = $1 ORDER BY event_id ASC
+        "#,
+    )
+    .bind(execution_id)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+    let pg_events = super::events::parse_event_rows_for_fold(rows);
+    let pg = fold_with_body(FoldSource::Postgres, pg_events.clone());
+
+    // --- WAL spine side -----------------------------------------------------
+    let spine_events = wal_spine_events(execution_id, None).await;
+    let wal = match &spine_events {
+        Ok(evs) => fold_with_body(FoldSource::WalSpine, evs.clone()),
+        Err(r) => Err(r.clone()),
+    };
+
+    let mut diff: Vec<String> = Vec::new();
+    let mut same_version = false;
+    if let (Ok((pgs, pgb)), Ok((wals, walb))) = (&pg, &wal) {
+        same_version = pgs.version == wals.version;
+        if same_version {
+            json_diff_paths(pgb, walb, "", &mut diff);
+        }
+    }
+
+    // Per-event field presence, so a state difference can be traced to the
+    // INPUT rather than only observed in the output. Counts only — no values,
+    // because `context` is exactly the field under suspicion and it is the one
+    // that could carry sensitive material.
+    let field_presence = |evs: &[crate::db::models::Event]| {
+        serde_json::json!({
+            "events": evs.len(),
+            "with_context": evs.iter().filter(|e| e.context.is_some()).count(),
+            "with_result": evs.iter().filter(|e| e.result.is_some()).count(),
+            "with_meta": evs.iter().filter(|e| e.meta.is_some()).count(),
+            "with_attempt": evs.iter().filter(|e| e.attempt.is_some()).count(),
+            "with_node_name": evs.iter().filter(|e| e.node_name.is_some()).count(),
+            "distinct_created_at": evs.iter().map(|e| e.created_at).collect::<std::collections::BTreeSet<_>>().len(),
+        })
+    };
+
+    Ok(axum::Json(serde_json::json!({
+        "action": "ehdb.projection.fold.diff",
+        "execution_id": execution_id,
+        "same_version": same_version,
+        "postgres": pg.as_ref().ok().map(|(s, _)| s),
+        "postgres_refusal": pg.as_ref().err(),
+        "wal": wal.as_ref().ok().map(|(s, _)| s),
+        "wal_refusal": wal.as_ref().err(),
+        "diff_paths": diff,
+        "input_fields_postgres": field_presence(&pg_events),
+        "input_fields_wal": spine_events.as_ref().ok().map(|e| field_presence(e)),
+    })))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1185,83 +1265,3 @@ mod tests {
 
 
 
-/// `GET /api/ehdb/projection-fold/diff/{id}` — WHICH FIELDS diverge, and how.
-///
-/// The Phase-3 equivalence arm measured the WAL-spine fold and the incumbent
-/// fold producing different digests at the **same version and same event
-/// count**. A digest says *that* they differ; this says *where*, which is the
-/// difference between a named cause and a guess.
-///
-/// Both sides are folded here, in one request, from the same execution — so a
-/// difference cannot be attributed to the execution advancing between calls.
-/// The version equality is asserted and reported rather than assumed.
-pub async fn fold_diff_endpoint(
-    axum::extract::State(state): axum::extract::State<crate::state::AppState>,
-    axum::extract::Path(execution_id): axum::extract::Path<i64>,
-) -> AppResult<axum::Json<serde_json::Value>> {
-    let pool = state.pools.pool_for(execution_id);
-
-    // --- incumbent side -----------------------------------------------------
-    let rows = sqlx::query(
-        r#"
-        SELECT event_id, execution_id, catalog_id,
-               parent_event_id, parent_execution_id,
-               event_type, node_id, node_name, node_type, status,
-               context, meta, result, worker_id,
-               NULLIF(meta->>'attempt', '')::int AS attempt,
-               created_at
-        FROM noetl.event WHERE execution_id = $1 ORDER BY event_id ASC
-        "#,
-    )
-    .bind(execution_id)
-    .fetch_all(pool)
-    .await
-    .unwrap_or_default();
-    let pg_events = super::events::parse_event_rows_for_fold(rows);
-    let pg = fold_with_body(FoldSource::Postgres, pg_events.clone());
-
-    // --- WAL spine side -----------------------------------------------------
-    let spine_events = wal_spine_events(execution_id, None).await;
-    let wal = match &spine_events {
-        Ok(evs) => fold_with_body(FoldSource::WalSpine, evs.clone()),
-        Err(r) => Err(r.clone()),
-    };
-
-    let mut diff: Vec<String> = Vec::new();
-    let mut same_version = false;
-    if let (Ok((pgs, pgb)), Ok((wals, walb))) = (&pg, &wal) {
-        same_version = pgs.version == wals.version;
-        if same_version {
-            json_diff_paths(pgb, walb, "", &mut diff);
-        }
-    }
-
-    // Per-event field presence, so a state difference can be traced to the
-    // INPUT rather than only observed in the output. Counts only — no values,
-    // because `context` is exactly the field under suspicion and it is the one
-    // that could carry sensitive material.
-    let field_presence = |evs: &[crate::db::models::Event]| {
-        serde_json::json!({
-            "events": evs.len(),
-            "with_context": evs.iter().filter(|e| e.context.is_some()).count(),
-            "with_result": evs.iter().filter(|e| e.result.is_some()).count(),
-            "with_meta": evs.iter().filter(|e| e.meta.is_some()).count(),
-            "with_attempt": evs.iter().filter(|e| e.attempt.is_some()).count(),
-            "with_node_name": evs.iter().filter(|e| e.node_name.is_some()).count(),
-            "distinct_created_at": evs.iter().map(|e| e.created_at).collect::<std::collections::BTreeSet<_>>().len(),
-        })
-    };
-
-    Ok(axum::Json(serde_json::json!({
-        "action": "ehdb.projection.fold.diff",
-        "execution_id": execution_id,
-        "same_version": same_version,
-        "postgres": pg.as_ref().ok().map(|(s, _)| s),
-        "postgres_refusal": pg.as_ref().err(),
-        "wal": wal.as_ref().ok().map(|(s, _)| s),
-        "wal_refusal": wal.as_ref().err(),
-        "diff_paths": diff,
-        "input_fields_postgres": field_presence(&pg_events),
-        "input_fields_wal": spine_events.as_ref().ok().map(|e| field_presence(e)),
-    })))
-}
