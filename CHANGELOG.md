@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.88.0](https://github.com/noetl/server/compare/v3.87.0...v3.88.0) (2026-08-26)
+
+### Features
+
+* **265:** source the control-flow recovery read from the durable EHDB projection ([d979552](https://github.com/noetl/server/commit/d97955246d79c28c5e664dc378f9ee4c262c7d7f)), closes [noetl/ai-meta#265](https://github.com/noetl/ai-meta/issues/265)
+
 ## [3.87.0](https://github.com/noetl/server/compare/v3.86.0...v3.87.0) (2026-08-26)
 
 ### Features
