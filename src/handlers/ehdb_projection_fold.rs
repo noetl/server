@@ -52,6 +52,11 @@ pub enum FoldSource {
     Postgres,
     /// The EHDB event-log tier, read through the worker relay.
     EhdbTier,
+    /// The worker's **WAL spine** — the off-server state builder's chain, served
+    /// by `GET /ehdb/state-spine`. The source ai-meta#265's RFC settles on:
+    /// it keeps `SLIM_EVENT_KEYS`, which includes `context` and both
+    /// `timestamp`/`created_at`, so a fold over it is the fold the drive does.
+    WalSpine,
 }
 
 impl FoldSource {
@@ -59,6 +64,7 @@ impl FoldSource {
         match self {
             Self::Postgres => "postgres",
             Self::EhdbTier => "ehdb_tier",
+            Self::WalSpine => "wal_spine",
         }
     }
 }
@@ -79,6 +85,14 @@ pub enum FoldRefusal {
     /// `from_events` returned `None` — it could not build a state from a
     /// non-empty event set.
     FoldFailed,
+    /// The WAL spine does not reach the requested head: the drain has not
+    /// caught up, or a chain link is missing.
+    ///
+    /// **The fail-closed case that matters most on this source.** The worker
+    /// answers `complete:false` with no events rather than a partial spine, and
+    /// this refusal carries that through — a fold over a gapped spine is a
+    /// different execution's history.
+    SpineIncomplete,
 }
 
 /// A folded state and the identity it can be checked by.
@@ -303,6 +317,186 @@ fn fold(
     })
 }
 
+
+/// Fold from the worker's **WAL spine** (ai-meta#265 Phase 2).
+///
+/// Reads `GET /ehdb/state-spine` from the worker relay and folds the ordered
+/// verbatim slim payloads it serves. This is the source the RFC settles on:
+///
+/// * it carries `context`, which the event-log tier does not and which
+///   `apply_event` reads in six places;
+/// * it carries `timestamp`/`created_at`, so no `Utc::now()` substitution — the
+///   reason a tier-sourced fold was byte-stable while the Postgres one was not,
+///   before the loader fix;
+/// * and it holds credential material **by alias**, not resolved, so folding
+///   from it propagates no secrets (measured on kind's population; prod's is
+///   unmeasured).
+///
+/// `head` pins the fold to a watermark. When supplied and the spine cannot
+/// reach it, this refuses with [`FoldRefusal::SpineIncomplete`] rather than
+/// folding what it has.
+pub async fn fold_from_wal_spine(
+    execution_id: i64,
+    head: Option<i64>,
+) -> Result<FoldedState, FoldRefusal> {
+    let base = std::env::var(super::ehdb::WORKER_QUERY_URL_ENV)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| FoldRefusal::SourceUnavailable("WORKER_QUERY_URL unset".into()))?;
+    let mut url = format!(
+        "{}/ehdb/state-spine?execution={execution_id}",
+        base.trim_end_matches('/')
+    );
+    if let Some(h) = head {
+        url.push_str(&format!("&head={h}"));
+    }
+    let body: serde_json::Value = reqwest::Client::new()
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(20))
+        .send()
+        .await
+        .map_err(|e| FoldRefusal::SourceUnavailable(e.to_string()))?
+        .json()
+        .await
+        .map_err(|e| FoldRefusal::Unparseable(e.to_string()))?;
+
+    match body.get("outcome").and_then(|o| o.as_str()) {
+        Some("ok") => {}
+        // `unavailable` is a worker with no index — NOT an execution with no
+        // events. Collapsing them would fold nothing and call it a state.
+        Some("unavailable") => {
+            return Err(FoldRefusal::SourceUnavailable(
+                "worker runs no state-builder index".into(),
+            ))
+        }
+        Some("incomplete") => return Err(FoldRefusal::SpineIncomplete),
+        other => {
+            return Err(FoldRefusal::Unparseable(format!(
+                "unexpected spine outcome {other:?}"
+            )))
+        }
+    }
+    // Belt and braces: the route promises no events on an incomplete build, and
+    // this checks the promise rather than trusting it. A future change that
+    // started serving a partial spine would be caught here instead of silently
+    // producing a state for a history that never happened.
+    if body.get("complete").and_then(|c| c.as_bool()) != Some(true) {
+        return Err(FoldRefusal::SpineIncomplete);
+    }
+
+    let events_json = body
+        .get("events")
+        .and_then(|e| e.as_array())
+        .ok_or_else(|| FoldRefusal::Unparseable("no events array".into()))?;
+    if events_json.is_empty() {
+        return Err(FoldRefusal::NoEvents);
+    }
+    let mut events: Vec<crate::db::models::Event> = Vec::with_capacity(events_json.len());
+    for p in events_json {
+        if let Some(ev) = event_from_tier_payload(p) {
+            events.push(ev);
+        }
+    }
+    if events.is_empty() {
+        return Err(FoldRefusal::Unparseable(
+            "spine events carried no event_id".into(),
+        ));
+    }
+    events.sort_by_key(|e| e.event_id);
+    fold(FoldSource::WalSpine, events)
+}
+
+/// Why a comparison against a fresh WAL re-fold did not hold.
+///
+/// Every variant is a reason to **not use** the stored projection. There is no
+/// "use it anyway" outcome, and there is deliberately no fallback-to-Postgres
+/// outcome either: a comparator whose failure mode is reading a different store
+/// establishes the second source of truth this whole effort exists to remove.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReFoldVerdict {
+    /// The stored record's digest equals a fresh fold of the spine at the same
+    /// version. The only outcome that permits use.
+    Match,
+    /// Both produced a state and the digests differ.
+    DigestMismatch,
+    /// The stored record claims a version the spine does not reach.
+    StoredAheadOfSpine,
+    /// The spine has moved past the stored record. Not corruption — the
+    /// materialiser has not caught up.
+    StoredBehindSpine,
+    /// Nothing stored for this execution yet.
+    NoStoredRecord,
+    /// The spine could not be folded; carries the refusal.
+    SpineRefused,
+}
+
+impl ReFoldVerdict {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Match => "match",
+            Self::DigestMismatch => "digest_mismatch",
+            Self::StoredAheadOfSpine => "stored_ahead_of_spine",
+            Self::StoredBehindSpine => "stored_behind_spine",
+            Self::NoStoredRecord => "no_stored_record",
+            Self::SpineRefused => "spine_refused",
+        }
+    }
+    /// Whether this verdict means the stored record is WRONG, as opposed to
+    /// absent or merely behind. Only these should page.
+    pub fn is_fault(self) -> bool {
+        matches!(self, Self::DigestMismatch | Self::StoredAheadOfSpine)
+    }
+}
+
+/// Every verdict label. Closed set, pinned at 0.
+pub const REFOLD_VERDICTS: [&str; 6] = [
+    "match",
+    "digest_mismatch",
+    "stored_ahead_of_spine",
+    "stored_behind_spine",
+    "no_stored_record",
+    "spine_refused",
+];
+
+/// Compare a stored projection record against a **fresh fold of the WAL spine**.
+///
+/// Ground truth is the re-fold, never Postgres. That is the whole difference
+/// from ai-meta#265 A4's comparator, which compared the tier against a
+/// `noetl.projection_snapshot` row — a copy against another copy, where the
+/// digest being compared was the same number moved rather than recomputed.
+///
+/// **Pure decision, given the two sides**, so the fault vocabulary is testable
+/// without a cluster.
+pub fn verdict_for(
+    stored: Option<(i64, &str)>,
+    spine: &Result<FoldedState, FoldRefusal>,
+) -> ReFoldVerdict {
+    let spine = match spine {
+        Ok(s) => s,
+        Err(FoldRefusal::SpineIncomplete) | Err(_) => return ReFoldVerdict::SpineRefused,
+    };
+    let Some((stored_version, stored_digest)) = stored else {
+        return ReFoldVerdict::NoStoredRecord;
+    };
+    if stored_version > spine.version {
+        // The record claims an event the spine does not have. Checked BEFORE
+        // the digest: an ahead record's digest necessarily differs, and
+        // reporting that as `digest_mismatch` would send an operator looking
+        // for corruption instead of for a store that is ahead of its own log.
+        return ReFoldVerdict::StoredAheadOfSpine;
+    }
+    if stored_version < spine.version {
+        return ReFoldVerdict::StoredBehindSpine;
+    }
+    if stored_digest == spine.digest {
+        ReFoldVerdict::Match
+    } else {
+        ReFoldVerdict::DigestMismatch
+    }
+}
+
 /// Both folds, and whether they agree — the Phase 1 question in one reply.
 #[derive(Debug, Serialize)]
 pub struct FoldComparison {
@@ -510,6 +704,103 @@ pub async fn compare_sources_endpoint(
     })))
 }
 
+/// Read the newest stored projection record's `(version, digest)` for one
+/// execution, from the projection tier.
+///
+/// Returns `Ok(None)` for "the tier holds nothing for this execution" and an
+/// `Err` for "the tier could not be read" — kept distinct for the same reason
+/// the spine route does: one is an absence, the other is an inability, and a
+/// comparator that scored them alike would report a broken relay as an unarmed
+/// materialiser.
+pub async fn stored_projection(execution_id: i64) -> Result<Option<(i64, String)>, String> {
+    let base = std::env::var(super::ehdb::WORKER_QUERY_URL_ENV)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "WORKER_QUERY_URL unset".to_string())?;
+    let url = format!(
+        "{}/ehdb/tiers/projection?execution={execution_id}&limit=500",
+        base.trim_end_matches('/')
+    );
+    let body: serde_json::Value = reqwest::Client::new()
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(20))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .json()
+        .await
+        .map_err(|e| e.to_string())?;
+    if let Some(o) = body.get("outcome").and_then(|o| o.as_str()) {
+        if o != "ok" {
+            return Err(format!("tier outcome={o}"));
+        }
+    }
+    let records = body
+        .get("records")
+        .and_then(|r| r.as_array())
+        .ok_or_else(|| "no records array".to_string())?;
+    let mut best: Option<(i64, u64, String)> = None;
+    for r in records {
+        let seq = r.get("global_sequence").and_then(|s| s.as_u64()).unwrap_or(0);
+        let p = match r.get("payload").and_then(|p| p.as_str()) {
+            Some(s) => match serde_json::from_str::<serde_json::Value>(s) {
+                Ok(v) => v,
+                Err(_) => continue,
+            },
+            None => r.clone(),
+        };
+        let (Some(v), Some(d)) = (
+            p.get("version").and_then(|v| {
+                v.as_i64()
+                    .or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()))
+            }),
+            p.get("digest")
+                .or_else(|| p.get("checksum"))
+                .and_then(|d| d.as_str()),
+        ) else {
+            continue;
+        };
+        // Newest by (version, sequence) — the same rule the read path uses, so
+        // the comparator judges the record a reader would serve.
+        if best
+            .as_ref()
+            .is_none_or(|(bv, bs, _)| (v, seq) > (*bv, *bs))
+        {
+            best = Some((v, seq, d.to_string()));
+        }
+    }
+    Ok(best.map(|(v, _, d)| (v, d)))
+}
+
+/// `GET /api/ehdb/projection-refold/executions/{id}` — the Phase 2 comparator.
+///
+/// Ground truth is a fresh fold of the WAL spine. Never Postgres.
+pub async fn refold_endpoint(
+    axum::extract::State(_state): axum::extract::State<crate::state::AppState>,
+    axum::extract::Path(execution_id): axum::extract::Path<i64>,
+) -> AppResult<axum::Json<serde_json::Value>> {
+    let spine = fold_from_wal_spine(execution_id, None).await;
+    let stored = stored_projection(execution_id).await;
+    let stored_pair = match &stored {
+        Ok(Some((v, d))) => Some((*v, d.as_str())),
+        _ => None,
+    };
+    let verdict = verdict_for(stored_pair, &spine);
+    crate::metrics::record_ehdb_projection_refold(verdict.as_str());
+    Ok(axum::Json(serde_json::json!({
+        "action": "ehdb.projection.refold",
+        "execution_id": execution_id,
+        "verdict": verdict.as_str(),
+        "is_fault": verdict.is_fault(),
+        "spine": spine.as_ref().ok(),
+        "spine_refusal": spine.as_ref().err(),
+        "stored_version": stored_pair.map(|(v, _)| v),
+        "stored_digest": stored_pair.map(|(_, d)| d),
+        "stored_read_error": stored.as_ref().err(),
+    })))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -564,6 +855,97 @@ mod tests {
         assert!(event_from_tier_payload(&payload).is_none());
     }
 
+
+    fn folded(version: i64, digest: &str) -> Result<FoldedState, FoldRefusal> {
+        Ok(FoldedState {
+            source: FoldSource::WalSpine,
+            version,
+            applied_count: 3,
+            digest: digest.to_string(),
+        })
+    }
+
+    /// Every fail-closed condition is named as ITSELF, and only two of them
+    /// page.
+    ///
+    /// Two-sided: the healthy case must also be reachable, or a `verdict_for`
+    /// that refused unconditionally would satisfy every negative assertion and
+    /// make the read model permanently unusable while looking rigorous.
+    #[test]
+    fn each_refold_condition_is_named_as_itself() {
+        let spine = folded(100, "aaa");
+
+        assert_eq!(verdict_for(Some((100, "aaa")), &spine), ReFoldVerdict::Match);
+        assert!(!ReFoldVerdict::Match.is_fault());
+
+        // Same version, different content — the corruption case.
+        assert_eq!(
+            verdict_for(Some((100, "bbb")), &spine),
+            ReFoldVerdict::DigestMismatch
+        );
+        assert!(ReFoldVerdict::DigestMismatch.is_fault());
+
+        // Claims an event the log does not have. Checked BEFORE the digest, so
+        // it is not mis-reported as corruption.
+        assert_eq!(
+            verdict_for(Some((101, "aaa")), &spine),
+            ReFoldVerdict::StoredAheadOfSpine
+        );
+        assert!(ReFoldVerdict::StoredAheadOfSpine.is_fault());
+
+        // Behind is the materialiser lagging, not corruption — must not page.
+        assert_eq!(
+            verdict_for(Some((99, "aaa")), &spine),
+            ReFoldVerdict::StoredBehindSpine
+        );
+        assert!(!ReFoldVerdict::StoredBehindSpine.is_fault());
+
+        assert_eq!(verdict_for(None, &spine), ReFoldVerdict::NoStoredRecord);
+        assert!(!ReFoldVerdict::NoStoredRecord.is_fault());
+    }
+
+    /// An incomplete spine refuses the comparison rather than passing it.
+    ///
+    /// The dangerous shape would be treating "the log could not be read" as
+    /// "nothing to disagree with" — a clean verdict from a comparison that
+    /// never happened, which is the vacuous pass this codebase keeps finding.
+    #[test]
+    fn a_spine_that_cannot_be_folded_refuses_rather_than_agreeing() {
+        let refused: Result<FoldedState, FoldRefusal> = Err(FoldRefusal::SpineIncomplete);
+        assert_eq!(
+            verdict_for(Some((100, "aaa")), &refused),
+            ReFoldVerdict::SpineRefused
+        );
+        // …and it is NOT a match even when the stored record looks fine.
+        assert_ne!(verdict_for(Some((100, "aaa")), &refused), ReFoldVerdict::Match);
+        // An unreachable worker is the same shape.
+        let unavail: Result<FoldedState, FoldRefusal> =
+            Err(FoldRefusal::SourceUnavailable("no index".into()));
+        assert_eq!(
+            verdict_for(Some((100, "aaa")), &unavail),
+            ReFoldVerdict::SpineRefused
+        );
+    }
+
+    /// Every verdict the code can emit is in the pinned label set.
+    #[test]
+    fn every_verdict_is_pinned() {
+        for v in [
+            ReFoldVerdict::Match,
+            ReFoldVerdict::DigestMismatch,
+            ReFoldVerdict::StoredAheadOfSpine,
+            ReFoldVerdict::StoredBehindSpine,
+            ReFoldVerdict::NoStoredRecord,
+            ReFoldVerdict::SpineRefused,
+        ] {
+            assert!(
+                REFOLD_VERDICTS.contains(&v.as_str()),
+                "{} is emitted but not pinned; its series is absent until it fires",
+                v.as_str()
+            );
+        }
+        assert_eq!(REFOLD_VERDICTS.len(), 6);
+    }
     /// Two refusals are not a match.
     #[test]
     fn agreement_requires_two_folds_not_two_refusals() {
@@ -585,4 +967,5 @@ mod tests {
         );
     }
 }
+
 
