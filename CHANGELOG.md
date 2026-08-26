@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.87.0](https://github.com/noetl/server/compare/v3.86.0...v3.87.0) (2026-08-26)
+
+### Features
+
+* **ehdb:** fold the WAL spine, and compare a stored projection to a fresh re-fold ([88a6a51](https://github.com/noetl/server/commit/88a6a51115fda4bb8affe875d7b60899b007f1f4)), closes [noetl/ai-meta#265](https://github.com/noetl/ai-meta/issues/265) [worker#283](https://github.com/noetl/worker/issues/283) [noetl/ai-meta#265](https://github.com/noetl/ai-meta/issues/265)
+* **state:** name the canonical state digest, and pin the property it rests on ([cdf8027](https://github.com/noetl/server/commit/cdf80279a8a4137226f05e8d9bbf63ba373e428b)), closes [noetl/ai-meta#265](https://github.com/noetl/ai-meta/issues/265) [#265](https://github.com/noetl/server/issues/265) [#265](https://github.com/noetl/server/issues/265) [noetl/ai-meta#265](https://github.com/noetl/ai-meta/issues/265)
+
+### Bug Fixes
+
+* **ehdb:** normalise event timestamps to Postgres's precision, and match its rounding ([44c16ed](https://github.com/noetl/server/commit/44c16eded097372b6f55542784775baa2a96ef00)), closes [noetl/ai-meta#265](https://github.com/noetl/ai-meta/issues/265) [noetl/ai-meta#265](https://github.com/noetl/ai-meta/issues/265)
+* **events:** read created_at as the tz-less column it is, not as timestamptz ([429e6d5](https://github.com/noetl/server/commit/429e6d52516211bd773a0277a643d7dd72af3a27)), closes [noetl/ai-meta#265](https://github.com/noetl/ai-meta/issues/265) [#265](https://github.com/noetl/server/issues/265) [ai-meta#85](https://github.com/noetl/ai-meta/issues/85)
+
 ## [3.86.0](https://github.com/noetl/server/compare/v3.85.0...v3.86.0) (2026-08-25)
 
 ### Features
