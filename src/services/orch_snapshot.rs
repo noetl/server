@@ -71,6 +71,18 @@ pub async fn save(
     let mirrored_at = chrono::Utc::now();
     let snapshot = serde_json::to_value(state)
         .map_err(|e| AppError::Internal(format!("orch_snapshot.save: serialise: {e}")))?;
+    // Digests `snapshot` — a `serde_json::Value` — and NOT `state` directly.
+    // That distinction is load-bearing and was undocumented until ai-meta#265
+    // Phase 0: `WorkflowState` holds its maps in `HashMap`, so digesting the
+    // struct yields a PER-PROCESS value (measured: four processes, four
+    // digests). `Value`'s object map is a `BTreeMap`, so this form is
+    // key-sorted at every level and comparable across processes.
+    //
+    // It has never mattered because nothing re-derives this number — it is
+    // computed once and copied, so #265's comparator compares it to itself. The
+    // event-sourced read model is the thing that breaks that assumption.
+    // `canonical_state_digest` names the property; the guard below pins that
+    // this call site keeps it.
     let checksum = {
         let bytes = serde_json::to_vec(&snapshot).unwrap_or_default();
         hex::encode(Sha256::digest(&bytes))
@@ -319,6 +331,43 @@ async fn load_incumbent(
 
 #[cfg(test)]
 mod tests {
+
+    /// The snapshot checksum must be over the CANONICAL form.
+    ///
+    /// `save` digests `serde_json::to_value(state)` rather than `state`, and
+    /// that is what makes the value comparable across processes. The shorter,
+    /// more obvious refactor — digest the struct — produces a per-process
+    /// digest that passes every existing test, because nothing re-derives it.
+    ///
+    /// Counting CODE, with `//` stripped, so the prose above cannot satisfy the
+    /// guard and deleting the prose cannot break it. Positive control: the real
+    /// `to_value` call must survive the stripper.
+    #[test]
+    fn the_snapshot_checksum_is_over_the_canonical_form() {
+        let whole = include_str!("orch_snapshot.rs");
+        let code_half = &whole[..whole
+            .find("mod tests {")
+            .expect("the test module must still be the tail of this file")];
+        let code: String = code_half
+            .lines()
+            .map(|l| match l.find("//") {
+                Some(i) => &l[..i],
+                None => l,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            code.contains("serde_json::to_value(state)"),
+            "the comment stripper ate the real call; this guard proves nothing"
+        );
+        assert!(
+            !code.contains("to_vec(state)") && !code.contains("to_vec(&state)"),
+            "the checksum must be over `to_value(state)`, never over the struct: \
+             WorkflowState's HashMaps serialise in per-process iteration order, so a \
+             struct digest is not comparable between the process that folded and the \
+             process that re-folds (ai-meta#265 Phase 0)"
+        );
+    }
     /// The serving read path must have **exactly one** reader of
     /// `noetl.projection_snapshot`.
     ///

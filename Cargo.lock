@@ -1349,10 +1349,12 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "chrono",
+ "hex",
  "minijinja",
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha2",
  "thiserror 2.0.20",
  "tracing",
 ]
