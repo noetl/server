@@ -370,82 +370,6 @@ pub async fn compare_sources(pool: &DbPool, execution_id: i64) -> AppResult<Fold
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The tier's record shape must be read faithfully, including the field it
-    /// does not carry.
-    ///
-    /// This is the Phase 1 question in unit form: a payload shaped exactly like
-    /// `ehdb_eventlog_mirror::mirror_payload` yields an event whose `context`
-    /// is `None`, while the same logical event from Postgres carries one. The
-    /// fold reads `context` in six places, so `None` is not a cosmetic
-    /// difference.
-    #[test]
-    fn a_tier_payload_has_no_context_and_the_reader_says_so() {
-        let payload = serde_json::json!({
-            "event_id": 10, "execution_id": 1, "catalog_id": 2,
-            "event_type": "step.enter", "status": "ok",
-            "node_name": "s1", "step": "s1",
-            "result": {"a": 1}, "meta": {"attempt": "1"},
-            "mirror_source": "server"
-        });
-        let ev = event_from_tier_payload(&payload).expect("parses");
-        assert_eq!(ev.event_id, 10);
-        assert_eq!(ev.result, Some(serde_json::json!({"a": 1})));
-        assert!(
-            ev.context.is_none(),
-            "the tier record carries no `context` — if this ever becomes Some, \
-             the mirror payload changed and the Phase 1 finding is stale"
-        );
-        assert_eq!(ev.attempt, Some(1), "attempt is derived from meta, as in the SQL projection");
-    }
-
-    /// …and when a payload DOES carry context, the reader picks it up. Without
-    /// this, the assertion above would also pass against a reader that simply
-    /// never reads the field — proving the reader broken rather than the
-    /// record incomplete.
-    #[test]
-    fn the_reader_picks_up_context_when_it_is_present() {
-        let payload = serde_json::json!({
-            "event_id": 11, "execution_id": 1, "catalog_id": 2,
-            "event_type": "step.enter", "status": "ok",
-            "context": {"loop": {"i": 3}}
-        });
-        let ev = event_from_tier_payload(&payload).expect("parses");
-        assert_eq!(ev.context, Some(serde_json::json!({"loop": {"i": 3}})));
-    }
-
-    /// A record set that parses to nothing is a refusal, never an empty state.
-    #[test]
-    fn records_without_event_ids_refuse_rather_than_fold_nothing() {
-        let payload = serde_json::json!({"no_event_id": true});
-        assert!(event_from_tier_payload(&payload).is_none());
-    }
-
-    /// Two refusals are not a match.
-    #[test]
-    fn agreement_requires_two_folds_not_two_refusals() {
-        let c = FoldComparison {
-            execution_id: 1,
-            postgres: None,
-            postgres_refusal: Some(FoldRefusal::NoEvents),
-            tier: None,
-            tier_refusal: Some(FoldRefusal::NoEvents),
-            digests_agree: false,
-            disagreement: None,
-            postgres_without_context: None,
-            context_explains_the_gap: false,
-        };
-        assert!(
-            !c.digests_agree,
-            "absence of disagreement is not agreement — this is the vacuous \
-             pass the whole comparator discipline exists to refuse"
-        );
-    }
-}
-
 /// Fold the same execution TWICE in one request and report every JSON path
 /// where the two results differ.
 ///
@@ -532,8 +456,8 @@ pub async fn determinism_endpoint(
         super::events::parse_event_rows_for_fold(rows)
     }
 
-    let ev1 = load_events(&pool, execution_id).await;
-    let ev2 = load_events(&pool, execution_id).await;
+    let ev1 = load_events(pool, execution_id).await;
+    let ev2 = load_events(pool, execution_id).await;
     // Also fold the SAME in-memory event vector twice, which separates "the
     // fold is non-deterministic" from "two reads of the table differ".
     let core1: Vec<noetl_orchestrate_core::event::Event> = ev1.iter().map(Into::into).collect();
@@ -579,9 +503,86 @@ pub async fn compare_sources_endpoint(
     axum::extract::Path(execution_id): axum::extract::Path<i64>,
 ) -> AppResult<axum::Json<serde_json::Value>> {
     let pool = state.pools.pool_for(execution_id);
-    let cmp = compare_sources(&pool, execution_id).await?;
+    let cmp = compare_sources(pool, execution_id).await?;
     Ok(axum::Json(serde_json::json!({
         "action": "ehdb.projection.fold.compare",
         "result": cmp,
     })))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The tier's record shape must be read faithfully, including the field it
+    /// does not carry.
+    ///
+    /// This is the Phase 1 question in unit form: a payload shaped exactly like
+    /// `ehdb_eventlog_mirror::mirror_payload` yields an event whose `context`
+    /// is `None`, while the same logical event from Postgres carries one. The
+    /// fold reads `context` in six places, so `None` is not a cosmetic
+    /// difference.
+    #[test]
+    fn a_tier_payload_has_no_context_and_the_reader_says_so() {
+        let payload = serde_json::json!({
+            "event_id": 10, "execution_id": 1, "catalog_id": 2,
+            "event_type": "step.enter", "status": "ok",
+            "node_name": "s1", "step": "s1",
+            "result": {"a": 1}, "meta": {"attempt": "1"},
+            "mirror_source": "server"
+        });
+        let ev = event_from_tier_payload(&payload).expect("parses");
+        assert_eq!(ev.event_id, 10);
+        assert_eq!(ev.result, Some(serde_json::json!({"a": 1})));
+        assert!(
+            ev.context.is_none(),
+            "the tier record carries no `context` — if this ever becomes Some, \
+             the mirror payload changed and the Phase 1 finding is stale"
+        );
+        assert_eq!(ev.attempt, Some(1), "attempt is derived from meta, as in the SQL projection");
+    }
+
+    /// …and when a payload DOES carry context, the reader picks it up. Without
+    /// this, the assertion above would also pass against a reader that simply
+    /// never reads the field — proving the reader broken rather than the
+    /// record incomplete.
+    #[test]
+    fn the_reader_picks_up_context_when_it_is_present() {
+        let payload = serde_json::json!({
+            "event_id": 11, "execution_id": 1, "catalog_id": 2,
+            "event_type": "step.enter", "status": "ok",
+            "context": {"loop": {"i": 3}}
+        });
+        let ev = event_from_tier_payload(&payload).expect("parses");
+        assert_eq!(ev.context, Some(serde_json::json!({"loop": {"i": 3}})));
+    }
+
+    /// A record set that parses to nothing is a refusal, never an empty state.
+    #[test]
+    fn records_without_event_ids_refuse_rather_than_fold_nothing() {
+        let payload = serde_json::json!({"no_event_id": true});
+        assert!(event_from_tier_payload(&payload).is_none());
+    }
+
+    /// Two refusals are not a match.
+    #[test]
+    fn agreement_requires_two_folds_not_two_refusals() {
+        let c = FoldComparison {
+            execution_id: 1,
+            postgres: None,
+            postgres_refusal: Some(FoldRefusal::NoEvents),
+            tier: None,
+            tier_refusal: Some(FoldRefusal::NoEvents),
+            digests_agree: false,
+            disagreement: None,
+            postgres_without_context: None,
+            context_explains_the_gap: false,
+        };
+        assert!(
+            !c.digests_agree,
+            "absence of disagreement is not agreement — this is the vacuous \
+             pass the whole comparator discipline exists to refuse"
+        );
+    }
+}
+
