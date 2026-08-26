@@ -166,6 +166,56 @@ pub async fn load_latest(pool: &DbPool, execution_id: i64) -> AppResult<Option<L
         return load_incumbent(pool, execution_id).await;
     }
 
+    // ai-meta#265 Phase 3 — the WAL-sourced control-flow read.
+    //
+    // Resolve from the projection tier materialised out of the WAL spine, and
+    // serve ONLY when a fresh re-fold agrees. Postgres is not read here at all,
+    // in either direction: a fallback on the error path is exactly how a second
+    // source of truth gets re-established.
+    //
+    // `Ok(None)` on refusal means the caller rebuilds without a snapshot, which
+    // for an in-flight execution is bounded by the events-since window. The
+    // stronger "do not advance at all" refusal belongs at the trigger, not
+    // here; this function's contract is "the latest snapshot, or none".
+    if source.is_wal() {
+        let (body, verdict) =
+            crate::handlers::ehdb_projection_fold::wal_projection_state(execution_id).await;
+        crate::metrics::record_ehdb_projection_read(match verdict {
+            crate::handlers::ehdb_projection_fold::ReFoldVerdict::Match => "served_tier",
+            v => v.as_str(),
+        });
+        let Some(body) = body else {
+            if verdict.is_fault() {
+                tracing::warn!(
+                    target: "noetl_server::ehdb_projection_read",
+                    execution_id,
+                    verdict = verdict.as_str(),
+                    "WAL-sourced projection REFUSED — not advancing on unverified state"
+                );
+            }
+            return Ok(None);
+        };
+        return match serde_json::from_value::<WorkflowState>(body) {
+            Ok(state) => Ok(Some(LoadedSnapshot {
+                state,
+                version: 0,
+                applied_count: 0,
+                updated_at: chrono::Utc::now(),
+                routing_meta: None,
+                checksum: None,
+            })),
+            Err(e) => {
+                tracing::warn!(
+                    target: "noetl_server::ehdb_projection_read",
+                    execution_id, %e,
+                    "WAL-sourced projection did not deserialise; refusing"
+                );
+                crate::metrics::record_ehdb_projection_read("undeserialisable");
+                Ok(None)
+            }
+        };
+    }
+
     // `verify` loads the incumbent FIRST and compares against it. That ordering
     // is what makes the mode safe by construction rather than by the checks
     // being right: the answer it can fall back to is already in hand before the
@@ -327,6 +377,60 @@ async fn load_incumbent(
         routing_meta,
         checksum,
     }))
+}
+
+
+/// Diagnostic: run the recovery read BOTH ways and compare what control flow
+/// would receive (ai-meta#265 Phase 3, re-scoped).
+///
+/// # What this gates
+///
+/// On the off-server topology the *primary* control-flow read is already
+/// WAL/EHDB-sourced — the worker builds state from the spine and `load_latest`
+/// is never called. `load_latest` is the **recovery** path: cold descriptor
+/// after a server restart, or a `system/...` execution.
+///
+/// The re-scoped Phase 3 objective is to take Postgres out of *that* path too.
+/// So the gate is: does the recovery read return the **same control-flow state**
+/// from the durable EHDB projection as it would from `noetl.projection_snapshot`?
+///
+/// Both branches are exercised here in one request, against one execution, so a
+/// difference cannot be attributed to the execution advancing between calls.
+/// The comparison is on the **canonical digest of the state control flow would
+/// actually use**, not on the stored records — which is the end-to-end form the
+/// 8/8 fold-equivalence result was only the input to.
+pub async fn recovery_read_comparison(
+    pool: &DbPool,
+    execution_id: i64,
+) -> serde_json::Value {
+    use noetl_orchestrate_core::state::canonical_state_digest;
+
+    // --- what recovery returns today (Postgres) -----------------------------
+    let pg = load_incumbent(pool, execution_id).await.ok().flatten();
+    let pg_digest = pg.as_ref().map(|s| canonical_state_digest(&s.state));
+
+    // --- what recovery would return from the durable EHDB projection --------
+    let (body, verdict) =
+        crate::handlers::ehdb_projection_fold::wal_projection_state(execution_id).await;
+    let wal_state: Option<WorkflowState> =
+        body.and_then(|b| serde_json::from_value(b).ok());
+    let wal_digest = wal_state.as_ref().map(canonical_state_digest);
+
+    let agree = matches!((&pg_digest, &wal_digest), (Some(a), Some(b)) if a == b);
+    serde_json::json!({
+        "action": "ehdb.projection.recovery.compare",
+        "execution_id": execution_id,
+        "postgres_digest": pg_digest,
+        "wal_digest": wal_digest,
+        "wal_verdict": verdict.as_str(),
+        "wal_is_fault": verdict.is_fault(),
+        // `true` ONLY when both produced a state and they agree. Two absences
+        // are not agreement — that is the vacuous pass this whole comparator
+        // discipline exists to refuse.
+        "agree": agree,
+        "postgres_present": pg_digest.is_some(),
+        "wal_present": wal_digest.is_some(),
+    })
 }
 
 #[cfg(test)]

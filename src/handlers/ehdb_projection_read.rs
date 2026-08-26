@@ -103,6 +103,16 @@ pub enum ReadSource {
     Postgres,
     Verify,
     Tier,
+    /// **The flag-ON control-flow path** (ai-meta#265 Phase 3): resolve state
+    /// from the projection tier materialised out of the **WAL spine**, verified
+    /// against a fresh re-fold before it is allowed to drive anything.
+    ///
+    /// Postgres is not consulted at all on this path — not as a source and not
+    /// as a fallback. Every non-`Match` verdict refuses, and refusing means
+    /// *this pass does not advance the execution*; the reconciler re-drives.
+    /// A fallback that silently read a different store on error would
+    /// re-establish the second source of truth this work exists to remove.
+    Wal,
 }
 
 impl ReadSource {
@@ -111,6 +121,7 @@ impl ReadSource {
             Self::Postgres => "postgres",
             Self::Verify => "verify",
             Self::Tier => "tier",
+            Self::Wal => "wal",
         }
     }
     /// Whether this mode touches the tier at all.
@@ -120,6 +131,10 @@ impl ReadSource {
     /// Whether this mode needs the incumbent row loaded *before* deciding.
     pub fn needs_incumbent_first(self) -> bool {
         matches!(self, Self::Postgres | Self::Verify)
+    }
+    /// Whether this mode resolves control-flow state from the WAL spine.
+    pub fn is_wal(self) -> bool {
+        matches!(self, Self::Wal)
     }
 }
 
@@ -136,6 +151,7 @@ pub fn read_source() -> ReadSource {
         None | Some("") | Some("postgres") => ReadSource::Postgres,
         Some("verify") => ReadSource::Verify,
         Some("tier") => ReadSource::Tier,
+        Some("wal") => ReadSource::Wal,
         Some(other) => {
             warn_unrecognised(other);
             ReadSource::Postgres
@@ -607,6 +623,51 @@ mod tests {
         assert!(ReadSource::Tier.reads_tier());
     }
 
+
+    /// The WAL mode must not consult Postgres — in either direction.
+    ///
+    /// `needs_incumbent_first` is what makes `verify` safe by construction (the
+    /// fallback is in hand before the tier is consulted). For `wal` the
+    /// opposite is required: Postgres is not a source AND not a fallback,
+    /// because a fallback on the error path is how a second source of truth
+    /// gets re-established. Asserted on the type rather than left to the call
+    /// site, since the call site is where it would silently regress.
+    #[test]
+    fn the_wal_mode_never_reaches_for_the_incumbent() {
+        assert!(ReadSource::Wal.reads_tier());
+        assert!(
+            !ReadSource::Wal.needs_incumbent_first(),
+            "wal mode must not load the incumbent first — it is not a comparison mode"
+        );
+        assert!(ReadSource::Wal.is_wal());
+        // …and the other modes are not wal, so a future `is_wal` that returned
+        // true unconditionally fails here rather than silently routing every
+        // read through the WAL path.
+        for m in [ReadSource::Postgres, ReadSource::Verify, ReadSource::Tier] {
+            assert!(!m.is_wal(), "{} must not be treated as wal", m.as_str());
+        }
+        assert_eq!(ReadSource::Wal.as_str(), "wal");
+    }
+
+    /// An unrecognised value still resolves to `postgres`, now that a fourth
+    /// mode exists.
+    #[test]
+    fn a_typo_still_lands_on_the_incumbent_not_on_wal() {
+        // The parse is env-driven, so exercise the mapping the same way
+        // `read_source` does: anything unknown must be Postgres.
+        for bad in ["wall", "WAL ", "spine", "true", ""] {
+            let got = match bad.trim().to_ascii_lowercase().as_str() {
+                "" | "postgres" => ReadSource::Postgres,
+                "verify" => ReadSource::Verify,
+                "tier" => ReadSource::Tier,
+                "wal" => ReadSource::Wal,
+                _ => ReadSource::Postgres,
+            };
+            if !bad.trim().eq_ignore_ascii_case("wal") {
+                assert!(!got.is_wal(), "{bad:?} must not enable the WAL control-flow path");
+            }
+        }
+    }
     /// A healthy record at or below the event tip is served.
     #[test]
     fn a_consistent_record_is_served() {

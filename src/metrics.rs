@@ -3507,6 +3507,9 @@ pub fn init_ehdb_projection_series() {
             .with_label_values(&[outcome])
             .inc_by(0);
     }
+    for o in ["materialized", "refused"] {
+        ehdb_projection_materialize_total().with_label_values(&[o]).inc_by(0);
+    }
     for v in crate::handlers::ehdb_projection_fold::REFOLD_VERDICTS {
         ehdb_projection_refold_total().with_label_values(&[v]).inc_by(0);
     }
@@ -3870,6 +3873,29 @@ pub fn ehdb_projection_refold_total() -> &'static IntCounterVec {
 
 pub fn record_ehdb_projection_refold(verdict: &str) {
     ehdb_projection_refold_total().with_label_values(&[verdict]).inc();
+}
+
+/// Counter: WAL-spine materialisations into the projection tier
+/// (ai-meta#265 Phase 3).
+pub fn ehdb_projection_materialize_total() -> &'static IntCounterVec {
+    static M: OnceLock<IntCounterVec> = OnceLock::new();
+    M.get_or_init(|| {
+        let c = IntCounterVec::new(
+            Opts::new(
+                "noetl_ehdb_projection_materialize_total",
+                "Executions materialised into the projection tier from the WAL spine, by outcome \
+                 (noetl/ai-meta#265).",
+            ),
+            &["outcome"],
+        )
+        .expect("static counter spec must be valid");
+        registry().register(Box::new(c.clone())).expect("counter registration must succeed");
+        c
+    })
+}
+
+pub fn record_ehdb_projection_materialize(outcome: &str) {
+    ehdb_projection_materialize_total().with_label_values(&[outcome]).inc();
 }
 
 pub fn init_ehdb_crossstore_series() {
