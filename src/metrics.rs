@@ -3422,6 +3422,41 @@ pub fn ehdb_projection_mirror_total() -> &'static IntCounterVec {
 pub const EHDB_PROJECTION_MIRROR_OUTCOMES: [&str; 4] =
     ["mirrored", "unconfigured", "unavailable", "degraded"];
 
+/// Outcomes of serving a Secret-Manager-sourced credential (noetl/ai-meta#267):
+/// `cache_hit`, `fetched`, `fetch_error`, `not_an_object`.
+///
+/// All four are emitted as series on first use of the path. `Registry::gather`
+/// prunes empty families, so an absent series is indistinguishable from a binary
+/// predating the metric — which matters most for `fetch_error`, the one an
+/// operator would go looking for.
+pub fn sm_sourced_credential_total() -> &'static IntCounterVec {
+    static M: std::sync::OnceLock<IntCounterVec> = std::sync::OnceLock::new();
+    M.get_or_init(|| {
+        let m = IntCounterVec::new(
+            prometheus::Opts::new(
+                "noetl_sm_sourced_credential_total",
+                "Serving a credential whose value is sourced from a secret manager, by outcome (noetl/ai-meta#267).",
+            ),
+            &["outcome"],
+        )
+        .expect("sm_sourced_credential_total metric");
+        for o in ["cache_hit", "fetched", "fetch_error", "not_an_object"] {
+            m.with_label_values(&[o]).reset();
+        }
+        registry()
+            .register(Box::new(m.clone()))
+            .expect("register sm_sourced_credential_total");
+        m
+    })
+}
+
+/// Record one SM-sourced credential serve outcome.
+pub fn record_sm_sourced_credential(outcome: &str) {
+    sm_sourced_credential_total()
+        .with_label_values(&[outcome])
+        .inc();
+}
+
 pub fn record_ehdb_projection_mirror(outcome: &str) {
     ehdb_projection_mirror_total()
         .with_label_values(&[outcome])

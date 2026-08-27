@@ -151,6 +151,32 @@ pub(crate) fn effective_region(kc: &KeychainDef) -> String {
     server_region().to_string()
 }
 
+
+/// Interpret a Secret Manager payload as either noetl's **structured credential
+/// object** or an opaque string (noetl/ai-meta#267).
+///
+/// A plain-text secret stays a string, byte-identically. Malformed JSON stays a
+/// string too — deliberately: degrading to an empty object would render an empty
+/// sub-field and fail at the API call, looking like a wrong credential rather
+/// than a parse failure.
+///
+/// The `.data` unwrap matches what the credential-indirect path serves, so the
+/// same template resolves the same way whichever path supplied it.
+pub fn structured_or_string(payload: &str) -> serde_json::Value {
+    let trimmed = payload.trim();
+    if !trimmed.starts_with('{') {
+        return serde_json::Value::String(payload.to_string());
+    }
+    match serde_json::from_str::<serde_json::Value>(trimmed) {
+        Ok(serde_json::Value::Object(mut o)) => match o.remove("data") {
+            Some(d @ serde_json::Value::Object(_)) => d,
+            _ => serde_json::Value::Object(o),
+        },
+        Ok(_) => serde_json::Value::String(payload.to_string()),
+        Err(_) => serde_json::Value::String(payload.to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;

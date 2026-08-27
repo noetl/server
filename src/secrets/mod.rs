@@ -35,7 +35,7 @@ pub use gcp::GcpSecretManager;
 pub use gcp_iam::GcpIamProvider;
 pub use k8s::K8sSecretProvider;
 pub use registry::get_provider;
-pub use resolver::{resolve_keychain_entry, resolve_keychain_entry_with_meta};
+pub use resolver::{resolve_keychain_entry, resolve_keychain_entry_with_meta, structured_or_string};
 pub use vault::VaultSecretProvider;
 
 use std::sync::{Arc, OnceLock};
