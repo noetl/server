@@ -127,7 +127,7 @@ pub async fn resolve_keychain_entry_with_meta(
                     return Err(e);
                 }
             };
-            Ok((serde_json::Value::String(secret.value), secret.expires_at))
+            Ok((structured_or_string(&secret.value), secret.expires_at))
         }
     };
     if result.is_ok() {
@@ -151,8 +151,141 @@ pub(crate) fn effective_region(kc: &KeychainDef) -> String {
     server_region().to_string()
 }
 
+
+/// Interpret a Secret Manager payload as either noetl's **structured credential
+/// object** or an opaque string (noetl/ai-meta#267).
+///
+/// The no-`map` branch used to return `Value::String(payload)` unconditionally.
+/// That is right for a plain-text secret and wrong for the shape operators
+/// actually upload:
+///
+/// ```json
+/// {"name":"auth0_client","type":"auth0","data":{"client_secret":"…"}}
+/// ```
+///
+/// Against a bare string, `{{ keychain.<alias>.client_secret }}` resolves
+/// nothing — the sub-field reference has no object to index.
+///
+/// # The `.data` unwrap is not arbitrary
+///
+/// The sibling **credential-indirect** branch in `services::credential` returns
+/// the record's decrypted `data` object, so playbooks write
+/// `keychain.<alias>.client_secret` against `data`'s keys. Returning the whole
+/// envelope here would make the *same* template resolve differently depending on
+/// which branch served it. Unwrapping `data` makes the two paths agree.
+///
+/// # Backward compatibility is the load-bearing property
+///
+/// Anything that is not a JSON object comes back as a string, byte-identical to
+/// today — plain-text secrets included. Malformed input is deliberately in that
+/// category: a truncated payload must **not** degrade into an empty object,
+/// because an empty object renders an empty sub-field and fails far from its
+/// cause.
+pub fn structured_or_string(payload: &str) -> serde_json::Value {
+    let trimmed = payload.trim();
+    // Cheap reject before parsing: a secret is overwhelmingly likely to be an
+    // opaque token, and `from_str` on one is wasted work.
+    if !trimmed.starts_with('{') {
+        return serde_json::Value::String(payload.to_string());
+    }
+    match serde_json::from_str::<serde_json::Value>(trimmed) {
+        Ok(serde_json::Value::Object(mut o)) => match o.remove("data") {
+            Some(d @ serde_json::Value::Object(_)) => d,
+            // An object without a `data` object is still an object — an operator
+            // may have uploaded the fields bare. Serve it rather than guessing.
+            _ => serde_json::Value::Object(o),
+        },
+        // Valid JSON that is not an object has no sub-fields to offer.
+        Ok(_) => serde_json::Value::String(payload.to_string()),
+        // Malformed. NOT an empty object — see above.
+        Err(_) => serde_json::Value::String(payload.to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+
+    // ---- noetl/ai-meta#267: structured Secret Manager payloads ----
+
+    /// The case this change exists for: the noetl envelope resolves to its inner
+    /// `data`, so `{{ keychain.<alias>.client_secret }}` finds a sub-field.
+    #[test]
+    fn the_noetl_envelope_resolves_to_its_data_object() {
+        let v = super::structured_or_string(
+            r#"{"name":"auth0_client","type":"auth0","data":{"client_secret":"S","client_id":"C"}}"#,
+        );
+        assert_eq!(v.get("client_secret").and_then(|x| x.as_str()), Some("S"));
+        assert_eq!(v.get("client_id").and_then(|x| x.as_str()), Some("C"));
+    }
+
+    /// The property that makes this safe to ship: plain text is untouched.
+    /// `auth0-test-user-password` is exactly this shape.
+    #[test]
+    fn plain_text_is_unchanged() {
+        for p in ["hunter2", "not json at all", "", "   ", "abc-123-def"] {
+            assert_eq!(
+                super::structured_or_string(p),
+                serde_json::Value::String(p.to_string()),
+                "payload {p:?}"
+            );
+        }
+    }
+
+    /// ⚠ The negative control. A truncated payload must NOT become an empty
+    /// object: an empty object renders an empty sub-field and fails later, at the
+    /// API call, looking like a wrong credential rather than a parse failure.
+    #[test]
+    fn malformed_json_stays_a_string_and_never_becomes_an_empty_object() {
+        for bad in [
+            r#"{"name":"auth0_client","data":{"client_secret":"#,
+            r#"{"unclosed": "#,
+            r#"{not json}"#,
+            r#"{"a":1,,}"#,
+        ] {
+            let v = super::structured_or_string(bad);
+            assert!(v.is_string(), "malformed payload became {v:?}");
+            assert_ne!(
+                v,
+                serde_json::json!({}),
+                "malformed payload degraded to an empty object"
+            );
+        }
+    }
+
+    /// An envelope whose `data` is present but empty is a real (if useless)
+    /// credential; distinguishing it from malformed input is the point of the
+    /// previous test.
+    #[test]
+    fn an_empty_data_object_is_preserved_not_confused_with_malformed() {
+        let v = super::structured_or_string(r#"{"name":"x","type":"y","data":{}}"#);
+        assert!(v.is_object());
+        assert_eq!(v, serde_json::json!({}));
+    }
+
+    /// A bare object without the envelope still works — an operator may upload
+    /// the fields directly, and guessing an unwrap would lose them.
+    #[test]
+    fn a_bare_object_without_the_envelope_is_served_as_is() {
+        let v = super::structured_or_string(r#"{"client_secret":"S"}"#);
+        assert_eq!(v.get("client_secret").and_then(|x| x.as_str()), Some("S"));
+    }
+
+    /// `data` that is not an object must not be unwrapped into a non-indexable
+    /// value; keep the envelope so the caller sees the shape.
+    #[test]
+    fn a_non_object_data_field_is_not_unwrapped() {
+        let v = super::structured_or_string(r#"{"name":"x","data":"oops"}"#);
+        assert!(v.is_object());
+        assert_eq!(v.get("name").and_then(|x| x.as_str()), Some("x"));
+    }
+
+    /// A file-uploaded secret commonly carries a trailing newline.
+    #[test]
+    fn surrounding_whitespace_does_not_defeat_the_parse() {
+        let v = super::structured_or_string("\n  {\"data\":{\"client_secret\":\"S\"}}  \n");
+        assert_eq!(v.get("client_secret").and_then(|x| x.as_str()), Some("S"));
+    }
+
     use std::sync::Mutex;
 
     use super::*;
