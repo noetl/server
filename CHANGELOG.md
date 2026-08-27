@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.90.0](https://github.com/noetl/server/compare/v3.89.0...v3.90.0) (2026-08-27)
+
+### Features
+
+* **secrets:** hydrate <VAR>_FILE for the three bootstrap secrets — INERT by default ([ed463ba](https://github.com/noetl/server/commit/ed463ba2f82de0da195fa978389e360b6b73c987)), closes [noetl/ai-meta#267](https://github.com/noetl/ai-meta/issues/267) [#297](https://github.com/noetl/server/issues/297) [noetl/ai-meta#267](https://github.com/noetl/ai-meta/issues/267)
+
 ## [3.89.0](https://github.com/noetl/server/compare/v3.88.0...v3.89.0) (2026-08-27)
 
 ### Features
