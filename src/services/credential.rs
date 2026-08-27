@@ -135,7 +135,23 @@ impl CredentialService {
                 let data = if include_data {
                     // `entry.data` is the self-describing envelope JSON from the
                     // TEXT column — unwrap the DEK + decrypt.
-                    Some(self.cipher.open_storage_json(&entry.data).await?)
+                    let stored = self.cipher.open_storage_json(&entry.data).await?;
+                    // noetl/ai-meta#267 — a credential may carry a marker saying
+                    // its VALUE lives in a secret manager. Only then do we fetch;
+                    // an unmarked credential takes exactly the path it always has,
+                    // which is what keeps every existing credential working.
+                    match crate::services::sm_sourced::parse_marker(&stored) {
+                        Some(src) => {
+                            tracing::info!(
+                                credential = %identifier,
+                                provider = %src.provider,
+                                secret = %src.secret,
+                                "credential value is secret-manager-sourced"
+                            );
+                            Some(crate::services::sm_sourced::resolve(&src).await?)
+                        }
+                        None => Some(stored),
+                    }
                 } else {
                     None
                 };
