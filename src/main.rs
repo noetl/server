@@ -794,6 +794,13 @@ async fn main() -> anyhow::Result<()> {
     // Load environment variables from .env file if present
     dotenvy::dotenv().ok();
 
+    // noetl/ai-meta#267 Tier 2 — hydrate <VAR> from <VAR>_FILE for the three
+    // bootstrap secrets, BEFORE any thread is spawned and before any config is
+    // read.  Inert unless a *_FILE variable is set, so this is a no-op on every
+    // deployment that has not migrated.  Placement is load-bearing and pinned by
+    // `file_env::tests::hydrate_is_called_at_the_top_of_main`.
+    let secret_sources = noetl_server::secrets::file_env::hydrate();
+
     // Initialize tracing
     init_tracing();
 
@@ -801,6 +808,20 @@ async fn main() -> anyhow::Result<()> {
         version = env!("CARGO_PKG_VERSION"),
         "Starting NoETL Control Plane"
     );
+
+    // Report WHERE each bootstrap secret came from — never what it is.  Both
+    // label values are emitted for every variable so "file" and "env" are always
+    // present as series: an absent series would be indistinguishable from a
+    // binary that predates this, which is the ambiguity noetl/ai-meta#267 and
+    // #297 both turned on.
+    for (var, source) in &secret_sources {
+        noetl_server::metrics::record_secret_source(var, source.as_str());
+        tracing::info!(
+            target: "noetl_server::secrets",
+            var, source = source.as_str(),
+            "bootstrap secret source resolved"
+        );
+    }
 
     // Publish the version and pin the known label sets, unconditionally and
     // before any configuration branch can skip them.  `Registry::gather` prunes

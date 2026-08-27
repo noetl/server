@@ -18,6 +18,7 @@ mod aws_sts;
 mod azure;
 mod azure_oauth;
 pub mod broker;
+pub mod file_env;
 pub mod dynamic;
 mod gcp;
 mod gcp_iam;

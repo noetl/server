@@ -3422,6 +3422,40 @@ pub fn ehdb_projection_mirror_total() -> &'static IntCounterVec {
 pub const EHDB_PROJECTION_MIRROR_OUTCOMES: [&str; 4] =
     ["mirrored", "unconfigured", "unavailable", "degraded"];
 
+/// Where each bootstrap secret came from (noetl/ai-meta#267 Tier 2) — labelled
+/// by `var` and `source` (`file` / `env` / `file_unusable`).  Records the
+/// PROVENANCE, never the value.
+///
+/// Every variable emits on every boot, so all three sources exist as series for
+/// each var from the first scrape.  `Registry::gather` prunes empty families, so
+/// a labelled metric is ABSENT until it fires — and an absent series is
+/// indistinguishable from a binary that predates the metric.  Emitting
+/// unconditionally is what makes "this secret is still coming from env" a
+/// readable 1 rather than a missing row.
+pub fn secret_source_total() -> &'static IntCounterVec {
+    static M: std::sync::OnceLock<IntCounterVec> = std::sync::OnceLock::new();
+    M.get_or_init(|| {
+        let m = IntCounterVec::new(
+            prometheus::Opts::new(
+                "noetl_secret_source_total",
+                "Where a bootstrap secret was read from at startup: file (CSI mount) or env (secretKeyRef). Provenance only, never the value (noetl/ai-meta#267).",
+            ),
+            &["var", "source"],
+        )
+        .expect("secret_source_total metric");
+        registry()
+            .register(Box::new(m.clone()))
+            .expect("register secret_source_total");
+        m
+    })
+}
+
+/// Record one bootstrap secret's provenance.  `source` is `file`, `env` or
+/// `file_unusable`.
+pub fn record_secret_source(var: &str, source: &str) {
+    secret_source_total().with_label_values(&[var, source]).inc();
+}
+
 pub fn record_ehdb_projection_mirror(outcome: &str) {
     ehdb_projection_mirror_total()
         .with_label_values(&[outcome])
