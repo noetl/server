@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.89.0](https://github.com/noetl/server/compare/v3.88.0...v3.89.0) (2026-08-27)
+
+### Features
+
+* **credentials:** source a credential's VALUE from a secret manager, keeping the working path ([594c030](https://github.com/noetl/server/commit/594c03001bbb41cdde779b46946cbb08cf31de82)), closes [noetl/ai-meta#267](https://github.com/noetl/ai-meta/issues/267) [#297](https://github.com/noetl/server/issues/297) [server#360](https://github.com/noetl/server/issues/360) [noetl/ai-meta#267](https://github.com/noetl/ai-meta/issues/267)
+
 ## [3.88.0](https://github.com/noetl/server/compare/v3.87.0...v3.88.0) (2026-08-26)
 
 ### Features
