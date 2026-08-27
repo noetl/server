@@ -3966,6 +3966,38 @@ pub fn init_ehdb_crossstore_series() {
     }
 }
 
+
+/// Where each bootstrap secret came from (noetl/ai-meta#267 Tier 2) — labelled
+/// by `var` and `source` (`file` / `env` / `file_unusable`).  Records the
+/// PROVENANCE, never the value.
+///
+/// Every variable emits on every boot, so all sources exist as series from the
+/// first scrape.  `Registry::gather` prunes empty families, so an absent series
+/// would be indistinguishable from a binary that predates the metric.
+pub fn secret_source_total() -> &'static IntCounterVec {
+    static M: std::sync::OnceLock<IntCounterVec> = std::sync::OnceLock::new();
+    M.get_or_init(|| {
+        let m = IntCounterVec::new(
+            prometheus::Opts::new(
+                "noetl_secret_source_total",
+                "Where a bootstrap secret was read from at startup: file (CSI mount) or env (secretKeyRef). Provenance only, never the value (noetl/ai-meta#267).",
+            ),
+            &["var", "source"],
+        )
+        .expect("secret_source_total metric");
+        registry()
+            .register(Box::new(m.clone()))
+            .expect("register secret_source_total");
+        m
+    })
+}
+
+/// Record one bootstrap secret's provenance.  `source` is `file`, `env` or
+/// `file_unusable`.
+pub fn record_secret_source(var: &str, source: &str) {
+    secret_source_total().with_label_values(&[var, source]).inc();
+}
+
 #[cfg(test)]
 mod tests {
 
