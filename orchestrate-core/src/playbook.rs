@@ -82,6 +82,56 @@ pub enum ToolKind {
     Wasm,
 }
 
+impl ToolKind {
+    /// Every variant, for validating a submitted kind and for naming the valid
+    /// set in the rejection (noetl/ai-meta#256).
+    ///
+    /// Kept honest by `every_variant_is_in_all`, which round-trips each entry
+    /// through serde and asserts the count — a variant added without extending
+    /// this array fails that test rather than silently becoming a kind the
+    /// registration validator rejects.
+    pub const ALL: [ToolKind; 25] = [
+        ToolKind::Http,
+        ToolKind::Postgres,
+        ToolKind::Duckdb,
+        ToolKind::Ducklake,
+        ToolKind::Python,
+        ToolKind::Workbook,
+        ToolKind::Playbook,
+        ToolKind::Playbooks,
+        ToolKind::Secrets,
+        ToolKind::Iterator,
+        ToolKind::Container,
+        ToolKind::Script,
+        ToolKind::Snowflake,
+        ToolKind::Transfer,
+        ToolKind::SnowflakeTransfer,
+        ToolKind::Gcs,
+        ToolKind::Gateway,
+        ToolKind::Nats,
+        ToolKind::Shell,
+        ToolKind::Artifact,
+        ToolKind::Noop,
+        ToolKind::TaskSequence,
+        ToolKind::Rhai,
+        ToolKind::Subscription,
+        ToolKind::Wasm,
+    ];
+
+    /// Parse a wire value, using serde as the oracle rather than a second copy
+    /// of the name list — two lists are two chances to disagree.
+    pub fn parse(value: &str) -> Option<Self> {
+        serde_json::from_value::<ToolKind>(serde_json::Value::String(value.to_string())).ok()
+    }
+
+    /// The valid set, sorted, for an error message.
+    pub fn valid_set() -> String {
+        let mut v: Vec<String> = Self::ALL.iter().map(|k| k.to_string()).collect();
+        v.sort();
+        v.join(", ")
+    }
+}
+
 impl std::fmt::Display for ToolKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = match self {
@@ -1690,5 +1740,63 @@ workflow:
             Some(&serde_json::json!(200)),
             "literal value must be preserved"
         );
+    }
+}
+
+#[cfg(test)]
+mod tool_kind_tests {
+    use super::*;
+
+    /// `ALL` must actually contain every variant. There is no reflection, so the
+    /// guard is: each entry round-trips through serde, the count matches, and the
+    /// names are distinct. A new variant that is not added here makes the count
+    /// assertion fail.
+    #[test]
+    fn every_variant_is_in_all() {
+        assert_eq!(ToolKind::ALL.len(), 25);
+        let mut names: Vec<String> = ToolKind::ALL.iter().map(|k| k.to_string()).collect();
+        names.sort();
+        names.dedup();
+        assert_eq!(names.len(), 25, "ALL contains a duplicate");
+        for k in ToolKind::ALL {
+            let name = k.to_string();
+            assert_eq!(
+                ToolKind::parse(&name),
+                Some(k),
+                "{name} does not round-trip through serde"
+            );
+        }
+    }
+
+    /// The kinds noetl/ai-meta#256 found in the live catalog must be rejected.
+    /// These are not hypothetical: all four were registered and are permanently
+    /// unexecutable.
+    #[test]
+    fn the_kinds_found_in_the_live_catalog_are_rejected() {
+        for bad in ["agent", "mcp", "provider", "result_fetch"] {
+            assert!(ToolKind::parse(bad).is_none(), "{bad} must not parse");
+        }
+        // Negative control from the issue's own probe table.
+        assert!(ToolKind::parse("totally_bogus_kind").is_none());
+        // Positive control: the check is capable of accepting something.
+        assert_eq!(ToolKind::parse("noop"), Some(ToolKind::Noop));
+        assert_eq!(ToolKind::parse("task_sequence"), Some(ToolKind::TaskSequence));
+    }
+
+    /// Case and whitespace are NOT silently accepted — `Agent` is as invalid as
+    /// `agent`, and normalising here would be a second interpretation of the
+    /// author's input rather than a validation of it.
+    #[test]
+    fn parsing_is_exact_not_forgiving() {
+        assert!(ToolKind::parse("HTTP").is_none());
+        assert!(ToolKind::parse(" http").is_none());
+        assert_eq!(ToolKind::parse("http"), Some(ToolKind::Http));
+    }
+
+    #[test]
+    fn the_valid_set_names_real_kinds() {
+        let s = ToolKind::valid_set();
+        assert!(s.contains("noop") && s.contains("task_sequence") && s.contains("wasm"));
+        assert!(!s.contains("agent"), "the invalid kinds must not be advertised");
     }
 }

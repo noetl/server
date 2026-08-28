@@ -64,6 +64,19 @@ impl CatalogService {
             validate_subscription_spec(&yaml)?;
         }
 
+        // noetl/ai-meta#256 — reject an unknown tool kind HERE, not at execute.
+        //
+        // Registration used to accept literal nonsense: a probe registering
+        // `totally_bogus_kind` was ACCEPTED and then failed at invocation with
+        // "data did not match any variant of untagged enum ToolDefinition". So
+        // registration success carried no information about whether a playbook
+        // could ever run, and six live paths had been unexecutable since the day
+        // they were written, with nothing saying so until somebody invoked them.
+        //
+        // The failure now lands on the author at registration instead of on a
+        // user at invocation.
+        validate_tool_kinds(&yaml)?;
+
         // Get next version
         let version = queries::get_next_version(&self.pool, &path).await?;
 
@@ -394,6 +407,69 @@ const SUBSCRIPTION_ACTIVATIONS: &[&str] = &["continuous", "scheduled"];
 /// shape and explicitly does **not** require a `workflow:` step DAG (a
 /// subscription is activated on a runtime, never dispatched as a one-shot
 /// DAG).
+/// Collect every `tool.kind` in a playbook's workflow, with the step it sits on.
+///
+/// Walks the whole `workflow:` tree rather than only its top level, because
+/// nested constructs (`iterator`, `task_sequence`) carry steps of their own and a
+/// top-level-only scan would report a clean playbook with a broken inner step.
+fn collect_tool_kinds(node: &serde_yaml::Value, step: Option<String>, out: &mut Vec<(String, String)>) {
+    match node {
+        serde_yaml::Value::Mapping(map) => {
+            let here = map
+                .get(serde_yaml::Value::from("step"))
+                .or_else(|| map.get(serde_yaml::Value::from("name")))
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .or(step);
+            if let Some(tool) = map.get(serde_yaml::Value::from("tool")) {
+                if let Some(k) = tool.get(serde_yaml::Value::from("kind")).and_then(|v| v.as_str()) {
+                    out.push((here.clone().unwrap_or_else(|| "<unnamed>".into()), k.to_string()));
+                }
+            }
+            for (_k, v) in map {
+                collect_tool_kinds(v, here.clone(), out);
+            }
+        }
+        serde_yaml::Value::Sequence(seq) => {
+            for v in seq {
+                collect_tool_kinds(v, step.clone(), out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Reject a playbook whose workflow names a tool kind that does not exist
+/// (noetl/ai-meta#256).
+///
+/// Fail-closed: an unknown kind is a 4xx naming the offending step, the kind, and
+/// the valid set. `ToolKind::parse` uses serde as the oracle, so this cannot drift
+/// from the enum the executor actually deserialises against — a second hand-written
+/// list would be a second chance to disagree.
+fn validate_tool_kinds(yaml: &serde_yaml::Value) -> AppResult<()> {
+    let Some(workflow) = yaml.get("workflow") else {
+        return Ok(());
+    };
+    let mut found = Vec::new();
+    collect_tool_kinds(workflow, None, &mut found);
+    let mut bad: Vec<String> = found
+        .iter()
+        .filter(|(_, k)| noetl_orchestrate_core::playbook::ToolKind::parse(k).is_none())
+        .map(|(step, k)| format!("step '{step}' has kind '{k}'"))
+        .collect();
+    if bad.is_empty() {
+        return Ok(());
+    }
+    bad.dedup();
+    Err(AppError::Validation(format!(
+        "unknown tool kind(s): {}. Valid kinds: {}. \
+         (noetl/ai-meta#256 — registering an unknown kind used to succeed and fail \
+         only at execute, leaving the playbook permanently unexecutable.)",
+        bad.join("; "),
+        noetl_orchestrate_core::playbook::ToolKind::valid_set()
+    )))
+}
+
 fn validate_subscription_spec(yaml: &serde_yaml::Value) -> AppResult<()> {
     let spec = yaml
         .get("spec")
@@ -773,6 +849,87 @@ fn validate_push_ingress(spec: &serde_yaml::Value) -> AppResult<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tool_kind_validation_tests {
+    use super::*;
+
+    fn yaml(src: &str) -> serde_yaml::Value {
+        serde_yaml::from_str(src).expect("test yaml parses")
+    }
+
+    /// A valid playbook registers. Positive control first: without it, a
+    /// validator that rejected everything would pass every negative test below.
+    #[test]
+    fn a_valid_kind_is_accepted() {
+        let y = yaml(
+            "workflow:\n  - step: a\n    tool:\n      kind: noop\n",
+        );
+        assert!(validate_tool_kinds(&y).is_ok());
+    }
+
+    /// The four kinds noetl/ai-meta#256 found live, plus the issue's own negative
+    /// control. Each was ACCEPTED by registration before this change.
+    #[test]
+    fn the_kinds_found_in_the_live_catalog_are_rejected_with_the_step_named() {
+        for bad in ["agent", "mcp", "provider", "result_fetch", "totally_bogus_kind"] {
+            let y = yaml(&format!(
+                "workflow:\n  - step: call_thing\n    tool:\n      kind: {bad}\n"
+            ));
+            let e = validate_tool_kinds(&y).unwrap_err().to_string();
+            assert!(e.contains(bad), "the offending kind must be quoted back: {e}");
+            assert!(
+                e.contains("call_thing"),
+                "the offending STEP must be named, or the author has to hunt: {e}"
+            );
+            assert!(e.contains("noop"), "the valid set must be offered: {e}");
+        }
+    }
+
+    /// A nested step must not hide behind a clean top level. The consolidated
+    /// planner in the live catalog carries NINE bad steps, several inside nested
+    /// constructs — a top-level-only scan would have called it clean.
+    #[test]
+    fn a_nested_bad_kind_is_found() {
+        let y = yaml(
+            "workflow:\n\
+             \x20 - step: outer\n\
+             \x20   tool:\n\
+             \x20     kind: iterator\n\
+             \x20   steps:\n\
+             \x20     - step: inner\n\
+             \x20       tool:\n\
+             \x20         kind: agent\n",
+        );
+        let e = validate_tool_kinds(&y).unwrap_err().to_string();
+        assert!(e.contains("inner"), "the nested step must be named: {e}");
+        assert!(e.contains("agent"));
+    }
+
+    /// A playbook with no workflow (a Subscription, a resource) is not a step DAG
+    /// and must not be rejected for having no tool kinds.
+    #[test]
+    fn no_workflow_is_not_an_error() {
+        assert!(validate_tool_kinds(&yaml("kind: Subscription\nspec: {}\n")).is_ok());
+    }
+
+    /// Every step is reported, not just the first — an author fixing one at a
+    /// time across nine steps is nine round trips.
+    #[test]
+    fn all_offending_steps_are_reported_not_only_the_first() {
+        let y = yaml(
+            "workflow:\n\
+             \x20 - step: one\n\
+             \x20   tool:\n\
+             \x20     kind: agent\n\
+             \x20 - step: two\n\
+             \x20   tool:\n\
+             \x20     kind: mcp\n",
+        );
+        let e = validate_tool_kinds(&y).unwrap_err().to_string();
+        assert!(e.contains("one") && e.contains("two"), "{e}");
+    }
 }
 
 #[cfg(test)]
