@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.91.0](https://github.com/noetl/server/compare/v3.90.0...v3.91.0) (2026-08-28)
+
+### Features
+
+* **auth:** router-level bearer gate for the privileged API, in shadow by default ([db1ecb6](https://github.com/noetl/server/commit/db1ecb6ce20ef359cce957fa4dc1273558348eb8)), closes [noetl/ai-meta#303](https://github.com/noetl/ai-meta/issues/303) [#303](https://github.com/noetl/server/issues/303) [noetl/ai-meta#303](https://github.com/noetl/ai-meta/issues/303)
+
 ## [3.90.0](https://github.com/noetl/server/compare/v3.89.0...v3.90.0) (2026-08-27)
 
 ### Features
