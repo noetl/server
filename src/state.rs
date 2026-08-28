@@ -862,11 +862,20 @@ impl AppState {
             None
         };
 
-        // noetl/ai-meta#212 L1 T3 — the events-bus transport. Same shape as the
-        // command bus above: default `nats` builds no EHDB state at all.
-        let event_bus_mode = crate::event_bus::EventBusMode::from_env_value(
+        // noetl/ai-meta#212 L1 T3 — the events-bus transport, REQUIRED since
+        // noetl/ai-meta#243.  Exactly the shape of the command bus above, and for
+        // the same reason: the old default `nats` meant unset, a typo and a stale
+        // `nats` all produced a server that started clean and wrote the durable
+        // event log nowhere.  Failing at startup is the point.
+        let event_bus_mode = match crate::event_bus::EventBusMode::from_env_value(
             &std::env::var("NOETL_EVENT_BUS").unwrap_or_default(),
-        );
+        ) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::error!(error = %e, "event bus misconfigured — refusing to start");
+                panic!("{e}");
+            }
+        };
         let ehdb_event_publisher = if event_bus_mode.publishes_ehdb() {
             let publisher = crate::event_bus::EhdbEventPublisher::from_env();
             crate::metrics::set_ehdb_event_publisher_configured(publisher.is_configured());
