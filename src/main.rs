@@ -883,6 +883,8 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    noetl_server::metrics::init_executions_limit_series();
+
     // Publish the version and pin the known label sets, unconditionally and
     // before any configuration branch can skip them.  `Registry::gather` prunes
     // empty metric families, so a labelled metric is ABSENT from /metrics until
