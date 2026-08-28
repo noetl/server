@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.91.2](https://github.com/noetl/server/compare/v3.91.1...v3.91.2) (2026-08-28)
+
+### Bug Fixes
+
+* **event-bus:** NOETL_EVENT_BUS is required — stop laundering three causes into one ([da604a3](https://github.com/noetl/server/commit/da604a3714615a0f27cfb175b7438648b9f8abc9)), closes [noetl/ai-meta#194](https://github.com/noetl/ai-meta/issues/194) [noetl/ai-meta#243](https://github.com/noetl/ai-meta/issues/243)
+
 ## [3.91.1](https://github.com/noetl/server/compare/v3.91.0...v3.91.1) (2026-08-28)
 
 ### Bug Fixes
