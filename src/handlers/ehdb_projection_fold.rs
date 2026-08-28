@@ -95,6 +95,39 @@ pub enum FoldRefusal {
     SpineIncomplete,
 }
 
+/// The refusal reasons, as metric labels. A closed set, pinned so every reason
+/// is a visible 0 rather than an absent series.
+pub const REFOLD_REFUSALS: [&str; 5] = [
+    "no_events",
+    "source_unavailable",
+    "unparseable",
+    "fold_failed",
+    "spine_incomplete",
+];
+
+impl FoldRefusal {
+    /// Why the fold refused, as a stable label.
+    ///
+    /// `verdict_for` deliberately collapses all five into the single verdict
+    /// `spine_refused`, because for the *decision* they are identical: none of
+    /// them is agreement. But for an operator they are not remotely identical —
+    /// `no_events` is benign, `spine_incomplete` is drain lag that will clear
+    /// itself, and `unparseable` is corruption. Prod currently reports
+    /// `spine_refused` on 4 of 4 refolds with no way to tell which of those it is.
+    ///
+    /// So the verdict vocabulary stays closed (the six-verdict fail-closed
+    /// contract is load-bearing) and the reason rides a separate counter.
+    pub fn reason(&self) -> &'static str {
+        match self {
+            Self::NoEvents => "no_events",
+            Self::SourceUnavailable(_) => "source_unavailable",
+            Self::Unparseable(_) => "unparseable",
+            Self::FoldFailed => "fold_failed",
+            Self::SpineIncomplete => "spine_incomplete",
+        }
+    }
+}
+
 /// A folded state and the identity it can be checked by.
 #[derive(Debug, Clone, Serialize)]
 pub struct FoldedState {
@@ -210,7 +243,9 @@ pub async fn fold_from_tier(execution_id: i64) -> Result<FoldedState, FoldRefusa
         if outcome != "ok" {
             // A typed refusal is not an empty tier. Scoring it as "no events"
             // would report a broken relay as an execution with no history.
-            return Err(FoldRefusal::SourceUnavailable(format!("tier outcome={outcome}")));
+            return Err(FoldRefusal::SourceUnavailable(format!(
+                "tier outcome={outcome}"
+            )));
         }
     }
     let records = body
@@ -250,7 +285,10 @@ pub async fn fold_from_tier(execution_id: i64) -> Result<FoldedState, FoldRefusa
 /// the difference the gate measures.
 fn event_from_tier_payload(p: &serde_json::Value) -> Option<crate::db::models::Event> {
     let read_i64 = |v: Option<&serde_json::Value>| -> Option<i64> {
-        v.and_then(|x| x.as_i64().or_else(|| x.as_str().and_then(|s| s.parse().ok())))
+        v.and_then(|x| {
+            x.as_i64()
+                .or_else(|| x.as_str().and_then(|s| s.parse().ok()))
+        })
     };
     Some(crate::db::models::Event {
         id: 0,
@@ -264,7 +302,10 @@ fn event_from_tier_payload(p: &serde_json::Value) -> Option<crate::db::models::E
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string(),
-        node_id: p.get("node_id").and_then(|v| v.as_str()).map(str::to_string),
+        node_id: p
+            .get("node_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
         node_name: p
             .get("node_name")
             .or_else(|| p.get("step"))
@@ -286,10 +327,14 @@ fn event_from_tier_payload(p: &serde_json::Value) -> Option<crate::db::models::E
             .get("worker_id")
             .and_then(|v| v.as_str())
             .map(str::to_string),
-        attempt: p.get("meta").and_then(|m| m.get("attempt")).and_then(|a| {
-            a.as_i64()
-                .or_else(|| a.as_str().and_then(|s| s.parse().ok()))
-        }).map(|v| v as i32),
+        attempt: p
+            .get("meta")
+            .and_then(|m| m.get("attempt"))
+            .and_then(|a| {
+                a.as_i64()
+                    .or_else(|| a.as_str().and_then(|s| s.parse().ok()))
+            })
+            .map(|v| v as i32),
         created_at: p
             .get("created_at")
             .and_then(|v| v.as_str())
@@ -404,8 +449,7 @@ fn fold(
     normalise_event_precision(&mut events);
     let version = events.iter().map(|e| e.event_id).max().unwrap_or(0);
     let applied_count = events.len();
-    let core: Vec<noetl_orchestrate_core::event::Event> =
-        events.iter().map(Into::into).collect();
+    let core: Vec<noetl_orchestrate_core::event::Event> = events.iter().map(Into::into).collect();
     let state = WorkflowState::from_events(&core).ok_or(FoldRefusal::FoldFailed)?;
     Ok(FoldedState {
         source,
@@ -414,7 +458,6 @@ fn fold(
         digest: canonical_state_digest(&state),
     })
 }
-
 
 /// Fold from the worker's **WAL spine** (ai-meta#265 Phase 2).
 ///
@@ -662,7 +705,9 @@ pub async fn compare_sources(pool: &DbPool, execution_id: i64) -> AppResult<Fold
         )),
         _ => None,
     };
-    let no_ctx = fold_from_postgres_without_context(pool, execution_id).await.ok();
+    let no_ctx = fold_from_postgres_without_context(pool, execution_id)
+        .await
+        .ok();
     let context_explains_the_gap = match (&no_ctx, &tier_ok) {
         (Some(a), Some(b)) => a.digest == b.digest,
         _ => false,
@@ -704,9 +749,7 @@ fn json_diff_paths(a: &serde_json::Value, b: &serde_json::Value, at: &str, out: 
             keys.dedup();
             for k in keys {
                 match (x.get(k), y.get(k)) {
-                    (Some(va), Some(vb)) => {
-                        json_diff_paths(va, vb, &format!("{at}/{k}"), out)
-                    }
+                    (Some(va), Some(vb)) => json_diff_paths(va, vb, &format!("{at}/{k}"), out),
                     (Some(_), None) => out.push(format!("{at}/{k} (only in first)")),
                     (None, Some(_)) => out.push(format!("{at}/{k} (only in second)")),
                     (None, None) => {}
@@ -858,7 +901,10 @@ pub async fn stored_projection(execution_id: i64) -> Result<Option<(i64, String)
         .ok_or_else(|| "no records array".to_string())?;
     let mut best: Option<(i64, u64, String)> = None;
     for r in records {
-        let seq = r.get("global_sequence").and_then(|s| s.as_u64()).unwrap_or(0);
+        let seq = r
+            .get("global_sequence")
+            .and_then(|s| s.as_u64())
+            .unwrap_or(0);
         let p = match r.get("payload").and_then(|p| p.as_str()) {
             Some(s) => match serde_json::from_str::<serde_json::Value>(s) {
                 Ok(v) => v,
@@ -904,10 +950,16 @@ pub async fn refold_endpoint(
     };
     let verdict = verdict_for(stored_pair, &spine);
     crate::metrics::record_ehdb_projection_refold(verdict.as_str());
+    if let Err(r) = &spine {
+        crate::metrics::record_ehdb_projection_refold_refusal(r.reason());
+    }
     Ok(axum::Json(serde_json::json!({
         "action": "ehdb.projection.refold",
         "execution_id": execution_id,
         "verdict": verdict.as_str(),
+        // Why the spine refused, when it did. `spine_refused` alone sends an
+        // operator looking for corruption when the answer is usually drain lag.
+        "refusal": spine.as_ref().err().map(|r| r.reason()),
         "is_fault": verdict.is_fault(),
         "spine": spine.as_ref().ok(),
         "spine_refusal": spine.as_ref().err(),
@@ -916,7 +968,6 @@ pub async fn refold_endpoint(
         "stored_read_error": stored.as_ref().err(),
     })))
 }
-
 
 /// Materialise one **in-flight** execution's state into the projection tier,
 /// folded from the WAL spine (ai-meta#265 Phase 3).
@@ -998,9 +1049,7 @@ pub async fn materialize_from_wal(execution_id: i64) -> Result<FoldedState, Fold
 ///
 /// The six verdicts are the ones already proven to fire in kind, one live
 /// execution per arm.
-pub async fn wal_projection_state(
-    execution_id: i64,
-) -> (Option<serde_json::Value>, ReFoldVerdict) {
+pub async fn wal_projection_state(execution_id: i64) -> (Option<serde_json::Value>, ReFoldVerdict) {
     // Materialise first so an in-flight execution has a record to verify. A
     // failure here is not fatal: the read below simply finds nothing and the
     // verdict says so.
@@ -1015,13 +1064,13 @@ pub async fn wal_projection_state(
         .map(|(v, d, _)| (*v, d.as_str()));
     let verdict = verdict_for(pair, &spine);
     crate::metrics::record_ehdb_projection_refold(verdict.as_str());
+    if let Err(r) = &spine {
+        crate::metrics::record_ehdb_projection_refold_refusal(r.reason());
+    }
     if verdict != ReFoldVerdict::Match {
         return (None, verdict);
     }
-    let body = stored
-        .ok()
-        .flatten()
-        .and_then(|(_, _, body)| body);
+    let body = stored.ok().flatten().and_then(|(_, _, body)| body);
     (body, verdict)
 }
 
@@ -1058,7 +1107,10 @@ pub async fn stored_projection_full(
         .ok_or_else(|| "no records array".to_string())?;
     let mut best: Option<(i64, u64, String, Option<serde_json::Value>)> = None;
     for r in records {
-        let seq = r.get("global_sequence").and_then(|s| s.as_u64()).unwrap_or(0);
+        let seq = r
+            .get("global_sequence")
+            .and_then(|s| s.as_u64())
+            .unwrap_or(0);
         let p = match r.get("payload").and_then(|p| p.as_str()) {
             Some(s) => match serde_json::from_str::<serde_json::Value>(s) {
                 Ok(v) => v,
@@ -1077,7 +1129,10 @@ pub async fn stored_projection_full(
         ) else {
             continue;
         };
-        if best.as_ref().is_none_or(|(bv, bs, _, _)| (v, seq) > (*bv, *bs)) {
+        if best
+            .as_ref()
+            .is_none_or(|(bv, bs, _, _)| (v, seq) > (*bv, *bs))
+        {
             best = Some((
                 v,
                 seq,
@@ -1199,7 +1254,11 @@ mod tests {
             "the tier record carries no `context` — if this ever becomes Some, \
              the mirror payload changed and the Phase 1 finding is stale"
         );
-        assert_eq!(ev.attempt, Some(1), "attempt is derived from meta, as in the SQL projection");
+        assert_eq!(
+            ev.attempt,
+            Some(1),
+            "attempt is derived from meta, as in the SQL projection"
+        );
     }
 
     /// …and when a payload DOES carry context, the reader picks it up. Without
@@ -1224,7 +1283,6 @@ mod tests {
         assert!(event_from_tier_payload(&payload).is_none());
     }
 
-
     fn folded(version: i64, digest: &str) -> Result<FoldedState, FoldRefusal> {
         Ok(FoldedState {
             source: FoldSource::WalSpine,
@@ -1244,7 +1302,10 @@ mod tests {
     fn each_refold_condition_is_named_as_itself() {
         let spine = folded(100, "aaa");
 
-        assert_eq!(verdict_for(Some((100, "aaa")), &spine), ReFoldVerdict::Match);
+        assert_eq!(
+            verdict_for(Some((100, "aaa")), &spine),
+            ReFoldVerdict::Match
+        );
         assert!(!ReFoldVerdict::Match.is_fault());
 
         // Same version, different content — the corruption case.
@@ -1286,7 +1347,10 @@ mod tests {
             ReFoldVerdict::SpineRefused
         );
         // …and it is NOT a match even when the stored record looks fine.
-        assert_ne!(verdict_for(Some((100, "aaa")), &refused), ReFoldVerdict::Match);
+        assert_ne!(
+            verdict_for(Some((100, "aaa")), &refused),
+            ReFoldVerdict::Match
+        );
         // An unreachable worker is the same shape.
         let unavail: Result<FoldedState, FoldRefusal> =
             Err(FoldRefusal::SourceUnavailable("no index".into()));
@@ -1294,6 +1358,61 @@ mod tests {
             verdict_for(Some((100, "aaa")), &unavail),
             ReFoldVerdict::SpineRefused
         );
+    }
+
+    /// Every refusal reason is pinned, and — the part that matters — the match is
+    /// TOTAL, so adding a `FoldRefusal` variant fails to compile here rather than
+    /// emitting an unpinned label nobody will notice is missing.
+    #[test]
+    fn every_refusal_reason_is_pinned_and_distinct() {
+        let all = [
+            FoldRefusal::NoEvents,
+            FoldRefusal::SourceUnavailable("x".into()),
+            FoldRefusal::Unparseable("x".into()),
+            FoldRefusal::FoldFailed,
+            FoldRefusal::SpineIncomplete,
+        ];
+        for r in &all {
+            // Total match: a new variant breaks the build here.
+            let expect = match r {
+                FoldRefusal::NoEvents => "no_events",
+                FoldRefusal::SourceUnavailable(_) => "source_unavailable",
+                FoldRefusal::Unparseable(_) => "unparseable",
+                FoldRefusal::FoldFailed => "fold_failed",
+                FoldRefusal::SpineIncomplete => "spine_incomplete",
+            };
+            assert_eq!(r.reason(), expect);
+            assert!(
+                REFOLD_REFUSALS.contains(&r.reason()),
+                "{} is emitted but not pinned; its series is absent until it fires",
+                r.reason()
+            );
+        }
+        let mut seen: Vec<&str> = all.iter().map(|r| r.reason()).collect();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), all.len(), "two refusals share a label");
+        assert_eq!(REFOLD_REFUSALS.len(), all.len());
+    }
+
+    /// The reason must not change the VERDICT. All five still refuse — the
+    /// six-verdict fail-closed contract is unchanged by adding the reason.
+    #[test]
+    fn labelling_the_reason_does_not_soften_any_verdict() {
+        for r in [
+            FoldRefusal::NoEvents,
+            FoldRefusal::SourceUnavailable("x".into()),
+            FoldRefusal::Unparseable("x".into()),
+            FoldRefusal::FoldFailed,
+            FoldRefusal::SpineIncomplete,
+        ] {
+            let e: Result<FoldedState, FoldRefusal> = Err(r);
+            assert_eq!(
+                verdict_for(Some((100, "aaa")), &e),
+                ReFoldVerdict::SpineRefused,
+                "a refusal must never read as agreement"
+            );
+        }
     }
 
     /// Every verdict the code can emit is in the pinned label set.
@@ -1336,7 +1455,10 @@ mod tests {
             .single()
             .expect("valid instant");
 
-        assert_ne!(ns, us, "the fixture must actually differ, or this proves nothing");
+        assert_ne!(
+            ns, us,
+            "the fixture must actually differ, or this proves nothing"
+        );
         assert_eq!(
             truncate_to_micros(ns),
             truncate_to_micros(us),
@@ -1401,7 +1523,8 @@ mod tests {
             "645_451_999 rounds up to the same µs as 645_452_001 rounds down to"
         );
         assert!(
-            evs.iter().all(|e| e.created_at.timestamp_subsec_nanos() % 1_000 == 0),
+            evs.iter()
+                .all(|e| e.created_at.timestamp_subsec_nanos() % 1_000 == 0),
             "no event may retain sub-microsecond precision after normalisation"
         );
     }
@@ -1434,10 +1557,6 @@ mod tests {
         );
     }
 }
-
-
-
-
 
 /// `GET /api/ehdb/projection-recovery/{id}` — the re-scoped Phase 3 gate.
 pub async fn recovery_compare_endpoint(
