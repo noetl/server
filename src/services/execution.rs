@@ -78,6 +78,70 @@ pub struct ExecutionFilter {
     pub offset: Option<i32>,
 }
 
+/// Default page size when the caller does not ask (noetl/ai-meta#255).
+pub const DEFAULT_LIMIT: i32 = 50;
+/// Largest page this endpoint will serve. A request above it is CAPPED, and the
+/// capping is reported rather than hidden.
+pub const MAX_LIMIT: i32 = 100;
+
+/// A resolved page window, plus whether the cap changed what the caller asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Paging {
+    /// What the query will actually use.
+    pub limit: i32,
+    pub offset: i32,
+    /// What the caller asked for, when they asked. `None` means "unspecified".
+    pub requested_limit: Option<i32>,
+    /// True when `requested_limit` exceeded [`MAX_LIMIT`] and was reduced.
+    pub capped: bool,
+}
+
+/// Resolve `?limit=` / `?offset=` into a window, or reject the request.
+///
+/// Pure, so the whole truth table is testable without a database.
+///
+/// # Why this exists
+///
+/// The previous expression was `filter.limit.unwrap_or(50).min(100)`. Two
+/// defects lived in it:
+///
+/// 1. **Silent truncation.** `?limit=300` returned exactly 100 rows with no
+///    error, no warning and no marker — a response *indistinguishable from
+///    "there are only 100"*. Anyone paginating by "ask for more than I expect
+///    and see if I get fewer" gets a wrong answer, and any script treating the
+///    result as exhaustive is silently sampling. That is the
+///    `representation-drift` shape: a complete-looking answer that is not.
+/// 2. **`?limit=-1` returned HTTP 500.** `(-1).min(100)` is `-1`, which reached
+///    Postgres as `LIMIT -1` and errored. A client mistake surfaced as a server
+///    fault.
+///
+/// Negative values are rejected rather than clamped: clamping a negative to 0 or
+/// to the default would be another silent reinterpretation of what was asked,
+/// which is the very thing this function exists to stop. `limit=0` is honoured —
+/// asking for nothing is a legitimate, unambiguous request.
+pub fn resolve_paging(limit: Option<i32>, offset: Option<i32>) -> Result<Paging, String> {
+    if let Some(l) = limit {
+        if l < 0 {
+            return Err(format!(
+                "limit must be >= 0 (got {l}); the maximum served is {MAX_LIMIT}"
+            ));
+        }
+    }
+    if let Some(o) = offset {
+        if o < 0 {
+            return Err(format!("offset must be >= 0 (got {o})"));
+        }
+    }
+    let requested_limit = limit;
+    let effective = limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
+    Ok(Paging {
+        limit: effective,
+        offset: offset.unwrap_or(0),
+        requested_limit,
+        capped: matches!(requested_limit, Some(l) if l > MAX_LIMIT),
+    })
+}
+
 /// Execution management service.
 ///
 /// Phase F R4-4b moved this from a single `DbPool` to a
@@ -336,8 +400,19 @@ impl ExecutionService {
     /// path filter into the cluster lookup as a pre-filter.
     #[allow(clippy::type_complexity)]
     pub async fn list(&self, filter: &ExecutionFilter) -> AppResult<Vec<ExecutionSummary>> {
-        let limit = filter.limit.unwrap_or(50).min(100);
-        let offset = filter.offset.unwrap_or(0);
+        // noetl/ai-meta#255 — resolved by `resolve_paging`, which reports whether
+        // the cap was applied instead of silently clamping.
+        // 400, not 422, to match `?limit=abc` — axum already rejects an
+        // unparseable limit with 400, and two shapes of the same mistake
+        // answering with two different codes is its own small confusion.
+        // Rejected here, not unwrapped: a negative limit used to reach Postgres as
+        // `LIMIT -1` and surface as HTTP 500 — a client mistake reported as a
+        // server fault. Returning the validation error keeps that a 400 even if a
+        // future caller reaches the service without going through the handler.
+        let paging = resolve_paging(filter.limit, filter.offset)
+            .map_err(crate::error::AppError::BadRequest)?;
+        let limit = paging.limit;
+        let offset = paging.offset;
         let fetch_cap: i64 = (limit as i64) + (offset as i64);
         // Candidate window for stage 1 (noetl/ai-meta#62).  Without a status
         // filter the N most-recent *executions* are exactly the answer, so the
@@ -1121,6 +1196,93 @@ impl ExecutionService {
             }
         }
         "RUNNING".to_string()
+    }
+}
+
+#[cfg(test)]
+mod paging_tests {
+    use super::*;
+
+    /// The default, unchanged: no `?limit=` means [`DEFAULT_LIMIT`].
+    #[test]
+    fn unspecified_uses_the_default_and_is_not_capped() {
+        let p = resolve_paging(None, None).unwrap();
+        assert_eq!(p.limit, DEFAULT_LIMIT);
+        assert_eq!(p.offset, 0);
+        assert_eq!(p.requested_limit, None);
+        assert!(!p.capped, "an unspecified limit was not capped, it was defaulted");
+    }
+
+    /// noetl/ai-meta#255 defect 1: the cap applied silently.
+    /// It still applies — but it now SAYS SO.
+    #[test]
+    fn over_the_cap_is_capped_and_reports_it() {
+        let p = resolve_paging(Some(300), None).unwrap();
+        assert_eq!(p.limit, MAX_LIMIT, "the cap still bounds the query");
+        assert_eq!(p.requested_limit, Some(300), "what was asked is preserved");
+        assert!(p.capped, "the whole point: truncation must be visible");
+    }
+
+    /// The boundary, both sides. `MAX_LIMIT` exactly is NOT capped — an
+    /// off-by-one here would report truncation on a complete page, which is the
+    /// mirror of the original bug and just as misleading.
+    #[test]
+    fn the_cap_boundary_is_exact() {
+        let at = resolve_paging(Some(MAX_LIMIT), None).unwrap();
+        assert_eq!(at.limit, MAX_LIMIT);
+        assert!(!at.capped, "exactly MAX_LIMIT is served whole, not capped");
+
+        let over = resolve_paging(Some(MAX_LIMIT + 1), None).unwrap();
+        assert!(over.capped);
+        assert_eq!(over.limit, MAX_LIMIT);
+
+        let under = resolve_paging(Some(MAX_LIMIT - 1), None).unwrap();
+        assert!(!under.capped);
+        assert_eq!(under.limit, MAX_LIMIT - 1);
+    }
+
+    /// noetl/ai-meta#255 defect 2, previously unreported: `?limit=-1` reached
+    /// Postgres as `LIMIT -1` and returned **HTTP 500** — a client mistake
+    /// surfacing as a server fault.
+    #[test]
+    fn a_negative_limit_is_rejected_not_turned_into_a_server_error() {
+        let e = resolve_paging(Some(-1), None).unwrap_err();
+        assert!(e.contains("limit must be >= 0"), "{e}");
+        assert!(e.contains("-1"), "the offending value must be quoted back: {e}");
+        assert!(resolve_paging(None, Some(-1)).is_err(), "offset too");
+    }
+
+    /// Rejected rather than clamped, deliberately: clamping a negative to 0 or to
+    /// the default would be another silent reinterpretation of the request, which
+    /// is exactly the class of behaviour this change removes.
+    #[test]
+    fn a_negative_is_not_silently_reinterpreted() {
+        assert!(resolve_paging(Some(-5), None).is_err());
+        // Positive control: 0 IS honoured, so the rule above is about negatives
+        // and not a blanket refusal of small values.
+        let zero = resolve_paging(Some(0), None).unwrap();
+        assert_eq!(zero.limit, 0);
+        assert!(!zero.capped);
+    }
+
+    /// `capped` must track the REQUEST, not the effective value. Asserted as a
+    /// sweep so a future refactor that sets `capped` from `limit == MAX_LIMIT`
+    /// fails here — that version would mark an honest `?limit=100` as truncated.
+    #[test]
+    fn capped_reflects_the_request_not_the_effective_limit() {
+        for (req, want_capped) in [
+            (None, false),
+            (Some(0), false),
+            (Some(1), false),
+            (Some(MAX_LIMIT - 1), false),
+            (Some(MAX_LIMIT), false),
+            (Some(MAX_LIMIT + 1), true),
+            (Some(i32::MAX), true),
+        ] {
+            let p = resolve_paging(req, None).unwrap();
+            assert_eq!(p.capped, want_capped, "requested {req:?}");
+            assert!(p.limit <= MAX_LIMIT, "the cap always bounds the query");
+        }
     }
 }
 

@@ -4094,6 +4094,43 @@ pub fn record_ehdb_projection_refold_refusal(reason: &str) {
         .inc();
 }
 
+/// Whether `GET /api/executions` served a capped page (noetl/ai-meta#255).
+///
+/// Both label values are pinned at 0 at startup: the interesting question is
+/// "is anything hitting the cap?", and an absent `capped="true"` series would be
+/// indistinguishable from a binary that predates the metric.
+pub fn executions_limit_total() -> &'static IntCounterVec {
+    static M: std::sync::OnceLock<IntCounterVec> = std::sync::OnceLock::new();
+    M.get_or_init(|| {
+        let m = IntCounterVec::new(
+            prometheus::Opts::new(
+                "noetl_executions_limit_total",
+                "GET /api/executions requests by whether the page size was capped at MAX_LIMIT (noetl/ai-meta#255).",
+            ),
+            &["capped"],
+        )
+        .expect("executions_limit_total metric");
+        registry()
+            .register(Box::new(m.clone()))
+            .expect("register executions_limit_total");
+        m
+    })
+}
+
+/// Record one list request.
+pub fn record_executions_limit(capped: bool) {
+    executions_limit_total()
+        .with_label_values(&[if capped { "true" } else { "false" }])
+        .inc();
+}
+
+/// Pin both outcomes, unconditionally.
+pub fn init_executions_limit_series() {
+    for v in ["true", "false"] {
+        executions_limit_total().with_label_values(&[v]).inc_by(0);
+    }
+}
+
 #[cfg(test)]
 mod tests {
 
