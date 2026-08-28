@@ -692,17 +692,52 @@ fn build_router(
 
     // Combine all routes
     let mut app = Router::new()
+        // noetl/ai-meta#303 — the privileged route groups carry a router-level
+        // bearer gate.  It is a LAYER, not an extractor, precisely because the
+        // existing per-handler extractor could be (and was) forgotten: on prod
+        // `/api/credentials/{id}?include_data=true` answered 200 with decrypted
+        // credential data and no Authorization header, reachable from the user
+        // worker pool.  Two `/api/internal/*` routes were open for the same
+        // reason, which makes the prefix a claim rather than a control.
+        //
+        // Default mode is SHADOW: nothing is rejected, and every request that
+        // WOULD be rejected is counted by group.  Promotion to enforce is an env
+        // change, made per group once its shadow counters have sat at zero.
         .merge(health_routes)
         .merge(catalog_routes)
-        .merge(credential_routes)
+        .merge(credential_routes.layer(axum::middleware::from_fn_with_state(
+            "credentials",
+            noetl_server::auth_gate::gate,
+        )))
         .merge(auth_routes)
-        .merge(sealed_credential_routes)
-        .merge(cross_region_routes)
-        .merge(wallet_rotate_routes)
-        .merge(secret_audit_routes)
-        .merge(container_callback_routes)
-        .merge(projection_routes)
-        .merge(keychain_routes)
+        .merge(sealed_credential_routes.layer(axum::middleware::from_fn_with_state(
+            "credentials",
+            noetl_server::auth_gate::gate,
+        )))
+        .merge(cross_region_routes.layer(axum::middleware::from_fn_with_state(
+            "internal",
+            noetl_server::auth_gate::gate,
+        )))
+        .merge(wallet_rotate_routes.layer(axum::middleware::from_fn_with_state(
+            "internal",
+            noetl_server::auth_gate::gate,
+        )))
+        .merge(secret_audit_routes.layer(axum::middleware::from_fn_with_state(
+            "internal",
+            noetl_server::auth_gate::gate,
+        )))
+        .merge(container_callback_routes.layer(axum::middleware::from_fn_with_state(
+            "internal",
+            noetl_server::auth_gate::gate,
+        )))
+        .merge(projection_routes.layer(axum::middleware::from_fn_with_state(
+            "internal",
+            noetl_server::auth_gate::gate,
+        )))
+        .merge(keychain_routes.layer(axum::middleware::from_fn_with_state(
+            "keychain",
+            noetl_server::auth_gate::gate,
+        )))
         .merge(execution_routes)
         .merge(executions_routes)
         .merge(ehdb_routes)
@@ -715,12 +750,30 @@ fn build_router(
         .merge(runtime_routes)
         .merge(sharding_routes)
         .merge(database_routes)
-        .merge(internal_routes)
-        .merge(object_store_routes)
-        .merge(cell_routes)
-        .merge(result_tier_routes)
-        .merge(sink_state_routes)
-        .merge(ingress_routes)
+        .merge(internal_routes.layer(axum::middleware::from_fn_with_state(
+            "internal",
+            noetl_server::auth_gate::gate,
+        )))
+        .merge(object_store_routes.layer(axum::middleware::from_fn_with_state(
+            "internal",
+            noetl_server::auth_gate::gate,
+        )))
+        .merge(cell_routes.layer(axum::middleware::from_fn_with_state(
+            "internal",
+            noetl_server::auth_gate::gate,
+        )))
+        .merge(result_tier_routes.layer(axum::middleware::from_fn_with_state(
+            "internal",
+            noetl_server::auth_gate::gate,
+        )))
+        .merge(sink_state_routes.layer(axum::middleware::from_fn_with_state(
+            "internal",
+            noetl_server::auth_gate::gate,
+        )))
+        .merge(ingress_routes.layer(axum::middleware::from_fn_with_state(
+            "internal",
+            noetl_server::auth_gate::gate,
+        )))
         .merge(system_routes)
         .merge(dashboard_routes);
 
@@ -815,6 +868,18 @@ async fn main() -> anyhow::Result<()> {
             target: "noetl_server::secrets",
             var, source = source.as_str(),
             "bootstrap secret source resolved"
+        );
+    }
+
+    // noetl/ai-meta#303 — pin the auth-gate series for the mode this process is
+    // actually in, so a 0 means "has not happened" rather than "old binary".
+    {
+        let m = noetl_server::auth_gate::mode();
+        noetl_server::metrics::init_internal_auth_series(m.as_str());
+        tracing::info!(
+            target: "noetl_server::auth_gate",
+            mode = m.as_str(),
+            "internal auth gate mode"
         );
     }
 

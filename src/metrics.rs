@@ -3998,6 +3998,55 @@ pub fn record_secret_source(var: &str, source: &str) {
     secret_source_total().with_label_values(&[var, source]).inc();
 }
 
+/// Outcomes of the router-level internal-auth gate (noetl/ai-meta#303), labelled
+/// by `group` (`credentials` / `keychain` / `internal`), `outcome`
+/// (`valid` / `missing` / `malformed` / `mismatch` / `unconfigured`) and the
+/// `mode` the gate was running in.
+///
+/// The whole point of the shadow mode is to answer "who would break if we
+/// enforced this?", so an absent series is the one thing that must not be
+/// ambiguous. `Registry::gather` prunes empty families, so every group x outcome
+/// pair is pinned at 0 by [`init_internal_auth_series`] at startup: a 0 means
+/// "this has not happened", never "this binary predates the metric".
+pub fn internal_auth_total() -> &'static IntCounterVec {
+    static M: std::sync::OnceLock<IntCounterVec> = std::sync::OnceLock::new();
+    M.get_or_init(|| {
+        let m = IntCounterVec::new(
+            prometheus::Opts::new(
+                "noetl_internal_auth_total",
+                "Router-level internal API token gate outcomes by route group and mode (noetl/ai-meta#303). In shadow mode nothing is rejected; a non-valid outcome is what WOULD be rejected under enforce.",
+            ),
+            &["group", "outcome", "mode"],
+        )
+        .expect("internal_auth_total metric");
+        registry()
+            .register(Box::new(m.clone()))
+            .expect("register internal_auth_total");
+        m
+    })
+}
+
+/// Record one gate decision.
+pub fn record_internal_auth(group: &str, outcome: &str, mode: &str) {
+    internal_auth_total()
+        .with_label_values(&[group, outcome, mode])
+        .inc();
+}
+
+/// Pin every group x outcome series at 0, for the current mode, unconditionally
+/// at startup.
+///
+/// Pinned for the mode the process is actually running in. Pinning all three
+/// modes would be worse than useless: it would show `mode="enforce"` series on a
+/// server running in shadow, which reads as "enforcement is on".
+pub fn init_internal_auth_series(mode: &str) {
+    for g in crate::auth_gate::GROUPS {
+        for o in crate::auth_gate::Outcome::ALL {
+            internal_auth_total().with_label_values(&[g, o.as_str(), mode]);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
 

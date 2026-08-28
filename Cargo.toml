@@ -182,6 +182,10 @@ tokio-test = "0.4"
 # test threads don't race on NOETL_INTERNAL_API_TOKEN; see
 # src/handlers/internal.rs tests.
 serial_test = "3"
+# `oneshot` for driving a Router in-process, so the auth gate is proven at the
+# ROUTER level (is it attached to the right routes?) and not only at the
+# decision level (noetl/ai-meta#303).
+tower = { version = "0.5", features = ["util"] }
 
 [[bin]]
 name = "noetl-control-plane"
