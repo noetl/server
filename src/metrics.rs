@@ -3543,10 +3543,19 @@ pub fn init_ehdb_projection_series() {
             .inc_by(0);
     }
     for o in ["materialized", "refused"] {
-        ehdb_projection_materialize_total().with_label_values(&[o]).inc_by(0);
+        ehdb_projection_materialize_total()
+            .with_label_values(&[o])
+            .inc_by(0);
     }
     for v in crate::handlers::ehdb_projection_fold::REFOLD_VERDICTS {
-        ehdb_projection_refold_total().with_label_values(&[v]).inc_by(0);
+        ehdb_projection_refold_total()
+            .with_label_values(&[v])
+            .inc_by(0);
+    }
+    for r in crate::handlers::ehdb_projection_fold::REFOLD_REFUSALS {
+        ehdb_projection_refold_refusal_total()
+            .with_label_values(&[r])
+            .inc_by(0);
     }
     for outcome in EHDB_PROJECTION_SNAPSHOT_GATE_OUTCOMES {
         ehdb_projection_snapshot_gate_total()
@@ -3901,13 +3910,17 @@ pub fn ehdb_projection_refold_total() -> &'static IntCounterVec {
             &["verdict"],
         )
         .expect("static counter spec must be valid");
-        registry().register(Box::new(c.clone())).expect("counter registration must succeed");
+        registry()
+            .register(Box::new(c.clone()))
+            .expect("counter registration must succeed");
         c
     })
 }
 
 pub fn record_ehdb_projection_refold(verdict: &str) {
-    ehdb_projection_refold_total().with_label_values(&[verdict]).inc();
+    ehdb_projection_refold_total()
+        .with_label_values(&[verdict])
+        .inc();
 }
 
 /// Counter: WAL-spine materialisations into the projection tier
@@ -3924,22 +3937,24 @@ pub fn ehdb_projection_materialize_total() -> &'static IntCounterVec {
             &["outcome"],
         )
         .expect("static counter spec must be valid");
-        registry().register(Box::new(c.clone())).expect("counter registration must succeed");
+        registry()
+            .register(Box::new(c.clone()))
+            .expect("counter registration must succeed");
         c
     })
 }
 
 pub fn record_ehdb_projection_materialize(outcome: &str) {
-    ehdb_projection_materialize_total().with_label_values(&[outcome]).inc();
+    ehdb_projection_materialize_total()
+        .with_label_values(&[outcome])
+        .inc();
 }
 
 pub fn init_ehdb_crossstore_series() {
     // Unconditional pin: absent and zero are different answers, and this one's
     // whole value is being readable as 0 on a healthy binary.
     event_created_at_fallback_total().inc_by(0);
-    use crate::handlers::ehdb_parity::{
-        CONTROL_NAMES, DIVERGENCE_KINDS, PARITY_OUTCOMES, TIER,
-    };
+    use crate::handlers::ehdb_parity::{CONTROL_NAMES, DIVERGENCE_KINDS, PARITY_OUTCOMES, TIER};
     for outcome in PARITY_OUTCOMES {
         ehdb_crossstore_parity_total()
             .with_label_values(&[TIER, outcome.as_str()])
@@ -3965,7 +3980,6 @@ pub fn init_ehdb_crossstore_series() {
         }
     }
 }
-
 
 /// Where each bootstrap secret came from (noetl/ai-meta#267 Tier 2) — labelled
 /// by `var` and `source` (`file` / `env` / `file_unusable`).  Records the
@@ -3995,7 +4009,9 @@ pub fn secret_source_total() -> &'static IntCounterVec {
 /// Record one bootstrap secret's provenance.  `source` is `file`, `env` or
 /// `file_unusable`.
 pub fn record_secret_source(var: &str, source: &str) {
-    secret_source_total().with_label_values(&[var, source]).inc();
+    secret_source_total()
+        .with_label_values(&[var, source])
+        .inc();
 }
 
 /// Outcomes of the router-level internal-auth gate (noetl/ai-meta#303), labelled
@@ -4045,6 +4061,37 @@ pub fn init_internal_auth_series(mode: &str) {
             internal_auth_total().with_label_values(&[g, o.as_str(), mode]);
         }
     }
+}
+
+/// Why a projection re-fold refused, when it refused (noetl/ai-meta#303 follow-up).
+///
+/// `noetl_ehdb_projection_refold_total{verdict="spine_refused"}` says a
+/// comparison did not happen; this says why. Prod reports 4 of 4 refolds refused
+/// with no way to distinguish drain lag from corruption, which are opposite
+/// operational responses.
+pub fn ehdb_projection_refold_refusal_total() -> &'static IntCounterVec {
+    static M: std::sync::OnceLock<IntCounterVec> = std::sync::OnceLock::new();
+    M.get_or_init(|| {
+        let m = IntCounterVec::new(
+            prometheus::Opts::new(
+                "noetl_ehdb_projection_refold_refusal_total",
+                "Reason a projection re-fold refused: no_events / source_unavailable / unparseable / fold_failed / spine_incomplete.",
+            ),
+            &["reason"],
+        )
+        .expect("ehdb_projection_refold_refusal_total metric");
+        registry()
+            .register(Box::new(m.clone()))
+            .expect("register ehdb_projection_refold_refusal_total");
+        m
+    })
+}
+
+/// Record one refusal reason.
+pub fn record_ehdb_projection_refold_refusal(reason: &str) {
+    ehdb_projection_refold_refusal_total()
+        .with_label_values(&[reason])
+        .inc();
 }
 
 #[cfg(test)]
