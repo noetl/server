@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.91.3](https://github.com/noetl/server/compare/v3.91.2...v3.91.3) (2026-08-28)
+
+### Bug Fixes
+
+* **executions:** make the page cap visible, and stop a negative limit 500ing ([d1c7529](https://github.com/noetl/server/commit/d1c75291f942faa9489ab37ff9d48757f30557cc)), closes [noetl/ai-meta#255](https://github.com/noetl/ai-meta/issues/255) [noetl/ai-meta#255](https://github.com/noetl/ai-meta/issues/255)
+
 ## [3.91.2](https://github.com/noetl/server/compare/v3.91.1...v3.91.2) (2026-08-28)
 
 ### Bug Fixes
