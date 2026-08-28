@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.91.1](https://github.com/noetl/server/compare/v3.91.0...v3.91.1) (2026-08-28)
+
+### Bug Fixes
+
+* **ehdb:** say WHY a projection re-fold refused, instead of one label for five causes ([7ae7d98](https://github.com/noetl/server/commit/7ae7d98eee69595672f28a63f91d1cb1addb29bd)), closes [noetl/ai-meta#243](https://github.com/noetl/ai-meta/issues/243) [noetl/ai-meta#303](https://github.com/noetl/ai-meta/issues/303)
+
 ## [3.91.0](https://github.com/noetl/server/compare/v3.90.0...v3.91.0) (2026-08-28)
 
 ### Features
