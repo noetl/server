@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.91.4](https://github.com/noetl/server/compare/v3.91.3...v3.91.4) (2026-08-28)
+
+### Bug Fixes
+
+* **catalog:** reject unknown tool kinds at registration, not at execute ([115d72b](https://github.com/noetl/server/commit/115d72b2ff4701953e6c0ae7c11a67be43d06c6b)), closes [noetl/ai-meta#256](https://github.com/noetl/ai-meta/issues/256) [noetl/ai-meta#256](https://github.com/noetl/ai-meta/issues/256)
+
 ## [3.91.3](https://github.com/noetl/server/compare/v3.91.2...v3.91.3) (2026-08-28)
 
 ### Bug Fixes
