@@ -45,6 +45,7 @@
 //! }
 //! ```
 
+pub mod auth_gate;
 pub mod affinity;
 pub mod coherence;
 pub mod command_bus;
