@@ -252,6 +252,19 @@ pub async fn fold_from_tier_within(
     execution_id: i64,
     timeout: std::time::Duration,
 ) -> Result<FoldedState, FoldRefusal> {
+    let events = tier_events_within(execution_id, timeout).await?;
+    fold(FoldSource::EhdbTier, events)
+}
+
+/// The events one execution has in the durable event-log tier.
+///
+/// The fetch half of [`fold_from_tier_within`], split out so the recovery path
+/// can fold **with a body** (which the projection record needs) without a
+/// second implementation of the relay read.
+pub async fn tier_events_within(
+    execution_id: i64,
+    timeout: std::time::Duration,
+) -> Result<Vec<crate::db::models::Event>, FoldRefusal> {
     let base = std::env::var(super::ehdb::WORKER_QUERY_URL_ENV)
         .ok()
         .map(|s| s.trim().to_string())
@@ -288,8 +301,7 @@ pub async fn fold_from_tier_within(
         return Err(FoldRefusal::NoEvents);
     }
 
-    let events = events_from_tier_records(records)?;
-    fold(FoldSource::EhdbTier, events)
+    events_from_tier_records(records)
 }
 
 /// Turn tier records into foldable events: version-gate, parse, order, dedup.
@@ -543,21 +555,19 @@ fn fold(
 /// reach it, this refuses with [`FoldRefusal::SpineIncomplete`] rather than
 /// folding what it has.
 /// Fetch and parse the WAL spine's events, without folding.
-/// Shared by [`fold_from_wal_spine`] and the field-level diff endpoint.
+///
+/// Used by the field-level diff endpoint, which needs the events themselves
+/// rather than a state.
+///
+/// ⚠ Spine-pinned on purpose: a *diff* is asking "what do these two sources
+/// each say", so it must not take the recovery ladder's fallback. Anything
+/// asking "what is this execution's state" wants [`events_for_recovery`].
 pub async fn wal_spine_events(
     execution_id: i64,
     head: Option<i64>,
 ) -> Result<Vec<crate::db::models::Event>, FoldRefusal> {
     let inner = fold_spine_inner(execution_id, head).await?;
     Ok(inner)
-}
-
-pub async fn fold_from_wal_spine(
-    execution_id: i64,
-    head: Option<i64>,
-) -> Result<FoldedState, FoldRefusal> {
-    let events = fold_spine_inner(execution_id, head).await?;
-    fold(FoldSource::WalSpine, events)
 }
 
 async fn fold_spine_inner(
@@ -1003,12 +1013,19 @@ pub async fn stored_projection(execution_id: i64) -> Result<Option<(i64, String)
 
 /// `GET /api/ehdb/projection-refold/executions/{id}` — the Phase 2 comparator.
 ///
-/// Ground truth is a fresh fold of the WAL spine. Never Postgres.
+/// Ground truth is a fresh fold of the EHDB log — the spine, or the durable
+/// event-log tier when the spine cannot answer. Never Postgres.
 pub async fn refold_endpoint(
     axum::extract::State(_state): axum::extract::State<crate::state::AppState>,
     axum::extract::Path(execution_id): axum::extract::Path<i64>,
 ) -> AppResult<axum::Json<serde_json::Value>> {
-    let spine = fold_from_wal_spine(execution_id, None).await;
+    // Through the ladder, so this reports what recovery would ACTUALLY do under
+    // the configured mode. This is the endpoint #307 was diagnosed with; had it
+    // answered for a path the serving code no longer takes, it would have
+    // become a second thing to be wrong about.
+    let spine = events_for_recovery(execution_id)
+        .await
+        .and_then(|(source, events)| fold(source, events));
     let stored = stored_projection(execution_id).await;
     let stored_pair = match &stored {
         Ok(Some((v, d))) => Some((*v, d.as_str())),
@@ -1055,10 +1072,158 @@ pub async fn refold_endpoint(
 ///
 /// Best-effort and non-fatal: this is a read model, and failing to materialise
 /// must never fail the execution that triggered it.
+/// `NOETL_EHDB_RECOVERY_SOURCE` — where a recovery fold resolves its events.
+pub const RECOVERY_SOURCE_ENV: &str = "NOETL_EHDB_RECOVERY_SOURCE";
+
+/// The configured modes, pinned as metric labels.
+pub const RECOVERY_SOURCES: [&str; 3] = ["spine", "verify", "tier"];
+
+/// The sources a fold can actually be attempted against, pinned as labels.
+pub const RECOVERY_FOLD_SOURCES: [&str; 2] = ["spine", "tier"];
+
+/// Where a recovery fold resolves an execution's events from (ai-meta#307).
+///
+/// # The mismatch this exists to fix
+///
+/// Recovery folded only from the worker's in-memory state-builder index, which
+/// holds **in-flight** executions and evicts them on completion. The comparator,
+/// by its nature, asks about **completed** ones. Two components with
+/// incompatible lifetimes: nothing was broken, and coverage was ~0 *by
+/// construction*. Prod showed `spine_refused` on 4 of 4 refolds, `served_tier=0`
+/// and 0 events compared, for nine hours, on executions whose 38,611 events were
+/// sitting in the retained log the whole time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoverySource {
+    /// The in-memory spine only — the behaviour before #307, exactly. Default,
+    /// so this change lands inert and the flip is a deliberate act.
+    Spine,
+    /// Attempt the tier when the spine refuses, record what it *would* have
+    /// done, and still refuse. The dark-launch rung: it makes coverage
+    /// measurable without letting anything unproven drive an execution.
+    Verify,
+    /// Serve from the tier when the spine refuses.
+    Tier,
+}
+
+impl RecoverySource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Spine => "spine",
+            Self::Verify => "verify",
+            Self::Tier => "tier",
+        }
+    }
+    /// Whether this mode consults the tier at all.
+    fn consults_tier(self) -> bool {
+        !matches!(self, Self::Spine)
+    }
+    /// Whether a tier fold may actually be **used**.
+    fn serves_tier(self) -> bool {
+        matches!(self, Self::Tier)
+    }
+}
+
+/// Resolve the configured recovery source.
+///
+/// Unrecognised ⇒ `Spine`, warned once per distinct value. Defaulting to the
+/// pre-#307 behaviour rather than to the new one is deliberate: a typo must not
+/// silently switch which store drives executions. Same posture as
+/// `ehdb_projection_read::read_source`, and for the reason noetl/ai-meta#243
+/// records — a default that swallows a typo erases *which* cause it had.
+pub fn recovery_source() -> RecoverySource {
+    parse_recovery_source(std::env::var(RECOVERY_SOURCE_ENV).ok().as_deref())
+}
+
+/// The parse, without the environment.
+///
+/// Split out so the rules are testable without `set_var` — which would race,
+/// because `cargo test` does **not** serialise tests (a SAFETY note in this
+/// workspace claimed it did; ai-meta#232 records that it does not).
+pub fn parse_recovery_source(raw: Option<&str>) -> RecoverySource {
+    match raw.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        None | Some("") | Some("spine") => RecoverySource::Spine,
+        Some("verify") => RecoverySource::Verify,
+        Some("tier") => RecoverySource::Tier,
+        Some(other) => {
+            use std::collections::HashSet;
+            use std::sync::{Mutex, OnceLock};
+            static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+            let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+            let mut g = seen.lock().unwrap_or_else(|e| e.into_inner());
+            if g.insert(other.to_string()) {
+                tracing::warn!(
+                    target: "noetl_server::ehdb_projection_fold",
+                    value = other,
+                    "unrecognised {RECOVERY_SOURCE_ENV}; falling back to `spine` \
+                     (pre-#307 behaviour)"
+                );
+            }
+            RecoverySource::Spine
+        }
+    }
+}
+
+/// Resolve an execution's events for a recovery fold: the spine, then the
+/// durable event-log tier when the spine cannot answer.
+///
+/// # Order, and why this one
+///
+/// The spine is tried **first** so an in-flight execution takes exactly the path
+/// it took before this change — no added latency, no new failure mode, on the
+/// only case that previously worked. The tier is consulted only where there was
+/// already a refusal, so the added relay call buys coverage that did not exist
+/// and costs nothing that did.
+///
+/// # Metric semantics
+///
+/// Counts fold **attempts**, and one recovery read makes two of them: the
+/// materialise pass and the independent re-fold that verifies it. The second
+/// fetch is not redundant — re-reading and re-computing is what makes the
+/// comparison a check rather than a copy of the same number compared with
+/// itself.
+pub async fn events_for_recovery(
+    execution_id: i64,
+) -> Result<(FoldSource, Vec<crate::db::models::Event>), FoldRefusal> {
+    let mode = recovery_source();
+
+    let spine = fold_spine_inner(execution_id, None).await;
+    match &spine {
+        Ok(_) => crate::metrics::record_ehdb_recovery_fold("spine", "folded"),
+        Err(r) => crate::metrics::record_ehdb_recovery_fold("spine", r.reason()),
+    }
+    let spine_refusal = match spine {
+        Ok(events) => return Ok((FoldSource::WalSpine, events)),
+        Err(r) => r,
+    };
+
+    if !mode.consults_tier() {
+        return Err(spine_refusal);
+    }
+
+    match tier_events_within(execution_id, TIER_FOLD_TIMEOUT).await {
+        Ok(events) => {
+            crate::metrics::record_ehdb_recovery_fold("tier", "folded");
+            if !mode.serves_tier() {
+                // `verify`: measured, deliberately not served. Returning the
+                // SPINE's refusal — not a tier-flavoured one — keeps the
+                // caller's behaviour byte-identical to `spine` mode, so the
+                // dark launch cannot change an outcome while it is being
+                // trusted to only observe.
+                return Err(spine_refusal);
+            }
+            Ok((FoldSource::EhdbTier, events))
+        }
+        Err(r) => {
+            crate::metrics::record_ehdb_recovery_fold("tier", r.reason());
+            Err(r)
+        }
+    }
+}
+
 pub async fn materialize_from_wal(execution_id: i64) -> Result<FoldedState, FoldRefusal> {
     let (folded, body) = {
-        let events = fold_spine_inner(execution_id, None).await?;
-        fold_with_body(FoldSource::WalSpine, events)?
+        let (source, events) = events_for_recovery(execution_id).await?;
+        fold_with_body(source, events)?
     };
     let base = std::env::var(super::ehdb::WORKER_QUERY_URL_ENV)
         .ok()
@@ -1076,7 +1241,12 @@ pub async fn materialize_from_wal(execution_id: i64) -> Result<FoldedState, Fold
         "checksum": folded.digest,
         "snapshot": body,
         "updated_at": chrono::Utc::now().to_rfc3339(),
-        "mirror_source": "wal_spine",
+        // The source that actually answered, not a constant. A record claiming
+        // `wal_spine` while the tier answered would be a provenance label that
+        // is merely truthful-LOOKING — the exact failure ai-meta#257 records,
+        // where `source=service` kept reading correct while a silent fallback
+        // served a different store entirely.
+        "mirror_source": folded.source.as_str(),
         "aggregate_type": "orchestrator_workflow_state",
     });
     let url = format!("{}/ehdb/tiers/projection", base.trim_end_matches('/'));
@@ -1121,7 +1291,18 @@ pub async fn wal_projection_state(execution_id: i64) -> (Option<serde_json::Valu
     // verdict says so.
     let _ = materialize_from_wal(execution_id).await;
 
-    let spine = fold_from_wal_spine(execution_id, None).await;
+    // The independent re-fold. Goes through the SAME ladder as the materialise
+    // above: a refold pinned to the spine while the record was materialised
+    // from the tier would refuse on every execution the tier answered for —
+    // reporting the fix itself as a divergence.
+    //
+    // Still a genuine re-fold, not a reuse: it re-reads and re-computes rather
+    // than comparing the materialised digest with itself. That distinction is
+    // the whole difference from ai-meta#265 A3, where the digest compared was
+    // the same value moved.
+    let spine = events_for_recovery(execution_id)
+        .await
+        .and_then(|(source, events)| fold(source, events));
     let stored = stored_projection_full(execution_id).await;
     let pair = stored
         .as_ref()
@@ -1423,6 +1604,100 @@ mod tests {
         assert_eq!(
             verdict_for(Some((100, "aaa")), &unavail),
             ReFoldVerdict::SpineRefused
+        );
+    }
+
+    /// The default is the PRE-#307 behaviour, so this change lands inert.
+    #[test]
+    fn recovery_defaults_to_spine_so_the_change_lands_inert() {
+        assert_eq!(parse_recovery_source(None), RecoverySource::Spine);
+        assert_eq!(parse_recovery_source(Some("")), RecoverySource::Spine);
+        assert_eq!(parse_recovery_source(Some("  ")), RecoverySource::Spine);
+    }
+
+    /// A typo falls back to `spine`, not to the new path.
+    ///
+    /// The direction matters: falling back to `tier` would let a
+    /// misspelt value silently change which store drives executions,
+    /// which is the shape ai-meta#243 records.
+    #[test]
+    fn an_unrecognised_mode_falls_back_to_the_old_behaviour_not_the_new_one() {
+        for junk in ["teir", "TIER!", "wal", "true", "1", "postgres"] {
+            assert_eq!(
+                parse_recovery_source(Some(junk)),
+                RecoverySource::Spine,
+                "{junk} must not enable an unproven read path"
+            );
+        }
+    }
+
+    #[test]
+    fn modes_parse_case_and_space_insensitively() {
+        assert_eq!(parse_recovery_source(Some(" Verify ")), RecoverySource::Verify);
+        assert_eq!(parse_recovery_source(Some("TIER")), RecoverySource::Tier);
+        assert_eq!(parse_recovery_source(Some("Spine")), RecoverySource::Spine);
+    }
+
+    /// `verify` observes and `tier` serves — and only `tier` serves.
+    #[test]
+    fn only_tier_mode_may_actually_serve_from_the_tier() {
+        assert!(!RecoverySource::Spine.consults_tier());
+        assert!(RecoverySource::Verify.consults_tier());
+        assert!(RecoverySource::Tier.consults_tier());
+
+        assert!(!RecoverySource::Spine.serves_tier());
+        assert!(
+            !RecoverySource::Verify.serves_tier(),
+            "verify is the dark-launch rung; if it serves, the rung does not exist"
+        );
+        assert!(RecoverySource::Tier.serves_tier());
+    }
+
+    /// Every mode and fold-source label is pinned, via a TOTAL match so a new
+    /// variant fails the build here rather than going absent on a metric.
+    #[test]
+    fn every_recovery_label_is_pinned() {
+        for m in [
+            RecoverySource::Spine,
+            RecoverySource::Verify,
+            RecoverySource::Tier,
+        ] {
+            let expect = match m {
+                RecoverySource::Spine => "spine",
+                RecoverySource::Verify => "verify",
+                RecoverySource::Tier => "tier",
+            };
+            assert_eq!(m.as_str(), expect);
+            assert!(RECOVERY_SOURCES.contains(&m.as_str()));
+        }
+        assert_eq!(RECOVERY_SOURCES.len(), 3);
+        // The fold sources are the two a fold is actually attempted against —
+        // `verify` is a mode, never a source, and must not appear here.
+        assert_eq!(RECOVERY_FOLD_SOURCES, ["spine", "tier"]);
+        assert!(!RECOVERY_FOLD_SOURCES.contains(&"verify"));
+    }
+
+    /// Recovery must not reach the spine directly, bypassing the ladder.
+    ///
+    /// Counts CALL SITES rather than naming the callers: a guard that lists the
+    /// functions it trusts passes unchanged when a new one is added beside
+    /// them. Scans only the code ABOVE `#[cfg(test)]`, because `include_str!`
+    /// pulls in this module — including this assertion, whose own needle would
+    /// otherwise be the match it finds.
+    #[test]
+    fn recovery_reaches_the_spine_only_through_the_ladder() {
+        let src = include_str!("ehdb_projection_fold.rs");
+        let code = src
+            .split_once("\n#[cfg(test)]")
+            .map(|(above, _)| above)
+            .unwrap_or(src);
+        let sites = code.matches("fold_spine_inner(").count();
+        assert_eq!(
+            sites, 3,
+            "expected exactly 3: the definition, `wal_spine_events` (diff-only, \
+             deliberately spine-pinned), and `events_for_recovery`. A 4th means a \
+             recovery path is reading the in-flight-only index directly again — \
+             which is the whole of ai-meta#307."
         );
     }
 

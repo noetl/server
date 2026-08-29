@@ -3557,6 +3557,28 @@ pub fn init_ehdb_projection_series() {
             .with_label_values(&[r])
             .inc_by(0);
     }
+    // #307 — the recovery coverage counter. Every (source, outcome) pair is
+    // pinned, because the value being read here is a ZERO and an absent series
+    // would be indistinguishable from one. Pinned from the fold module's own
+    // arrays so a new refusal reason cannot go missing on exactly the label an
+    // operator is checking.
+    for source in crate::handlers::ehdb_projection_fold::RECOVERY_FOLD_SOURCES {
+        ehdb_recovery_fold_total()
+            .with_label_values(&[source, "folded"])
+            .inc_by(0);
+        for r in crate::handlers::ehdb_projection_fold::REFOLD_REFUSALS {
+            ehdb_recovery_fold_total()
+                .with_label_values(&[source, r])
+                .inc_by(0);
+        }
+    }
+    for mode in crate::handlers::ehdb_projection_fold::RECOVERY_SOURCES {
+        ehdb_recovery_source_info()
+            .with_label_values(&[mode])
+            .set(i64::from(
+                crate::handlers::ehdb_projection_fold::recovery_source().as_str() == mode,
+            ));
+    }
     for outcome in EHDB_PROJECTION_SNAPSHOT_GATE_OUTCOMES {
         ehdb_projection_snapshot_gate_total()
             .with_label_values(&[outcome])
@@ -4092,6 +4114,66 @@ pub fn record_ehdb_projection_refold_refusal(reason: &str) {
     ehdb_projection_refold_refusal_total()
         .with_label_values(&[reason])
         .inc();
+}
+
+/// Which source answered a recovery fold, and how (noetl/ai-meta#307).
+///
+/// **This is the counter that was structurally 0.** Recovery folded only from
+/// the worker's in-memory spine, which holds in-flight executions and evicts
+/// them on completion — while the comparator, by its nature, asks about
+/// *completed* ones. So coverage was ~0 by construction rather than by failure,
+/// and nothing said so except a zero, which reads identically to "healthy and
+/// quiet".
+///
+/// `source="tier"` going non-zero is the whole point: it means a completed
+/// execution was refolded from the durable log.
+pub fn ehdb_recovery_fold_total() -> &'static IntCounterVec {
+    static M: std::sync::OnceLock<IntCounterVec> = std::sync::OnceLock::new();
+    M.get_or_init(|| {
+        let m = IntCounterVec::new(
+            prometheus::Opts::new(
+                "noetl_ehdb_recovery_fold_total",
+                "Recovery fold attempts by source (spine / tier) and outcome (folded, or the refusal reason).",
+            ),
+            &["source", "outcome"],
+        )
+        .expect("ehdb_recovery_fold_total metric");
+        registry()
+            .register(Box::new(m.clone()))
+            .expect("register ehdb_recovery_fold_total");
+        m
+    })
+}
+
+/// Record one recovery-fold attempt.
+pub fn record_ehdb_recovery_fold(source: &str, outcome: &str) {
+    ehdb_recovery_fold_total()
+        .with_label_values(&[source, outcome])
+        .inc();
+}
+
+/// The configured recovery source, as a gauge (noetl/ai-meta#307).
+///
+/// Without this, "the tier never folded" and "the tier fallback is switched
+/// off" are the same evidence — both are an absent `source="tier"` series. That
+/// ambiguity is precisely what made the original zero unreadable, so the mode
+/// is published rather than inferred from the counters it governs.
+pub fn ehdb_recovery_source_info() -> &'static IntGaugeVec {
+    static M: std::sync::OnceLock<IntGaugeVec> = std::sync::OnceLock::new();
+    M.get_or_init(|| {
+        let m = IntGaugeVec::new(
+            prometheus::Opts::new(
+                "noetl_ehdb_recovery_source_info",
+                "Configured recovery fold source; 1 on the active mode, 0 on the others.",
+            ),
+            &["mode"],
+        )
+        .expect("ehdb_recovery_source_info metric");
+        registry()
+            .register(Box::new(m.clone()))
+            .expect("register ehdb_recovery_source_info");
+        m
+    })
 }
 
 /// Whether `GET /api/executions` served a capped page (noetl/ai-meta#255).
