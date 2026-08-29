@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.95.1](https://github.com/noetl/server/compare/v3.95.0...v3.95.1) (2026-08-29)
+
+### Bug Fixes
+
+* **auth:** gate /api/internal/registry/*, which said it was gated and was not ([fd268a6](https://github.com/noetl/server/commit/fd268a6f37a25cfea41d4469277e439aa6fda516)), closes [noetl/ai-meta#312](https://github.com/noetl/ai-meta/issues/312) [#312](https://github.com/noetl/server/issues/312) [noetl/ai-meta#312](https://github.com/noetl/ai-meta/issues/312) [noetl/ai-meta#303](https://github.com/noetl/ai-meta/issues/303)
+
 ## [3.95.0](https://github.com/noetl/server/compare/v3.94.0...v3.95.0) (2026-08-29)
 
 ### Features
