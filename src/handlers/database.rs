@@ -99,6 +99,20 @@ pub async fn execute_postgres(
         request.query.clone()
     };
 
+    // noetl/ai-meta#312 — the staged policy. `open` (default) is a no-op and
+    // this whole block costs one enum read.
+    let pol = crate::handlers::db_routes_policy::policy();
+    if pol.execute_disabled() {
+        // 501, not 403: the surface exists and the caller is entitled to ask —
+        // this deployment has chosen not to offer it. Same vocabulary the tier
+        // relay uses for an unconfigured mirror.
+        return Err(AppError::Validation(format!(
+            "/api/postgres/execute is disabled by {}={} (noetl/ai-meta#312)",
+            crate::handlers::db_routes_policy::POLICY_ENV,
+            pol.as_str()
+        )));
+    }
+
     // Get query or procedure
     let sql = if let Some(q) = query {
         q.trim().to_string()
@@ -121,6 +135,17 @@ pub async fn execute_postgres(
     }
 
     // Execute the query
+    // Fail-closed: anything not recognised as a single read is refused, so an
+    // unparsed shape is a refusal rather than an execution.
+    if pol.read_only() && !crate::handlers::db_routes_policy::is_read_only(&sql) {
+        return Err(AppError::Validation(format!(
+            "{}={} permits read-only statements only; this one was refused \
+             (noetl/ai-meta#312)",
+            crate::handlers::db_routes_policy::POLICY_ENV,
+            pol.as_str()
+        )));
+    }
+
     let result = execute_query(&db, &sql, request.parameters.as_deref()).await?;
 
     Ok(Json(PostgresExecuteResponse {

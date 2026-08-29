@@ -155,7 +155,21 @@ fn every_privileged_router_is_gated_in_main() {
         "these privileged routers are merged without the auth gate: {ungated:?}"
     );
     // Count, so the list above cannot silently drift from what is wired.
-    let gated = src.matches("noetl_server::auth_gate::gate").count();
+    //
+    // ⚠ Counted within the MERGE CHAIN only. noetl/ai-meta#312 staged a
+    // conditional gate on `database_routes` that is applied where the router is
+    // built rather than where it is merged, so a whole-file count now includes
+    // occurrences this list was never about. Scoping the count to the chain
+    // keeps it measuring the thing it claims to measure.
+    //
+    // This guard is superseded by `no_router_is_merged_ungated_without_an_explicit_reason`,
+    // which asserts the invariant instead of a list; it is kept because a list
+    // that names the expected routers still reads better in a failure message.
+    let chain = src
+        .split_once("// Combine all routes")
+        .map(|(_, after)| after)
+        .unwrap_or(src);
+    let gated = chain.matches("noetl_server::auth_gate::gate").count();
     assert_eq!(
         gated,
         PRIVILEGED.len(),
