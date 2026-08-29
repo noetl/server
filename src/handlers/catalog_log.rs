@@ -199,7 +199,20 @@ pub async fn record_registration(
 
     match resp {
         Ok(r) if r.status().is_success() => {
-            crate::metrics::record_catalog_log(mode.as_str(), "recorded");
+            // ⚠ A 2xx is NOT sufficient. The tier relay answers 200 with an
+            // outcome in the BODY, so a refused append arrives as a successful
+            // HTTP response. Trusting the status alone lost three registrations
+            // in kind while reporting `recorded` for every one of them.
+            let body = r.text().await.unwrap_or_default();
+            let outcome = classify_append_reply(&body);
+            crate::metrics::record_catalog_log(mode.as_str(), outcome);
+            if outcome != "recorded" {
+                tracing::warn!(
+                    target: "noetl_server::catalog_log",
+                    path, version, body = %body.chars().take(200).collect::<String>(),
+                    "catalog log append did not land; the catalog row is committed regardless"
+                );
+            }
         }
         Ok(r) => {
             crate::metrics::record_catalog_log(mode.as_str(), "append_failed");
@@ -218,6 +231,31 @@ pub async fn record_registration(
             );
         }
     }
+}
+
+/// Classify a tier-append reply body.
+///
+/// The relay answers **200 with the outcome in the body**, so the HTTP status
+/// says only that the request was understood. This reads what actually happened.
+/// Split out so the rule is asserted by a test rather than only by a live relay.
+pub fn classify_append_reply(body: &str) -> &'static str {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
+        // A non-JSON 200 is not a success we can confirm. Refusing to call it
+        // one is the whole point: an unconfirmable append must not be counted
+        // as a landed record.
+        return "append_failed";
+    };
+    if let Some(o) = v.get("outcome").and_then(|o| o.as_str()) {
+        if o != "ok" {
+            return "append_failed";
+        }
+    }
+    if let Some(n) = v.get("appended").and_then(|n| n.as_i64()) {
+        if n < 1 {
+            return "append_failed";
+        }
+    }
+    "recorded"
 }
 
 /// One folded catalog entry, keyed by `(path, version)`.
@@ -327,6 +365,21 @@ pub async fn verify_endpoint(
         .send()
         .await
     {
+        // ⚠ Status FIRST. A 502 from the relay carries a JSON error body with no
+        // `records` key, so parsing it without checking the status reported
+        // `records_read: 0` — an unreachable tier reading exactly like an empty
+        // one. That is the absent-vs-error conflation, and it hid a real failure
+        // for a full gate round.
+        Ok(r) if !r.status().is_success() => {
+            let st = r.status();
+            let text = r.text().await.unwrap_or_default();
+            return Ok(axum::Json(serde_json::json!({
+                "action": "catalog.log.verify",
+                "outcome": "unavailable",
+                "status": st.as_u16(),
+                "error": text.chars().take(400).collect::<String>(),
+            })));
+        }
         Ok(r) => match r.json().await {
             Ok(v) => v,
             Err(e) => {
@@ -510,6 +563,27 @@ mod tests {
         assert!(!fold_agrees(0, 3));
         assert!(!fold_agrees(9, 1));
         assert!(fold_agrees(9, 0));
+    }
+
+    /// ⚠ A 200 with a failure body must NOT count as a landed record.
+    ///
+    /// This is the regression that lost three registrations in kind: the relay
+    /// answers 200 with the outcome in the body, and trusting the status alone
+    /// reported every one of them as `recorded`.
+    #[test]
+    fn a_two_hundred_with_a_failure_body_is_not_a_landed_record() {
+        assert_eq!(classify_append_reply(r#"{"outcome":"ok","appended":1}"#), "recorded");
+        assert_eq!(
+            classify_append_reply(r#"{"outcome":"unconfigured"}"#),
+            "append_failed",
+            "an unconfigured mirror reported as recorded is a silently lost record"
+        );
+        assert_eq!(classify_append_reply(r#"{"outcome":"ok","appended":0}"#), "append_failed");
+        assert_eq!(
+            classify_append_reply("not json at all"),
+            "append_failed",
+            "an unconfirmable append must not be counted as a landed record"
+        );
     }
 
     #[test]
