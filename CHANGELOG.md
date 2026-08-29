@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.94.0](https://github.com/noetl/server/compare/v3.93.0...v3.94.0) (2026-08-29)
+
+### Features
+
+* **catalog:** bulk register, and a backfill that preserves the source version ([f20ae4e](https://github.com/noetl/server/commit/f20ae4e4f5ec8ee5b4a89043efd54ab1357f9bdb)), closes [noetl/ai-meta#307](https://github.com/noetl/ai-meta/issues/307) [noetl/ai-meta#311](https://github.com/noetl/ai-meta/issues/311)
+* **catalog:** give catalog registration a log ([0d0df9e](https://github.com/noetl/server/commit/0d0df9e14f6c5cc9df78aefb6e2aeac339cb4020)), closes [#303](https://github.com/noetl/server/issues/303) [noetl/ai-meta#307](https://github.com/noetl/ai-meta/issues/307)
+* **catalog:** the catalog relation — a fold that answers the five reads ([24a309c](https://github.com/noetl/server/commit/24a309c2229ac02436af16cf9fb5ca14a120b33a)), closes [noetl/ai-meta#307](https://github.com/noetl/ai-meta/issues/307) [noetl/ai-meta#311](https://github.com/noetl/ai-meta/issues/311)
+
+### Bug Fixes
+
+* **catalog:** a 200 with a failure body is not a landed record ([425fe57](https://github.com/noetl/server/commit/425fe57b1945ec96d5d84414af1f8f601decf804)), closes [noetl/ai-meta#307](https://github.com/noetl/ai-meta/issues/307)
+* **catalog:** fold the catalog log by paging — a whole-log scan cannot work ([a2caef5](https://github.com/noetl/server/commit/a2caef5f37e254fa289918f448513e3c53ee3fb8)), closes [noetl/ai-meta#307](https://github.com/noetl/ai-meta/issues/307) [noetl/ai-meta#311](https://github.com/noetl/ai-meta/issues/311)
+
 ## [3.93.0](https://github.com/noetl/server/compare/v3.92.0...v3.93.0) (2026-08-29)
 
 ### Features
