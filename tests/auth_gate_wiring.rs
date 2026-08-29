@@ -119,7 +119,7 @@ fn every_privileged_router_is_gated_in_main() {
     let src = include_str!("../src/main.rs");
     // Router groups that expose credentials, keychain material, or the internal
     // control surface. Kept explicit so adding one is a deliberate act.
-    const PRIVILEGED: [&str; 15] = [
+    const PRIVILEGED: [&str; 16] = [
         "credential_routes",
         "sealed_credential_routes",
         "keychain_routes",
@@ -139,6 +139,9 @@ fn every_privileged_router_is_gated_in_main() {
         // completed ids, so it carries the gate rather than inheriting that
         // group's ungated posture.
         "ehdb_equivalence_routes",
+        // noetl/ai-meta#312 — serves /api/internal/registry/*, which its own
+        // handler doc already described as service-account-gated. It was not.
+        "registry_routes",
     ];
     let mut ungated = Vec::new();
     for name in PRIVILEGED {
@@ -176,7 +179,7 @@ fn the_structural_check_can_fail() {
 ///
 /// **Every entry needs a reason.** This is the list a reviewer argues with; the
 /// test below makes it impossible to add an ungated router *without* arguing.
-const PUBLIC_BY_DESIGN: [(&str, &str); 18] = [
+const PUBLIC_BY_DESIGN: [(&str, &str); 17] = [
     ("health_routes", "liveness/readiness probes carry no credential"),
     ("catalog_routes", "register/list is the authoring surface; delete is separately gated by RequireInternalApiToken"),
     ("auth_routes", "the login surface itself — gating it would be circular"),
@@ -193,16 +196,6 @@ const PUBLIC_BY_DESIGN: [(&str, &str); 18] = [
     ("sharding_routes", "shard diagnostics, no data"),
     ("system_routes", "system information endpoints, no data and no credential material"),
     ("dashboard_routes", "read-only aggregate counts for the UI; no per-record data and no credential material"),
-    // ⚠⚠ noetl/ai-meta#312, second instance. NOT a justification — a record.
-    //
-    // These serve `/api/internal/registry/*`. The `/api/internal/` prefix is what
-    // `internal_routes` uses, and THAT router IS gated — so anyone auditing by
-    // path prefix would conclude these are protected. They are not.
-    //
-    // Latent rather than live: the group is merged only when
-    // NOETL_REGISTRY_ENABLED is set, and it is NOT set on prod, so these routes
-    // do not exist there today. Enabling the feature would expose them.
-    ("registry_routes", "⚠ #312 — /api/internal/registry/* is UNGATED. Latent only: NOETL_REGISTRY_ENABLED is unset on prod."),
     // ⚠ noetl/ai-meta#312. NOT a justification — a record of the current state.
     // `/api/postgres/execute` runs arbitrary SQL with no auth and no statement
     // restriction. Evidence on #312 shows no prod or CI path depends on it being
