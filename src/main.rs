@@ -546,17 +546,45 @@ fn build_router(
         .with_state(state.clone());
 
     // Database routes
-    let database_routes = Router::new()
+    // noetl/ai-meta#312 — staged, not chosen. `open` (the default) builds
+    // exactly the router that exists today; the other four options from the
+    // issue are reachable by setting NOETL_DATABASE_ROUTES_AUTH.
+    //
+    // Split into two groups because the whole decision turns on whether
+    // `db/init` and `db/validate` are gated: those are what a local
+    // `noetl db init` calls with no token, while `/api/postgres/execute` has no
+    // caller outside developer test scripts.
+    let db_policy = handlers::db_routes_policy::policy();
+    let execute_route = Router::new()
         .route(
             "/api/postgres/execute",
             post(handlers::database::execute_postgres),
         )
+        .with_state(db_pool.clone());
+    let init_validate_routes = Router::new()
         .route("/api/db/init", post(handlers::database::init_database))
         .route(
             "/api/db/validate",
             get(handlers::database::validate_database),
         )
         .with_state(db_pool.clone());
+    let execute_route = if db_policy.gates_execute() {
+        execute_route.layer(axum::middleware::from_fn_with_state(
+            "internal",
+            noetl_server::auth_gate::gate,
+        ))
+    } else {
+        execute_route
+    };
+    let init_validate_routes = if db_policy.gates_init_validate() {
+        init_validate_routes.layer(axum::middleware::from_fn_with_state(
+            "internal",
+            noetl_server::auth_gate::gate,
+        ))
+    } else {
+        init_validate_routes
+    };
+    let database_routes = execute_route.merge(init_validate_routes);
 
     // Internal API — system worker pool only.  Gated by the
     // ``RequireInternalApiToken`` extractor in

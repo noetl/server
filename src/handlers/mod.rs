@@ -6,6 +6,7 @@ pub mod auth;
 pub mod auth_verify;
 pub mod catalog;
 pub mod catalog_log;
+pub mod db_routes_policy;
 pub mod dead_data;
 pub mod catalog_read;
 pub mod catalog_relation;
