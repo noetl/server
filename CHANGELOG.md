@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.95.0](https://github.com/noetl/server/compare/v3.94.0...v3.95.0) (2026-08-29)
+
+### Features
+
+* **catalog:** stage the read-cutover and a gated dead-data survey ([3bf5943](https://github.com/noetl/server/commit/3bf59430f6709e1b9375bd6d59009a0d7ffe9679)), closes [#303](https://github.com/noetl/server/issues/303) [noetl/ai-meta#312](https://github.com/noetl/ai-meta/issues/312) [noetl/ai-meta#307](https://github.com/noetl/ai-meta/issues/307) [noetl/ai-meta#308](https://github.com/noetl/ai-meta/issues/308) [noetl/ai-meta#312](https://github.com/noetl/ai-meta/issues/312)
+
 ## [3.94.0](https://github.com/noetl/server/compare/v3.93.0...v3.94.0) (2026-08-29)
 
 ### Features
