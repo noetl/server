@@ -76,3 +76,49 @@ fn the_snapshot_is_given_the_parsed_content_and_effective_workload() {
          for, not what ran:\n{call}"
     );
 }
+
+// ---- catalog read-source ladder (RFC step 3 §5) ----
+
+/// The ladder must be WIRED, or flipping the flag would do nothing.
+///
+/// An unreachable mode is the failure this codebase keeps finding: a flag that
+/// is set, documented, and read by nothing. `NOETL_CATALOG_READ_SOURCE=tier`
+/// must be a cutover, not a no-op.
+#[test]
+fn the_catalog_read_ladder_is_wired_into_resolution() {
+    assert!(
+        EXECUTE.contains("catalog_read::mode()"),
+        "resolve_catalog does not consult the read-source mode; the flag would be inert"
+    );
+    assert!(
+        EXECUTE.contains("catalog_read::compare_latest("),
+        "the comparison is never performed, so `verify` would measure nothing"
+    );
+}
+
+/// ⭐ The relation's answer is NOT served here.
+///
+/// This is the held decision. `verify` must resolve from Postgres, and the
+/// cutover must be a deliberate, separate change — not something that arrives
+/// by accident in a refactor.
+#[test]
+fn resolution_still_returns_the_incumbent_answer() {
+    let at = EXECUTE
+        .find("catalog_read::mode()")
+        .expect("the ladder must be wired");
+    let tail = &EXECUTE[at..];
+    let end = tail.find("} else {").expect("the by-path branch must end");
+    let block = &tail[..end];
+    assert!(
+        block.contains("Ok((entry.0, entry.1))"),
+        "resolution no longer returns the incumbent tuple — the read-cutover may \
+         have been taken by accident:\n{block}"
+    );
+    for forbidden in ["rel.get_latest", "relation.get_latest", "e.version)"] {
+        assert!(
+            !block.contains(forbidden),
+            "the relation's answer is being used to resolve; that is the held \
+             read-cutover, not a staging step: found `{forbidden}`"
+        );
+    }
+}

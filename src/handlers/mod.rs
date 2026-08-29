@@ -6,6 +6,8 @@ pub mod auth;
 pub mod auth_verify;
 pub mod catalog;
 pub mod catalog_log;
+pub mod dead_data;
+pub mod catalog_read;
 pub mod catalog_relation;
 pub mod catalog_snapshot;
 pub mod cells;

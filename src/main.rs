@@ -393,6 +393,18 @@ fn build_router(
             "/api/catalog-log/backfill",
             post(handlers::catalog_log::backfill_endpoint),
         )
+        // ai-meta#308 cleanup track. In the gated router deliberately: it
+        // enumerates table sizes and can create/drop a scratch table, so it is
+        // not the shape of thing to leave open — which is the whole point of it
+        // existing rather than reaching for /api/postgres/execute (#312).
+        .route(
+            "/api/admin/dead-data/report",
+            get(handlers::dead_data::report_endpoint),
+        )
+        .route(
+            "/api/admin/dead-data/rehearse",
+            post(handlers::dead_data::rehearse_endpoint),
+        )
         .with_state(state.clone());
 
     let ehdb_parity_routes = Router::new()

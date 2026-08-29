@@ -594,7 +594,7 @@ async fn resolve_catalog(state: &AppState, request: &ExecuteRequest) -> AppResul
         Ok(entry)
     } else if let Some(path) = &request.path {
         // Lookup by path (latest version; Phase F R4-3: cluster-wide)
-        let entry = sqlx::query_as::<_, (i64, String)>(
+        let entry = sqlx::query_as::<_, (i64, String, i16)>(
             // noetl/ai-meta#237 — an archived entry is retired: it must not
             // resolve by PATH, which is how everything normally runs.
             // Resolution by explicit `catalog_id` (above) deliberately still
@@ -606,7 +606,10 @@ async fn resolve_catalog(state: &AppState, request: &ExecuteRequest) -> AppResul
             // it every execute-by-path returned 500. When absent this is the
             // empty string and the query is byte-identical to pre-soft-delete.
             &format!(
-                "SELECT catalog_id, path FROM noetl.catalog \
+                // `version` is selected for the catalog read-source
+                // comparison (RFC step 3 §5). Same query plan; the column is
+                // ignored entirely under the default `postgres` mode.
+                "SELECT catalog_id, path, version FROM noetl.catalog \
                      WHERE path = $1{archived} \
                      ORDER BY version DESC LIMIT 1",
                 archived = crate::db::queries::catalog::archived_filter()
@@ -617,7 +620,35 @@ async fn resolve_catalog(state: &AppState, request: &ExecuteRequest) -> AppResul
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Playbook not found: {}", path)))?;
 
-        Ok(entry)
+        // Catalog read-source ladder (RFC step 3 §5). Under the default
+        // `postgres` mode this is a single branch and returns immediately: no
+        // fold, no relay call, no extra query. A mode that is switched off must
+        // cost nothing, or "switched off" is not a real rollback.
+        //
+        // `verify` compares the relation's answer with the one just resolved and
+        // records the outcome; it serves the Postgres answer either way. `tier`
+        // is the cutover and is an owner decision — it is NOT taken here, and
+        // the relation's answer is never substituted below.
+        let m = crate::handlers::catalog_read::mode();
+        if m.consults_relation() {
+            let rel = crate::handlers::catalog_read::cached_relation().await;
+            let outcome = crate::handlers::catalog_read::compare_latest(
+                rel.as_ref(),
+                &entry.1,
+                Some(entry.2 as i32),
+            );
+            crate::handlers::catalog_read::record(outcome);
+            if outcome == "disagree" {
+                tracing::warn!(
+                    target: "noetl_server::catalog_read",
+                    path = %entry.1, incumbent_version = entry.2,
+                    "catalog relation disagrees with the incumbent on the resolved version; \
+                     serving the incumbent"
+                );
+            }
+        }
+
+        Ok((entry.0, entry.1))
     } else {
         Err(AppError::Validation(
             "Either path or catalog_id must be provided".to_string(),

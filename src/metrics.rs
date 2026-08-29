@@ -3572,6 +3572,11 @@ pub fn init_ehdb_projection_series() {
                 .inc_by(0);
         }
     }
+    for o in crate::handlers::catalog_read::OUTCOMES {
+        catalog_relation_read_total()
+            .with_label_values(&["get_latest", o])
+            .inc_by(0);
+    }
     for m in crate::handlers::catalog_log::MODES {
         for o in crate::handlers::catalog_log::OUTCOMES {
             catalog_log_total().with_label_values(&[m, o]).inc_by(0);
@@ -4184,6 +4189,32 @@ pub fn ehdb_recovery_source_info() -> &'static IntGaugeVec {
             .expect("register ehdb_recovery_source_info");
         m
     })
+}
+
+/// Catalog relation reads compared against the incumbent (RFC step 3 §5.1).
+pub fn catalog_relation_read_total() -> &'static IntCounterVec {
+    static M: std::sync::OnceLock<IntCounterVec> = std::sync::OnceLock::new();
+    M.get_or_init(|| {
+        let m = IntCounterVec::new(
+            prometheus::Opts::new(
+                "noetl_catalog_relation_read_total",
+                "Catalog relation reads by operation and outcome (agree/disagree/fold_missing/...).",
+            ),
+            &["operation", "outcome"],
+        )
+        .expect("catalog_relation_read_total metric");
+        registry()
+            .register(Box::new(m.clone()))
+            .expect("register catalog_relation_read_total");
+        m
+    })
+}
+
+/// Record one relation-vs-incumbent comparison.
+pub fn record_catalog_relation_read(operation: &str, outcome: &str) {
+    catalog_relation_read_total()
+        .with_label_values(&[operation, outcome])
+        .inc();
 }
 
 /// Catalog-log records, by mode and outcome (noetl/ai-meta#311 step 2).
