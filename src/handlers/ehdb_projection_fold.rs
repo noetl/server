@@ -93,16 +93,30 @@ pub enum FoldRefusal {
     /// this refusal carries that through — a fold over a gapped spine is a
     /// different execution's history.
     SpineIncomplete,
+    /// The tier holds the execution, but under a payload contract older than
+    /// the fold requires — v1 records carry no `context`.
+    ///
+    /// **This exists so that "too old to fold" cannot be reported as
+    /// "diverged".** Folding a v1 record succeeds; it just produces a state
+    /// missing everything `context` contributes, which then digest-mismatches
+    /// the Postgres fold. That mismatch is a *fault* verdict, so without this
+    /// variant every execution mirrored before v2 would report as divergence —
+    /// a false alarm on the one signal this whole comparator exists to make
+    /// trustworthy, and one that would fire hardest immediately after the fix
+    /// shipped. Refuse instead: it is honest, and it self-clears as v2 records
+    /// accumulate.
+    PayloadTooOld(String),
 }
 
 /// The refusal reasons, as metric labels. A closed set, pinned so every reason
 /// is a visible 0 rather than an absent series.
-pub const REFOLD_REFUSALS: [&str; 5] = [
+pub const REFOLD_REFUSALS: [&str; 6] = [
     "no_events",
     "source_unavailable",
     "unparseable",
     "fold_failed",
     "spine_incomplete",
+    "payload_too_old",
 ];
 
 impl FoldRefusal {
@@ -124,6 +138,7 @@ impl FoldRefusal {
             Self::Unparseable(_) => "unparseable",
             Self::FoldFailed => "fold_failed",
             Self::SpineIncomplete => "spine_incomplete",
+            Self::PayloadTooOld(_) => "payload_too_old",
         }
     }
 }
@@ -220,6 +235,23 @@ pub async fn fold_from_postgres_without_context(
 
 /// Fold from the EHDB event-log tier, read through the worker relay.
 pub async fn fold_from_tier(execution_id: i64) -> Result<FoldedState, FoldRefusal> {
+    fold_from_tier_within(execution_id, TIER_FOLD_TIMEOUT).await
+}
+
+/// How long a tier fold may take on the recovery read path.
+///
+/// The 20s the diagnostic endpoints use is fine for an operator waiting on a
+/// reply and far too long here: this sits in front of a rebuild that has a
+/// perfectly good incumbent one query away, so waiting is strictly worse than
+/// refusing. Same reasoning as `ehdb_projection_read::RELAY_TIMEOUT`, and the
+/// same value, deliberately.
+pub const TIER_FOLD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// As [`fold_from_tier`], with the relay timeout given explicitly.
+pub async fn fold_from_tier_within(
+    execution_id: i64,
+    timeout: std::time::Duration,
+) -> Result<FoldedState, FoldRefusal> {
     let base = std::env::var(super::ehdb::WORKER_QUERY_URL_ENV)
         .ok()
         .map(|s| s.trim().to_string())
@@ -231,7 +263,7 @@ pub async fn fold_from_tier(execution_id: i64) -> Result<FoldedState, FoldRefusa
     );
     let body: serde_json::Value = reqwest::Client::new()
         .get(&url)
-        .timeout(std::time::Duration::from_secs(20))
+        .timeout(timeout)
         .send()
         .await
         .map_err(|e| FoldRefusal::SourceUnavailable(e.to_string()))?
@@ -256,6 +288,18 @@ pub async fn fold_from_tier(execution_id: i64) -> Result<FoldedState, FoldRefusa
         return Err(FoldRefusal::NoEvents);
     }
 
+    let events = events_from_tier_records(records)?;
+    fold(FoldSource::EhdbTier, events)
+}
+
+/// Turn tier records into foldable events: version-gate, parse, order, dedup.
+///
+/// Split out of [`fold_from_tier_within`] so the three rules below are reachable
+/// by a unit test. Behind the HTTP call they were only exercisable against a
+/// live relay, which is how a rule ends up asserted by nothing.
+pub fn events_from_tier_records(
+    records: &[serde_json::Value],
+) -> Result<Vec<crate::db::models::Event>, FoldRefusal> {
     let mut events: Vec<crate::db::models::Event> = Vec::with_capacity(records.len());
     for r in records {
         let payload = match r.get("payload").and_then(|p| p.as_str()) {
@@ -263,6 +307,21 @@ pub async fn fold_from_tier(execution_id: i64) -> Result<FoldedState, FoldRefusa
                 .map_err(|e| FoldRefusal::Unparseable(e.to_string()))?,
             None => r.clone(),
         };
+        // A single pre-v2 record poisons the WHOLE fold, so the check is per
+        // record and refuses the lot. An execution spanning the upgrade holds
+        // both shapes, and folding the v2 half plus a context-less v1 half
+        // produces a state that is wrong in a way no digest comparison can
+        // attribute — it would read as divergence at an arbitrary field.
+        let version = payload
+            .get(super::ehdb_eventlog_mirror::MIRROR_PAYLOAD_VERSION_KEY)
+            .and_then(|v| v.as_i64())
+            .unwrap_or(1);
+        if version < super::ehdb_eventlog_mirror::MIRROR_PAYLOAD_VERSION {
+            return Err(FoldRefusal::PayloadTooOld(format!(
+                "record payload v{version} < v{} (pre-`context`)",
+                super::ehdb_eventlog_mirror::MIRROR_PAYLOAD_VERSION
+            )));
+        }
         if let Some(ev) = event_from_tier_payload(&payload) {
             events.push(ev);
         }
@@ -273,7 +332,14 @@ pub async fn fold_from_tier(execution_id: i64) -> Result<FoldedState, FoldRefusa
         ));
     }
     events.sort_by_key(|e| e.event_id);
-    fold(FoldSource::EhdbTier, events)
+    // The tier is append-only and the mirror is best-effort behind a retrying
+    // drain, so the same authoritative event CAN appear twice. `apply_event` is
+    // not idempotent — a duplicated event is a second state transition — so a
+    // duplicate folds into a state that never existed, silently. Postgres
+    // cannot produce this (the primary key forbids it), which is exactly why it
+    // has to be handled on the way out of the tier rather than assumed away.
+    events.dedup_by_key(|e| e.event_id);
+    Ok(events)
 }
 
 /// Build an [`Event`] from a tier record's payload.
@@ -1360,6 +1426,92 @@ mod tests {
         );
     }
 
+    fn v2_record(event_id: i64) -> serde_json::Value {
+        serde_json::json!({
+            "event_id": event_id,
+            "event_type": "step.enter",
+            "status": "RUNNING",
+            "execution_id": 42,
+            "created_at": "2026-08-28T00:00:00Z",
+            "context": {"path": "p"},
+            crate::handlers::ehdb_eventlog_mirror::MIRROR_PAYLOAD_VERSION_KEY:
+                crate::handlers::ehdb_eventlog_mirror::MIRROR_PAYLOAD_VERSION,
+        })
+    }
+
+    /// A pre-v2 record REFUSES rather than folding without `context`.
+    ///
+    /// The distinction this pins is the whole reason the variant exists: the
+    /// wrong behaviour here is not a crash, it is a *successful* fold whose
+    /// digest then disagrees with Postgres and is reported as divergence. That
+    /// would have fired on every pre-existing execution the moment this shipped
+    /// — loudest exactly when it was least true.
+    #[test]
+    fn a_record_written_before_context_refuses_instead_of_folding_short() {
+        let mut old = v2_record(1);
+        old.as_object_mut()
+            .unwrap()
+            .remove(crate::handlers::ehdb_eventlog_mirror::MIRROR_PAYLOAD_VERSION_KEY);
+        old.as_object_mut().unwrap().remove("context");
+
+        let r = events_from_tier_records(&[old]).expect_err("a v1 record must not fold");
+        assert_eq!(r.reason(), "payload_too_old");
+        assert_ne!(
+            r.reason(),
+            "no_events",
+            "a too-old payload must not be laundered into a benign reason"
+        );
+        assert!(REFOLD_REFUSALS.contains(&r.reason()));
+    }
+
+    /// One stale record refuses the WHOLE set — the upgrade-straddling case.
+    #[test]
+    fn a_single_stale_record_refuses_the_whole_execution() {
+        let mut old = v2_record(1);
+        old.as_object_mut()
+            .unwrap()
+            .remove(crate::handlers::ehdb_eventlog_mirror::MIRROR_PAYLOAD_VERSION_KEY);
+        let mixed = vec![old, v2_record(2), v2_record(3)];
+        assert_eq!(
+            events_from_tier_records(&mixed)
+                .expect_err("a mixed-version execution must refuse")
+                .reason(),
+            "payload_too_old",
+            "folding the v2 majority and dropping the v1 record would produce a state for a \
+             history that never happened"
+        );
+    }
+
+    /// v2 records fold, and arrive in event_id order.
+    #[test]
+    fn v2_records_fold_and_are_ordered() {
+        let ev = events_from_tier_records(&[v2_record(3), v2_record(1), v2_record(2)])
+            .expect("v2 records must fold");
+        assert_eq!(
+            ev.iter().map(|e| e.event_id).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert!(ev[0].context.is_some(), "context must survive the read");
+    }
+
+    /// A duplicated record is applied ONCE.
+    ///
+    /// `apply_event` is not idempotent, so a duplicate is a second state
+    /// transition, not a no-op. The tier is append-only behind a retrying
+    /// drain and can hold one; Postgres cannot, so this is a failure mode the
+    /// incumbent source simply does not have and the comparison would blame on
+    /// the fold.
+    #[test]
+    fn a_duplicated_tier_record_is_folded_once() {
+        let ev = events_from_tier_records(&[v2_record(1), v2_record(1), v2_record(2)])
+            .expect("duplicates must not refuse");
+        assert_eq!(
+            ev.iter().map(|e| e.event_id).collect::<Vec<_>>(),
+            vec![1, 2],
+            "a duplicate event was applied twice; the folded state never existed"
+        );
+    }
+
     /// Every refusal reason is pinned, and — the part that matters — the match is
     /// TOTAL, so adding a `FoldRefusal` variant fails to compile here rather than
     /// emitting an unpinned label nobody will notice is missing.
@@ -1371,6 +1523,7 @@ mod tests {
             FoldRefusal::Unparseable("x".into()),
             FoldRefusal::FoldFailed,
             FoldRefusal::SpineIncomplete,
+            FoldRefusal::PayloadTooOld("x".into()),
         ];
         for r in &all {
             // Total match: a new variant breaks the build here.
@@ -1380,6 +1533,7 @@ mod tests {
                 FoldRefusal::Unparseable(_) => "unparseable",
                 FoldRefusal::FoldFailed => "fold_failed",
                 FoldRefusal::SpineIncomplete => "spine_incomplete",
+                FoldRefusal::PayloadTooOld(_) => "payload_too_old",
             };
             assert_eq!(r.reason(), expect);
             assert!(
@@ -1395,7 +1549,7 @@ mod tests {
         assert_eq!(REFOLD_REFUSALS.len(), all.len());
     }
 
-    /// The reason must not change the VERDICT. All five still refuse — the
+    /// The reason must not change the VERDICT. All six still refuse — the
     /// six-verdict fail-closed contract is unchanged by adding the reason.
     #[test]
     fn labelling_the_reason_does_not_soften_any_verdict() {
