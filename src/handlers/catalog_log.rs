@@ -233,6 +233,100 @@ pub async fn record_registration(
     }
 }
 
+/// Emit a **backfill** registration for an existing catalog row.
+///
+/// ⚠⚠ This is NOT `register`. It deliberately does **not** touch
+/// `noetl.catalog`: the row already exists, and putting it through the normal
+/// registration path would run `MAX(version)+1` and create a *second* version of
+/// every one of the 2,518 existing entries — doubling the catalog to describe it.
+///
+/// It emits the same `catalog.registered` record the live path emits, carrying
+/// the row's **existing** `catalog_id`, `path`, `kind`, `version` and `content`,
+/// so the relation folds identically whether an entry arrived live or by
+/// backfill. `backfilled: true` rides along so provenance stays honest — the
+/// event says when the log learned about the registration, not when the
+/// registration happened.
+pub async fn record_backfill(
+    catalog_id: i64,
+    path: &str,
+    kind: &str,
+    version: i16,
+    content: &str,
+    archived: bool,
+) -> bool {
+    let mode = mode();
+    if !mode.enabled() {
+        return false;
+    }
+    let Some(base) = relay_base() else {
+        return false;
+    };
+
+    let mut rec = serde_json::to_value(build(
+        catalog_id,
+        path,
+        kind,
+        version,
+        content,
+        chrono::Utc::now().to_rfc3339(),
+    ))
+    .unwrap_or_default();
+    if let Some(o) = rec.as_object_mut() {
+        o.insert("backfilled".into(), serde_json::json!(true));
+    }
+
+    let mut ok = append(&base, catalog_id, &rec.to_string()).await;
+    // Liveness is derived from the sequence, so an archived row needs its
+    // archive event too — otherwise the fold reports a retired entry as live and
+    // `get_latest` resolves to a version the source would not serve.
+    if ok && archived {
+        let tomb = serde_json::json!({
+            "record_version": RECORD_VERSION,
+            "event_type": EVENT_ARCHIVED,
+            "catalog_id": catalog_id.to_string(),
+            "path": path,
+            "version": version,
+            "backfilled": true,
+            "registered_at": chrono::Utc::now().to_rfc3339(),
+        });
+        ok = append(&base, catalog_id, &tomb.to_string()).await;
+    }
+    crate::metrics::record_catalog_log(
+        mode.as_str(),
+        if ok { "recorded" } else { "append_failed" },
+    );
+    ok
+}
+
+/// `catalog.archived` — emitted by the backfill for a retired row.
+pub const EVENT_ARCHIVED: &str = "catalog.archived";
+
+/// The relay base, or `None` when unconfigured.
+fn relay_base() -> Option<String> {
+    std::env::var(crate::handlers::ehdb::WORKER_QUERY_URL_ENV)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// POST one record and report whether it actually landed.
+async fn append(base: &str, key: i64, payload: &str) -> bool {
+    let body = serde_json::json!({ "execution_id": key.to_string(), "records": [payload] });
+    let url = format!("{}/ehdb/tiers/{TIER}", base.trim_end_matches('/'));
+    match reqwest::Client::new()
+        .post(&url)
+        .json(&body)
+        .timeout(APPEND_TIMEOUT)
+        .send()
+        .await
+    {
+        Ok(r) if r.status().is_success() => {
+            classify_append_reply(&r.text().await.unwrap_or_default()) == "recorded"
+        }
+        _ => false,
+    }
+}
+
 /// Classify a tier-append reply body.
 ///
 /// The relay answers **200 with the outcome in the body**, so the HTTP status
@@ -451,6 +545,185 @@ pub async fn verify_endpoint(
         "missing_in_source": missing_in_source,
         "agrees": fold_agrees(compared, mismatched) && missing_in_source == 0,
         "mismatches": mismatches,
+    })))
+}
+
+/// `POST /api/catalog-log/backfill` — bring the catalog log to full coverage.
+///
+/// # Why this exists
+///
+/// 2,518 catalog rows predate the log, so the relation's coverage is a strict
+/// subset of the catalog — and a fold-served read on a missing entry would be
+/// **wrong**, not merely stale, while `list_by_kind` would silently
+/// under-report. Full coverage is the gate for serving.
+///
+/// # Idempotent by diffing, not by hoping
+///
+/// It folds the log **first** and emits only rows the fold is missing or
+/// disagrees with. A second run emits nothing. That is a stronger property than
+/// "re-running is harmless": the log is append-only, so an emit-everything
+/// backfill would keep appending duplicates forever even though the folded
+/// relation stayed the same.
+///
+/// # Cursor
+///
+/// `after_catalog_id` makes it resumable, so a 2,518-row backfill is a sequence
+/// of bounded calls rather than one request that must not fail.
+pub async fn backfill_endpoint(
+    axum::extract::State(state): axum::extract::State<crate::state::AppState>,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> crate::error::AppResult<axum::Json<serde_json::Value>> {
+    let limit: i64 = q
+        .get("limit")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(200)
+        .clamp(1, 1000);
+    let after: i64 = q
+        .get("after_catalog_id")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let dry_run = q.get("dry_run").map(|v| v == "true").unwrap_or(false);
+
+    if !mode().enabled() {
+        return Ok(axum::Json(serde_json::json!({
+            "action": "catalog.log.backfill",
+            "outcome": "disabled",
+            "hint": format!("set {MODE_ENV}=shadow"),
+        })));
+    }
+
+    // Fold what the log already has, so this run only emits the difference.
+    let existing = match read_and_fold(2000).await {
+        Ok(r) => r,
+        Err(e) => {
+            return Ok(axum::Json(serde_json::json!({
+                "action": "catalog.log.backfill",
+                "outcome": "unavailable",
+                "error": e,
+            })))
+        }
+    };
+
+    let archived_sel = if crate::db::queries::catalog::archived_column_present() {
+        "archived_at IS NOT NULL"
+    } else {
+        "false"
+    };
+    let sql = format!(
+        "SELECT catalog_id, path, kind, version, COALESCE(content, ''), {archived_sel} \
+         FROM noetl.catalog WHERE catalog_id > $1 ORDER BY catalog_id ASC LIMIT $2"
+    );
+    let rows: Vec<(i64, String, String, i16, String, bool)> = sqlx::query_as(&sql)
+        .bind(after)
+        .bind(limit)
+        .fetch_all(state.pools.cluster())
+        .await?;
+
+    let scanned = rows.len();
+    let (mut emitted, mut already, mut failed) = (0usize, 0usize, 0usize);
+    let mut next = after;
+    for (cid, path, kind, version, content, archived) in rows {
+        next = cid;
+        let digest = crate::handlers::catalog_snapshot::sha256_hex(content.as_bytes());
+        // Covered means the fold has this key with the SAME digest AND the same
+        // liveness. Digest-only would let an archived row read as covered while
+        // the fold still served it as live.
+        let covered = existing
+            .get(&path, version as i32)
+            .is_some_and(|e| e.content_sha256 == digest && e.archived == archived);
+        if covered {
+            already += 1;
+            continue;
+        }
+        if dry_run {
+            emitted += 1;
+            continue;
+        }
+        if record_backfill(cid, &path, &kind, version, &content, archived).await {
+            emitted += 1;
+        } else {
+            failed += 1;
+        }
+    }
+
+    Ok(axum::Json(serde_json::json!({
+        "action": "catalog.log.backfill",
+        "outcome": "ok",
+        "dry_run": dry_run,
+        "scanned": scanned,
+        "already_covered": already,
+        "emitted": emitted,
+        "failed": failed,
+        "next_after_catalog_id": next,
+        // `scanned < limit` is the only honest "done" signal; a caller that
+        // stopped on `emitted == 0` would stop at the first fully-covered page.
+        "done": (scanned as i64) < limit,
+    })))
+}
+
+/// Read the catalog tier and fold it.
+pub async fn read_and_fold(
+    limit: usize,
+) -> Result<crate::handlers::catalog_relation::CatalogRelation, String> {
+    let base = relay_base().ok_or_else(|| {
+        format!("{} is unset", crate::handlers::ehdb::WORKER_QUERY_URL_ENV)
+    })?;
+    let url = format!("{}/ehdb/tiers/{TIER}?limit={limit}", base.trim_end_matches('/'));
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(30))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!(
+            "tier read {}: {}",
+            resp.status(),
+            resp.text().await.unwrap_or_default().chars().take(200).collect::<String>()
+        ));
+    }
+    let body: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    let records: Vec<serde_json::Value> = body
+        .get("records")
+        .and_then(|r| r.as_array())
+        .cloned()
+        .unwrap_or_default();
+    Ok(crate::handlers::catalog_relation::CatalogRelation::fold(&records))
+}
+
+/// `GET /api/catalog-log/coverage` — is the relation complete enough to serve?
+///
+/// The blocker for the read cutover is coverage, so it gets its own answer
+/// rather than being inferred from the verifier's counts.
+pub async fn coverage_endpoint(
+    axum::extract::State(state): axum::extract::State<crate::state::AppState>,
+) -> crate::error::AppResult<axum::Json<serde_json::Value>> {
+    let rel = match read_and_fold(5000).await {
+        Ok(r) => r,
+        Err(e) => {
+            return Ok(axum::Json(serde_json::json!({
+                "action": "catalog.log.coverage",
+                "outcome": "unavailable",
+                "error": e,
+            })))
+        }
+    };
+    let (source_rows,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM noetl.catalog")
+        .fetch_one(state.pools.cluster())
+        .await?;
+    let folded = rel.len() as i64;
+    Ok(axum::Json(serde_json::json!({
+        "action": "catalog.log.coverage",
+        "outcome": "ok",
+        "source_rows": source_rows,
+        "folded_entries": folded,
+        "fold_missing": (source_rows - folded).max(0),
+        "records_seen": rel.records_seen,
+        "records_applied": rel.records_applied,
+        // Serving is permissible only at FULL coverage. Under-reporting is the
+        // failure mode nobody notices, so this is stated rather than left to a
+        // reader comparing two numbers.
+        "full_coverage": folded >= source_rows && source_rows > 0,
     })))
 }
 

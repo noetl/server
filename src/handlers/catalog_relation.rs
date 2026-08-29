@@ -345,6 +345,57 @@ mod tests {
         assert_eq!(r.records_applied, 0);
     }
 
+    /// ⭐ A BACKFILL record folds identically to a live registration.
+    ///
+    /// The whole point of the backfill emitting through the same record shape:
+    /// an entry must be indistinguishable in the relation whether it arrived
+    /// live or was seeded from an existing row. Only its provenance differs.
+    #[test]
+    fn a_backfilled_record_folds_the_same_as_a_live_one() {
+        let live = reg("a", 7, "d7", "playbook", 77);
+        let mut back = live.clone();
+        back["backfilled"] = serde_json::json!(true);
+        assert_eq!(
+            CatalogRelation::fold(&[live]).get("a", 7),
+            CatalogRelation::fold(&[back]).get("a", 7),
+            "a backfilled entry must fold identically; only provenance differs"
+        );
+    }
+
+    /// ⭐ The backfill must NOT bump versions.
+    ///
+    /// Re-registering the existing catalog through the normal path would run
+    /// MAX(version)+1 and create a second version of every entry — describing a
+    /// 2,518-row catalog by doubling it. This pins the property the backfill
+    /// preserves: the folded version is the SOURCE version.
+    #[test]
+    fn the_backfill_preserves_the_source_version() {
+        let r = CatalogRelation::fold(&[
+            reg("a", 3, "d3", "playbook", 33),
+            reg("a", 4, "d4", "playbook", 44),
+        ]);
+        assert_eq!(
+            r.list_versions("a").iter().map(|e| e.version).collect::<Vec<_>>(),
+            vec![3, 4],
+            "backfilled versions must be the source's own, not 1..n"
+        );
+        assert_eq!(r.get_latest("a").unwrap().version, 4);
+        assert!(r.get("a", 1).is_none(), "no phantom version was invented");
+    }
+
+    /// Re-folding a log that already contains an entry leaves the relation
+    /// unchanged — the property the backfill's diff relies on.
+    #[test]
+    fn re_emitting_an_identical_record_does_not_change_the_relation() {
+        let one = CatalogRelation::fold(&[reg("a", 1, "d1", "playbook", 1)]);
+        let twice = CatalogRelation::fold(&[
+            reg("a", 1, "d1", "playbook", 1),
+            reg("a", 1, "d1", "playbook", 1),
+        ]);
+        assert_eq!(one.get("a", 1), twice.get("a", 1));
+        assert_eq!(one.len(), twice.len(), "a duplicate must not create a second entry");
+    }
+
     /// Records wrapped in a tier `payload` string fold identically to inline ones.
     #[test]
     fn wrapped_and_inline_records_fold_identically() {

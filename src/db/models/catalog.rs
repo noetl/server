@@ -61,6 +61,42 @@ fn default_resource_type() -> String {
     "Playbook".to_string()
 }
 
+/// Bulk registration — N items in one call.
+///
+/// Bulk-loading the catalog was previously a shell loop of single POSTs (see
+/// `repos/ops/automation/development/validate-*.sh`), which is 2,518 round trips
+/// for a full load and has no per-item outcome a caller can act on.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CatalogRegisterBatchRequest {
+    pub items: Vec<CatalogRegisterRequest>,
+}
+
+/// One item's outcome. **Partial failure is first-class**: a single bad YAML
+/// yields an error at its index and the rest still register — the same posture
+/// `execute_batch` takes, and the reason a bulk load does not become
+/// all-or-nothing on one malformed file.
+#[derive(Debug, Clone, Serialize)]
+pub struct CatalogRegisterBatchItem {
+    pub index: usize,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<i16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub catalog_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CatalogRegisterBatchResponse {
+    pub count: usize,
+    pub registered: usize,
+    pub failed: usize,
+    pub results: Vec<CatalogRegisterBatchItem>,
+}
+
 /// Response after registering a catalog resource.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CatalogRegisterResponse {
