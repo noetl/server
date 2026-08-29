@@ -373,6 +373,14 @@ fn build_router(
             "/api/ehdb/projection-recovery/equivalence",
             get(handlers::ehdb_projection_fold::equivalence_endpoint),
         )
+        // ai-meta#311 step 2 — the catalog log's fold-vs-source verifier. Same
+        // router, so it inherits the #303 gate for the same reason: it
+        // enumerates catalog content rather than answering about one id the
+        // caller already holds.
+        .route(
+            "/api/catalog-log/verify",
+            get(handlers::catalog_log::verify_endpoint),
+        )
         .with_state(state.clone());
 
     let ehdb_parity_routes = Router::new()

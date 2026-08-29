@@ -5,6 +5,7 @@
 pub mod auth;
 pub mod auth_verify;
 pub mod catalog;
+pub mod catalog_log;
 pub mod catalog_snapshot;
 pub mod cells;
 pub mod container_callback;

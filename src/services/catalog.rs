@@ -104,6 +104,24 @@ impl CatalogService {
         )
         .await?;
 
+        // Step 2 of the catalog relation: give the catalog a LOG.
+        //
+        // After the INSERT, never instead of it — the row is the source every
+        // read still resolves from, and this only *also* records the
+        // registration so the fold can be built and compared before anything
+        // depends on it.
+        //
+        // Returns `()` and swallows every failure: the row is already committed,
+        // and failing the request now would report a failure for work that
+        // succeeded — the caller would re-register and create a second version
+        // of an identical playbook.
+        //
+        // No-op unless `NOETL_CATALOG_LOG=shadow`.
+        crate::handlers::catalog_log::record_registration(
+            catalog_id, &path, &kind, version, &content,
+        )
+        .await;
+
         Ok(CatalogRegisterResponse {
             status: "success".to_string(),
             message: format!("Resource '{}' version '{}' registered.", path, version),
