@@ -361,6 +361,20 @@ fn build_router(
     // worker relay the route above uses.  Default-off: with
     // `NOETL_EHDB_CROSSSTORE_PARITY_ENABLED` unset both routes answer 501 with
     // the reason.
+    // ai-meta#307's verify-before-serve gate. Its OWN router so it can carry the
+    // #303 auth gate, which `ehdb_parity_routes` does not: the sibling
+    // comparators report on an execution id the caller already has, while this
+    // one ENUMERATES recently-completed ids. That is a new capability, small but
+    // real, and it should not be the thing that quietly widens an
+    // unauthenticated surface. Shadow-mode today, so gating costs nothing now
+    // and covers this route by construction when #303 enforcement lands.
+    let ehdb_equivalence_routes = Router::new()
+        .route(
+            "/api/ehdb/projection-recovery/equivalence",
+            get(handlers::ehdb_projection_fold::equivalence_endpoint),
+        )
+        .with_state(state.clone());
+
     let ehdb_parity_routes = Router::new()
         // ai-meta#265 — the projection tier's comparator. Its own paths rather
         // than a `tier` path segment on the event log's: the two return
@@ -743,6 +757,10 @@ fn build_router(
         .merge(ehdb_routes)
         .merge(ehdb_tier_routes)
         .merge(ehdb_parity_routes)
+        .merge(ehdb_equivalence_routes.layer(axum::middleware::from_fn_with_state(
+            "internal",
+            noetl_server::auth_gate::gate,
+        )))
         .merge(subscription_routes)
         .merge(replay_routes)
         .merge(result_store_routes)

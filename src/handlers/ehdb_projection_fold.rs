@@ -1701,6 +1701,21 @@ mod tests {
         );
     }
 
+    /// The equivalence gate must be able to FAIL, including on the shape that
+    /// looks most like success: nothing compared at all.
+    #[test]
+    fn an_equivalence_sweep_that_compared_nothing_is_not_a_pass() {
+        assert!(
+            !equivalence_holds(0, 0),
+            "zero agreements and zero disagreements is a sweep where everything \
+             refused — reporting it as equivalent is the vacuous pass"
+        );
+        assert!(!equivalence_holds(0, 5));
+        assert!(!equivalence_holds(9, 1), "one disagreement fails the sweep");
+        assert!(equivalence_holds(9, 0));
+        assert!(equivalence_holds(1, 0));
+    }
+
     fn v2_record(event_id: i64) -> serde_json::Value {
         serde_json::json!({
             "event_id": event_id,
@@ -1985,6 +2000,144 @@ mod tests {
              pass the whole comparator discipline exists to refuse"
         );
     }
+}
+
+/// How many completed executions the equivalence sweep may examine at once.
+const EQUIVALENCE_MAX: i64 = 200;
+
+/// Did the equivalence sweep pass?
+///
+/// **Both conditions, and the first is the one that matters.** A sweep in which
+/// every execution refused has zero disagreements, so `disagreed == 0` alone
+/// would report it as a pass — the vacuous pass this codebase keeps refusing.
+/// Two refusals are not a match, and a gate that cannot fail is not a gate.
+///
+/// Pure, so the rule is asserted by a test rather than only by the endpoint
+/// that happens to apply it.
+pub fn equivalence_holds(agreed: usize, disagreed: usize) -> bool {
+    agreed > 0 && disagreed == 0
+}
+
+/// The most recently **completed** executions, newest first.
+///
+/// Terminal-event driven rather than `noetl.execution.status`, which is a frozen
+/// Python-era column nothing in the Rust path writes (ai-meta#235). Reading it
+/// here would select a set that stopped being maintained in June and call the
+/// result coverage.
+async fn recently_completed(pool: &DbPool, limit: i64) -> AppResult<Vec<i64>> {
+    let rows: Vec<(i64,)> = sqlx::query_as(
+        r#"
+        SELECT execution_id
+        FROM noetl.event
+        WHERE event_type IN (
+            'playbook.completed', 'playbook_completed',
+            'playbook.failed',    'playbook_failed',
+            'playbook.cancelled', 'playbook_cancelled'
+        )
+        GROUP BY execution_id
+        ORDER BY MAX(created_at) DESC
+        LIMIT $1
+        "#,
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|(id,)| id).collect())
+}
+
+/// `GET /api/ehdb/projection-recovery/equivalence?limit=N` — the
+/// verify-before-serve gate for ai-meta#307.
+///
+/// Folds real **completed** executions from Postgres and from the durable
+/// event-log tier and reports whether the digests agree. Read-only, and
+/// independent of `NOETL_EHDB_RECOVERY_SOURCE`, so the evidence can be gathered
+/// while the serving path is still on `spine`.
+///
+/// # Why `equivalent` demands a non-zero denominator
+///
+/// A sweep in which every execution refused would otherwise report zero
+/// disagreements and read as a pass. That is the vacuous-pass shape this
+/// codebase keeps refusing — two refusals are not a match, and a check that can
+/// only pass is not a check. `equivalent` is therefore
+/// `agreed > 0 && disagreed == 0`, and `agreed` is reported alongside it so the
+/// denominator is never invisible.
+///
+/// Completed executions are exactly the population that could not be covered
+/// before: the worker's in-memory spine evicts them on completion, so every one
+/// of these previously refused.
+pub async fn equivalence_endpoint(
+    axum::extract::State(state): axum::extract::State<crate::state::AppState>,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> AppResult<axum::Json<serde_json::Value>> {
+    let requested: i64 = q
+        .get("limit")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(25);
+    let limit = requested.clamp(1, EQUIVALENCE_MAX);
+
+    let pool = state.pools.pool_for(0);
+    let ids = recently_completed(pool, limit).await?;
+
+    let (mut agreed, mut disagreed) = (0usize, 0usize);
+    let mut tier_refusals: std::collections::BTreeMap<String, usize> = Default::default();
+    let mut pg_refusals: std::collections::BTreeMap<String, usize> = Default::default();
+    let mut context_explained = 0usize;
+    let mut disagreements: Vec<serde_json::Value> = Vec::new();
+
+    for id in &ids {
+        let pool = state.pools.pool_for(*id);
+        let c = match compare_sources(pool, *id).await {
+            Ok(c) => c,
+            Err(e) => {
+                *pg_refusals
+                    .entry(format!("comparison_error: {e}"))
+                    .or_default() += 1;
+                continue;
+            }
+        };
+        if let Some(r) = &c.tier_refusal {
+            *tier_refusals.entry(r.reason().to_string()).or_default() += 1;
+        }
+        if let Some(r) = &c.postgres_refusal {
+            *pg_refusals.entry(r.reason().to_string()).or_default() += 1;
+        }
+        if c.digests_agree {
+            agreed += 1;
+        } else if c.postgres.is_some() && c.tier.is_some() {
+            disagreed += 1;
+            if c.context_explains_the_gap {
+                context_explained += 1;
+            }
+            if disagreements.len() < 10 {
+                disagreements.push(serde_json::json!({
+                    "execution_id": *id,
+                    "detail": c.disagreement,
+                    // When blanking `context` on the Postgres side reproduces
+                    // the tier digest exactly, the record predates the mirror
+                    // carrying it — a stale record, not a diverged one.
+                    "context_explains_the_gap": c.context_explains_the_gap,
+                }));
+            }
+        }
+    }
+
+    Ok(axum::Json(serde_json::json!({
+        "action": "ehdb.projection.recovery.equivalence",
+        "requested_limit": requested,
+        "limit": limit,
+        "examined": ids.len(),
+        "agreed": agreed,
+        "disagreed": disagreed,
+        // Both conditions, and the first one is the one that matters: a sweep
+        // where everything refused agrees with nothing.
+        "equivalent": equivalence_holds(agreed, disagreed),
+        "tier_refusals": tier_refusals,
+        "postgres_refusals": pg_refusals,
+        "disagreements_explained_by_missing_context": context_explained,
+        "disagreements": disagreements,
+        "recovery_source": recovery_source().as_str(),
+        "mirror_payload_version": super::ehdb_eventlog_mirror::MIRROR_PAYLOAD_VERSION,
+    })))
 }
 
 /// `GET /api/ehdb/projection-recovery/{id}` — the re-scoped Phase 3 gate.
