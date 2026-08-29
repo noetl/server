@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.92.0](https://github.com/noetl/server/compare/v3.91.4...v3.92.0) (2026-08-29)
+
+### Features
+
+* **ehdb:** equivalence sweep — the verify-before-serve gate for [#307](https://github.com/noetl/server/issues/307) ([76a71b6](https://github.com/noetl/server/commit/76a71b60ca43dad48f2b4ccdc81c572d430003cf)), closes [ai-meta#235](https://github.com/noetl/ai-meta/issues/235) [#303](https://github.com/noetl/server/issues/303) [#303](https://github.com/noetl/server/issues/303)
+
+### Bug Fixes
+
+* **ehdb:** mirror context into the tier so a tier-sourced fold can agree ([4ebac60](https://github.com/noetl/server/commit/4ebac608a710536efd1a8011a51be9095a93c712)), closes [noetl/ai-meta#307](https://github.com/noetl/ai-meta/issues/307) [noetl/ai-meta#243](https://github.com/noetl/ai-meta/issues/243) [noetl/ai-meta#307](https://github.com/noetl/ai-meta/issues/307)
+* **ehdb:** recovery folds from the durable tier when the spine cannot answer ([1a0402a](https://github.com/noetl/server/commit/1a0402ab17a099a44e38b4fd440b6430143e144f)), closes [noetl/ai-meta#307](https://github.com/noetl/ai-meta/issues/307) [pre-#307](https://github.com/noetl/pre-/issues/307) [#307](https://github.com/noetl/server/issues/307) [ai-meta#265](https://github.com/noetl/ai-meta/issues/265) [ai-meta#257](https://github.com/noetl/ai-meta/issues/257) [noetl/ai-meta#307](https://github.com/noetl/ai-meta/issues/307)
+
 ## [3.91.4](https://github.com/noetl/server/compare/v3.91.3...v3.91.4) (2026-08-28)
 
 ### Bug Fixes
