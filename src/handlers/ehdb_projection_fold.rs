@@ -93,16 +93,30 @@ pub enum FoldRefusal {
     /// this refusal carries that through — a fold over a gapped spine is a
     /// different execution's history.
     SpineIncomplete,
+    /// The tier holds the execution, but under a payload contract older than
+    /// the fold requires — v1 records carry no `context`.
+    ///
+    /// **This exists so that "too old to fold" cannot be reported as
+    /// "diverged".** Folding a v1 record succeeds; it just produces a state
+    /// missing everything `context` contributes, which then digest-mismatches
+    /// the Postgres fold. That mismatch is a *fault* verdict, so without this
+    /// variant every execution mirrored before v2 would report as divergence —
+    /// a false alarm on the one signal this whole comparator exists to make
+    /// trustworthy, and one that would fire hardest immediately after the fix
+    /// shipped. Refuse instead: it is honest, and it self-clears as v2 records
+    /// accumulate.
+    PayloadTooOld(String),
 }
 
 /// The refusal reasons, as metric labels. A closed set, pinned so every reason
 /// is a visible 0 rather than an absent series.
-pub const REFOLD_REFUSALS: [&str; 5] = [
+pub const REFOLD_REFUSALS: [&str; 6] = [
     "no_events",
     "source_unavailable",
     "unparseable",
     "fold_failed",
     "spine_incomplete",
+    "payload_too_old",
 ];
 
 impl FoldRefusal {
@@ -124,6 +138,7 @@ impl FoldRefusal {
             Self::Unparseable(_) => "unparseable",
             Self::FoldFailed => "fold_failed",
             Self::SpineIncomplete => "spine_incomplete",
+            Self::PayloadTooOld(_) => "payload_too_old",
         }
     }
 }
@@ -220,6 +235,36 @@ pub async fn fold_from_postgres_without_context(
 
 /// Fold from the EHDB event-log tier, read through the worker relay.
 pub async fn fold_from_tier(execution_id: i64) -> Result<FoldedState, FoldRefusal> {
+    fold_from_tier_within(execution_id, TIER_FOLD_TIMEOUT).await
+}
+
+/// How long a tier fold may take on the recovery read path.
+///
+/// The 20s the diagnostic endpoints use is fine for an operator waiting on a
+/// reply and far too long here: this sits in front of a rebuild that has a
+/// perfectly good incumbent one query away, so waiting is strictly worse than
+/// refusing. Same reasoning as `ehdb_projection_read::RELAY_TIMEOUT`, and the
+/// same value, deliberately.
+pub const TIER_FOLD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// As [`fold_from_tier`], with the relay timeout given explicitly.
+pub async fn fold_from_tier_within(
+    execution_id: i64,
+    timeout: std::time::Duration,
+) -> Result<FoldedState, FoldRefusal> {
+    let events = tier_events_within(execution_id, timeout).await?;
+    fold(FoldSource::EhdbTier, events)
+}
+
+/// The events one execution has in the durable event-log tier.
+///
+/// The fetch half of [`fold_from_tier_within`], split out so the recovery path
+/// can fold **with a body** (which the projection record needs) without a
+/// second implementation of the relay read.
+pub async fn tier_events_within(
+    execution_id: i64,
+    timeout: std::time::Duration,
+) -> Result<Vec<crate::db::models::Event>, FoldRefusal> {
     let base = std::env::var(super::ehdb::WORKER_QUERY_URL_ENV)
         .ok()
         .map(|s| s.trim().to_string())
@@ -231,7 +276,7 @@ pub async fn fold_from_tier(execution_id: i64) -> Result<FoldedState, FoldRefusa
     );
     let body: serde_json::Value = reqwest::Client::new()
         .get(&url)
-        .timeout(std::time::Duration::from_secs(20))
+        .timeout(timeout)
         .send()
         .await
         .map_err(|e| FoldRefusal::SourceUnavailable(e.to_string()))?
@@ -256,6 +301,17 @@ pub async fn fold_from_tier(execution_id: i64) -> Result<FoldedState, FoldRefusa
         return Err(FoldRefusal::NoEvents);
     }
 
+    events_from_tier_records(records)
+}
+
+/// Turn tier records into foldable events: version-gate, parse, order, dedup.
+///
+/// Split out of [`fold_from_tier_within`] so the three rules below are reachable
+/// by a unit test. Behind the HTTP call they were only exercisable against a
+/// live relay, which is how a rule ends up asserted by nothing.
+pub fn events_from_tier_records(
+    records: &[serde_json::Value],
+) -> Result<Vec<crate::db::models::Event>, FoldRefusal> {
     let mut events: Vec<crate::db::models::Event> = Vec::with_capacity(records.len());
     for r in records {
         let payload = match r.get("payload").and_then(|p| p.as_str()) {
@@ -263,6 +319,21 @@ pub async fn fold_from_tier(execution_id: i64) -> Result<FoldedState, FoldRefusa
                 .map_err(|e| FoldRefusal::Unparseable(e.to_string()))?,
             None => r.clone(),
         };
+        // A single pre-v2 record poisons the WHOLE fold, so the check is per
+        // record and refuses the lot. An execution spanning the upgrade holds
+        // both shapes, and folding the v2 half plus a context-less v1 half
+        // produces a state that is wrong in a way no digest comparison can
+        // attribute — it would read as divergence at an arbitrary field.
+        let version = payload
+            .get(super::ehdb_eventlog_mirror::MIRROR_PAYLOAD_VERSION_KEY)
+            .and_then(|v| v.as_i64())
+            .unwrap_or(1);
+        if version < super::ehdb_eventlog_mirror::MIRROR_PAYLOAD_VERSION {
+            return Err(FoldRefusal::PayloadTooOld(format!(
+                "record payload v{version} < v{} (pre-`context`)",
+                super::ehdb_eventlog_mirror::MIRROR_PAYLOAD_VERSION
+            )));
+        }
         if let Some(ev) = event_from_tier_payload(&payload) {
             events.push(ev);
         }
@@ -273,7 +344,14 @@ pub async fn fold_from_tier(execution_id: i64) -> Result<FoldedState, FoldRefusa
         ));
     }
     events.sort_by_key(|e| e.event_id);
-    fold(FoldSource::EhdbTier, events)
+    // The tier is append-only and the mirror is best-effort behind a retrying
+    // drain, so the same authoritative event CAN appear twice. `apply_event` is
+    // not idempotent — a duplicated event is a second state transition — so a
+    // duplicate folds into a state that never existed, silently. Postgres
+    // cannot produce this (the primary key forbids it), which is exactly why it
+    // has to be handled on the way out of the tier rather than assumed away.
+    events.dedup_by_key(|e| e.event_id);
+    Ok(events)
 }
 
 /// Build an [`Event`] from a tier record's payload.
@@ -477,21 +555,19 @@ fn fold(
 /// reach it, this refuses with [`FoldRefusal::SpineIncomplete`] rather than
 /// folding what it has.
 /// Fetch and parse the WAL spine's events, without folding.
-/// Shared by [`fold_from_wal_spine`] and the field-level diff endpoint.
+///
+/// Used by the field-level diff endpoint, which needs the events themselves
+/// rather than a state.
+///
+/// ⚠ Spine-pinned on purpose: a *diff* is asking "what do these two sources
+/// each say", so it must not take the recovery ladder's fallback. Anything
+/// asking "what is this execution's state" wants [`events_for_recovery`].
 pub async fn wal_spine_events(
     execution_id: i64,
     head: Option<i64>,
 ) -> Result<Vec<crate::db::models::Event>, FoldRefusal> {
     let inner = fold_spine_inner(execution_id, head).await?;
     Ok(inner)
-}
-
-pub async fn fold_from_wal_spine(
-    execution_id: i64,
-    head: Option<i64>,
-) -> Result<FoldedState, FoldRefusal> {
-    let events = fold_spine_inner(execution_id, head).await?;
-    fold(FoldSource::WalSpine, events)
 }
 
 async fn fold_spine_inner(
@@ -937,12 +1013,19 @@ pub async fn stored_projection(execution_id: i64) -> Result<Option<(i64, String)
 
 /// `GET /api/ehdb/projection-refold/executions/{id}` — the Phase 2 comparator.
 ///
-/// Ground truth is a fresh fold of the WAL spine. Never Postgres.
+/// Ground truth is a fresh fold of the EHDB log — the spine, or the durable
+/// event-log tier when the spine cannot answer. Never Postgres.
 pub async fn refold_endpoint(
     axum::extract::State(_state): axum::extract::State<crate::state::AppState>,
     axum::extract::Path(execution_id): axum::extract::Path<i64>,
 ) -> AppResult<axum::Json<serde_json::Value>> {
-    let spine = fold_from_wal_spine(execution_id, None).await;
+    // Through the ladder, so this reports what recovery would ACTUALLY do under
+    // the configured mode. This is the endpoint #307 was diagnosed with; had it
+    // answered for a path the serving code no longer takes, it would have
+    // become a second thing to be wrong about.
+    let spine = events_for_recovery(execution_id)
+        .await
+        .and_then(|(source, events)| fold(source, events));
     let stored = stored_projection(execution_id).await;
     let stored_pair = match &stored {
         Ok(Some((v, d))) => Some((*v, d.as_str())),
@@ -989,10 +1072,158 @@ pub async fn refold_endpoint(
 ///
 /// Best-effort and non-fatal: this is a read model, and failing to materialise
 /// must never fail the execution that triggered it.
+/// `NOETL_EHDB_RECOVERY_SOURCE` — where a recovery fold resolves its events.
+pub const RECOVERY_SOURCE_ENV: &str = "NOETL_EHDB_RECOVERY_SOURCE";
+
+/// The configured modes, pinned as metric labels.
+pub const RECOVERY_SOURCES: [&str; 3] = ["spine", "verify", "tier"];
+
+/// The sources a fold can actually be attempted against, pinned as labels.
+pub const RECOVERY_FOLD_SOURCES: [&str; 2] = ["spine", "tier"];
+
+/// Where a recovery fold resolves an execution's events from (ai-meta#307).
+///
+/// # The mismatch this exists to fix
+///
+/// Recovery folded only from the worker's in-memory state-builder index, which
+/// holds **in-flight** executions and evicts them on completion. The comparator,
+/// by its nature, asks about **completed** ones. Two components with
+/// incompatible lifetimes: nothing was broken, and coverage was ~0 *by
+/// construction*. Prod showed `spine_refused` on 4 of 4 refolds, `served_tier=0`
+/// and 0 events compared, for nine hours, on executions whose 38,611 events were
+/// sitting in the retained log the whole time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoverySource {
+    /// The in-memory spine only — the behaviour before #307, exactly. Default,
+    /// so this change lands inert and the flip is a deliberate act.
+    Spine,
+    /// Attempt the tier when the spine refuses, record what it *would* have
+    /// done, and still refuse. The dark-launch rung: it makes coverage
+    /// measurable without letting anything unproven drive an execution.
+    Verify,
+    /// Serve from the tier when the spine refuses.
+    Tier,
+}
+
+impl RecoverySource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Spine => "spine",
+            Self::Verify => "verify",
+            Self::Tier => "tier",
+        }
+    }
+    /// Whether this mode consults the tier at all.
+    fn consults_tier(self) -> bool {
+        !matches!(self, Self::Spine)
+    }
+    /// Whether a tier fold may actually be **used**.
+    fn serves_tier(self) -> bool {
+        matches!(self, Self::Tier)
+    }
+}
+
+/// Resolve the configured recovery source.
+///
+/// Unrecognised ⇒ `Spine`, warned once per distinct value. Defaulting to the
+/// pre-#307 behaviour rather than to the new one is deliberate: a typo must not
+/// silently switch which store drives executions. Same posture as
+/// `ehdb_projection_read::read_source`, and for the reason noetl/ai-meta#243
+/// records — a default that swallows a typo erases *which* cause it had.
+pub fn recovery_source() -> RecoverySource {
+    parse_recovery_source(std::env::var(RECOVERY_SOURCE_ENV).ok().as_deref())
+}
+
+/// The parse, without the environment.
+///
+/// Split out so the rules are testable without `set_var` — which would race,
+/// because `cargo test` does **not** serialise tests (a SAFETY note in this
+/// workspace claimed it did; ai-meta#232 records that it does not).
+pub fn parse_recovery_source(raw: Option<&str>) -> RecoverySource {
+    match raw.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        None | Some("") | Some("spine") => RecoverySource::Spine,
+        Some("verify") => RecoverySource::Verify,
+        Some("tier") => RecoverySource::Tier,
+        Some(other) => {
+            use std::collections::HashSet;
+            use std::sync::{Mutex, OnceLock};
+            static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+            let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+            let mut g = seen.lock().unwrap_or_else(|e| e.into_inner());
+            if g.insert(other.to_string()) {
+                tracing::warn!(
+                    target: "noetl_server::ehdb_projection_fold",
+                    value = other,
+                    "unrecognised {RECOVERY_SOURCE_ENV}; falling back to `spine` \
+                     (pre-#307 behaviour)"
+                );
+            }
+            RecoverySource::Spine
+        }
+    }
+}
+
+/// Resolve an execution's events for a recovery fold: the spine, then the
+/// durable event-log tier when the spine cannot answer.
+///
+/// # Order, and why this one
+///
+/// The spine is tried **first** so an in-flight execution takes exactly the path
+/// it took before this change — no added latency, no new failure mode, on the
+/// only case that previously worked. The tier is consulted only where there was
+/// already a refusal, so the added relay call buys coverage that did not exist
+/// and costs nothing that did.
+///
+/// # Metric semantics
+///
+/// Counts fold **attempts**, and one recovery read makes two of them: the
+/// materialise pass and the independent re-fold that verifies it. The second
+/// fetch is not redundant — re-reading and re-computing is what makes the
+/// comparison a check rather than a copy of the same number compared with
+/// itself.
+pub async fn events_for_recovery(
+    execution_id: i64,
+) -> Result<(FoldSource, Vec<crate::db::models::Event>), FoldRefusal> {
+    let mode = recovery_source();
+
+    let spine = fold_spine_inner(execution_id, None).await;
+    match &spine {
+        Ok(_) => crate::metrics::record_ehdb_recovery_fold("spine", "folded"),
+        Err(r) => crate::metrics::record_ehdb_recovery_fold("spine", r.reason()),
+    }
+    let spine_refusal = match spine {
+        Ok(events) => return Ok((FoldSource::WalSpine, events)),
+        Err(r) => r,
+    };
+
+    if !mode.consults_tier() {
+        return Err(spine_refusal);
+    }
+
+    match tier_events_within(execution_id, TIER_FOLD_TIMEOUT).await {
+        Ok(events) => {
+            crate::metrics::record_ehdb_recovery_fold("tier", "folded");
+            if !mode.serves_tier() {
+                // `verify`: measured, deliberately not served. Returning the
+                // SPINE's refusal — not a tier-flavoured one — keeps the
+                // caller's behaviour byte-identical to `spine` mode, so the
+                // dark launch cannot change an outcome while it is being
+                // trusted to only observe.
+                return Err(spine_refusal);
+            }
+            Ok((FoldSource::EhdbTier, events))
+        }
+        Err(r) => {
+            crate::metrics::record_ehdb_recovery_fold("tier", r.reason());
+            Err(r)
+        }
+    }
+}
+
 pub async fn materialize_from_wal(execution_id: i64) -> Result<FoldedState, FoldRefusal> {
     let (folded, body) = {
-        let events = fold_spine_inner(execution_id, None).await?;
-        fold_with_body(FoldSource::WalSpine, events)?
+        let (source, events) = events_for_recovery(execution_id).await?;
+        fold_with_body(source, events)?
     };
     let base = std::env::var(super::ehdb::WORKER_QUERY_URL_ENV)
         .ok()
@@ -1010,7 +1241,12 @@ pub async fn materialize_from_wal(execution_id: i64) -> Result<FoldedState, Fold
         "checksum": folded.digest,
         "snapshot": body,
         "updated_at": chrono::Utc::now().to_rfc3339(),
-        "mirror_source": "wal_spine",
+        // The source that actually answered, not a constant. A record claiming
+        // `wal_spine` while the tier answered would be a provenance label that
+        // is merely truthful-LOOKING — the exact failure ai-meta#257 records,
+        // where `source=service` kept reading correct while a silent fallback
+        // served a different store entirely.
+        "mirror_source": folded.source.as_str(),
         "aggregate_type": "orchestrator_workflow_state",
     });
     let url = format!("{}/ehdb/tiers/projection", base.trim_end_matches('/'));
@@ -1055,7 +1291,18 @@ pub async fn wal_projection_state(execution_id: i64) -> (Option<serde_json::Valu
     // verdict says so.
     let _ = materialize_from_wal(execution_id).await;
 
-    let spine = fold_from_wal_spine(execution_id, None).await;
+    // The independent re-fold. Goes through the SAME ladder as the materialise
+    // above: a refold pinned to the spine while the record was materialised
+    // from the tier would refuse on every execution the tier answered for —
+    // reporting the fix itself as a divergence.
+    //
+    // Still a genuine re-fold, not a reuse: it re-reads and re-computes rather
+    // than comparing the materialised digest with itself. That distinction is
+    // the whole difference from ai-meta#265 A3, where the digest compared was
+    // the same value moved.
+    let spine = events_for_recovery(execution_id)
+        .await
+        .and_then(|(source, events)| fold(source, events));
     let stored = stored_projection_full(execution_id).await;
     let pair = stored
         .as_ref()
@@ -1360,6 +1607,201 @@ mod tests {
         );
     }
 
+    /// The default is the PRE-#307 behaviour, so this change lands inert.
+    #[test]
+    fn recovery_defaults_to_spine_so_the_change_lands_inert() {
+        assert_eq!(parse_recovery_source(None), RecoverySource::Spine);
+        assert_eq!(parse_recovery_source(Some("")), RecoverySource::Spine);
+        assert_eq!(parse_recovery_source(Some("  ")), RecoverySource::Spine);
+    }
+
+    /// A typo falls back to `spine`, not to the new path.
+    ///
+    /// The direction matters: falling back to `tier` would let a
+    /// misspelt value silently change which store drives executions,
+    /// which is the shape ai-meta#243 records.
+    #[test]
+    fn an_unrecognised_mode_falls_back_to_the_old_behaviour_not_the_new_one() {
+        for junk in ["teir", "TIER!", "wal", "true", "1", "postgres"] {
+            assert_eq!(
+                parse_recovery_source(Some(junk)),
+                RecoverySource::Spine,
+                "{junk} must not enable an unproven read path"
+            );
+        }
+    }
+
+    #[test]
+    fn modes_parse_case_and_space_insensitively() {
+        assert_eq!(parse_recovery_source(Some(" Verify ")), RecoverySource::Verify);
+        assert_eq!(parse_recovery_source(Some("TIER")), RecoverySource::Tier);
+        assert_eq!(parse_recovery_source(Some("Spine")), RecoverySource::Spine);
+    }
+
+    /// `verify` observes and `tier` serves — and only `tier` serves.
+    #[test]
+    fn only_tier_mode_may_actually_serve_from_the_tier() {
+        assert!(!RecoverySource::Spine.consults_tier());
+        assert!(RecoverySource::Verify.consults_tier());
+        assert!(RecoverySource::Tier.consults_tier());
+
+        assert!(!RecoverySource::Spine.serves_tier());
+        assert!(
+            !RecoverySource::Verify.serves_tier(),
+            "verify is the dark-launch rung; if it serves, the rung does not exist"
+        );
+        assert!(RecoverySource::Tier.serves_tier());
+    }
+
+    /// Every mode and fold-source label is pinned, via a TOTAL match so a new
+    /// variant fails the build here rather than going absent on a metric.
+    #[test]
+    fn every_recovery_label_is_pinned() {
+        for m in [
+            RecoverySource::Spine,
+            RecoverySource::Verify,
+            RecoverySource::Tier,
+        ] {
+            let expect = match m {
+                RecoverySource::Spine => "spine",
+                RecoverySource::Verify => "verify",
+                RecoverySource::Tier => "tier",
+            };
+            assert_eq!(m.as_str(), expect);
+            assert!(RECOVERY_SOURCES.contains(&m.as_str()));
+        }
+        assert_eq!(RECOVERY_SOURCES.len(), 3);
+        // The fold sources are the two a fold is actually attempted against —
+        // `verify` is a mode, never a source, and must not appear here.
+        assert_eq!(RECOVERY_FOLD_SOURCES, ["spine", "tier"]);
+        assert!(!RECOVERY_FOLD_SOURCES.contains(&"verify"));
+    }
+
+    /// Recovery must not reach the spine directly, bypassing the ladder.
+    ///
+    /// Counts CALL SITES rather than naming the callers: a guard that lists the
+    /// functions it trusts passes unchanged when a new one is added beside
+    /// them. Scans only the code ABOVE `#[cfg(test)]`, because `include_str!`
+    /// pulls in this module — including this assertion, whose own needle would
+    /// otherwise be the match it finds.
+    #[test]
+    fn recovery_reaches_the_spine_only_through_the_ladder() {
+        let src = include_str!("ehdb_projection_fold.rs");
+        let code = src
+            .split_once("\n#[cfg(test)]")
+            .map(|(above, _)| above)
+            .unwrap_or(src);
+        let sites = code.matches("fold_spine_inner(").count();
+        assert_eq!(
+            sites, 3,
+            "expected exactly 3: the definition, `wal_spine_events` (diff-only, \
+             deliberately spine-pinned), and `events_for_recovery`. A 4th means a \
+             recovery path is reading the in-flight-only index directly again — \
+             which is the whole of ai-meta#307."
+        );
+    }
+
+    /// The equivalence gate must be able to FAIL, including on the shape that
+    /// looks most like success: nothing compared at all.
+    #[test]
+    fn an_equivalence_sweep_that_compared_nothing_is_not_a_pass() {
+        assert!(
+            !equivalence_holds(0, 0),
+            "zero agreements and zero disagreements is a sweep where everything \
+             refused — reporting it as equivalent is the vacuous pass"
+        );
+        assert!(!equivalence_holds(0, 5));
+        assert!(!equivalence_holds(9, 1), "one disagreement fails the sweep");
+        assert!(equivalence_holds(9, 0));
+        assert!(equivalence_holds(1, 0));
+    }
+
+    fn v2_record(event_id: i64) -> serde_json::Value {
+        serde_json::json!({
+            "event_id": event_id,
+            "event_type": "step.enter",
+            "status": "RUNNING",
+            "execution_id": 42,
+            "created_at": "2026-08-28T00:00:00Z",
+            "context": {"path": "p"},
+            crate::handlers::ehdb_eventlog_mirror::MIRROR_PAYLOAD_VERSION_KEY:
+                crate::handlers::ehdb_eventlog_mirror::MIRROR_PAYLOAD_VERSION,
+        })
+    }
+
+    /// A pre-v2 record REFUSES rather than folding without `context`.
+    ///
+    /// The distinction this pins is the whole reason the variant exists: the
+    /// wrong behaviour here is not a crash, it is a *successful* fold whose
+    /// digest then disagrees with Postgres and is reported as divergence. That
+    /// would have fired on every pre-existing execution the moment this shipped
+    /// — loudest exactly when it was least true.
+    #[test]
+    fn a_record_written_before_context_refuses_instead_of_folding_short() {
+        let mut old = v2_record(1);
+        old.as_object_mut()
+            .unwrap()
+            .remove(crate::handlers::ehdb_eventlog_mirror::MIRROR_PAYLOAD_VERSION_KEY);
+        old.as_object_mut().unwrap().remove("context");
+
+        let r = events_from_tier_records(&[old]).expect_err("a v1 record must not fold");
+        assert_eq!(r.reason(), "payload_too_old");
+        assert_ne!(
+            r.reason(),
+            "no_events",
+            "a too-old payload must not be laundered into a benign reason"
+        );
+        assert!(REFOLD_REFUSALS.contains(&r.reason()));
+    }
+
+    /// One stale record refuses the WHOLE set — the upgrade-straddling case.
+    #[test]
+    fn a_single_stale_record_refuses_the_whole_execution() {
+        let mut old = v2_record(1);
+        old.as_object_mut()
+            .unwrap()
+            .remove(crate::handlers::ehdb_eventlog_mirror::MIRROR_PAYLOAD_VERSION_KEY);
+        let mixed = vec![old, v2_record(2), v2_record(3)];
+        assert_eq!(
+            events_from_tier_records(&mixed)
+                .expect_err("a mixed-version execution must refuse")
+                .reason(),
+            "payload_too_old",
+            "folding the v2 majority and dropping the v1 record would produce a state for a \
+             history that never happened"
+        );
+    }
+
+    /// v2 records fold, and arrive in event_id order.
+    #[test]
+    fn v2_records_fold_and_are_ordered() {
+        let ev = events_from_tier_records(&[v2_record(3), v2_record(1), v2_record(2)])
+            .expect("v2 records must fold");
+        assert_eq!(
+            ev.iter().map(|e| e.event_id).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert!(ev[0].context.is_some(), "context must survive the read");
+    }
+
+    /// A duplicated record is applied ONCE.
+    ///
+    /// `apply_event` is not idempotent, so a duplicate is a second state
+    /// transition, not a no-op. The tier is append-only behind a retrying
+    /// drain and can hold one; Postgres cannot, so this is a failure mode the
+    /// incumbent source simply does not have and the comparison would blame on
+    /// the fold.
+    #[test]
+    fn a_duplicated_tier_record_is_folded_once() {
+        let ev = events_from_tier_records(&[v2_record(1), v2_record(1), v2_record(2)])
+            .expect("duplicates must not refuse");
+        assert_eq!(
+            ev.iter().map(|e| e.event_id).collect::<Vec<_>>(),
+            vec![1, 2],
+            "a duplicate event was applied twice; the folded state never existed"
+        );
+    }
+
     /// Every refusal reason is pinned, and — the part that matters — the match is
     /// TOTAL, so adding a `FoldRefusal` variant fails to compile here rather than
     /// emitting an unpinned label nobody will notice is missing.
@@ -1371,6 +1813,7 @@ mod tests {
             FoldRefusal::Unparseable("x".into()),
             FoldRefusal::FoldFailed,
             FoldRefusal::SpineIncomplete,
+            FoldRefusal::PayloadTooOld("x".into()),
         ];
         for r in &all {
             // Total match: a new variant breaks the build here.
@@ -1380,6 +1823,7 @@ mod tests {
                 FoldRefusal::Unparseable(_) => "unparseable",
                 FoldRefusal::FoldFailed => "fold_failed",
                 FoldRefusal::SpineIncomplete => "spine_incomplete",
+                FoldRefusal::PayloadTooOld(_) => "payload_too_old",
             };
             assert_eq!(r.reason(), expect);
             assert!(
@@ -1395,7 +1839,7 @@ mod tests {
         assert_eq!(REFOLD_REFUSALS.len(), all.len());
     }
 
-    /// The reason must not change the VERDICT. All five still refuse — the
+    /// The reason must not change the VERDICT. All six still refuse — the
     /// six-verdict fail-closed contract is unchanged by adding the reason.
     #[test]
     fn labelling_the_reason_does_not_soften_any_verdict() {
@@ -1556,6 +2000,144 @@ mod tests {
              pass the whole comparator discipline exists to refuse"
         );
     }
+}
+
+/// How many completed executions the equivalence sweep may examine at once.
+const EQUIVALENCE_MAX: i64 = 200;
+
+/// Did the equivalence sweep pass?
+///
+/// **Both conditions, and the first is the one that matters.** A sweep in which
+/// every execution refused has zero disagreements, so `disagreed == 0` alone
+/// would report it as a pass — the vacuous pass this codebase keeps refusing.
+/// Two refusals are not a match, and a gate that cannot fail is not a gate.
+///
+/// Pure, so the rule is asserted by a test rather than only by the endpoint
+/// that happens to apply it.
+pub fn equivalence_holds(agreed: usize, disagreed: usize) -> bool {
+    agreed > 0 && disagreed == 0
+}
+
+/// The most recently **completed** executions, newest first.
+///
+/// Terminal-event driven rather than `noetl.execution.status`, which is a frozen
+/// Python-era column nothing in the Rust path writes (ai-meta#235). Reading it
+/// here would select a set that stopped being maintained in June and call the
+/// result coverage.
+async fn recently_completed(pool: &DbPool, limit: i64) -> AppResult<Vec<i64>> {
+    let rows: Vec<(i64,)> = sqlx::query_as(
+        r#"
+        SELECT execution_id
+        FROM noetl.event
+        WHERE event_type IN (
+            'playbook.completed', 'playbook_completed',
+            'playbook.failed',    'playbook_failed',
+            'playbook.cancelled', 'playbook_cancelled'
+        )
+        GROUP BY execution_id
+        ORDER BY MAX(created_at) DESC
+        LIMIT $1
+        "#,
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|(id,)| id).collect())
+}
+
+/// `GET /api/ehdb/projection-recovery/equivalence?limit=N` — the
+/// verify-before-serve gate for ai-meta#307.
+///
+/// Folds real **completed** executions from Postgres and from the durable
+/// event-log tier and reports whether the digests agree. Read-only, and
+/// independent of `NOETL_EHDB_RECOVERY_SOURCE`, so the evidence can be gathered
+/// while the serving path is still on `spine`.
+///
+/// # Why `equivalent` demands a non-zero denominator
+///
+/// A sweep in which every execution refused would otherwise report zero
+/// disagreements and read as a pass. That is the vacuous-pass shape this
+/// codebase keeps refusing — two refusals are not a match, and a check that can
+/// only pass is not a check. `equivalent` is therefore
+/// `agreed > 0 && disagreed == 0`, and `agreed` is reported alongside it so the
+/// denominator is never invisible.
+///
+/// Completed executions are exactly the population that could not be covered
+/// before: the worker's in-memory spine evicts them on completion, so every one
+/// of these previously refused.
+pub async fn equivalence_endpoint(
+    axum::extract::State(state): axum::extract::State<crate::state::AppState>,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> AppResult<axum::Json<serde_json::Value>> {
+    let requested: i64 = q
+        .get("limit")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(25);
+    let limit = requested.clamp(1, EQUIVALENCE_MAX);
+
+    let pool = state.pools.pool_for(0);
+    let ids = recently_completed(pool, limit).await?;
+
+    let (mut agreed, mut disagreed) = (0usize, 0usize);
+    let mut tier_refusals: std::collections::BTreeMap<String, usize> = Default::default();
+    let mut pg_refusals: std::collections::BTreeMap<String, usize> = Default::default();
+    let mut context_explained = 0usize;
+    let mut disagreements: Vec<serde_json::Value> = Vec::new();
+
+    for id in &ids {
+        let pool = state.pools.pool_for(*id);
+        let c = match compare_sources(pool, *id).await {
+            Ok(c) => c,
+            Err(e) => {
+                *pg_refusals
+                    .entry(format!("comparison_error: {e}"))
+                    .or_default() += 1;
+                continue;
+            }
+        };
+        if let Some(r) = &c.tier_refusal {
+            *tier_refusals.entry(r.reason().to_string()).or_default() += 1;
+        }
+        if let Some(r) = &c.postgres_refusal {
+            *pg_refusals.entry(r.reason().to_string()).or_default() += 1;
+        }
+        if c.digests_agree {
+            agreed += 1;
+        } else if c.postgres.is_some() && c.tier.is_some() {
+            disagreed += 1;
+            if c.context_explains_the_gap {
+                context_explained += 1;
+            }
+            if disagreements.len() < 10 {
+                disagreements.push(serde_json::json!({
+                    "execution_id": *id,
+                    "detail": c.disagreement,
+                    // When blanking `context` on the Postgres side reproduces
+                    // the tier digest exactly, the record predates the mirror
+                    // carrying it — a stale record, not a diverged one.
+                    "context_explains_the_gap": c.context_explains_the_gap,
+                }));
+            }
+        }
+    }
+
+    Ok(axum::Json(serde_json::json!({
+        "action": "ehdb.projection.recovery.equivalence",
+        "requested_limit": requested,
+        "limit": limit,
+        "examined": ids.len(),
+        "agreed": agreed,
+        "disagreed": disagreed,
+        // Both conditions, and the first one is the one that matters: a sweep
+        // where everything refused agrees with nothing.
+        "equivalent": equivalence_holds(agreed, disagreed),
+        "tier_refusals": tier_refusals,
+        "postgres_refusals": pg_refusals,
+        "disagreements_explained_by_missing_context": context_explained,
+        "disagreements": disagreements,
+        "recovery_source": recovery_source().as_str(),
+        "mirror_payload_version": super::ehdb_eventlog_mirror::MIRROR_PAYLOAD_VERSION,
+    })))
 }
 
 /// `GET /api/ehdb/projection-recovery/{id}` — the re-scoped Phase 3 gate.

@@ -117,7 +117,7 @@ fn every_privileged_router_is_gated_in_main() {
     let src = include_str!("../src/main.rs");
     // Router groups that expose credentials, keychain material, or the internal
     // control surface. Kept explicit so adding one is a deliberate act.
-    const PRIVILEGED: [&str; 14] = [
+    const PRIVILEGED: [&str; 15] = [
         "credential_routes",
         "sealed_credential_routes",
         "keychain_routes",
@@ -132,6 +132,11 @@ fn every_privileged_router_is_gated_in_main() {
         "result_tier_routes",
         "sink_state_routes",
         "ingress_routes",
+        // ai-meta#307. Its siblings in `ehdb_parity_routes` report on an
+        // execution id the caller already holds; this one ENUMERATES recently
+        // completed ids, so it carries the gate rather than inheriting that
+        // group's ungated posture.
+        "ehdb_equivalence_routes",
     ];
     let mut ungated = Vec::new();
     for name in PRIVILEGED {

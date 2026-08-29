@@ -157,6 +157,28 @@ pub fn server_mirrors() -> bool {
     MirrorSource::from_process_env() == MirrorSource::Server
 }
 
+/// Key naming the payload contract a tier record was written under.
+pub const MIRROR_PAYLOAD_VERSION_KEY: &str = "mirror_payload_version";
+
+/// The payload contract this build writes.
+///
+/// **v1 (the absent value) omitted `context`.** That was invisible while the
+/// tier was only ever compared on an identifying projection — `event_id`,
+/// `event_type`, `step`, `status` — none of which touch it. It stops being
+/// invisible the moment anything *folds* a tier record, because
+/// `WorkflowState::apply_event` reads `context` (it is where `workload`,
+/// `path` and `version` come from on the start event, and several branches
+/// fall back to it), so a v1 record folds into a **different state** than the
+/// same event read from `noetl.event`.
+///
+/// v2 carries `context`. The version is written explicitly rather than being
+/// inferred from "is `context` present?", because a genuinely null `context`
+/// and a record written before v2 are indistinguishable by that test — and
+/// they must not be: one is foldable, the other is not. Inferring it would
+/// reintroduce exactly the dead-default failure noetl/ai-meta#243 records,
+/// where one value laundered three different causes.
+pub const MIRROR_PAYLOAD_VERSION: i64 = 2;
+
 /// The tier record for one authoritative row.
 ///
 /// Two constraints meet here.
@@ -195,10 +217,19 @@ pub fn mirror_payload(row: &EventRow) -> serde_json::Value {
         "error": row.error,
         "worker_id": row.worker_id,
         "created_at": row.created_at,
+        // Load-bearing for any reader that FOLDS this record rather than merely
+        // identifying it. See MIRROR_PAYLOAD_VERSION for why its absence in v1
+        // was invisible, and why the version is written rather than inferred.
+        "context": row.context,
         // Provenance. A record in the tier should say which mirror wrote it —
         // without this, "the server mirror was rolled but the worker was not"
         // and "both mirrored" are the same evidence after the fact.
         "mirror_source": MirrorSource::Server.as_str(),
+        // Lets a folding reader refuse a pre-v2 record as *too old to fold*
+        // rather than folding it and reporting the missing `context` as a
+        // digest divergence. Those are different facts and want different
+        // operator responses.
+        MIRROR_PAYLOAD_VERSION_KEY: MIRROR_PAYLOAD_VERSION,
     })
 }
 
@@ -352,6 +383,65 @@ pub(crate) async fn deliver(batch: &MirrorBatch) {
 
 #[cfg(test)]
 mod tests {
+
+    /// The fold reads `context`; the payload must therefore carry it.
+    ///
+    /// Guarding the *field* and not just the version, because a version bump
+    /// with the field still missing is the failure this whole change exists to
+    /// end — and it would advertise itself as fixed.
+    #[test]
+    fn a_mirrored_record_carries_the_context_the_fold_reads() {
+        let row = crate::handlers::event_write::EventRow::new(
+            7, 42, 1, "execution.start", "STARTED", chrono::Utc::now(),
+        )
+        .with_context(serde_json::json!({"workload": {"k": "v"}, "path": "p", "version": "1"}));
+        let p = mirror_payload(&row);
+
+        assert_eq!(
+            p.get("context").and_then(|c| c.get("path")).and_then(|v| v.as_str()),
+            Some("p"),
+            "context is absent from the mirrored record — a fold of it cannot equal a fold of \
+             noetl.event, and the difference shows up as a digest divergence"
+        );
+        assert_eq!(
+            p.get(MIRROR_PAYLOAD_VERSION_KEY).and_then(|v| v.as_i64()),
+            Some(MIRROR_PAYLOAD_VERSION)
+        );
+    }
+
+    /// A null `context` still produces the key, and the version still says v2.
+    ///
+    /// This is the case that makes the explicit version load-bearing: a record
+    /// whose context is genuinely null is byte-identical, on the `context` key
+    /// alone, to a v1 record written before the field existed. One is foldable
+    /// and one is not, so the reader cannot be left to infer which it has.
+    #[test]
+    fn a_null_context_is_still_v2_and_therefore_still_foldable() {
+        let row = crate::handlers::event_write::EventRow::new(
+            8, 42, 1, "step.enter", "RUNNING", chrono::Utc::now(),
+        );
+        let p = mirror_payload(&row);
+        assert!(p.get("context").is_some_and(|c| c.is_null()));
+        assert_eq!(
+            p.get(MIRROR_PAYLOAD_VERSION_KEY).and_then(|v| v.as_i64()),
+            Some(MIRROR_PAYLOAD_VERSION),
+            "a genuinely-null context must not be mistakable for a pre-v2 record"
+        );
+    }
+
+    /// The identifying projection the comparator reads is untouched by v2.
+    #[test]
+    fn v2_does_not_disturb_the_comparators_identifying_fields() {
+        let row = crate::handlers::event_write::EventRow::new(
+            9, 42, 1, "step.exit", "COMPLETED", chrono::Utc::now(),
+        )
+        .with_node("fetch");
+        let p = mirror_payload(&row);
+        assert_eq!(p.get("event_id").and_then(|v| v.as_i64()), Some(9));
+        assert_eq!(p.get("event_type").and_then(|v| v.as_str()), Some("step.exit"));
+        assert_eq!(p.get("step").and_then(|v| v.as_str()), Some("fetch"));
+        assert_eq!(p.get("status").and_then(|v| v.as_str()), Some("COMPLETED"));
+    }
     use super::*;
     use chrono::{DateTime, Utc};
 
