@@ -188,6 +188,11 @@ impl CatalogRelation {
             .collect()
     }
 
+    /// Every entry, in key order.
+    pub fn entries(&self) -> impl Iterator<Item = &Entry> {
+        self.by_key.values()
+    }
+
     pub fn len(&self) -> usize {
         self.by_key.len()
     }

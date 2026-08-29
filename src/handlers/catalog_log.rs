@@ -428,8 +428,13 @@ pub fn fold_agrees(compared: usize, mismatched: usize) -> bool {
 /// `GET /api/catalog-log/verify?limit=N` — fold the catalog log and compare it
 /// against `noetl.catalog`.
 ///
-/// Read-only, and independent of the mode, so evidence can be gathered while
-/// registration reads still resolve entirely from Postgres.
+/// Read-only and independent of the mode, so evidence can be gathered while
+/// catalog reads still resolve entirely from Postgres.
+///
+/// Goes through [`read_and_fold`] rather than reading the tier itself: this
+/// endpoint originally did its own single unpaged read and answered
+/// `unavailable` once the log outgrew a 1 MiB frame — a verifier that stops
+/// working at exactly the coverage it exists to confirm.
 pub async fn verify_endpoint(
     axum::extract::State(state): axum::extract::State<crate::state::AppState>,
     axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
@@ -437,83 +442,32 @@ pub async fn verify_endpoint(
     let limit: usize = q
         .get("limit")
         .and_then(|v| v.parse().ok())
-        .unwrap_or(200)
-        .clamp(1, 2000);
+        .unwrap_or(FOLD_READ_CAP)
+        .clamp(1, FOLD_READ_CAP);
 
-    let base = std::env::var(crate::handlers::ehdb::WORKER_QUERY_URL_ENV)
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
-    let Some(base) = base else {
-        return Ok(axum::Json(serde_json::json!({
-            "action": "catalog.log.verify",
-            "outcome": "unconfigured",
-            "error": format!("{} is unset", crate::handlers::ehdb::WORKER_QUERY_URL_ENV),
-        })));
-    };
-
-    let url = format!("{}/ehdb/tiers/{TIER}?limit={limit}", base.trim_end_matches('/'));
-    let body: serde_json::Value = match reqwest::Client::new()
-        .get(&url)
-        .timeout(std::time::Duration::from_secs(20))
-        .send()
-        .await
-    {
-        // ⚠ Status FIRST. A 502 from the relay carries a JSON error body with no
-        // `records` key, so parsing it without checking the status reported
-        // `records_read: 0` — an unreachable tier reading exactly like an empty
-        // one. That is the absent-vs-error conflation, and it hid a real failure
-        // for a full gate round.
-        Ok(r) if !r.status().is_success() => {
-            let st = r.status();
-            let text = r.text().await.unwrap_or_default();
-            return Ok(axum::Json(serde_json::json!({
-                "action": "catalog.log.verify",
-                "outcome": "unavailable",
-                "status": st.as_u16(),
-                "error": text.chars().take(400).collect::<String>(),
-            })));
-        }
-        Ok(r) => match r.json().await {
-            Ok(v) => v,
-            Err(e) => {
-                return Ok(axum::Json(serde_json::json!({
-                    "action": "catalog.log.verify",
-                    "outcome": "unavailable",
-                    "error": e.to_string(),
-                })))
-            }
-        },
+    let folded = match read_and_fold(limit).await {
+        Ok(r) => r,
         Err(e) => {
             return Ok(axum::Json(serde_json::json!({
                 "action": "catalog.log.verify",
                 "outcome": "unavailable",
-                "error": e.to_string(),
+                "error": e,
             })))
         }
     };
 
-    let records: Vec<serde_json::Value> = body
-        .get("records")
-        .and_then(|r| r.as_array())
-        .cloned()
-        .unwrap_or_default();
-    let folded = fold_records(&records);
-
-    // Compare each folded entry against the authoritative row.
     let pool = state.pools.cluster();
     let (mut compared, mut mismatched, mut missing_in_source) = (0usize, 0usize, 0usize);
     let mut mismatches: Vec<serde_json::Value> = Vec::new();
-    for ((path, version), e) in &folded {
-        let row: Option<(String, String, i16)> = sqlx::query_as(
-            "SELECT COALESCE(content, ''), kind, version FROM noetl.catalog \
-             WHERE path = $1 AND version = $2",
+    for e in folded.entries() {
+        let row: Option<(String, String)> = sqlx::query_as(
+            "SELECT COALESCE(content, ''), kind FROM noetl.catalog WHERE path = $1 AND version = $2",
         )
-        .bind(path)
-        .bind(*version as i16)
+        .bind(&e.path)
+        .bind(e.version as i16)
         .fetch_optional(pool)
         .await?;
-        let Some((content, kind, _)) = row else {
+        let Some((content, kind)) = row else {
             missing_in_source += 1;
             continue;
         };
@@ -523,7 +477,7 @@ pub async fn verify_endpoint(
             mismatched += 1;
             if mismatches.len() < 10 {
                 mismatches.push(serde_json::json!({
-                    "path": path, "version": version,
+                    "path": e.path, "version": e.version,
                     "source_sha256": &src[..16.min(src.len())],
                     "folded_sha256": &e.content_sha256[..16.min(e.content_sha256.len())],
                     "source_kind": kind, "folded_kind": e.kind,
@@ -536,17 +490,107 @@ pub async fn verify_endpoint(
         "action": "catalog.log.verify",
         "outcome": "ok",
         "mode": mode().as_str(),
-        "records_read": records.len(),
+        "records_read": folded.records_seen,
+        "records_applied": folded.records_applied,
         "folded_entries": folded.len(),
         "compared": compared,
         "mismatched": mismatched,
-        // A folded entry with no row is a real fault: the log claims a
-        // registration the catalog does not have.
         "missing_in_source": missing_in_source,
         "agrees": fold_agrees(compared, mismatched) && missing_in_source == 0,
         "mismatches": mismatches,
     })))
 }
+
+pub async fn read_and_fold(
+    limit: usize,
+) -> Result<crate::handlers::catalog_relation::CatalogRelation, String> {
+    let base = relay_base().ok_or_else(|| {
+        format!("{} is unset", crate::handlers::ehdb::WORKER_QUERY_URL_ENV)
+    })?;
+    let client = reqwest::Client::new();
+    let mut all: Vec<serde_json::Value> = Vec::new();
+    let mut after: u64 = 0;
+    let mut page = FOLD_PAGE;
+
+    // ⚠⚠ Paged AND adaptive, and both are forced by the store rather than
+    // chosen. A tier-service frame is capped at 1 MiB; catalog records carry
+    // playbook content, and a single entry can be 267 KB. So neither a whole-log
+    // scan nor a fixed page size works — a page of 25 measured 1,311,308 bytes
+    // because a few large entries landed together. On a frame-cap refusal the
+    // page halves and retries; a page that cannot be made to fit is reported,
+    // not silently skipped, because a fold missing records is a WRONG answer and
+    // not a smaller one.
+    for _ in 0..MAX_FOLD_PAGES {
+        // The FIRST page must omit `after`: the store rejects `after=0` with
+        // "stream sequence must be greater than zero" — starting from the
+        // beginning is the ABSENCE of a cursor, not a zero one.
+        let url = if after == 0 {
+            format!("{}/ehdb/tiers/{TIER}?limit={page}", base.trim_end_matches('/'))
+        } else {
+            format!(
+                "{}/ehdb/tiers/{TIER}?limit={page}&after={after}",
+                base.trim_end_matches('/')
+            )
+        };
+        let resp = client
+            .get(&url)
+            .timeout(std::time::Duration::from_secs(60))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+
+        if !resp.status().is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            if text.contains("exceeds the") && text.contains("cap") && page > 1 {
+                page = (page / 2).max(1);
+                continue;
+            }
+            return Err(format!(
+                "tier read failed at page size {page} after={after}: {}",
+                text.chars().take(240).collect::<String>()
+            ));
+        }
+
+        let body: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+        let recs: Vec<serde_json::Value> = body
+            .get("records")
+            .and_then(|r| r.as_array())
+            .cloned()
+            .unwrap_or_default();
+        if recs.is_empty() {
+            break;
+        }
+        let next = recs
+            .iter()
+            .filter_map(|r| r.get("global_sequence").and_then(|v| v.as_u64()))
+            .max()
+            .unwrap_or(0);
+        let short = recs.len() < page;
+        all.extend(recs);
+        // A cursor that did not advance would re-read the same page forever.
+        if short || next <= after {
+            break;
+        }
+        after = next;
+        if all.len() >= limit {
+            break;
+        }
+    }
+    Ok(crate::handlers::catalog_relation::CatalogRelation::fold(&all))
+}
+
+/// Upper bound on records a single fold will accumulate.
+///
+/// Generous, because a partial fold is a WRONG answer rather than a smaller one;
+/// bounded anyway so a caller cannot ask for unbounded work.
+pub const FOLD_READ_CAP: usize = 50_000;
+
+/// Records per fold page. Small on purpose: one catalog entry can be 267 KB, and
+/// the tier-service frame cap is 1 MiB.
+const FOLD_PAGE: usize = 16;
+
+/// Page walk bound, so a stalled cursor cannot spin.
+const MAX_FOLD_PAGES: usize = 4000;
 
 /// `POST /api/catalog-log/backfill` — bring the catalog log to full coverage.
 ///
@@ -661,36 +705,6 @@ pub async fn backfill_endpoint(
     })))
 }
 
-/// Read the catalog tier and fold it.
-pub async fn read_and_fold(
-    limit: usize,
-) -> Result<crate::handlers::catalog_relation::CatalogRelation, String> {
-    let base = relay_base().ok_or_else(|| {
-        format!("{} is unset", crate::handlers::ehdb::WORKER_QUERY_URL_ENV)
-    })?;
-    let url = format!("{}/ehdb/tiers/{TIER}?limit={limit}", base.trim_end_matches('/'));
-    let resp = reqwest::Client::new()
-        .get(&url)
-        .timeout(std::time::Duration::from_secs(30))
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
-    if !resp.status().is_success() {
-        return Err(format!(
-            "tier read {}: {}",
-            resp.status(),
-            resp.text().await.unwrap_or_default().chars().take(200).collect::<String>()
-        ));
-    }
-    let body: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
-    let records: Vec<serde_json::Value> = body
-        .get("records")
-        .and_then(|r| r.as_array())
-        .cloned()
-        .unwrap_or_default();
-    Ok(crate::handlers::catalog_relation::CatalogRelation::fold(&records))
-}
-
 /// `GET /api/catalog-log/coverage` — is the relation complete enough to serve?
 ///
 /// The blocker for the read cutover is coverage, so it gets its own answer
@@ -698,7 +712,7 @@ pub async fn read_and_fold(
 pub async fn coverage_endpoint(
     axum::extract::State(state): axum::extract::State<crate::state::AppState>,
 ) -> crate::error::AppResult<axum::Json<serde_json::Value>> {
-    let rel = match read_and_fold(5000).await {
+    let rel = match read_and_fold(FOLD_READ_CAP).await {
         Ok(r) => r,
         Err(e) => {
             return Ok(axum::Json(serde_json::json!({
@@ -723,7 +737,10 @@ pub async fn coverage_endpoint(
         // Serving is permissible only at FULL coverage. Under-reporting is the
         // failure mode nobody notices, so this is stated rather than left to a
         // reader comparing two numbers.
-        "full_coverage": folded >= source_rows && source_rows > 0,
+        "full_coverage": folded >= source_rows && source_rows > 0
+            && rel.records_seen < FOLD_READ_CAP,
+        // Full coverage computed from a truncated read is not full coverage.
+        "fold_read_capped": rel.records_seen >= FOLD_READ_CAP,
     })))
 }
 
