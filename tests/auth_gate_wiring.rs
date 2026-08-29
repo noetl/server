@@ -223,6 +223,20 @@ const PUBLIC_BY_DESIGN: [(&str, &str); 17] = [
 /// Returns `(router_name, chunk)`, where the chunk runs to the next `.merge(`.
 /// Any gate applied to that router is inside its own chunk.
 fn merge_sites(src: &str) -> Vec<(String, String)> {
+    // ⚠ Only the APP's merge chain. Routers are also composed with each other
+    // before being exposed — noetl/ai-meta#312's staging builds
+    // `execute_route.merge(init_validate_routes)` so the two halves can be gated
+    // independently — and an internal composition is not an exposure. Scanning
+    // the whole file flagged `init_validate_routes`, which is never merged into
+    // the app at all.
+    //
+    // Everything merged onto `app` appears after this marker, including the
+    // conditional `app = app.merge(registry_routes)` further down, so nothing
+    // that IS exposed is skipped.
+    let src = src
+        .split_once("// Combine all routes")
+        .map(|(_, after)| after)
+        .unwrap_or(src);
     let mut out = Vec::new();
     let parts: Vec<&str> = src.split(".merge(").collect();
     for (i, p) in parts.iter().enumerate().skip(1) {
