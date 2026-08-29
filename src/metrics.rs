@@ -3572,6 +3572,11 @@ pub fn init_ehdb_projection_series() {
                 .inc_by(0);
         }
     }
+    for m in crate::handlers::catalog_snapshot::MODES {
+        for o in crate::handlers::catalog_snapshot::OUTCOMES {
+            catalog_snapshot_total().with_label_values(&[m, o]).inc_by(0);
+        }
+    }
     for mode in crate::handlers::ehdb_projection_fold::RECOVERY_SOURCES {
         ehdb_recovery_source_info()
             .with_label_values(&[mode])
@@ -4174,6 +4179,36 @@ pub fn ehdb_recovery_source_info() -> &'static IntGaugeVec {
             .expect("register ehdb_recovery_source_info");
         m
     })
+}
+
+/// Execution-start catalog snapshots, by mode and outcome.
+///
+/// `mode="off",outcome="disabled"` is the normal reading until the feature is
+/// switched on; every pair is pinned at 0 so "not recording" and "binary predates
+/// the metric" are distinguishable.
+pub fn catalog_snapshot_total() -> &'static IntCounterVec {
+    static M: std::sync::OnceLock<IntCounterVec> = std::sync::OnceLock::new();
+    M.get_or_init(|| {
+        let m = IntCounterVec::new(
+            prometheus::Opts::new(
+                "noetl_catalog_snapshot_total",
+                "Execution-start catalog snapshots by mode (off/digest/full) and outcome.",
+            ),
+            &["mode", "outcome"],
+        )
+        .expect("catalog_snapshot_total metric");
+        registry()
+            .register(Box::new(m.clone()))
+            .expect("register catalog_snapshot_total");
+        m
+    })
+}
+
+/// Record one snapshot attempt.
+pub fn record_catalog_snapshot(mode: &str, outcome: &str) {
+    catalog_snapshot_total()
+        .with_label_values(&[mode, outcome])
+        .inc();
 }
 
 /// Whether `GET /api/executions` served a capped page (noetl/ai-meta#255).
