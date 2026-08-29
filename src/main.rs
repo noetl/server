@@ -830,7 +830,23 @@ fn build_router(
     // Flag-gated registry group (noetl/ai-meta#146 G3) — merged only when
     // NOETL_REGISTRY_ENABLED is set.
     if let Some(registry_routes) = registry_routes {
-        app = app.merge(registry_routes);
+        // noetl/ai-meta#312 — these serve `/api/internal/registry/*`, and
+        // `handlers::registry`'s own doc comment already describes them as
+        // "service-account-gated like the rest of the internal API". They were
+        // not. The prefix is what `internal_routes` uses and THAT router is
+        // gated, so anyone auditing by path would have concluded these were
+        // protected.
+        //
+        // Gated independently of the #312 auth-model decision, which is about
+        // `database_routes`: these have no caller anywhere in the tree, the
+        // worker already sends `NOETL_INTERNAL_API_TOKEN` to sibling
+        // `/api/internal/*` routes, and the group is behind
+        // `NOETL_REGISTRY_ENABLED`, which is unset on prod — so this closes a
+        // latent exposure without changing anything that runs.
+        app = app.merge(registry_routes.layer(axum::middleware::from_fn_with_state(
+            "internal",
+            noetl_server::auth_gate::gate,
+        )));
     }
 
     app.layer(TraceLayer::new_for_http()).layer(cors)
