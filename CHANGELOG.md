@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.96.0](https://github.com/noetl/server/compare/v3.95.1...v3.96.0) (2026-08-29)
+
+### Features
+
+* **server:** stage all four [#312](https://github.com/noetl/server/issues/312) auth options behind one flag ([8f97e85](https://github.com/noetl/server/commit/8f97e858529cfe8e7d70562273e2cf3491137883)), closes [noetl/server#373](https://github.com/noetl/server/issues/373)
+
+### Bug Fixes
+
+* **test:** scope the ungated-router invariant to the app merge chain ([ed396a7](https://github.com/noetl/server/commit/ed396a74664e6c1bb33203043e67693a67dae05f)), closes [#312](https://github.com/noetl/server/issues/312) [noetl/ai-meta#312](https://github.com/noetl/ai-meta/issues/312)
+
 ## [3.95.1](https://github.com/noetl/server/compare/v3.95.0...v3.95.1) (2026-08-29)
 
 ### Bug Fixes
