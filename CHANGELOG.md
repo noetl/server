@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.93.0](https://github.com/noetl/server/compare/v3.92.0...v3.93.0) (2026-08-29)
+
+### Features
+
+* **catalog:** pin what an execution actually ran into the append-only log ([7181424](https://github.com/noetl/server/commit/7181424ed477b82b88c30500c3430cc5e6c0e386)), closes [noetl/ai-meta#307](https://github.com/noetl/ai-meta/issues/307) [noetl/ai-meta#307](https://github.com/noetl/ai-meta/issues/307)
+
 ## [3.92.0](https://github.com/noetl/server/compare/v3.91.4...v3.92.0) (2026-08-29)
 
 ### Features
