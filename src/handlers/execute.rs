@@ -423,6 +423,29 @@ pub(crate) async fn execute_one(
     )
     .await?;
 
+    // Catalog-relation step 1: pin exactly what this execution is running into
+    // the append-only log, tied to `execution_id`.
+    //
+    // AFTER `playbook_started`, so that stays the execution's first event and the
+    // chain root — `get_latest_event(.., "playbook_started")` and the descriptor
+    // seeding both depend on that ordering.
+    //
+    // `playbook_yaml` is the resolved content `parse_playbook` consumed and
+    // `workload` is the EFFECTIVE post-merge workload, so what is recorded is what
+    // the execution actually started with rather than what the request asked for.
+    //
+    // Returns `()` and swallows every failure: a snapshot is a record about an
+    // execution, never a precondition for one. No-op unless
+    // `NOETL_CATALOG_SNAPSHOT` is set.
+    crate::handlers::catalog_snapshot::record(
+        state,
+        execution_id,
+        catalog_id,
+        &playbook_yaml,
+        &workload,
+    )
+    .await;
+
     // Generate initial commands for the start step
     let commands_generated = generate_initial_commands(
         state,
