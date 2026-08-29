@@ -3572,6 +3572,11 @@ pub fn init_ehdb_projection_series() {
                 .inc_by(0);
         }
     }
+    for m in crate::handlers::catalog_log::MODES {
+        for o in crate::handlers::catalog_log::OUTCOMES {
+            catalog_log_total().with_label_values(&[m, o]).inc_by(0);
+        }
+    }
     for m in crate::handlers::catalog_snapshot::MODES {
         for o in crate::handlers::catalog_snapshot::OUTCOMES {
             catalog_snapshot_total().with_label_values(&[m, o]).inc_by(0);
@@ -4179,6 +4184,30 @@ pub fn ehdb_recovery_source_info() -> &'static IntGaugeVec {
             .expect("register ehdb_recovery_source_info");
         m
     })
+}
+
+/// Catalog-log records, by mode and outcome (noetl/ai-meta#311 step 2).
+pub fn catalog_log_total() -> &'static IntCounterVec {
+    static M: std::sync::OnceLock<IntCounterVec> = std::sync::OnceLock::new();
+    M.get_or_init(|| {
+        let m = IntCounterVec::new(
+            prometheus::Opts::new(
+                "noetl_catalog_log_total",
+                "Catalog registrations recorded to the catalog tier, by mode and outcome.",
+            ),
+            &["mode", "outcome"],
+        )
+        .expect("catalog_log_total metric");
+        registry()
+            .register(Box::new(m.clone()))
+            .expect("register catalog_log_total");
+        m
+    })
+}
+
+/// Record one catalog-log attempt.
+pub fn record_catalog_log(mode: &str, outcome: &str) {
+    catalog_log_total().with_label_values(&[mode, outcome]).inc();
 }
 
 /// Execution-start catalog snapshots, by mode and outcome.

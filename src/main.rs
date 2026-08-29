@@ -84,6 +84,10 @@ fn build_router(
     // Catalog routes
     let catalog_routes = Router::new()
         .route("/api/catalog/register", post(handlers::catalog::register))
+        .route(
+            "/api/catalog/register/batch",
+            post(handlers::catalog::register_batch),
+        )
         .route("/api/catalog/delete", post(handlers::catalog::delete))
         .route("/api/catalog/list", post(handlers::catalog::list))
         .route("/api/catalog/restore", post(handlers::catalog::restore))
@@ -372,6 +376,22 @@ fn build_router(
         .route(
             "/api/ehdb/projection-recovery/equivalence",
             get(handlers::ehdb_projection_fold::equivalence_endpoint),
+        )
+        // ai-meta#311 step 2 — the catalog log's fold-vs-source verifier. Same
+        // router, so it inherits the #303 gate for the same reason: it
+        // enumerates catalog content rather than answering about one id the
+        // caller already holds.
+        .route(
+            "/api/catalog-log/verify",
+            get(handlers::catalog_log::verify_endpoint),
+        )
+        .route(
+            "/api/catalog-log/coverage",
+            get(handlers::catalog_log::coverage_endpoint),
+        )
+        .route(
+            "/api/catalog-log/backfill",
+            post(handlers::catalog_log::backfill_endpoint),
         )
         .with_state(state.clone());
 

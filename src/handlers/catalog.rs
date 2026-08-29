@@ -14,6 +14,7 @@ use serde::Deserialize;
 use crate::db::models::{
     CatalogDeleteRequest, CatalogDeleteResponse, CatalogEntries, CatalogEntriesRequest,
     CatalogEntryRequest, CatalogEntryResponse, CatalogRegisterRequest, CatalogRegisterResponse,
+    CatalogRegisterBatchItem, CatalogRegisterBatchRequest, CatalogRegisterBatchResponse,
 };
 use crate::error::{AppError, AppResult};
 use crate::services::ui_schema::{infer_ui_schema, UiSchemaResponse};
@@ -65,6 +66,71 @@ async fn register_inner(
 ) -> AppResult<(StatusCode, Json<CatalogRegisterResponse>)> {
     let response = service.register(request).await?;
     Ok((StatusCode::OK, Json(response)))
+}
+
+/// Register many catalog resources in one call.
+///
+/// `POST /api/catalog/register/batch`
+///
+/// Each item goes through the **same** `CatalogService::register` the single
+/// endpoint uses, so validation, versioning and the step-2 catalog-log emit all
+/// behave identically — a batch is N registrations in one round trip, not a
+/// second registration path that could drift from the first.
+///
+/// ⚠ Each item still takes the next version for its path. This endpoint is for
+/// loading NEW content; it is **not** the backfill. Re-posting the existing
+/// catalog through here would create a second version of every entry. Seeding
+/// the log from rows that already exist is `POST /api/catalog-log/backfill`,
+/// which preserves the existing version.
+pub async fn register_batch(
+    State(service): State<CatalogService>,
+    Json(request): Json<CatalogRegisterBatchRequest>,
+) -> AppResult<(StatusCode, Json<CatalogRegisterBatchResponse>)> {
+    const MAX_ITEMS: usize = 1000;
+    if request.items.len() > MAX_ITEMS {
+        return Err(AppError::Validation(format!(
+            "batch of {} exceeds the {MAX_ITEMS}-item cap; page the load",
+            request.items.len()
+        )));
+    }
+    let count = request.items.len();
+    let mut results = Vec::with_capacity(count);
+    let (mut registered, mut failed) = (0usize, 0usize);
+    for (index, item) in request.items.into_iter().enumerate() {
+        match service.register(item).await {
+            Ok(r) => {
+                registered += 1;
+                results.push(CatalogRegisterBatchItem {
+                    index,
+                    status: "registered".into(),
+                    path: Some(r.path),
+                    version: Some(r.version),
+                    catalog_id: Some(r.catalog_id),
+                    error: None,
+                });
+            }
+            Err(e) => {
+                failed += 1;
+                results.push(CatalogRegisterBatchItem {
+                    index,
+                    status: "error".into(),
+                    path: None,
+                    version: None,
+                    catalog_id: None,
+                    error: Some(e.to_string()),
+                });
+            }
+        }
+    }
+    Ok((
+        StatusCode::OK,
+        Json(CatalogRegisterBatchResponse {
+            count,
+            registered,
+            failed,
+            results,
+        }),
+    ))
 }
 
 /// Delete catalog entries.
