@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.98.0](https://github.com/noetl/server/compare/v3.97.1...v3.98.0) (2026-08-30)
+
+### Features
+
+* **schema:** bring the platform DDL into this repo (transitional copy) ([1cfacff](https://github.com/noetl/server/commit/1cfacff579219fd10161b781abde5f1c1e1bf7c8)), closes [noetl/ai-meta#201](https://github.com/noetl/ai-meta/issues/201)
+
 ## [3.97.1](https://github.com/noetl/server/compare/v3.97.0...v3.97.1) (2026-08-30)
 
 ### Bug Fixes
