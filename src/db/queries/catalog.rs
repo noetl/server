@@ -10,7 +10,7 @@ use crate::error::AppResult;
 /// `noetl.catalog.kind` references `noetl.resource(name)`, so a catalog
 /// register of a `kind: Subscription` (noetl/ai-meta#90 Phase 2) fails with a
 /// foreign-key violation unless `subscription` is a seeded resource type.  The
-/// canonical seed lives in `noetl/noetl`'s `schema_ddl.sql`; this idempotent
+/// the seed lives in `db/ddl/postgres/schema_ddl.sql` in this repo; this idempotent
 /// startup upsert is the safety net so a `kind: Subscription` registers on any
 /// cluster the Rust server boots against, without an out-of-band migration.
 /// Only kinds the server explicitly knows about are seeded — the FK still
