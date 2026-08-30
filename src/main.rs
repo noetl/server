@@ -1228,7 +1228,8 @@ async fn main() -> anyhow::Result<()> {
     // additive `prev_event_id` link to noetl.event + noetl.command so the
     // populate-on-emit code never writes a column the running DB is missing
     // (the gate-off INSERT binds an explicit column list).  Idempotent; the
-    // canonical definition also lives in noetl/noetl's schema_ddl.sql.
+    // the schema this expects is db/ddl/postgres/schema_ddl.sql in this repo
+    // (still provisioned from noetl/noetl's copy until ops repoints).
     noetl_server::db::queries::event_chain::ensure_columns(&db_pool).await?;
     // kind: Subscription (noetl/ai-meta#90 Phase 2) — seed the `subscription`
     // resource kind so a catalog register doesn't trip the

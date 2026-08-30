@@ -8,8 +8,9 @@
 //! state builder lands in Phase 3 — this phase only *populates* the links;
 //! nothing reads them yet).
 //!
-//! The columns are owned by the platform schema (`schema_ddl.sql` in
-//! `noetl/noetl` carries the canonical definition for fresh installs), but the
+//! The columns are owned by the platform schema
+//! (`db/ddl/postgres/schema_ddl.sql` in this repo defines them for fresh
+//! installs; ops still provisions from noetl/noetl's copy until it repoints), but the
 //! server **also** ensures them idempotently at startup — mirroring
 //! [`crate::db::queries::result_store::ensure_table`] — so a server image
 //! carrying the populate-on-emit code never writes a column the running
@@ -24,7 +25,7 @@ use crate::error::AppResult;
 /// chain-walk lookup index.
 ///
 /// **Best-effort, never fatal.**  The platform schema is owned by the DB init
-/// role (the canonical definition is `schema_ddl.sql` in `noetl/noetl`); the
+/// role (defined in `db/ddl/postgres/schema_ddl.sql` in this repo); the
 /// server's connection role may not own `noetl.event` / `noetl.command` and so
 /// can't `ALTER` them (`must be owner of table …`).  In that deployment the
 /// columns are provisioned by the owner and this function's `ADD COLUMN IF NOT

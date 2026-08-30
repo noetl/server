@@ -1,0 +1,1083 @@
+-- NoETL platform schema (Postgres).
+--
+-- ⚠ TRANSITIONAL COPY — read this before editing.
+--
+-- The Rust server does not create this schema; it expects it to be provisioned,
+-- and its query modules describe these columns as owned elsewhere.  Historically
+-- "elsewhere" was noetl/noetl -- the legacy Python repo -- which is being
+-- retired.  This file is the destination that ownership moves to.
+--
+-- Ownership has NOT transferred yet.  Every deploy path still reads
+-- noetl/noetl's copy at noetl/database/ddl/postgres/schema_ddl.sql, because no
+-- ops automation defines a path to this repository: the playbooks that load the
+-- schema declare noetl_repo_dir, gateway_repo_dir, gui_repo_dir, e2e_repo_dir
+-- and ops_repo_dir, and no server_repo_dir.  Repointing them is a deploy-
+-- behaviour change and is gated on owner approval.
+--
+-- Until that lands there are two copies, so something must force them to agree:
+-- `playbooks/drift-audit.sh schema-copies` in noetl/ai-meta diffs them and
+-- reports DRIFT if they diverge.  If you edit one, edit both in the same change
+-- set, or the deploy will provision a schema this server was not built against.
+--
+-- Source of this copy: noetl/noetl@2c7a71ee
+--     noetl/database/ddl/postgres/schema_ddl.sql
+-- Canonical Schema DDL for NoETL Platform
+
+-- Resource
+CREATE TABLE IF NOT EXISTS noetl.resource (
+    name VARCHAR PRIMARY KEY,
+    meta JSONB
+);
+
+INSERT INTO noetl.resource (name, meta) VALUES
+    ('playbook', '{"description":"Executable NoETL workflow definition","executable":true,"catalog":true}'::jsonb),
+    ('credential', '{"description":"Credential or secret reference metadata","executable":false,"catalog":true}'::jsonb),
+    ('mcp', '{"description":"Model Context Protocol server/tool provider","executable":false,"catalog":true}'::jsonb),
+    ('agent', '{"description":"Agent-as-playbook or agent capability resource","executable":true,"catalog":true}'::jsonb),
+    ('memory', '{"description":"AI memory, knowledge, or coordination artifact","executable":false,"catalog":true}'::jsonb)
+ON CONFLICT (name) DO UPDATE
+SET meta = COALESCE(noetl.resource.meta, '{}'::jsonb) || EXCLUDED.meta;
+
+-- Catalog
+CREATE TABLE IF NOT EXISTS noetl.catalog (
+    catalog_id BIGINT PRIMARY KEY,
+    path     TEXT            NOT NULL,
+    version  SMALLSERIAL     NOT NULL,
+    kind     VARCHAR         NOT NULL REFERENCES noetl.resource(name),
+    content                  TEXT,
+    layout                   JSONB,     -- Optional layout for UI Workflow Builder
+    payload                  JSONB,
+    meta                     JSONB,
+    created_at               TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (path, version)
+);
+
+-- Variables Cache
+-- Stores runtime variables for playbook execution scope with access tracking
+CREATE TABLE IF NOT EXISTS noetl.transient (
+    execution_id BIGINT NOT NULL,
+    var_name TEXT NOT NULL,
+    var_type TEXT NOT NULL CHECK (var_type IN ('user_defined', 'step_result', 'computed', 'iterator_state')),
+    var_value JSONB NOT NULL,
+    source_step TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    accessed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    access_count INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (execution_id, var_name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_transient_type ON noetl.transient (var_type);
+CREATE INDEX IF NOT EXISTS idx_transient_source ON noetl.transient (source_step);
+CREATE INDEX IF NOT EXISTS idx_transient_execution ON noetl.transient (execution_id);
+
+COMMENT ON TABLE noetl.transient IS 'Execution-scoped variables for playbook runtime with cache tracking';
+COMMENT ON COLUMN noetl.transient.var_type IS 'step_result: result from a step, user_defined: explicit variable, computed: derived value, iterator_state: iterator loop state';
+COMMENT ON COLUMN noetl.transient.var_value IS 'Variable value stored as JSONB (supports any type)';
+COMMENT ON COLUMN noetl.transient.source_step IS 'Step name that produced this variable';
+COMMENT ON COLUMN noetl.transient.access_count IS 'Number of times this variable has been accessed';
+COMMENT ON COLUMN noetl.transient.accessed_at IS 'Last time this variable was read';
+
+-- Event (range-partitioned by execution_id for instant per-execution cleanup)
+--
+-- Partition key: execution_id (snowflake bigint, epoch = 2024-01-01 UTC)
+--   id = (elapsed_ms << 23) | (node_id << 12) | seq
+--   IDs per quarter ≈ 66 trillion; quarterly boundaries below.
+--
+-- Cleanup: DROP TABLE noetl.event_<quarter> — instant, no VACUUM needed.
+-- Add new partitions before each quarter starts:
+--   CREATE TABLE noetl.event_2028_q1 PARTITION OF noetl.event
+--     FOR VALUES FROM (1058897343283200000) TO (1124137159091200000);
+--
+-- Boundary reference (id_for_date, epoch=2024-01-01):
+--   2026-01-01:  529_811_059_507_200_000
+--   2026-04-01:  595_040_875_315_200_000
+--   2026-07-01:  660_995_466_854_400_000
+--   2026-10-01:  727_674_834_124_800_000
+--   2027-01-01:  794_354_201_395_200_000
+--   2027-07-01:  925_538_608_742_400_000
+--   2028-01-01:  1_058_897_343_283_200_000
+CREATE TABLE IF NOT EXISTS noetl.event (
+    execution_id        BIGINT,
+    catalog_id          BIGINT NOT NULL REFERENCES noetl.catalog(catalog_id),
+    event_id            BIGINT,
+    parent_event_id     BIGINT,
+    parent_execution_id BIGINT,
+    created_at          TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    event_type          VARCHAR,
+    node_id             VARCHAR,
+    node_name           VARCHAR,
+    node_type           VARCHAR,
+    status              VARCHAR,
+    duration            DOUBLE PRECISION,
+    context             JSONB,
+    result              JSONB,
+    meta                JSONB,
+    error               TEXT,
+    current_index       INTEGER,
+    current_item        TEXT,
+    worker_id           VARCHAR,
+    distributed_state   VARCHAR,
+    context_key         VARCHAR,
+    context_value       TEXT,
+    trace_component     JSONB,
+    stack_trace         TEXT,
+        CONSTRAINT chk_event_result_shape CHECK (
+            result IS NULL
+            OR (
+                jsonb_typeof(result) = 'object'
+                AND result ? 'status'
+                AND jsonb_typeof(result->'status') = 'string'
+                AND (result - 'status' - 'reference' - 'context') = '{}'::jsonb
+                AND (NOT (result ? 'reference') OR jsonb_typeof(result->'reference') = 'object')
+                AND (NOT (result ? 'context') OR jsonb_typeof(result->'context') = 'object')
+            )
+        ),
+    PRIMARY KEY (execution_id, event_id)
+) PARTITION BY RANGE (execution_id);
+
+-- Existing installations may already have noetl.event without the new constraint.
+-- Add it idempotently when missing. NOT VALID avoids a long validation scan on startup.
+DO $$
+BEGIN
+    IF to_regclass('noetl.event') IS NOT NULL
+       AND NOT EXISTS (
+           SELECT 1
+           FROM pg_constraint c
+           JOIN pg_namespace n ON n.oid = c.connamespace
+           JOIN pg_class t ON t.oid = c.conrelid
+           WHERE c.conname = 'chk_event_result_shape'
+             AND n.nspname = 'noetl'
+             AND t.relname = 'event'
+       ) THEN
+        ALTER TABLE noetl.event
+            ADD CONSTRAINT chk_event_result_shape
+            CHECK (
+                    result IS NULL
+                    OR (
+                        jsonb_typeof(result) = 'object'
+                        AND result ? 'status'
+                        AND jsonb_typeof(result->'status') = 'string'
+                        AND (result - 'status' - 'reference' - 'context') = '{}'::jsonb
+                        AND (NOT (result ? 'reference') OR jsonb_typeof(result->'reference') = 'object')
+                        AND (NOT (result ? 'context') OR jsonb_typeof(result->'context') = 'object')
+                    )
+                ) NOT VALID;
+    END IF;
+END;
+$$;
+
+-- Partitions — idempotent (IF NOT EXISTS supported on partition tables in PG15)
+CREATE TABLE IF NOT EXISTS noetl.event_pre_2026
+    PARTITION OF noetl.event FOR VALUES FROM (MINVALUE) TO (264905529753600000);
+CREATE TABLE IF NOT EXISTS noetl.event_2026_q1
+    PARTITION OF noetl.event FOR VALUES FROM (264905529753600000) TO (297520437657600000);
+CREATE TABLE IF NOT EXISTS noetl.event_2026_q2
+    PARTITION OF noetl.event FOR VALUES FROM (297520437657600000) TO (330497733427200000);
+CREATE TABLE IF NOT EXISTS noetl.event_2026_q3
+    PARTITION OF noetl.event FOR VALUES FROM (330497733427200000) TO (363837417062400000);
+CREATE TABLE IF NOT EXISTS noetl.event_2026_q4
+    PARTITION OF noetl.event FOR VALUES FROM (363837417062400000) TO (397177100697600000);
+CREATE TABLE IF NOT EXISTS noetl.event_2027_h1
+    PARTITION OF noetl.event FOR VALUES FROM (397177100697600000) TO (462769304371200000);
+CREATE TABLE IF NOT EXISTS noetl.event_2027_h2
+    PARTITION OF noetl.event FOR VALUES FROM (462769304371200000) TO (529448671641600000);
+-- GKE deployment uses a non-standard snowflake epoch producing IDs in the 569T–600T range.
+-- Existing GKE installations may already have those rows in event_default, which
+-- prevents attaching a new partition until the rows are moved. Skip instead of
+-- failing schema re-apply; operators can move/split default rows later.
+DO $$
+DECLARE
+    default_has_gke_overlap boolean := false;
+BEGIN
+    IF to_regclass('noetl.event_default') IS NOT NULL THEN
+        SELECT EXISTS (
+            SELECT 1
+            FROM noetl.event_default
+            WHERE execution_id >= 569000000000000000
+              AND execution_id < 600000000000000000
+            LIMIT 1
+        ) INTO default_has_gke_overlap;
+    END IF;
+
+    IF default_has_gke_overlap THEN
+        RAISE NOTICE
+            'Skipping event_2026_gke. Move/split overlapping rows from noetl.event_default before attaching this partition.';
+    ELSE
+        CREATE TABLE IF NOT EXISTS noetl.event_2026_gke
+            PARTITION OF noetl.event FOR VALUES FROM (569000000000000000) TO (600000000000000000);
+    END IF;
+END;
+$$;
+-- Current/future ranges for the standard noetl.snowflake_id() layout. These are
+-- skipped per-range when event_default already contains overlapping rows so
+-- schema re-apply never fails on clusters that already caught rows in default.
+-- The 569T-600T interval is already covered by event_2026_gke, so the standard
+-- 2026 ranges are split around it to avoid overlapping partition bounds.
+DO $$
+DECLARE
+    partition_names text[] := ARRAY[
+        'event_2026_q1_standard',
+        'event_2026_q2_standard',
+        'event_2026_q3_standard',
+        'event_2026_q4_standard',
+        'event_2027_h1_standard',
+        'event_2027_h2_standard',
+        'event_2028_q1_standard'
+    ];
+    start_ids bigint[] := ARRAY[
+        529811059507200000,
+        600000000000000000,
+        660995466854400000,
+        727674834124800000,
+        794354201395200000,
+        925538608742400000,
+        1058897343283200000
+    ];
+    end_ids bigint[] := ARRAY[
+        569000000000000000,
+        660995466854400000,
+        727674834124800000,
+        794354201395200000,
+        925538608742400000,
+        1058897343283200000,
+        1124137159091200000
+    ];
+    idx int;
+    default_has_overlap boolean;
+BEGIN
+    FOR idx IN 1..array_length(partition_names, 1) LOOP
+        default_has_overlap := false;
+        IF to_regclass('noetl.event_default') IS NOT NULL THEN
+            EXECUTE format(
+                'SELECT EXISTS (SELECT 1 FROM noetl.event_default WHERE execution_id >= %s AND execution_id < %s LIMIT 1)',
+                start_ids[idx],
+                end_ids[idx]
+            ) INTO default_has_overlap;
+        END IF;
+
+        IF default_has_overlap THEN
+            RAISE NOTICE
+                'Skipping %. Move/split overlapping rows from noetl.event_default before attaching this partition.',
+                partition_names[idx];
+        ELSE
+            EXECUTE format(
+                'CREATE TABLE IF NOT EXISTS noetl.%I PARTITION OF noetl.event FOR VALUES FROM (%s) TO (%s)',
+                partition_names[idx],
+                start_ids[idx],
+                end_ids[idx]
+            );
+        END IF;
+    END LOOP;
+END;
+$$;
+-- Default catches any IDs not covered by named partitions above
+CREATE TABLE IF NOT EXISTS noetl.event_default
+    PARTITION OF noetl.event DEFAULT;
+
+-- Indexes on parent table — automatically inherited by all partitions
+CREATE INDEX IF NOT EXISTS idx_event_execution_id          ON noetl.event (execution_id);
+CREATE INDEX IF NOT EXISTS idx_event_catalog_id            ON noetl.event (catalog_id);
+CREATE INDEX IF NOT EXISTS idx_event_type                  ON noetl.event (event_type);
+CREATE INDEX IF NOT EXISTS idx_event_status                ON noetl.event (status);
+CREATE INDEX IF NOT EXISTS idx_event_created_at            ON noetl.event (created_at);
+CREATE INDEX IF NOT EXISTS idx_event_node_name             ON noetl.event (node_name);
+CREATE INDEX IF NOT EXISTS idx_event_parent_event_id       ON noetl.event (parent_event_id);
+CREATE INDEX IF NOT EXISTS idx_event_parent_execution_id   ON noetl.event (parent_execution_id);
+
+-- Composite index for paginated event queries (sorted by event_id DESC for most recent first)
+CREATE INDEX IF NOT EXISTS idx_event_exec_id_event_id_desc ON noetl.event (execution_id, event_id DESC);
+
+-- Composite index for filtering by event_type within execution
+CREATE INDEX IF NOT EXISTS idx_event_exec_type ON noetl.event (execution_id, event_type, event_id DESC);
+
+-- Fast idempotency lookup for batch acceptance
+CREATE INDEX IF NOT EXISTS idx_event_idempotency_key
+    ON noetl.event (execution_id, ((meta->>'idempotency_key')))
+    WHERE meta ? 'idempotency_key';
+
+-- Command lifecycle lookups (claim/start/completed/failed) by command_id stored in meta
+CREATE INDEX IF NOT EXISTS idx_event_exec_type_meta_command_id_event_id_desc
+    ON noetl.event (execution_id, event_type, ((meta->>'command_id')), event_id DESC)
+    WHERE meta ? 'command_id';
+
+-- Reaper fast-path: scan recent command.issued candidates by time window and event_id
+CREATE INDEX IF NOT EXISTS idx_event_command_issued_created_event_id_desc
+    ON noetl.event (created_at DESC, event_id DESC, execution_id, ((meta->>'command_id')))
+    WHERE event_type = 'command.issued' AND meta ? 'command_id';
+
+-- Legacy inline result index (result->data->command_id) is obsolete under reference-only contract.
+-- Drop it via one-time migration script, not from canonical schema DDL.
+
+-- Reference lookup indexes
+CREATE INDEX IF NOT EXISTS idx_event_result_reference_type
+    ON noetl.event (((result->'reference'->>'type')))
+    WHERE result ? 'reference';
+CREATE INDEX IF NOT EXISTS idx_event_result_reference_record_id
+    ON noetl.event (((result->'reference'->>'record_id')))
+    WHERE (result->'reference') ? 'record_id';
+
+-- Batch status polling by request id
+CREATE INDEX IF NOT EXISTS idx_event_batch_request_event_id_desc
+    ON noetl.event (((meta->>'batch_request_id')), event_id DESC)
+    WHERE meta ? 'batch_request_id';
+
+-- Fast seed for /api/executions polling (latest started executions)
+CREATE INDEX IF NOT EXISTS idx_event_playbook_init_event_id_desc
+    ON noetl.event (event_id DESC)
+    INCLUDE (execution_id, catalog_id, parent_execution_id, created_at)
+    WHERE event_type = 'playbook.initialized';
+
+-- Event-sourced distributed runtime envelope fields (additive).
+-- Existing writers can continue using legacy columns/meta; new writers should
+-- populate these canonical fields directly so replay does not depend on
+-- backend-specific transport metadata.
+ALTER TABLE noetl.event
+    ADD COLUMN IF NOT EXISTS tenant_id TEXT NOT NULL DEFAULT 'default',
+    ADD COLUMN IF NOT EXISTS organization_id TEXT NOT NULL DEFAULT 'default',
+    ADD COLUMN IF NOT EXISTS stream_id TEXT,
+    ADD COLUMN IF NOT EXISTS stream_version BIGINT,
+    ADD COLUMN IF NOT EXISTS aggregate_id TEXT,
+    ADD COLUMN IF NOT EXISTS aggregate_type TEXT,
+    ADD COLUMN IF NOT EXISTS schema_name TEXT,
+    ADD COLUMN IF NOT EXISTS schema_version INTEGER NOT NULL DEFAULT 1,
+    ADD COLUMN IF NOT EXISTS event_time TIMESTAMPTZ NOT NULL DEFAULT now(),
+    ADD COLUMN IF NOT EXISTS ingest_time TIMESTAMPTZ NOT NULL DEFAULT now(),
+    ADD COLUMN IF NOT EXISTS producer TEXT,
+    ADD COLUMN IF NOT EXISTS causation_id TEXT,
+    ADD COLUMN IF NOT EXISTS correlation_id TEXT,
+    ADD COLUMN IF NOT EXISTS idempotency_key TEXT,
+    ADD COLUMN IF NOT EXISTS payload_ref JSONB,
+    ADD COLUMN IF NOT EXISTS envelope_checksum TEXT;
+
+-- One-level event chain (RFC noetl/ai-meta#115 Phase 2, §4).  `prev_event_id`
+-- names the immediately-previous event in this execution's causal order, so
+-- per-execution state can be followed pointer-by-pointer (one level at a time)
+-- instead of scanning the whole event table.  Additive + backward-compatible;
+-- the noetl-server also ensures this column idempotently at startup so a server
+-- image carrying the populate-on-emit code never writes a missing column.
+ALTER TABLE noetl.event
+    ADD COLUMN IF NOT EXISTS prev_event_id BIGINT;
+
+-- Chain-integrity / forward-replay lookup ("who points AT this node").  The
+-- "give me node <head>" walk is served by the (execution_id, event_id) PK.
+CREATE INDEX IF NOT EXISTS idx_event_prev_event_id
+    ON noetl.event (execution_id, prev_event_id)
+    WHERE prev_event_id IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_event_tenant_org_execution_event_id
+    ON noetl.event (tenant_id, organization_id, execution_id, event_id DESC);
+CREATE INDEX IF NOT EXISTS idx_event_stream_version
+    ON noetl.event (tenant_id, organization_id, stream_id, stream_version)
+    WHERE stream_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_event_aggregate_event_id
+    ON noetl.event (tenant_id, organization_id, aggregate_type, aggregate_id, event_id DESC)
+    WHERE aggregate_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_event_idempotency_key_column
+    ON noetl.event (tenant_id, organization_id, idempotency_key)
+    WHERE idempotency_key IS NOT NULL;
+
+-- Transactional outbox for event distribution. Writers insert here in the same
+-- transaction as noetl.event, and a publisher drains committed rows to NATS.
+CREATE TABLE IF NOT EXISTS noetl.outbox (
+    outbox_id BIGSERIAL PRIMARY KEY,
+    execution_id BIGINT,
+    event_id BIGINT NOT NULL,
+    subject TEXT,
+    payload JSONB NOT NULL,
+    payload_bytes BYTEA,
+    payload_codec TEXT NOT NULL DEFAULT 'arrow-feather',
+    status TEXT NOT NULL DEFAULT 'PENDING'
+        CHECK (status IN ('PENDING', 'IN_FLIGHT', 'PUBLISHED', 'FAILED')),
+    attempts INTEGER NOT NULL DEFAULT 0,
+    available_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    locked_at TIMESTAMPTZ,
+    published_at TIMESTAMPTZ,
+    last_error TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (execution_id, event_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_outbox_ready
+    ON noetl.outbox (status, available_at, outbox_id)
+    WHERE status IN ('PENDING', 'FAILED');
+
+CREATE INDEX IF NOT EXISTS idx_outbox_execution_event
+    ON noetl.outbox (execution_id, event_id);
+
+-- Legacy compatibility view for event_log. Keep this after additive event
+-- columns so SELECT * expands to the migrated event envelope.
+CREATE OR REPLACE VIEW noetl.event_log AS SELECT * FROM noetl.event;
+
+-- Credential
+CREATE TABLE IF NOT EXISTS noetl.credential (
+    id BIGINT PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    type TEXT NOT NULL,
+    data_encrypted TEXT NOT NULL,
+    schema JSONB,
+    meta JSONB,
+    tags TEXT[],
+    description TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_credential_type ON noetl.credential (type);
+ALTER TABLE noetl.catalog ADD COLUMN IF NOT EXISTS credential_id INTEGER;
+
+-- Runtime
+CREATE TABLE IF NOT EXISTS noetl.runtime (
+    runtime_id BIGINT PRIMARY KEY,
+    name TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('worker_pool','server_api','broker')),
+    uri TEXT,  -- Resource URI (endpoint for servers, resource location for workers)
+    status TEXT NOT NULL,
+    labels JSONB,
+    capabilities JSONB,
+    capacity INTEGER,
+    runtime JSONB,
+    heartbeat TIMESTAMPTZ NOT NULL DEFAULT now(),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_runtime_kind_name ON noetl.runtime (kind, name);
+CREATE INDEX IF NOT EXISTS idx_runtime_kind ON noetl.runtime (kind);
+CREATE INDEX IF NOT EXISTS idx_runtime_status ON noetl.runtime (status);
+
+-- Schedule
+CREATE TABLE IF NOT EXISTS noetl.schedule (
+    schedule_id BIGSERIAL PRIMARY KEY,
+    playbook_path TEXT NOT NULL,
+    playbook_version TEXT,
+    cron TEXT,
+    interval_seconds INTEGER,
+    enabled BOOLEAN NOT NULL DEFAULT TRUE,
+    timezone TEXT DEFAULT 'UTC',
+    next_run_at TIMESTAMPTZ,
+    last_run_at TIMESTAMPTZ,
+    last_status TEXT,
+    input_payload JSONB,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    meta JSONB
+);
+CREATE INDEX IF NOT EXISTS idx_schedule_next_run ON noetl.schedule (next_run_at) WHERE enabled = TRUE;
+CREATE INDEX IF NOT EXISTS idx_schedule_playbook ON noetl.schedule (playbook_path);
+-- Keychain
+-- Stores decrypted credentials and tokens with TTL for playbook execution scope
+CREATE TABLE IF NOT EXISTS noetl.keychain (
+    cache_key TEXT PRIMARY KEY,
+    keychain_name TEXT NOT NULL,
+    catalog_id BIGINT NOT NULL REFERENCES noetl.catalog(catalog_id),
+    credential_type TEXT NOT NULL,
+    cache_type TEXT NOT NULL CHECK (cache_type IN ('secret', 'token')),
+    scope_type TEXT NOT NULL CHECK (scope_type IN ('local', 'global', 'shared')),
+    execution_id BIGINT,
+    parent_execution_id BIGINT,
+    data_encrypted TEXT NOT NULL,
+    schema JSONB,
+    expires_at TIMESTAMPTZ NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    accessed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    access_count INTEGER DEFAULT 0,
+    auto_renew BOOLEAN DEFAULT false,
+    renew_config JSONB
+);
+
+CREATE INDEX IF NOT EXISTS idx_keychain_execution ON noetl.keychain (execution_id) WHERE execution_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_keychain_parent_execution ON noetl.keychain (parent_execution_id) WHERE parent_execution_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_keychain_expires ON noetl.keychain (expires_at);
+CREATE INDEX IF NOT EXISTS idx_keychain_type ON noetl.keychain (cache_type, scope_type);
+CREATE INDEX IF NOT EXISTS idx_keychain_name ON noetl.keychain (keychain_name);
+CREATE INDEX IF NOT EXISTS idx_keychain_catalog ON noetl.keychain (catalog_id);
+CREATE INDEX IF NOT EXISTS idx_keychain_name_catalog ON noetl.keychain (keychain_name, catalog_id);
+
+COMMENT ON TABLE noetl.keychain IS 'Caches decrypted credentials and tokens with TTL, scoped to playbook catalog. Schema field defines expected data structure for validation.';
+COMMENT ON COLUMN noetl.keychain.cache_key IS 'Unique cache key: <keychain_name>:<catalog_id>:<execution_id> for local scope, <keychain_name>:<catalog_id>:global for global tokens';
+COMMENT ON COLUMN noetl.keychain.keychain_name IS 'Name of the keychain entry defined in playbook (e.g., amadeus_token, postgres_creds)';
+COMMENT ON COLUMN noetl.keychain.catalog_id IS 'References the playbook catalog entry that defined this keychain';
+COMMENT ON COLUMN noetl.keychain.cache_type IS 'secret: raw credential data, token: derived authentication token (OAuth, JWT, etc.)';
+COMMENT ON COLUMN noetl.keychain.scope_type IS 'local: limited to playbook execution and sub-playbooks, global: shared across all executions until token expires, shared: shared within execution tree';
+COMMENT ON COLUMN noetl.keychain.execution_id IS 'Execution scope: credential tied to this execution and its sub-playbooks';
+COMMENT ON COLUMN noetl.keychain.parent_execution_id IS 'Top-level execution ID for cleanup when parent completes';
+COMMENT ON COLUMN noetl.keychain.expires_at IS 'TTL: local-scoped expires when playbook completes, global expires based on token expiration';
+COMMENT ON COLUMN noetl.keychain.auto_renew IS 'If true, automatically renew token when expired using renew_config';
+COMMENT ON COLUMN noetl.keychain.renew_config IS 'Configuration for automatic token renewal (endpoint, method, auth, etc.)';
+
+-- Snowflake-like id helpers
+CREATE SEQUENCE IF NOT EXISTS noetl.snowflake_seq;
+CREATE OR REPLACE FUNCTION noetl.snowflake_id() RETURNS BIGINT AS $$
+DECLARE
+    our_epoch BIGINT := 1704067200000;
+    seq_id BIGINT;
+    now_ms BIGINT;
+    shard_id INT := 1;
+BEGIN
+    SELECT nextval('noetl.snowflake_seq') % 1024 INTO seq_id;
+    now_ms := (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT;
+    RETURN ((now_ms - our_epoch) << 23) |
+           ((shard_id & 31) << 18) |
+           (seq_id & 262143);
+END;
+$$ LANGUAGE plpgsql;
+ALTER TABLE noetl.catalog ALTER COLUMN catalog_id SET DEFAULT noetl.snowflake_id();
+ALTER TABLE noetl.schedule ALTER COLUMN schedule_id SET DEFAULT noetl.snowflake_id();
+alter table noetl.credential ALTER COLUMN id SET DEFAULT noetl.snowflake_id();
+
+-- ============================================================================
+-- Result Storage Tables
+-- ============================================================================
+-- Zero-copy reference system for efficient data passing between steps.
+-- Metadata index for temp storage. Actual data resides in NATS KV/Object,
+-- S3/GCS, or PostgreSQL temp tables.
+
+CREATE TABLE IF NOT EXISTS noetl.result_ref (
+    ref_id BIGINT PRIMARY KEY DEFAULT noetl.snowflake_id(),
+    ref TEXT UNIQUE NOT NULL,  -- noetl://execution/<eid>/result/<name>/<id>
+    execution_id BIGINT NOT NULL,
+    parent_execution_id BIGINT,  -- For workflow scope tracking
+
+    -- Identification
+    name TEXT NOT NULL,
+    scope TEXT NOT NULL CHECK (scope IN ('step', 'execution', 'workflow', 'permanent')),
+    source_step TEXT,
+
+    -- Storage tier
+    store_tier TEXT NOT NULL CHECK (store_tier IN ('memory', 'kv', 'disk', 'object', 's3', 'gcs', 'db', 'duckdb', 'eventlog')),
+    physical_uri TEXT,  -- Actual storage location (s3://..., gs://..., kv://bucket/key)
+
+    -- Metadata
+    content_type TEXT DEFAULT 'application/json',
+    bytes_size BIGINT DEFAULT 0,
+    sha256 TEXT,
+    compression TEXT DEFAULT 'none' CHECK (compression IN ('none', 'gzip', 'lz4')),
+
+    -- Lifecycle
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    expires_at TIMESTAMPTZ,
+    accessed_at TIMESTAMPTZ DEFAULT now(),
+    access_count INTEGER DEFAULT 0,
+
+    -- Preview and correlation
+    preview JSONB,  -- Truncated sample for UI (max 1KB)
+    extracted JSONB,  -- Fields from output.select (available without resolution)
+    correlation JSONB,  -- Loop/pagination tracking keys
+    meta JSONB,  -- Additional metadata
+
+    -- Accumulation tracking
+    is_accumulated BOOLEAN DEFAULT FALSE,
+    accumulation_index INTEGER,
+    accumulation_manifest_ref TEXT
+);
+
+-- Indexes for common queries
+CREATE INDEX IF NOT EXISTS idx_result_ref_execution ON noetl.result_ref (execution_id);
+CREATE INDEX IF NOT EXISTS idx_result_ref_parent ON noetl.result_ref (parent_execution_id) WHERE parent_execution_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_result_ref_scope ON noetl.result_ref (scope);
+CREATE INDEX IF NOT EXISTS idx_result_ref_expires ON noetl.result_ref (expires_at) WHERE expires_at IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_result_ref_name_exec ON noetl.result_ref (execution_id, name);
+CREATE INDEX IF NOT EXISTS idx_result_ref_step ON noetl.result_ref (execution_id, source_step) WHERE source_step IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_result_ref_store_tier ON noetl.result_ref (store_tier);
+
+COMMENT ON TABLE noetl.result_ref IS 'ResultRef projection table - metadata index for result storage. Actual data in NATS/cloud storage.';
+COMMENT ON COLUMN noetl.result_ref.ref IS 'Logical URI: noetl://execution/<eid>/result/<name>/<id>';
+COMMENT ON COLUMN noetl.result_ref.scope IS 'Lifecycle scope: step (cleanup on step done), execution (cleanup on playbook done), workflow (cleanup on root done), permanent (never auto-cleaned)';
+COMMENT ON COLUMN noetl.result_ref.store_tier IS 'Storage backend: memory (in-process), kv (NATS KV), disk (local SSD cache + cloud spill), s3 (S3-compatible storage), gcs, db (PostgreSQL), duckdb, eventlog. "object" retained for in-flight rows; auto-remapped to "disk" on read.';
+COMMENT ON COLUMN noetl.result_ref.physical_uri IS 'Actual storage URI (s3://bucket/key, kv://bucket/key, etc.)';
+COMMENT ON COLUMN noetl.result_ref.preview IS 'Truncated sample of data for UI preview (max 1KB JSON)';
+COMMENT ON COLUMN noetl.result_ref.extracted IS 'Fields from output.select available without resolution';
+COMMENT ON COLUMN noetl.result_ref.correlation IS 'Loop/pagination tracking: iteration, page, cursor, batch_id';
+
+-- Legacy alias view for backwards compatibility
+CREATE OR REPLACE VIEW noetl.temp_ref AS SELECT * FROM noetl.result_ref;
+
+-- ============================================================================
+-- Manifest Table
+-- ============================================================================
+-- Aggregated results for pagination and loops. Instead of merging large
+-- datasets in memory, a manifest references the parts for streaming access.
+
+CREATE TABLE IF NOT EXISTS noetl.manifest (
+    manifest_id BIGINT PRIMARY KEY DEFAULT noetl.snowflake_id(),
+    ref TEXT UNIQUE NOT NULL,  -- noetl://execution/<eid>/manifest/<name>/<id>
+    execution_id BIGINT NOT NULL,
+
+    -- Configuration
+    strategy TEXT NOT NULL CHECK (strategy IN ('append', 'replace', 'merge', 'concat')),
+    merge_path TEXT,  -- JSONPath for nested array merge (e.g., $.data.items)
+
+    -- Statistics
+    total_parts INTEGER DEFAULT 0,
+    total_bytes BIGINT DEFAULT 0,
+
+    -- Lifecycle
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    completed_at TIMESTAMPTZ,
+
+    -- Metadata
+    source_step TEXT,
+    correlation JSONB,
+    meta JSONB
+);
+
+CREATE INDEX IF NOT EXISTS idx_manifest_execution ON noetl.manifest (execution_id);
+CREATE INDEX IF NOT EXISTS idx_manifest_step ON noetl.manifest (source_step) WHERE source_step IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_manifest_completed ON noetl.manifest (completed_at) WHERE completed_at IS NOT NULL;
+
+COMMENT ON TABLE noetl.manifest IS 'Manifest for aggregated results from pagination/loops. References parts rather than merging.';
+COMMENT ON COLUMN noetl.manifest.ref IS 'Logical URI: noetl://execution/<eid>/manifest/<name>/<id>';
+COMMENT ON COLUMN noetl.manifest.strategy IS 'Combination strategy: append (list), replace (overwrite), merge (deep merge), concat (flatten arrays)';
+COMMENT ON COLUMN noetl.manifest.merge_path IS 'JSONPath for nested array extraction in concat strategy';
+
+-- ============================================================================
+-- Manifest Parts Table
+-- ============================================================================
+-- Individual parts referenced by a manifest
+
+CREATE TABLE IF NOT EXISTS noetl.manifest_part (
+    manifest_id BIGINT NOT NULL REFERENCES noetl.manifest(manifest_id) ON DELETE CASCADE,
+    part_index INTEGER NOT NULL,
+    part_ref TEXT NOT NULL,  -- ResultRef URI
+    bytes_size BIGINT DEFAULT 0,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    meta JSONB,
+    PRIMARY KEY (manifest_id, part_index)
+);
+
+CREATE INDEX IF NOT EXISTS idx_manifest_part_ref ON noetl.manifest_part (part_ref);
+
+COMMENT ON TABLE noetl.manifest_part IS 'Individual parts of a manifest, ordered by part_index';
+COMMENT ON COLUMN noetl.manifest_part.part_ref IS 'Reference to part data (ResultRef URI or inline)';
+
+-- ============================================================================
+-- Extend transient table for ResultRef integration
+-- ============================================================================
+-- Add scope and expires_at columns if not present
+
+DO $$ BEGIN
+    ALTER TABLE noetl.transient ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;
+EXCEPTION WHEN duplicate_column THEN NULL; END $$;
+
+DO $$ BEGIN
+    ALTER TABLE noetl.transient ADD COLUMN IF NOT EXISTS scope TEXT DEFAULT 'execution' CHECK (scope IN ('step', 'execution', 'workflow', 'permanent'));
+EXCEPTION WHEN duplicate_column THEN NULL; END $$;
+
+-- Index for TTL-based cleanup
+CREATE INDEX IF NOT EXISTS idx_transient_expires ON noetl.transient (expires_at) WHERE expires_at IS NOT NULL;
+
+-- ============================================================================
+-- Cleanup function for expired ResultRefs
+-- ============================================================================
+CREATE OR REPLACE FUNCTION noetl.cleanup_expired_result_refs()
+RETURNS INTEGER AS $$
+DECLARE
+    deleted_count INTEGER;
+BEGIN
+    -- Delete expired result_refs (permanent scope never expires via TTL)
+    WITH deleted AS (
+        DELETE FROM noetl.result_ref
+        WHERE expires_at IS NOT NULL AND expires_at < NOW()
+          AND scope != 'permanent'
+        RETURNING ref_id
+    )
+    SELECT COUNT(*) INTO deleted_count FROM deleted;
+
+    RETURN deleted_count;
+END;
+$$ LANGUAGE plpgsql;
+
+COMMENT ON FUNCTION noetl.cleanup_expired_result_refs() IS 'Clean up expired ResultRefs. Call periodically or via pg_cron.';
+
+-- ============================================================================
+-- Cleanup function for execution-scoped refs
+-- ============================================================================
+CREATE OR REPLACE FUNCTION noetl.cleanup_execution_result_refs(p_execution_id BIGINT)
+RETURNS INTEGER AS $$
+DECLARE
+    deleted_count INTEGER;
+BEGIN
+    -- Delete execution-scoped result_refs (not permanent)
+    WITH deleted AS (
+        DELETE FROM noetl.result_ref
+        WHERE execution_id = p_execution_id
+          AND scope IN ('step', 'execution')
+        RETURNING ref_id
+    )
+    SELECT COUNT(*) INTO deleted_count FROM deleted;
+
+    -- Delete manifests for this execution
+    DELETE FROM noetl.manifest WHERE execution_id = p_execution_id;
+
+    RETURN deleted_count;
+END;
+$$ LANGUAGE plpgsql;
+
+COMMENT ON FUNCTION noetl.cleanup_execution_result_refs(BIGINT) IS 'Clean up all result refs for a completed execution (excludes permanent scope).';
+CREATE TABLE IF NOT EXISTS noetl.execution (
+    execution_id    BIGINT PRIMARY KEY,
+    catalog_id      BIGINT NOT NULL REFERENCES noetl.catalog(catalog_id),
+    status          VARCHAR NOT NULL,
+    start_time      TIMESTAMP WITH TIME ZONE,
+    end_time        TIMESTAMP WITH TIME ZONE,
+    error           TEXT,
+    created_at      TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at      TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_execution_status ON noetl.execution (status);
+CREATE INDEX IF NOT EXISTS idx_execution_catalog_id ON noetl.execution (catalog_id);
+CREATE INDEX IF NOT EXISTS idx_execution_created_at ON noetl.execution (created_at DESC);
+CREATE TABLE IF NOT EXISTS noetl.execution (
+    execution_id          BIGINT PRIMARY KEY,
+    catalog_id            BIGINT NOT NULL REFERENCES noetl.catalog(catalog_id),
+    parent_execution_id   BIGINT,
+    status                VARCHAR NOT NULL,
+    last_event_type       VARCHAR,
+    last_node_name        VARCHAR,
+    last_event_id         BIGINT,
+    start_time            TIMESTAMP WITH TIME ZONE,
+    end_time              TIMESTAMP WITH TIME ZONE,
+    error                 TEXT,
+    created_at            TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at            TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+ALTER TABLE noetl.execution
+    ADD COLUMN IF NOT EXISTS parent_execution_id BIGINT,
+    ADD COLUMN IF NOT EXISTS last_event_type VARCHAR,
+    ADD COLUMN IF NOT EXISTS last_node_name VARCHAR,
+    ADD COLUMN IF NOT EXISTS last_event_id BIGINT;
+
+CREATE INDEX IF NOT EXISTS idx_execution_status ON noetl.execution (status);
+CREATE INDEX IF NOT EXISTS idx_execution_catalog_id ON noetl.execution (catalog_id);
+CREATE INDEX IF NOT EXISTS idx_execution_start_time ON noetl.execution (start_time DESC);
+CREATE INDEX IF NOT EXISTS idx_execution_list_page
+    ON noetl.execution ((COALESCE(start_time, created_at)) DESC NULLS LAST, execution_id DESC)
+    INCLUDE (catalog_id, parent_execution_id, status, last_event_type, last_node_name, last_event_id, end_time, error);
+-- Execution projection is maintained by the projection worker and state store.
+-- Explicitly remove the old row-level trigger so schema re-application after
+-- Postgres recovery cannot recreate the high-contention hot path.
+DROP TRIGGER IF EXISTS trg_event_to_execution ON noetl.event;
+DROP FUNCTION IF EXISTS noetl.trg_execution_state_upsert();
+
+ALTER TABLE noetl.execution ADD COLUMN IF NOT EXISTS state JSONB;
+
+-- ============================================================================
+-- noetl.stage / noetl.frame — additive distributed runtime control plane
+-- ============================================================================
+-- These tables introduce stage-shaped scheduling without migrating existing
+-- command rows. The event log remains the replay authority; stage/frame rows
+-- are operational projections for fast claim, heartbeat, and commit paths.
+
+CREATE TABLE IF NOT EXISTS noetl.stage (
+    stage_id        BIGINT PRIMARY KEY,
+    execution_id    BIGINT NOT NULL REFERENCES noetl.execution(execution_id),
+    parent_event_id BIGINT,
+    parent_stage_id BIGINT REFERENCES noetl.stage(stage_id),
+    loop_event_id   TEXT,
+    opened_event_id BIGINT,
+    closed_event_id BIGINT,
+    kind            TEXT NOT NULL CHECK (kind IN ('loop','fanout','reduce')),
+    step_name       TEXT NOT NULL,
+    dsl_ref         TEXT NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'OPEN',
+    frame_policy    JSONB NOT NULL DEFAULT '{}'::jsonb,
+    tenant_id       TEXT NOT NULL DEFAULT 'default',
+    organization_id TEXT NOT NULL DEFAULT 'default',
+    started_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    ended_at        TIMESTAMPTZ,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+ALTER TABLE noetl.stage ADD COLUMN IF NOT EXISTS parent_stage_id BIGINT REFERENCES noetl.stage(stage_id);
+ALTER TABLE noetl.stage ADD COLUMN IF NOT EXISTS loop_event_id TEXT;
+ALTER TABLE noetl.stage ADD COLUMN IF NOT EXISTS opened_event_id BIGINT;
+ALTER TABLE noetl.stage ADD COLUMN IF NOT EXISTS closed_event_id BIGINT;
+
+CREATE INDEX IF NOT EXISTS idx_stage_execution_status
+    ON noetl.stage (execution_id, status, stage_id);
+CREATE INDEX IF NOT EXISTS idx_stage_tenant_org_execution
+    ON noetl.stage (tenant_id, organization_id, execution_id, stage_id);
+CREATE INDEX IF NOT EXISTS idx_stage_execution_step_loop
+    ON noetl.stage (execution_id, step_name, loop_event_id)
+    WHERE loop_event_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_stage_parent_stage
+    ON noetl.stage (parent_stage_id)
+    WHERE parent_stage_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_stage_opened_event
+    ON noetl.stage (opened_event_id)
+    WHERE opened_event_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_stage_closed_event
+    ON noetl.stage (closed_event_id)
+    WHERE closed_event_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS noetl.frame (
+    frame_id        BIGINT PRIMARY KEY,
+    stage_id        BIGINT NOT NULL REFERENCES noetl.stage(stage_id),
+    execution_id    BIGINT NOT NULL REFERENCES noetl.execution(execution_id),
+    parent_frame_id BIGINT REFERENCES noetl.frame(frame_id),
+    command_id      BIGINT,
+    claimed_event_id BIGINT,
+    terminal_event_id BIGINT,
+    cursor          JSONB NOT NULL DEFAULT '{}'::jsonb,
+    row_count       INTEGER NOT NULL DEFAULT 0,
+    status          TEXT NOT NULL DEFAULT 'PENDING',
+    owner_worker    TEXT,
+    lease_until     TIMESTAMPTZ,
+    output_ref      JSONB,
+    events_emitted  INTEGER NOT NULL DEFAULT 0,
+    attempts        INTEGER NOT NULL DEFAULT 0,
+    tenant_id       TEXT NOT NULL DEFAULT 'default',
+    organization_id TEXT NOT NULL DEFAULT 'default',
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    completed_at    TIMESTAMPTZ
+);
+
+ALTER TABLE noetl.frame ADD COLUMN IF NOT EXISTS parent_frame_id BIGINT REFERENCES noetl.frame(frame_id);
+ALTER TABLE noetl.frame ADD COLUMN IF NOT EXISTS command_id BIGINT;
+ALTER TABLE noetl.frame ADD COLUMN IF NOT EXISTS claimed_event_id BIGINT;
+ALTER TABLE noetl.frame ADD COLUMN IF NOT EXISTS terminal_event_id BIGINT;
+
+CREATE INDEX IF NOT EXISTS frame_open_idx
+    ON noetl.frame (stage_id, status, lease_until)
+    WHERE status IN ('PENDING','CLAIMED','RUNNING');
+CREATE INDEX IF NOT EXISTS idx_frame_execution_status
+    ON noetl.frame (execution_id, status, frame_id);
+CREATE INDEX IF NOT EXISTS idx_frame_tenant_org_execution
+    ON noetl.frame (tenant_id, organization_id, execution_id, frame_id);
+CREATE INDEX IF NOT EXISTS idx_frame_stage_frame
+    ON noetl.frame (stage_id, frame_id);
+CREATE INDEX IF NOT EXISTS idx_frame_stage_cursor_slot_index
+    ON noetl.frame (stage_id, (cursor->>'worker_slot_id'), (cursor->>'frame_index'), frame_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_frame_claim_key_unique
+    ON noetl.frame (stage_id, (cursor->>'worker_slot_id'), (cursor->>'frame_index'))
+    WHERE cursor ? 'worker_slot_id' AND cursor ? 'frame_index';
+CREATE INDEX IF NOT EXISTS idx_frame_idempotent_claim
+    ON noetl.frame (
+        stage_id,
+        command_id,
+        owner_worker,
+        (cursor->>'worker_slot_id'),
+        (cursor->>'frame_index'),
+        frame_id
+    )
+    WHERE status IN ('CLAIMED','RUNNING');
+CREATE INDEX IF NOT EXISTS idx_frame_parent_frame
+    ON noetl.frame (parent_frame_id)
+    WHERE parent_frame_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_frame_command
+    ON noetl.frame (command_id)
+    WHERE command_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_frame_claimed_event
+    ON noetl.frame (claimed_event_id)
+    WHERE claimed_event_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_frame_terminal_event
+    ON noetl.frame (terminal_event_id)
+    WHERE terminal_event_id IS NOT NULL;
+
+-- Replayable projection store reference tables. These are derived state and
+-- can be rebuilt from noetl.event plus immutable payloads.
+CREATE TABLE IF NOT EXISTS noetl.projection (
+    projection_id   TEXT PRIMARY KEY,
+    projection_type TEXT NOT NULL,
+    tenant_id       TEXT NOT NULL DEFAULT 'default',
+    organization_id TEXT NOT NULL DEFAULT 'default',
+    execution_id    BIGINT,
+    version         BIGINT NOT NULL,
+    source_event_id BIGINT,
+    state           JSONB NOT NULL,
+    checksum        TEXT NOT NULL,
+    meta            JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_projection_tenant_type
+    ON noetl.projection (tenant_id, organization_id, projection_type);
+CREATE INDEX IF NOT EXISTS idx_projection_execution
+    ON noetl.projection (execution_id, projection_type)
+    WHERE execution_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS noetl.projection_snapshot (
+    aggregate_id    TEXT NOT NULL,
+    aggregate_type  TEXT NOT NULL,
+    tenant_id       TEXT NOT NULL DEFAULT 'default',
+    organization_id TEXT NOT NULL DEFAULT 'default',
+    version         BIGINT NOT NULL,
+    snapshot        JSONB NOT NULL,
+    checksum        TEXT NOT NULL,
+    meta            JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (tenant_id, organization_id, aggregate_type, aggregate_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_projection_snapshot_type
+    ON noetl.projection_snapshot (tenant_id, organization_id, aggregate_type, version DESC);
+
+CREATE INDEX IF NOT EXISTS idx_event_loop_event_id
+    ON noetl.event (execution_id, node_name, ((meta->>'loop_event_id')))
+    WHERE meta ? 'loop_event_id';
+CREATE INDEX IF NOT EXISTS idx_event_loop_epoch_id
+    ON noetl.event (execution_id, node_name, ((meta->>'__loop_epoch_id')))
+    WHERE meta ? '__loop_epoch_id';
+
+
+CREATE INDEX IF NOT EXISTS idx_event_loop_epoch_coalesce
+    ON noetl.event (execution_id, node_name, (COALESCE(meta->>'loop_event_id', meta->>'__loop_epoch_id')))
+    WHERE COALESCE(meta->>'loop_event_id', meta->>'__loop_epoch_id') IS NOT NULL;
+
+-- ============================================================================
+-- noetl.command — Runtime worker instruction projection (HASH-partitioned)
+-- ============================================================================
+-- Mutable table: one row per executable instruction. Server creates on
+-- command.issued, updates on claim/start/complete/fail. Workers fetch
+-- context from here. Event table stays append-only and fact-only.
+--
+-- Partitioning: HASH (execution_id) into 16 partitions to:
+--   - Prune to one partition for the dominant `WHERE execution_id = ?`
+--     query pattern (~3% of the data per scan vs. 100%).
+--   - Enable partition-wise joins with noetl.event (when event is also
+--     hash-partitioned by execution_id with the same modulus).
+--   - Distribute insert load across 16 b-trees instead of one.
+--
+-- PRIMARY KEY is composite (execution_id, command_id) because Postgres
+-- requires the partition key to participate in any UNIQUE constraint on
+-- a partitioned table. command_id is constructed application-side as
+-- `<execution_id>:<step_name>:<seq>` so the composite is effectively
+-- already unique.
+--
+-- An online migration script for existing flat noetl.command tables is
+-- provided in `scripts/db/migrate_command_to_hash_partitioned.sql`.
+
+CREATE TABLE IF NOT EXISTS noetl.command (
+    command_id          BIGINT NOT NULL,
+    event_id            BIGINT NOT NULL,
+    execution_id        BIGINT NOT NULL,
+    catalog_id          BIGINT NOT NULL,
+    parent_execution_id BIGINT,
+    parent_command_id   BIGINT,
+
+    step_name           TEXT NOT NULL,
+    tool_kind           TEXT,
+
+    status              TEXT NOT NULL DEFAULT 'PENDING',
+    worker_id           TEXT,
+    claimed_at          TIMESTAMPTZ,
+    started_at          TIMESTAMPTZ,
+    completed_at        TIMESTAMPTZ,
+    attempt             INT NOT NULL DEFAULT 1,
+
+    context             JSONB,
+    context_key         TEXT,
+
+    loop_event_id       TEXT,
+    iter_index          INT,
+    meta                JSONB,
+
+    result              JSONB,
+    error               TEXT,
+
+    latest_event_id     BIGINT,
+
+    -- One-level event chain (RFC noetl/ai-meta#115 Phase 2, §4.1): the event
+    -- whose application issued this command (the drive trigger; for a cursor
+    -- fan-out, the claim/branch event).  Additive; the issuing link, distinct
+    -- from `latest_event_id` (most-recent lifecycle event).
+    prev_event_id       BIGINT,
+
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    PRIMARY KEY (execution_id, command_id)
+) PARTITION BY HASH (execution_id);
+
+-- Existing installs may predate the prev_event_id column; add it idempotently.
+ALTER TABLE noetl.command ADD COLUMN IF NOT EXISTS prev_event_id BIGINT;
+
+-- 16 hash partitions (matching planned noetl.event modulus for
+-- partition-wise joins).
+CREATE TABLE IF NOT EXISTS noetl.command_p00 PARTITION OF noetl.command FOR VALUES WITH (MODULUS 16, REMAINDER 0);
+CREATE TABLE IF NOT EXISTS noetl.command_p01 PARTITION OF noetl.command FOR VALUES WITH (MODULUS 16, REMAINDER 1);
+CREATE TABLE IF NOT EXISTS noetl.command_p02 PARTITION OF noetl.command FOR VALUES WITH (MODULUS 16, REMAINDER 2);
+CREATE TABLE IF NOT EXISTS noetl.command_p03 PARTITION OF noetl.command FOR VALUES WITH (MODULUS 16, REMAINDER 3);
+CREATE TABLE IF NOT EXISTS noetl.command_p04 PARTITION OF noetl.command FOR VALUES WITH (MODULUS 16, REMAINDER 4);
+CREATE TABLE IF NOT EXISTS noetl.command_p05 PARTITION OF noetl.command FOR VALUES WITH (MODULUS 16, REMAINDER 5);
+CREATE TABLE IF NOT EXISTS noetl.command_p06 PARTITION OF noetl.command FOR VALUES WITH (MODULUS 16, REMAINDER 6);
+CREATE TABLE IF NOT EXISTS noetl.command_p07 PARTITION OF noetl.command FOR VALUES WITH (MODULUS 16, REMAINDER 7);
+CREATE TABLE IF NOT EXISTS noetl.command_p08 PARTITION OF noetl.command FOR VALUES WITH (MODULUS 16, REMAINDER 8);
+CREATE TABLE IF NOT EXISTS noetl.command_p09 PARTITION OF noetl.command FOR VALUES WITH (MODULUS 16, REMAINDER 9);
+CREATE TABLE IF NOT EXISTS noetl.command_p10 PARTITION OF noetl.command FOR VALUES WITH (MODULUS 16, REMAINDER 10);
+CREATE TABLE IF NOT EXISTS noetl.command_p11 PARTITION OF noetl.command FOR VALUES WITH (MODULUS 16, REMAINDER 11);
+CREATE TABLE IF NOT EXISTS noetl.command_p12 PARTITION OF noetl.command FOR VALUES WITH (MODULUS 16, REMAINDER 12);
+CREATE TABLE IF NOT EXISTS noetl.command_p13 PARTITION OF noetl.command FOR VALUES WITH (MODULUS 16, REMAINDER 13);
+CREATE TABLE IF NOT EXISTS noetl.command_p14 PARTITION OF noetl.command FOR VALUES WITH (MODULUS 16, REMAINDER 14);
+CREATE TABLE IF NOT EXISTS noetl.command_p15 PARTITION OF noetl.command FOR VALUES WITH (MODULUS 16, REMAINDER 15);
+
+CREATE INDEX IF NOT EXISTS idx_command_execution_id
+    ON noetl.command (execution_id);
+CREATE INDEX IF NOT EXISTS idx_command_execution_step
+    ON noetl.command (execution_id, step_name);
+CREATE INDEX IF NOT EXISTS idx_command_status
+    ON noetl.command (status) WHERE status IN ('PENDING', 'CLAIMED');
+CREATE INDEX IF NOT EXISTS idx_command_execution_status
+    ON noetl.command (execution_id, status)
+    WHERE status IN ('PENDING', 'CLAIMED', 'RUNNING');
+CREATE INDEX IF NOT EXISTS idx_command_worker
+    ON noetl.command (worker_id, updated_at) WHERE status = 'CLAIMED';
+CREATE INDEX IF NOT EXISTS idx_command_loop
+    ON noetl.command (execution_id, loop_event_id, status)
+    WHERE loop_event_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_command_loop_step_status
+    ON noetl.command (execution_id, step_name, loop_event_id, status, iter_index)
+    WHERE loop_event_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_command_pending_loop_step_created
+    ON noetl.command (execution_id, step_name, loop_event_id, created_at, iter_index)
+    WHERE status = 'PENDING' AND iter_index IS NOT NULL;
+-- Lookup-by-command_id (non-unique because partitioned UNIQUE requires
+-- the partition key; collisions are application-prevented via the
+-- command_id construction).
+CREATE INDEX IF NOT EXISTS idx_command_command_id
+    ON noetl.command (command_id);
+-- Lookup-by-event_id.  `POST /api/commands/{event_id}/claim` resolves a command
+-- from the bus notification by `event_id` alone -- it has no `execution_id` to
+-- give, so every index above (all of which lead with the partition key) is
+-- unusable and the planner falls back to a parallel seq scan of all 16
+-- partitions.  Measured on a 428k-row table: 88,199 buffers touched per claim,
+-- ~295ms, paid TWICE per hop; with this index, 31 buffers and ~0.2ms.  End to
+-- end that was ~79% of a playbook turn (noetl/ai-meta#155).
+CREATE INDEX IF NOT EXISTS idx_command_event_id
+    ON noetl.command (event_id);
+
+ALTER TABLE noetl.command ADD COLUMN IF NOT EXISTS stage_id BIGINT;
+ALTER TABLE noetl.command ADD COLUMN IF NOT EXISTS frame_id BIGINT;
+CREATE INDEX IF NOT EXISTS idx_command_stage
+    ON noetl.command (execution_id, stage_id, status)
+    WHERE stage_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_command_stage_worker_slot
+    ON noetl.command (execution_id, stage_id, ((meta->>'worker_slot_id')))
+    WHERE stage_id IS NOT NULL AND meta ? 'worker_slot_id';
+CREATE INDEX IF NOT EXISTS idx_command_frame
+    ON noetl.command (execution_id, frame_id)
+    WHERE frame_id IS NOT NULL;
+
+-- Linkage: event → command (BIGINT to match noetl.command.command_id)
+ALTER TABLE noetl.event ADD COLUMN IF NOT EXISTS command_id BIGINT;
+ALTER TABLE noetl.event ADD COLUMN IF NOT EXISTS stage_id BIGINT;
+ALTER TABLE noetl.event ADD COLUMN IF NOT EXISTS frame_id BIGINT;
+CREATE INDEX IF NOT EXISTS idx_event_command_id
+    ON noetl.event (command_id) WHERE command_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_event_exec_type_command_id_event_id_desc
+    ON noetl.event (execution_id, event_type, command_id, event_id DESC)
+    WHERE command_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_event_stage_id
+    ON noetl.event (stage_id, event_id DESC) WHERE stage_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_event_exec_stage_event_id_desc
+    ON noetl.event (execution_id, stage_id, event_id DESC) WHERE stage_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_event_frame_id
+    ON noetl.event (frame_id, event_id DESC) WHERE frame_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_event_exec_frame_event_id_desc
+    ON noetl.event (execution_id, frame_id, event_id DESC) WHERE frame_id IS NOT NULL;
