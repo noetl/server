@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.97.1](https://github.com/noetl/server/compare/v3.97.0...v3.97.1) (2026-08-30)
+
+### Bug Fixes
+
+* **fold:** TRUNCATE created_at to microseconds — Postgres does not round ([7e59e80](https://github.com/noetl/server/commit/7e59e80c5eb4da288a8996f5c60d96dbffdbb446)), closes [noetl/ai-meta#307](https://github.com/noetl/ai-meta/issues/307) [noetl/ai-meta#307](https://github.com/noetl/ai-meta/issues/307)
+
 ## [3.97.0](https://github.com/noetl/server/compare/v3.96.0...v3.97.0) (2026-08-30)
 
 ### Features
