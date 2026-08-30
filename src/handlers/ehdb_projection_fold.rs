@@ -1401,10 +1401,55 @@ pub async fn stored_projection_full(
 /// Both sides are folded here, in one request, from the same execution — so a
 /// difference cannot be attributed to the execution advancing between calls.
 /// The version equality is asserted and reported rather than assumed.
+/// Which fields of one event differ between two sources.
+///
+/// Split out of [`fold_diff_endpoint`] so it is reachable by a unit test — the
+/// same reason [`events_from_tier_records`] is separate. A differ that is only
+/// exercisable through an HTTP call against a live relay is a differ whose
+/// "no differences" answer nobody has ever checked, and a false negative here
+/// sends an investigation in the wrong direction.
+///
+/// ⚠ Field NAMES only. Values are the caller's decision, and it reports them for
+/// `created_at` alone — `context`, `meta` and `result` can carry customer
+/// material.
+pub fn differing_fields(
+    a: &crate::db::models::Event,
+    b: &crate::db::models::Event,
+) -> Vec<&'static str> {
+    let mut f: Vec<&'static str> = Vec::new();
+    if a.event_type != b.event_type { f.push("event_type"); }
+    if a.status != b.status { f.push("status"); }
+    if a.node_id != b.node_id { f.push("node_id"); }
+    if a.node_name != b.node_name { f.push("node_name"); }
+    if a.node_type != b.node_type { f.push("node_type"); }
+    if a.catalog_id != b.catalog_id { f.push("catalog_id"); }
+    if a.parent_event_id != b.parent_event_id { f.push("parent_event_id"); }
+    if a.parent_execution_id != b.parent_execution_id { f.push("parent_execution_id"); }
+    if a.worker_id != b.worker_id { f.push("worker_id"); }
+    if a.attempt != b.attempt { f.push("attempt"); }
+    if a.context != b.context { f.push("context"); }
+    if a.meta != b.meta { f.push("meta"); }
+    if a.result != b.result { f.push("result"); }
+    if a.created_at != b.created_at { f.push("created_at"); }
+    f
+}
+
 pub async fn fold_diff_endpoint(
     axum::extract::State(state): axum::extract::State<crate::state::AppState>,
     axum::extract::Path(execution_id): axum::extract::Path<i64>,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> AppResult<axum::Json<serde_json::Value>> {
+    // Which source Postgres is compared against.
+    //
+    // ⚠ `wal` stays the default so existing callers are unchanged. `tier` exists
+    // because the WAL spine returns `spine_incomplete` for COMPLETED executions
+    // — which is the very coverage gap noetl/ai-meta#307 is about — so the only
+    // field-level differ that shipped could not diagnose the tier divergence the
+    // equivalence sweep reports.
+    let comparand_source = match q.get("source").map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        Some("tier") => "tier",
+        _ => "wal",
+    };
     let pool = state.pools.pool_for(execution_id);
 
     // --- incumbent side -----------------------------------------------------
@@ -1426,21 +1471,99 @@ pub async fn fold_diff_endpoint(
     let pg_events = super::events::parse_event_rows_for_fold(rows);
     let pg = fold_with_body(FoldSource::Postgres, pg_events.clone());
 
-    // --- WAL spine side -----------------------------------------------------
-    let spine_events = wal_spine_events(execution_id, None).await;
-    let wal = match &spine_events {
-        Ok(evs) => fold_with_body(FoldSource::WalSpine, evs.clone()),
+    // --- comparand side -----------------------------------------------------
+    let comparand_events: Result<Vec<crate::db::models::Event>, FoldRefusal> =
+        if comparand_source == "tier" {
+            tier_events_within(execution_id, TIER_FOLD_TIMEOUT).await
+        } else {
+            wal_spine_events(execution_id, None).await
+        };
+    let comparand = match &comparand_events {
+        Ok(evs) => fold_with_body(
+            if comparand_source == "tier" {
+                FoldSource::EhdbTier
+            } else {
+                FoldSource::WalSpine
+            },
+            evs.clone(),
+        ),
         Err(r) => Err(r.clone()),
     };
 
     let mut diff: Vec<String> = Vec::new();
     let mut same_version = false;
-    if let (Ok((pgs, pgb)), Ok((wals, walb))) = (&pg, &wal) {
-        same_version = pgs.version == wals.version;
+    if let (Ok((pgs, pgb)), Ok((cs, cb))) = (&pg, &comparand) {
+        same_version = pgs.version == cs.version;
         if same_version {
-            json_diff_paths(pgb, walb, "", &mut diff);
+            json_diff_paths(pgb, cb, "", &mut diff);
         }
     }
+
+    // Per-event INPUT diff — the minimal reproducer.
+    //
+    // `diff_paths` names the differing *state* path; this names the event and
+    // field that produced it. Without it a divergence is observable but not
+    // attributable, which is what left noetl/ai-meta#307 stuck.
+    //
+    // ⚠ Values are reported ONLY for `created_at`, which is the hypothesis under
+    // test and carries nothing sensitive. `context`, `meta` and `result` report
+    // only THAT they differ — the same discipline the presence counts below
+    // already follow, because `context` is exactly the field that could carry
+    // customer material.
+    let input_event_diffs: Vec<serde_json::Value> = match &comparand_events {
+        Err(_) => Vec::new(),
+        Ok(cev) => {
+            let by_id: std::collections::BTreeMap<i64, &crate::db::models::Event> =
+                cev.iter().map(|e| (e.event_id, e)).collect();
+            pg_events
+                .iter()
+                .filter_map(|a| {
+                    let b = by_id.get(&a.event_id)?;
+                    let fields = differing_fields(a, b);
+                    let ts_differs = fields.contains(&"created_at");
+                    if fields.is_empty() {
+                        return None;
+                    }
+                    Some(serde_json::json!({
+                        "event_id": a.event_id,
+                        "event_type": a.event_type,
+                        "fields": fields,
+                        // Timestamps only — see the note above.
+                        "postgres_created_at": ts_differs.then(|| a.created_at.to_rfc3339()),
+                        "comparand_created_at": ts_differs.then(|| b.created_at.to_rfc3339()),
+                    }))
+                })
+                .collect()
+        }
+    };
+
+    // ⚠ Compared AFTER `normalise_event_precision` would run, so a difference
+    // here is one the fold actually sees — not one the normaliser reconciles.
+    let input_event_diffs_post_normalisation: Vec<serde_json::Value> = match &comparand_events {
+        Err(_) => Vec::new(),
+        Ok(cev) => {
+            let mut a_norm = pg_events.clone();
+            let mut b_norm = cev.clone();
+            normalise_event_precision(&mut a_norm);
+            normalise_event_precision(&mut b_norm);
+            let by_id: std::collections::BTreeMap<i64, &crate::db::models::Event> =
+                b_norm.iter().map(|e| (e.event_id, e)).collect();
+            a_norm
+                .iter()
+                .filter_map(|a| {
+                    let b = by_id.get(&a.event_id)?;
+                    (a.created_at != b.created_at).then(|| {
+                        serde_json::json!({
+                            "event_id": a.event_id,
+                            "event_type": a.event_type,
+                            "postgres_created_at": a.created_at.to_rfc3339(),
+                            "comparand_created_at": b.created_at.to_rfc3339(),
+                        })
+                    })
+                })
+                .collect()
+        }
+    };
 
     // Per-event field presence, so a state difference can be traced to the
     // INPUT rather than only observed in the output. Counts only — no values,
@@ -1464,11 +1587,22 @@ pub async fn fold_diff_endpoint(
         "same_version": same_version,
         "postgres": pg.as_ref().ok().map(|(s, _)| s),
         "postgres_refusal": pg.as_ref().err(),
-        "wal": wal.as_ref().ok().map(|(s, _)| s),
-        "wal_refusal": wal.as_ref().err(),
+        // Back-compat: these keep their names for `source=wal`, and are null
+        // under `source=tier` so an old caller never silently reads a tier
+        // answer as a WAL one.
+        "wal": (comparand_source == "wal").then(|| comparand.as_ref().ok().map(|(s, _)| s)).flatten(),
+        "wal_refusal": (comparand_source == "wal").then(|| comparand.as_ref().err()).flatten(),
+        "comparand_source": comparand_source,
+        "comparand": comparand.as_ref().ok().map(|(s, _)| s),
+        "comparand_refusal": comparand.as_ref().err(),
         "diff_paths": diff,
+        "input_event_diffs": input_event_diffs,
+        "input_event_diffs_post_normalisation": input_event_diffs_post_normalisation,
         "input_fields_postgres": field_presence(&pg_events),
-        "input_fields_wal": spine_events.as_ref().ok().map(|e| field_presence(e)),
+        "input_fields_wal": (comparand_source == "wal")
+            .then(|| comparand_events.as_ref().ok().map(|e| field_presence(e)))
+            .flatten(),
+        "input_fields_comparand": comparand_events.as_ref().ok().map(|e| field_presence(e)),
     })))
 }
 
@@ -2149,4 +2283,98 @@ pub async fn recovery_compare_endpoint(
     Ok(axum::Json(
         crate::services::orch_snapshot::recovery_read_comparison(pool, execution_id).await,
     ))
+}
+
+#[cfg(test)]
+mod differing_fields_tests {
+    use super::*;
+
+    fn ev(id: i64) -> crate::db::models::Event {
+        crate::db::models::Event {
+            id: 0,
+            event_id: id,
+            execution_id: 1,
+            catalog_id: 2,
+            parent_event_id: None,
+            parent_execution_id: None,
+            event_type: "command.issued".to_string(),
+            node_id: Some("n".into()),
+            node_name: Some("step".into()),
+            node_type: Some("task".into()),
+            status: "ok".to_string(),
+            context: None,
+            meta: None,
+            result: None,
+            worker_id: Some("w".into()),
+            attempt: Some(1),
+            created_at: chrono::DateTime::parse_from_rfc3339("2026-08-30T15:00:05.354081798Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+        }
+    }
+
+    #[test]
+    fn identical_events_report_nothing() {
+        // ⚠ The control that matters most: if this ever returns fields for equal
+        // events, every "no differences" answer the endpoint gives is noise, and
+        // an investigation reading it goes the wrong way.
+        assert!(differing_fields(&ev(1), &ev(1)).is_empty());
+    }
+
+    #[test]
+    fn a_one_nanosecond_difference_is_seen() {
+        // The hypothesis this endpoint exists to test. A differ that rounded, or
+        // compared to second precision, would report nothing here and exonerate
+        // the very cause under investigation.
+        let a = ev(1);
+        let mut b = ev(1);
+        b.created_at = chrono::DateTime::parse_from_rfc3339("2026-08-30T15:00:05.354081799Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert_eq!(differing_fields(&a, &b), vec!["created_at"]);
+    }
+
+    #[test]
+    fn a_one_microsecond_difference_is_seen() {
+        // The specific residual the previous floor-vs-round investigation
+        // measured: "…725065Z != …725064Z".
+        let a = ev(1);
+        let mut b = ev(1);
+        b.created_at = chrono::DateTime::parse_from_rfc3339("2026-08-30T15:00:05.354082798Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert_eq!(differing_fields(&a, &b), vec!["created_at"]);
+    }
+
+    #[test]
+    fn every_compared_field_is_actually_compared() {
+        // ⚠⚠ A field the differ forgets is a cause it can never name. Each
+        // mutation below must surface exactly its own field — this is the
+        // positive control for coverage, not just for equality.
+        let base = ev(1);
+        let cases: Vec<(&str, Box<dyn Fn(&mut crate::db::models::Event)>)> = vec![
+            ("event_type", Box::new(|e: &mut crate::db::models::Event| e.event_type = "x".into())),
+            ("status", Box::new(|e: &mut crate::db::models::Event| e.status = "x".into())),
+            ("node_id", Box::new(|e: &mut crate::db::models::Event| e.node_id = None)),
+            ("node_name", Box::new(|e: &mut crate::db::models::Event| e.node_name = None)),
+            ("node_type", Box::new(|e: &mut crate::db::models::Event| e.node_type = None)),
+            ("catalog_id", Box::new(|e: &mut crate::db::models::Event| e.catalog_id = 99)),
+            ("parent_event_id", Box::new(|e: &mut crate::db::models::Event| e.parent_event_id = Some(7))),
+            ("parent_execution_id", Box::new(|e: &mut crate::db::models::Event| e.parent_execution_id = Some(7))),
+            ("worker_id", Box::new(|e: &mut crate::db::models::Event| e.worker_id = None)),
+            ("attempt", Box::new(|e: &mut crate::db::models::Event| e.attempt = Some(9))),
+            ("context", Box::new(|e: &mut crate::db::models::Event| e.context = Some(serde_json::json!({"a":1})))),
+            ("meta", Box::new(|e: &mut crate::db::models::Event| e.meta = Some(serde_json::json!({"a":1})))),
+            ("result", Box::new(|e: &mut crate::db::models::Event| e.result = Some(serde_json::json!({"a":1})))),
+        ];
+        for (name, mutate) in cases {
+            let mut b = base.clone();
+            mutate(&mut b);
+            assert_eq!(
+                differing_fields(&base, &b),
+                vec![name],
+                "mutating {name} must be reported as exactly {name}"
+            );
+        }
+    }
 }
