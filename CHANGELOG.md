@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.97.0](https://github.com/noetl/server/compare/v3.96.0...v3.97.0) (2026-08-30)
+
+### Features
+
+* **catalog:** implement the tier serve path, fail-closed ([8ba64c3](https://github.com/noetl/server/commit/8ba64c3ba1a23714b2f97c4c5a09f9ce860f6f9b))
+* **fold-diff:** compare Postgres against the TIER and name the diverging field ([9bf6680](https://github.com/noetl/server/commit/9bf66809b578937f12ccaac53a417aab70771280)), closes [noetl/ai-meta#307](https://github.com/noetl/ai-meta/issues/307) [#307](https://github.com/noetl/server/issues/307)
+
 ## [3.96.0](https://github.com/noetl/server/compare/v3.95.1...v3.96.0) (2026-08-29)
 
 ### Features
