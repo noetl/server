@@ -630,25 +630,43 @@ async fn resolve_catalog(state: &AppState, request: &ExecuteRequest) -> AppResul
         // is the cutover and is an owner decision — it is NOT taken here, and
         // the relation's answer is never substituted below.
         let m = crate::handlers::catalog_read::mode();
-        if m.consults_relation() {
-            let rel = crate::handlers::catalog_read::cached_relation().await;
-            let outcome = crate::handlers::catalog_read::compare_latest(
-                rel.as_ref(),
-                &entry.1,
-                Some(entry.2 as i32),
-            );
-            crate::handlers::catalog_read::record(outcome);
-            if outcome == "disagree" {
-                tracing::warn!(
-                    target: "noetl_server::catalog_read",
-                    path = %entry.1, incumbent_version = entry.2,
-                    "catalog relation disagrees with the incumbent on the resolved version; \
-                     serving the incumbent"
-                );
-            }
+        if !m.consults_relation() {
+            return Ok((entry.0, entry.1));
         }
 
-        Ok((entry.0, entry.1))
+        let rel = crate::handlers::catalog_read::cached_relation().await;
+        let outcome = crate::handlers::catalog_read::compare_latest(
+            rel.as_ref(),
+            &entry.1,
+            Some(entry.2 as i32),
+        );
+        crate::handlers::catalog_read::record(outcome);
+        if outcome == "disagree" {
+            tracing::warn!(
+                target: "noetl_server::catalog_read",
+                path = %entry.1, incumbent_version = entry.2,
+                "catalog relation disagrees with the incumbent on the resolved version; \
+                 serving the incumbent"
+            );
+        }
+
+        // The cutover (RFC step 3 §5). ⚠⚠ Fail-closed: `serve_decision` returns
+        // the relation's entry ONLY on `agree`, so `tier` can never serve a
+        // worse answer than the database — a stale relation (the 60s
+        // read-your-writes window) resolves as `fold_missing` and keeps the
+        // incumbent rather than failing to find a playbook that exists.
+        let served =
+            crate::handlers::catalog_read::serve_decision(m, rel.as_ref(), outcome, &entry.1);
+        match served {
+            Some(e) => {
+                crate::handlers::catalog_read::record_served("relation");
+                Ok((e.catalog_id, e.path.clone()))
+            }
+            None => {
+                crate::handlers::catalog_read::record_served("incumbent");
+                Ok((entry.0, entry.1))
+            }
+        }
     } else {
         Err(AppError::Validation(
             "Either path or catalog_id must be provided".to_string(),

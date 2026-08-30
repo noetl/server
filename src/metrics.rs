@@ -3577,6 +3577,13 @@ pub fn init_ehdb_projection_series() {
             .with_label_values(&["get_latest", o])
             .inc_by(0);
     }
+    // ⚠ Pinned: `relation` reading 0 must be distinguishable from the family
+    // being absent, which is the whole evidence question for the cutover.
+    for b in crate::handlers::catalog_read::SERVED_BY {
+        catalog_read_served_total()
+            .with_label_values(&[b])
+            .inc_by(0);
+    }
     for m in crate::handlers::catalog_log::MODES {
         for o in crate::handlers::catalog_log::OUTCOMES {
             catalog_log_total().with_label_values(&[m, o]).inc_by(0);
@@ -3584,7 +3591,9 @@ pub fn init_ehdb_projection_series() {
     }
     for m in crate::handlers::catalog_snapshot::MODES {
         for o in crate::handlers::catalog_snapshot::OUTCOMES {
-            catalog_snapshot_total().with_label_values(&[m, o]).inc_by(0);
+            catalog_snapshot_total()
+                .with_label_values(&[m, o])
+                .inc_by(0);
         }
     }
     for mode in crate::handlers::ehdb_projection_fold::RECOVERY_SOURCES {
@@ -4192,6 +4201,26 @@ pub fn ehdb_recovery_source_info() -> &'static IntGaugeVec {
 }
 
 /// Catalog relation reads compared against the incumbent (RFC step 3 §5.1).
+pub fn catalog_read_served_total() -> &'static IntCounterVec {
+    static M: std::sync::OnceLock<IntCounterVec> = std::sync::OnceLock::new();
+    M.get_or_init(|| {
+        let m = IntCounterVec::new(
+            prometheus::Opts::new(
+                "noetl_catalog_read_served_total",
+                "Catalog path resolutions by which source answered (incumbent Postgres vs the folded relation).",
+            ),
+            &["served_by"],
+        )
+        .expect("catalog_read_served_total");
+        registry().register(Box::new(m.clone())).ok();
+        m
+    })
+}
+
+pub fn record_catalog_read_served(by: &str) {
+    catalog_read_served_total().with_label_values(&[by]).inc();
+}
+
 pub fn catalog_relation_read_total() -> &'static IntCounterVec {
     static M: std::sync::OnceLock<IntCounterVec> = std::sync::OnceLock::new();
     M.get_or_init(|| {
@@ -4238,7 +4267,9 @@ pub fn catalog_log_total() -> &'static IntCounterVec {
 
 /// Record one catalog-log attempt.
 pub fn record_catalog_log(mode: &str, outcome: &str) {
-    catalog_log_total().with_label_values(&[mode, outcome]).inc();
+    catalog_log_total()
+        .with_label_values(&[mode, outcome])
+        .inc();
 }
 
 /// Execution-start catalog snapshots, by mode and outcome.
