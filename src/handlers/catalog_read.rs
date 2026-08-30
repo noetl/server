@@ -131,11 +131,10 @@ pub async fn cached_relation() -> Option<crate::handlers::catalog_relation::Cata
             }
         }
     }
-    let fresh = crate::handlers::catalog_log::read_and_fold(
-        crate::handlers::catalog_log::FOLD_READ_CAP,
-    )
-    .await
-    .ok()?;
+    let fresh =
+        crate::handlers::catalog_log::read_and_fold(crate::handlers::catalog_log::FOLD_READ_CAP)
+            .await
+            .ok()?;
     let mut g = cache().lock().unwrap_or_else(|e| e.into_inner());
     *g = Some((Instant::now(), fresh.clone()));
     Some(fresh)
@@ -145,6 +144,40 @@ pub async fn cached_relation() -> Option<crate::handlers::catalog_relation::Cata
 ///
 /// Returns the outcome label. **Never returns the relation's answer for use** —
 /// serving is a separate decision and a separate mode.
+/// The answer `tier` mode serves, or `None` to keep the incumbent.
+///
+/// ⚠⚠ **Fail-closed by construction.** The relation's answer is served *only*
+/// when it AGREES with the incumbent on the resolved version. Every other
+/// outcome — the relation missing the entry (`fold_missing`), unavailable
+/// (`fold_unavailable`), holding an entry the source retired
+/// (`source_missing`), or disagreeing on the version — keeps the incumbent.
+///
+/// That makes the cutover observationally identical to `postgres` in steady
+/// state, which is exactly what a safe cutover should look like: the relation
+/// enters the serving path and its failures become visible, without any window
+/// in which it can serve a *worse* answer than the database.
+///
+/// ⚠ The case this specifically protects against is the read-your-writes window:
+/// `cached_relation()` is up to `NOETL_CATALOG_READ_CACHE_SECS` (default 60s)
+/// stale, so a playbook registered seconds ago resolves as `fold_missing` — and
+/// a version of this that served the relation regardless would fail to find a
+/// playbook that demonstrably exists.
+pub fn serve_decision<'a>(
+    mode: Mode,
+    relation: Option<&'a crate::handlers::catalog_relation::CatalogRelation>,
+    outcome: &str,
+    path: &str,
+) -> Option<&'a crate::handlers::catalog_relation::Entry> {
+    if !mode.serves_relation() || outcome != "agree" {
+        return None;
+    }
+    relation.and_then(|r| r.get_latest(path))
+}
+
+/// Which source actually answered. Pinned so `relation` reading 0 is
+/// distinguishable from the family being absent.
+pub const SERVED_BY: [&str; 2] = ["incumbent", "relation"];
+
 pub fn compare_latest(
     relation: Option<&crate::handlers::catalog_relation::CatalogRelation>,
     path: &str,
@@ -168,6 +201,16 @@ pub fn compare_latest(
 /// Record one comparison.
 pub fn record(outcome: &str) {
     crate::metrics::record_catalog_relation_read("get_latest", outcome);
+}
+
+/// Which source actually answered this resolution.
+///
+/// ⚠ The number that makes a cutover demonstrable rather than asserted: under
+/// `tier`, `served_by="relation"` climbing is the only evidence the relation is
+/// really in the serving path. Under `verify` it stays at `incumbent` by
+/// construction, which is the control.
+pub fn record_served(by: &str) {
+    crate::metrics::record_catalog_read_served(by);
 }
 
 #[cfg(test)]
@@ -280,8 +323,82 @@ mod tests {
         }
         assert_eq!(MODES.len(), 3);
         assert_eq!(OUTCOMES.len(), 5);
-        for o in ["agree", "disagree", "fold_missing", "source_missing", "fold_unavailable"] {
+        for o in [
+            "agree",
+            "disagree",
+            "fold_missing",
+            "source_missing",
+            "fold_unavailable",
+        ] {
             assert!(OUTCOMES.contains(&o));
         }
+    }
+}
+
+#[cfg(test)]
+mod serve_decision_tests {
+    use super::*;
+    use crate::handlers::catalog_relation::CatalogRelation;
+
+    fn rel_with(path: &str, version: i32) -> CatalogRelation {
+        CatalogRelation::fold(&[serde_json::json!({
+            "event_type": "catalog.registered", "path": path, "version": version,
+            "content_sha256": "d1", "kind": "playbook", "catalog_id": "42",
+        })])
+    }
+
+    #[test]
+    fn verify_never_serves_the_relation() {
+        // ⭐ The control that keeps `verify` an observation mode. If this ever
+        // fails, enabling `verify` has silently become a cutover.
+        let r = rel_with("p", 3);
+        assert!(serve_decision(Mode::Verify, Some(&r), "agree", "p").is_none());
+        assert!(serve_decision(Mode::Postgres, Some(&r), "agree", "p").is_none());
+    }
+
+    #[test]
+    fn tier_serves_only_on_agree() {
+        let r = rel_with("p", 3);
+        assert!(
+            serve_decision(Mode::Tier, Some(&r), "agree", "p").is_some(),
+            "the positive case — otherwise the cutover serves nothing and is a no-op"
+        );
+        // ⚠⚠ Every other outcome must keep the incumbent. `fold_missing` is the
+        // read-your-writes window: a playbook registered inside the 60s cache
+        // window is absent from the relation, and serving that absence would
+        // fail to find a playbook that demonstrably exists.
+        for bad in [
+            "fold_missing",
+            "fold_unavailable",
+            "source_missing",
+            "disagree",
+        ] {
+            assert!(
+                serve_decision(Mode::Tier, Some(&r), bad, "p").is_none(),
+                "tier must NOT serve on {bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn tier_with_no_relation_keeps_the_incumbent() {
+        assert!(serve_decision(Mode::Tier, None, "agree", "p").is_none());
+    }
+
+    #[test]
+    fn tier_serves_the_relations_own_catalog_id() {
+        // The substitution must actually take the relation's value — returning
+        // the incumbent's would make the cutover invisible and untestable.
+        let r = rel_with("p", 3);
+        let e = serve_decision(Mode::Tier, Some(&r), "agree", "p").expect("serves");
+        assert_eq!(e.catalog_id, 42);
+        assert_eq!(e.path, "p");
+    }
+
+    #[test]
+    fn the_served_by_labels_are_the_two_that_get_pinned() {
+        assert_eq!(SERVED_BY.len(), 2);
+        assert!(SERVED_BY.contains(&"incumbent"));
+        assert!(SERVED_BY.contains(&"relation"));
     }
 }
