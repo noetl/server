@@ -465,18 +465,30 @@ fn event_from_tier_payload(p: &serde_json::Value) -> Option<crate::db::models::E
 /// agreement-by-construction this effort keeps refusing.
 fn truncate_to_micros(ts: chrono::DateTime<chrono::Utc>) -> chrono::DateTime<chrono::Utc> {
     use chrono::TimeZone;
-    // ROUND half-up, do not truncate.
+    // TRUNCATE (floor). Do NOT round.
     //
-    // Postgres rounds a `timestamp` to the nearest microsecond; the first
-    // version of this function floored, and the two agreed only when the
-    // sub-microsecond remainder happened to be < 500 ns — measured at 1 of 4
-    // executions matching, with the residual diff exactly one microsecond:
+    // ⚠⚠ AN EARLIER VERSION ROUNDED HALF-UP, ON A FALSE PREMISE. Its comment
+    // asserted "Postgres rounds a `timestamp` to the nearest microsecond".
+    // Postgres does not — it truncates. Measured on prod 2026-08-30 with
+    // `/api/ehdb/projection-fold/diff/{id}?source=tier`, execution
+    // 352467520122265600, event 352467520235511808 (`playbook_started`):
     //
-    //   /started_at: "…05:09:02.725065Z" != "…05:09:02.725064Z"
-    //                        └ Postgres rounded up   └ we floored
+    //   source instant (EHDB tier, nanoseconds) …15:00:05.354081798
+    //   what Postgres actually stored           …15:00:05.354081   ← TRUNCATED
+    //   what round-half-up produced             …15:00:05.354082   ← 1 µs adrift
     //
-    // Matching the system of record's rounding is the whole point: the goal is
-    // the value Postgres would have stored, not merely a coarser value.
+    // 798 ns would have rounded UP. Postgres kept 354081. That is truncation,
+    // and the same shape held on every one of the 14 events across three
+    // executions — `created_at` was the ONLY differing field.
+    //
+    // The round-half-up change was made to fix this very divergence and did not:
+    // agreement among comparable executions was "1 of 4" before it and 15 of 37
+    // after. It moved the fold AWAY from the system of record.
+    //
+    // ⚠ Do not "fix" this back to rounding. The goal is the value Postgres would
+    // have stored, and prod says that value is the truncated one. If you believe
+    // otherwise, re-run the diff endpoint above before changing it — the
+    // hard pass condition is `input_event_diffs_post_normalisation == 0`.
     let nanos = match ts.timestamp_nanos_opt() {
         Some(n) => n,
         // Outside the ~1677–2262 nanosecond-representable window. Leave it
@@ -484,10 +496,10 @@ fn truncate_to_micros(ts: chrono::DateTime<chrono::Utc>) -> chrono::DateTime<chr
         // about; such an event cannot come from this platform's clock.
         None => return ts,
     };
+    // `div_euclid` floors, which for the positive instants this platform
+    // produces is exactly truncation toward the epoch.
     let micros = nanos.div_euclid(1_000);
-    let rem = nanos.rem_euclid(1_000);
-    let rounded = if rem >= 500 { micros + 1 } else { micros };
-    chrono::Utc.timestamp_micros(rounded).single().unwrap_or(ts)
+    chrono::Utc.timestamp_micros(micros).single().unwrap_or(ts)
 }
 
 /// Apply [`truncate_to_micros`] across an event set, in place.
@@ -2048,17 +2060,34 @@ mod tests {
             645_451,
             "microsecond precision must be preserved; only sub-µs is resolved"
         );
-        // ROUNDING, not flooring — this is what Postgres does, and the first
-        // version of this code got it wrong in a way that only showed on ~half
-        // of real executions.
+        // ⚠⚠ TRUNCATION, not rounding. This assertion previously required the
+        // opposite, on the premise that Postgres rounds. It does not.
+        //
+        // Measured on prod 2026-08-30 (execution 352467520122265600, event
+        // 352467520235511808): the source instant was …354081798 and Postgres
+        // stored …354081. A remainder of 798 ns would have rounded UP; Postgres
+        // kept the floor.
+        //
+        // The round-half-up version was introduced to fix exactly this
+        // divergence and did not — agreement went from "1 of 4" to 15 of 37.
+        // Flipping this back to rounding re-opens it.
         let up = chrono::Utc
             .timestamp_opt(1_756_184_493, 645_451_500)
             .single()
             .unwrap();
         assert_eq!(
             truncate_to_micros(up).timestamp_subsec_micros(),
-            645_452,
-            "a remainder >= 500ns must round UP, as Postgres does"
+            645_451,
+            "a remainder of 500ns must TRUNCATE, not round up — Postgres floors"
+        );
+        let high = chrono::Utc
+            .timestamp_opt(1_756_184_493, 645_451_798)
+            .single()
+            .unwrap();
+        assert_eq!(
+            truncate_to_micros(high).timestamp_subsec_micros(),
+            645_451,
+            "the exact prod remainder (798ns) must floor — this is the reproducer"
         );
         let down = chrono::Utc
             .timestamp_opt(1_756_184_493, 645_451_499)
@@ -2067,7 +2096,18 @@ mod tests {
         assert_eq!(
             truncate_to_micros(down).timestamp_subsec_micros(),
             645_451,
-            "a remainder < 500ns must round DOWN"
+            "a remainder < 500ns floors too — truncation has no threshold"
+        );
+        // ⚠ 999ns is the strongest case: rounding would carry into the next
+        // microsecond, truncation cannot.
+        let nearly = chrono::Utc
+            .timestamp_opt(1_756_184_493, 645_451_999)
+            .single()
+            .unwrap();
+        assert_eq!(
+            truncate_to_micros(nearly).timestamp_subsec_micros(),
+            645_451,
+            "999ns must NOT carry — that carry is the entire 1µs divergence"
         );
         // Two instants a microsecond apart stay distinct.
         let next = chrono::Utc
@@ -2089,16 +2129,19 @@ mod tests {
                 .unwrap();
             e
         };
-        // 645_451_448 rounds DOWN to 645451; 645_451_999 rounds UP to 645452.
+        // ⚠ Under TRUNCATION: 645_451_448 and 645_451_999 both floor to 645451;
+        // 645_452_001 floors to 645452. The previous version of this test
+        // asserted the opposite pairing, because it assumed rounding.
         let mut evs = vec![mk(645_451_448), mk(645_451_999), mk(645_452_001)];
         normalise_event_precision(&mut evs);
-        assert_ne!(
-            evs[0].created_at, evs[1].created_at,
-            "these straddle the half-µs boundary and must NOT collapse together"
-        );
         assert_eq!(
+            evs[0].created_at, evs[1].created_at,
+            "both are within the same microsecond and must floor together — \
+             under rounding these would have split, which is the bug"
+        );
+        assert_ne!(
             evs[1].created_at, evs[2].created_at,
-            "645_451_999 rounds up to the same µs as 645_452_001 rounds down to"
+            "645_451_999 must NOT carry into 645452; that carry is the 1µs drift"
         );
         assert!(
             evs.iter()
