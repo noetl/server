@@ -401,10 +401,18 @@ fn event_from_tier_payload(p: &serde_json::Value) -> Option<crate::db::models::E
         context: p.get("context").filter(|v| !v.is_null()).cloned(),
         meta: p.get("meta").filter(|v| !v.is_null()).cloned(),
         result: p.get("result").filter(|v| !v.is_null()).cloned(),
-        worker_id: p
-            .get("worker_id")
-            .and_then(|v| v.as_str())
-            .map(str::to_string),
+        // The column is `worker_id VARCHAR`, but a payload can carry the value
+        // as a JSON *number* — a snowflake id serialises that way unless the
+        // producer stringifies it. Reading only `as_str()` silently yielded
+        // `None` for those, while the Postgres side read the same row as
+        // `Some("8123456789")`. That asymmetry is a digest divergence with no
+        // visible cause, and it is one of the two residual #307 diffs.
+        worker_id: p.get("worker_id").and_then(|v| {
+            v.as_str()
+                .map(str::to_string)
+                .or_else(|| v.as_i64().map(|n| n.to_string()))
+                .or_else(|| v.as_u64().map(|n| n.to_string()))
+        }),
         attempt: p
             .get("meta")
             .and_then(|m| m.get("attempt"))
@@ -515,6 +523,7 @@ fn fold_with_body(
 ) -> Result<(FoldedState, serde_json::Value), FoldRefusal> {
     use noetl_orchestrate_core::state::{canonical_state_digest, WorkflowState};
     normalise_event_precision(&mut events);
+    normalise_null_json(&mut events);
     let version = events.iter().map(|e| e.event_id).max().unwrap_or(0);
     let applied_count = events.len();
     let core: Vec<noetl_orchestrate_core::event::Event> = events.iter().map(Into::into).collect();
@@ -529,6 +538,40 @@ fn fold_with_body(
         },
         body,
     ))
+}
+
+/// Collapse a JSON `null` in a JSON-typed column to `None`, on both fold paths.
+///
+/// # Why this is symmetric rather than a tier-side fix
+///
+/// `noetl.event.context` is `JSONB`. sqlx decodes a SQL NULL into `None` but a
+/// jsonb `'null'` into `Some(Value::Null)` — two different Rust values for two
+/// database states. The mirror payload cannot preserve that distinction: it
+/// serialises `Option<Value>` into JSON, so *both* arrive at the tier as
+/// `"context": null`.
+///
+/// The tier reader compensated with `.filter(|v| !v.is_null())`, which is right
+/// for the common case (SQL NULL) and wrong for the rare one, and the Postgres
+/// reader had no matching filter. So one jsonb-`null` row was enough to make the
+/// two sides fold to different digests — the residual `context` diff in
+/// noetl/ai-meta#307.
+///
+/// Rather than try to carry a distinction the payload cannot express, this
+/// erases it on both sides. That is sound because it is also semantically
+/// right: a `context` of JSON `null` carries exactly as much information as an
+/// absent one, and `WorkflowState::apply_event` treats them identically.
+fn normalise_null_json(events: &mut [crate::db::models::Event]) {
+    for e in events.iter_mut() {
+        if matches!(e.context, Some(serde_json::Value::Null)) {
+            e.context = None;
+        }
+        if matches!(e.meta, Some(serde_json::Value::Null)) {
+            e.meta = None;
+        }
+        if matches!(e.result, Some(serde_json::Value::Null)) {
+            e.result = None;
+        }
+    }
 }
 
 fn fold(
@@ -2419,5 +2462,113 @@ mod differing_fields_tests {
                 "mutating {name} must be reported as exactly {name}"
             );
         }
+    }
+
+    /// #307 residual divergence: does the TIER reader disagree with the
+    /// POSTGRES reader on the same value?
+    ///
+    /// The two paths extract the same fields differently.  Postgres uses
+    /// `try_get`, driven by the column type; the tier picks fields out of JSON
+    /// by hand.  Hand-written extraction is where an asymmetry hides, and an
+    /// asymmetry here shows up as a digest divergence with no obvious cause —
+    /// which is exactly what #307's residual `worker_id` / `context` diffs look
+    /// like.
+    ///
+    /// This is a table of the values the mirror can actually put in a payload,
+    /// checked against what the Postgres reader would have produced from the
+    /// same row.  It is a controlled experiment, not an inference.
+    #[test]
+    fn tier_reader_agrees_with_postgres_reader_on_edge_values() {
+        use serde_json::json;
+
+        // (label, tier payload value, what Postgres `try_get` yields for that row)
+        struct Case {
+            label: &'static str,
+            payload: serde_json::Value,
+            pg_context: Option<serde_json::Value>,
+            pg_worker: Option<String>,
+        }
+
+        let cases = vec![
+            Case {
+                label: "context is SQL NULL",
+                payload: json!({"event_id": 1, "event_type": "x", "status": "s",
+                                "context": null, "worker_id": null}),
+                pg_context: None,
+                pg_worker: None,
+            },
+            Case {
+                label: "context is JSONB 'null' (a JSON null INSIDE the column)",
+                payload: json!({"event_id": 1, "event_type": "x", "status": "s",
+                                "context": null, "worker_id": "w1"}),
+                // sqlx decodes a jsonb `null` into Value::Null, NOT into None.
+                pg_context: Some(serde_json::Value::Null),
+                pg_worker: Some("w1".into()),
+            },
+            Case {
+                label: "worker_id present as a string",
+                payload: json!({"event_id": 1, "event_type": "x", "status": "s",
+                                "context": {"a": 1}, "worker_id": "worker-7"}),
+                pg_context: Some(json!({"a": 1})),
+                pg_worker: Some("worker-7".into()),
+            },
+            Case {
+                label: "worker_id serialised as a NUMBER (snowflake)",
+                payload: json!({"event_id": 1, "event_type": "x", "status": "s",
+                                "context": {}, "worker_id": 8123456789_i64}),
+                pg_context: Some(json!({})),
+                pg_worker: Some("8123456789".into()),
+            },
+            Case {
+                label: "context is an empty object",
+                payload: json!({"event_id": 1, "event_type": "x", "status": "s",
+                                "context": {}, "worker_id": "w"}),
+                pg_context: Some(json!({})),
+                pg_worker: Some("w".into()),
+            },
+        ];
+
+        let mut disagreements = Vec::new();
+        for c in &cases {
+            let mut tier = vec![event_from_tier_payload(&c.payload)
+                .unwrap_or_else(|| panic!("{}: tier reader refused the payload", c.label))];
+            // Compare what the FOLD sees, not what the readers raw-produce: the
+            // `context` fix is a normalisation both paths go through, so the
+            // invariant under test is post-normalisation agreement.
+            let mut pg = tier.clone();
+            pg[0].context = c.pg_context.clone();
+            pg[0].worker_id = c.pg_worker.clone();
+            normalise_null_json(&mut tier);
+            normalise_null_json(&mut pg);
+            let ev = &tier[0];
+            let c_pg_context = pg[0].context.clone();
+            let c_pg_worker = pg[0].worker_id.clone();
+            let c = Case {
+                label: c.label,
+                payload: c.payload.clone(),
+                pg_context: c_pg_context,
+                pg_worker: c_pg_worker,
+            };
+            let c = &c;
+            if ev.context != c.pg_context {
+                disagreements.push(format!(
+                    "{}: context tier={:?} postgres={:?}",
+                    c.label, ev.context, c.pg_context
+                ));
+            }
+            if ev.worker_id != c.pg_worker {
+                disagreements.push(format!(
+                    "{}: worker_id tier={:?} postgres={:?}",
+                    c.label, ev.worker_id, c.pg_worker
+                ));
+            }
+        }
+
+        assert!(
+            disagreements.is_empty(),
+            "the tier reader and the Postgres reader disagree on {} case(s):\n  {}",
+            disagreements.len(),
+            disagreements.join("\n  ")
+        );
     }
 }
