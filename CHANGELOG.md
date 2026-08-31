@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.99.1](https://github.com/noetl/server/compare/v3.99.0...v3.99.1) (2026-08-31)
+
+### Bug Fixes
+
+* **events:** unify the created_at producers so the stores agree by construction ([1f73b57](https://github.com/noetl/server/commit/1f73b57a2dfb75a553672c0e71e164192798016f)), closes [noetl/ai-meta#307](https://github.com/noetl/ai-meta/issues/307) [noetl/ai-meta#307](https://github.com/noetl/ai-meta/issues/307)
+
 ## [3.99.0](https://github.com/noetl/server/compare/v3.98.2...v3.99.0) (2026-08-31)
 
 ### Features
