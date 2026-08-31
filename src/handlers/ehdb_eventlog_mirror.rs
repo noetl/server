@@ -253,6 +253,59 @@ pub struct MirrorBatch {
     pub enqueued_at: Instant,
 }
 
+/// Env var gating the projector-sink mirror (noetl/ai-meta#307).
+pub const SINK_MIRROR_ENV: &str = "NOETL_EHDB_SINK_MIRROR";
+
+/// Whether `/api/internal/events/project` mirrors what it writes.
+///
+/// **Default OFF, and that is a retreat, not a design.**
+///
+/// Mirroring this sink closes the #307 missing-event class: the projector wrote
+/// 5,088 events on prod that never reached the tier, and an affected execution
+/// reads n=30 in Postgres against n=29 in the tier. Enabling it did fix that —
+/// post-deploy executions showed matching event counts.
+///
+/// It also introduced the opposite defect, which is why this flag exists.
+/// Measured on prod 2026-08-31, execution 352823243654045696:
+///
+/// ```text
+/// authoritative (mirror-expected) = 30
+/// ehdb (tier)                     = 45
+/// matched                         = 41   <- 41 tier records for 30 rows
+/// extra_event                     = 4    <- tier records with NO authoritative row
+///                                           [352824940644278272, 352824958205829120,
+///                                            352824960726605824, 352824961766793216]
+/// ```
+///
+/// So the tier gained **11 duplicates of matched rows plus 4 orphans**. The
+/// duplicates and the orphans are probably two different faults, and neither
+/// mechanism is pinned. Ruled out so far: the worker does not double-mirror
+/// (all pools run `MIRROR_SOURCE=server`); the emit-path INSERT carries no
+/// `ON CONFLICT`, so a retry aborts rather than silently re-mirroring; and the
+/// sink mirrors only rows the INSERT's `RETURNING` reported as accepted, so it
+/// cannot be mirroring rows Postgres rejected.
+///
+/// Turning it off returns the tier to the behaviour that measured
+/// `extra_event = 0` over 6,951 compared events, at the cost of reopening the
+/// missing-event class. That trade is deliberate: a tier holding MORE than the
+/// system of record is the worse failure, because nothing downstream is looking
+/// for it, and `extra_event` feeds the parity alert.
+///
+/// ⚠ Do not flip this on without first reproducing the duplicate mechanism in a
+/// test. "It looked fine in a burst" is what produced this flag — the first
+/// verification passed only because the comparator had not sampled those
+/// executions yet (`compared` was 0 at the same moment `extra_event` was 0).
+pub fn sink_mirror_enabled() -> bool {
+    std::env::var(SINK_MIRROR_ENV)
+        .ok()
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            v == "1" || v == "true" || v == "on" || v == "enabled"
+        })
+        .unwrap_or(false)
+}
+
+
 /// Mirror a batch of authoritative rows into the event-log tier.
 ///
 /// Called from the `emit_events` chokepoint with the rows that are about to
@@ -814,6 +867,63 @@ mod tests {
             "expected exactly the 5 known `noetl.event` insert-site files; found {:?}. \
              A new file writing this table must be registered above.",
             found.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// The projector-sink mirror must be OFF unless explicitly enabled.
+    ///
+    /// It shipped ON in server v3.99.0 and drove `extra_event` from 0 to 6 on
+    /// production within ten minutes. Default-off is the safe state until the
+    /// duplicate mechanism is reproduced.
+    #[test]
+    fn sink_mirror_is_off_by_default_and_needs_an_explicit_opt_in() {
+        // Cannot mutate process env safely here (tests share it and cargo does
+        // NOT serialise them), so exercise the parse rule directly.
+        fn parses_as_enabled(v: &str) -> bool {
+            let v = v.trim().to_ascii_lowercase();
+            v == "1" || v == "true" || v == "on" || v == "enabled"
+        }
+
+        for off in ["", " ", "0", "false", "no", "off", "disabled", "yes", "maybe"] {
+            assert!(
+                !parses_as_enabled(off),
+                "{off:?} must NOT enable the sink mirror — anything but an \
+                 explicit opt-in leaves the tier in the state that measured \
+                 extra_event = 0"
+            );
+        }
+        for on in ["1", "true", "TRUE", " on ", "enabled"] {
+            assert!(parses_as_enabled(on), "{on:?} must enable it");
+        }
+
+        // The unset case is the one that matters, and it is what the deployed
+        // manifests express: no NOETL_EHDB_SINK_MIRROR anywhere.
+        assert!(
+            !sink_mirror_enabled() || std::env::var(SINK_MIRROR_ENV).is_ok(),
+            "sink_mirror_enabled() returned true with {SINK_MIRROR_ENV} unset"
+        );
+    }
+
+    /// The guard from #263 must still account for every insert site.
+    ///
+    /// Gating the mirror changes which files contain a `mirror_rows` call, and a
+    /// registry that silently stopped matching would hide the next bypass.
+    #[test]
+    fn gating_the_sink_mirror_did_not_break_the_insert_registry() {
+        let internal = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/handlers/internal.rs"),
+        )
+        .expect("handlers/internal.rs readable");
+        let code = internal.split("#[cfg(test)]").next().unwrap_or("");
+        assert!(
+            code.contains("mirror_rows"),
+            "handlers/internal.rs must still CONTAIN the mirror call — the #263 \
+             registry lists it as the caller that mirrors services/internal.rs, \
+             and that claim is checked by file content"
+        );
+        assert!(
+            code.contains("sink_mirror_enabled()"),
+            "the call must be gated, not unconditional"
         );
     }
 }

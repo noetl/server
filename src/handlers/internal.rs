@@ -361,7 +361,10 @@ pub async fn events_project(
     // `mirror_rows` never returns an error, so a tier that is down degrades the
     // tier rather than failing a projection that Postgres already durably
     // accepted. Event-log stays primary; this only feeds the copy.
-    crate::handlers::ehdb_eventlog_mirror::mirror_rows(&state, &inserted).await;
+    // ⚠ DEFAULT OFF. See `sink_mirror_enabled` for why.
+    if crate::handlers::ehdb_eventlog_mirror::sink_mirror_enabled() {
+        crate::handlers::ehdb_eventlog_mirror::mirror_rows(&state, &inserted).await;
+    }
     // The durable-log write counter (noetl/ai-meta#212). This sink is the sole
     // writer of `noetl.event` under NOETL_EVENT_INGEST_PUBLISH_ONLY, and until
     // now it emitted only a log line — so "are rows still landing in the log"
