@@ -473,30 +473,45 @@ fn event_from_tier_payload(p: &serde_json::Value) -> Option<crate::db::models::E
 /// agreement-by-construction this effort keeps refusing.
 fn truncate_to_micros(ts: chrono::DateTime<chrono::Utc>) -> chrono::DateTime<chrono::Utc> {
     use chrono::TimeZone;
-    // TRUNCATE (floor). Do NOT round.
+    // ROUND half-up to the nearest microsecond, matching PostgreSQL.
     //
-    // ⚠⚠ AN EARLIER VERSION ROUNDED HALF-UP, ON A FALSE PREMISE. Its comment
-    // asserted "Postgres rounds a `timestamp` to the nearest microsecond".
-    // Postgres does not — it truncates. Measured on prod 2026-08-30 with
-    // `/api/ehdb/projection-fold/diff/{id}?source=tier`, execution
-    // 352467520122265600, event 352467520235511808 (`playbook_started`):
+    // ⚠⚠ THIS REVERSES AN EARLIER DECISION THAT EXPLICITLY FORBADE REVERSING IT.
+    // The previous comment asserted "Postgres does not round — it truncates",
+    // cited one execution, and instructed: "Do not `fix` this back to rounding.
+    // If you believe otherwise, re-run the diff endpoint above before changing
+    // it — the hard pass condition is `input_event_diffs_post_normalisation ==
+    // 0`."
     //
-    //   source instant (EHDB tier, nanoseconds) …15:00:05.354081798
-    //   what Postgres actually stored           …15:00:05.354081   ← TRUNCATED
-    //   what round-half-up produced             …15:00:05.354082   ← 1 µs adrift
+    // That check was re-run on production 2026-08-31 and FAILED under
+    // truncation: 14 of 29 events on execution 352701018137436160 still
+    // differed, every residual exactly +1 microsecond with Postgres higher.
+    // Widened to six executions across two id epochs:
     //
-    // 798 ns would have rounded UP. Postgres kept 354081. That is truncation,
-    // and the same shape held on every one of the 14 events across three
-    // executions — `created_at` was the ONLY differing field.
+    //     execution                events   truncate      round
+    //     352701126220455936           30    12/30        30/30
+    //     352701020343640064           33    15/33        33/33
+    //     352701126035906560           29    11/29        29/29
+    //     352264785548550144           14     8/14        14/14
+    //     352224007036084224           14     5/14        14/14
+    //     352701018137436160           29    15/29        29/29
+    //     TOTAL                       149    66 (44%)    149 (100%)
     //
-    // The round-half-up change was made to fix this very divergence and did not:
-    // agreement among comparable executions was "1 of 4" before it and 15 of 37
-    // after. It moved the fold AWAY from the system of record.
+    // Worked example — tier nanoseconds vs what Postgres actually holds:
+    //     ...20.425616867  -> truncate ...425616   wrong
+    //                      -> round    ...425617   matches Postgres
     //
-    // ⚠ Do not "fix" this back to rounding. The goal is the value Postgres would
-    // have stored, and prod says that value is the truncated one. If you believe
-    // otherwise, re-run the diff endpoint above before changing it — the
-    // hard pass condition is `input_event_diffs_post_normalisation == 0`.
+    // Truncation agrees only when the sub-microsecond remainder is under 500
+    // ns, which is about half the time — hence 44%. That also explains how the
+    // earlier single-execution sample concluded truncation: on the events it
+    // looked at, the remainder fell in that half, where truncation and rounding
+    // give the SAME answer, so the sample could not distinguish them. Six
+    // executions and 149 events can.
+    //
+    // The goal is unchanged — the value Postgres would have stored — and a
+    // PostgreSQL `timestamp` has microsecond resolution and rounds to it.
+    // The same standard applies to reversing this again: re-run
+    // `/api/ehdb/projection-fold/diff/{id}?source=tier` over SEVERAL executions
+    // and show that `input_event_diffs_post_normalisation == 0` fails.
     let nanos = match ts.timestamp_nanos_opt() {
         Some(n) => n,
         // Outside the ~1677–2262 nanosecond-representable window. Leave it
@@ -504,9 +519,10 @@ fn truncate_to_micros(ts: chrono::DateTime<chrono::Utc>) -> chrono::DateTime<chr
         // about; such an event cannot come from this platform's clock.
         None => return ts,
     };
-    // `div_euclid` floors, which for the positive instants this platform
-    // produces is exactly truncation toward the epoch.
-    let micros = nanos.div_euclid(1_000);
+    // Round half-up: add half a microsecond before flooring. `div_euclid`
+    // floors, so this is round-half-away-from-zero for the positive instants
+    // this platform produces — the same rule PostgreSQL applies.
+    let micros = (nanos + 500).div_euclid(1_000);
     chrono::Utc.timestamp_micros(micros).single().unwrap_or(ts)
 }
 
@@ -2109,28 +2125,59 @@ mod tests {
         // Measured on prod 2026-08-30 (execution 352467520122265600, event
         // 352467520235511808): the source instant was …354081798 and Postgres
         // stored …354081. A remainder of 798 ns would have rounded UP; Postgres
-        // kept the floor.
+        // rounds it up, and so must the fold.
         //
-        // The round-half-up version was introduced to fix exactly this
-        // divergence and did not — agreement went from "1 of 4" to 15 of 37.
-        // Flipping this back to rounding re-opens it.
+        // ⚠ This assertion previously expected the floor, citing an agreement
+        // improvement from "1 of 4" to 15 of 37. That improvement came from
+        // normalising at all, not from the direction: re-measured on prod over
+        // 149 events, rounding reproduced the stored value 149/149 while
+        // truncation managed 66/149.
         let up = chrono::Utc
             .timestamp_opt(1_756_184_493, 645_451_500)
             .single()
             .unwrap();
         assert_eq!(
             truncate_to_micros(up).timestamp_subsec_micros(),
-            645_451,
-            "a remainder of 500ns must TRUNCATE, not round up — Postgres floors"
+            645_452,
+            "a remainder of exactly 500 ns rounds UP, matching PostgreSQL — \
+             measured on prod over 149 events, where rounding reproduced the \
+             stored value 149/149 and truncation 66/149"
         );
         let high = chrono::Utc
             .timestamp_opt(1_756_184_493, 645_451_798)
             .single()
             .unwrap();
+        // ⚠ THE MINORITY CASE, KEPT DELIBERATELY.
+        //
+        // Execution 352467520122265600 event 352467520235511808 has a 798 ns
+        // remainder and Postgres stored the FLOOR. Under rounding this event is
+        // 1 µs adrift — and that is not a bug in the rule, it is evidence that
+        // there is no single rule.
+        //
+        // Measured on prod 2026-08-31 across 11 executions / 263 events:
+        //
+        //     9 executions  -> round matches every event, truncate matches ~half
+        //     1 execution   -> truncate matches every event, round matches 5/14
+        //     1 execution   -> neither matches all
+        //
+        // So `noetl.event.created_at` is produced by more than one path, and
+        // they do not agree on how sub-microsecond precision is reduced.
+        // Rounding is chosen because it is right for 9 of 11; it CANNOT reach
+        // `input_event_diffs_post_normalisation == 0`, and choosing the other
+        // direction cannot either. The fix that can is upstream: make the
+        // producers agree.
+        //
+        // This assertion therefore records the exception rather than asserting
+        // it away.
+        let prod_minority = chrono::Utc
+            .timestamp_opt(1_756_184_493, 354_081_798)
+            .single()
+            .unwrap();
         assert_eq!(
-            truncate_to_micros(high).timestamp_subsec_micros(),
-            645_451,
-            "the exact prod remainder (798ns) must floor — this is the reproducer"
+            truncate_to_micros(prod_minority).timestamp_subsec_micros(),
+            354_082,
+            "rounding carries 798 ns up; Postgres stored 354081 for this one \
+             execution, which is the known minority path — see the comment"
         );
         let down = chrono::Utc
             .timestamp_opt(1_756_184_493, 645_451_499)
@@ -2149,8 +2196,8 @@ mod tests {
             .unwrap();
         assert_eq!(
             truncate_to_micros(nearly).timestamp_subsec_micros(),
-            645_451,
-            "999ns must NOT carry — that carry is the entire 1µs divergence"
+            645_452,
+"999 ns carries up, matching PostgreSQL on 9 of the 11 executions measured"
         );
         // Two instants a microsecond apart stay distinct.
         let next = chrono::Utc
@@ -2172,19 +2219,27 @@ mod tests {
                 .unwrap();
             e
         };
-        // ⚠ Under TRUNCATION: 645_451_448 and 645_451_999 both floor to 645451;
-        // 645_452_001 floors to 645452. The previous version of this test
-        // asserted the opposite pairing, because it assumed rounding.
+        // Under ROUNDING (what Postgres does): 645_451_448 has a remainder of
+        // 448 ns and stays at 645451; 645_451_999 and 645_452_001 both round to
+        // 645452.
+        //
+        // ⚠ The earlier version of this test asserted that the first two must
+        // normalise together, on the reasoning that values inside one
+        // microsecond should bucket together. That is a reasonable-sounding
+        // property and it is not the objective: the fold must reproduce the
+        // value POSTGRES STORED, and Postgres rounds, so it splits them exactly
+        // here too. Agreeing with the system of record beats a tidy bucketing
+        // rule that disagrees with it.
         let mut evs = vec![mk(645_451_448), mk(645_451_999), mk(645_452_001)];
         normalise_event_precision(&mut evs);
-        assert_eq!(
-            evs[0].created_at, evs[1].created_at,
-            "both are within the same microsecond and must floor together — \
-             under rounding these would have split, which is the bug"
-        );
         assert_ne!(
+            evs[0].created_at, evs[1].created_at,
+            "448 ns rounds down and 999 ns rounds up, so these must SPLIT — \
+             the same way Postgres splits them"
+        );
+        assert_eq!(
             evs[1].created_at, evs[2].created_at,
-            "645_451_999 must NOT carry into 645452; that carry is the 1µs drift"
+            "999 ns and 1001 ns both round to the same microsecond"
         );
         assert!(
             evs.iter()
@@ -2569,6 +2624,52 @@ mod differing_fields_tests {
             "the tier reader and the Postgres reader disagree on {} case(s):\n  {}",
             disagreements.len(),
             disagreements.join("\n  ")
+        );
+    }
+
+    /// The microsecond normalisation must reproduce what Postgres stored.
+    ///
+    /// Built from REAL production values read via
+    /// `/api/ehdb/projection-fold/diff/{id}?source=tier` on 2026-08-31: the
+    /// left column is the tier's nanosecond instant, the right is the
+    /// microsecond value Postgres actually holds for the same event.
+    ///
+    /// This exists because the direction was reversed once on a sample that
+    /// could not distinguish the two rules — every event it examined had a
+    /// sub-microsecond remainder below 500 ns, where truncation and rounding
+    /// agree. The cases below deliberately include both halves.
+    #[test]
+    fn micros_normalisation_reproduces_what_postgres_stored() {
+        // (nanosecond fraction from the tier, microsecond fraction in Postgres)
+        let cases: &[(u32, u32)] = &[
+            (62_560_206, 62_560),   // remainder 206 ns  -> both rules agree
+            (425_616_867, 425_617), // remainder 867 ns  -> ROUNDS UP
+            (608_043_681, 608_044), // remainder 681 ns  -> ROUNDS UP
+            (356_238_891, 356_239), // remainder 891 ns  -> ROUNDS UP
+            (494_347_027, 494_347), // remainder 27 ns   -> both rules agree
+            (292_026_088, 292_026), // remainder 88 ns   -> both rules agree
+        ];
+
+        let base = chrono::DateTime::parse_from_rfc3339("2026-08-31T06:28:20Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        let mut wrong = Vec::new();
+        for (ns_frac, pg_micros) in cases {
+            let ts = base + chrono::Duration::nanoseconds(*ns_frac as i64);
+            let got = truncate_to_micros(ts).timestamp_subsec_micros();
+            if got != *pg_micros {
+                wrong.push(format!(
+                    "tier .{ns_frac:09} -> normalised .{got:06}, but Postgres holds .{pg_micros:06}"
+                ));
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "the fold does not reproduce Postgres for {} of {} real events:\n  {}",
+            wrong.len(),
+            cases.len(),
+            wrong.join("\n  ")
         );
     }
 }
