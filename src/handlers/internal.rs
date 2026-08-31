@@ -340,8 +340,28 @@ pub async fn events_project(
         .await;
     }
 
-    let (projected, duplicates) = svc::project_events(&state.db, &request.events).await?;
+    let (projected, duplicates, inserted) =
+        svc::project_events(&state.db, &request.events).await?;
     info!(projected, duplicates, "events/project done");
+
+    // Mirror what this sink just wrote (noetl/ai-meta#307).
+    //
+    // This endpoint is a `noetl.event` writer that never reached the event-log
+    // tier: `noetl_events_projected_total` stood at 5,088 on production
+    // 2026-08-31 with none of those events mirrored. An affected execution
+    // reads n=30 in Postgres and n=29 in the tier, which strands a loop step at
+    // `command_started` holding 2 of 3 iterations.
+    //
+    // `inserted` is what Postgres ACCEPTED (the INSERT's RETURNING), not the
+    // request batch — mirroring the batch would push rows the system of record
+    // rejected into the tier, which is divergence in the harder-to-notice
+    // direction.
+    //
+    // Post-commit and failure-tolerant, matching the other mirror call sites:
+    // `mirror_rows` never returns an error, so a tier that is down degrades the
+    // tier rather than failing a projection that Postgres already durably
+    // accepted. Event-log stays primary; this only feeds the copy.
+    crate::handlers::ehdb_eventlog_mirror::mirror_rows(&state, &inserted).await;
     // The durable-log write counter (noetl/ai-meta#212). This sink is the sole
     // writer of `noetl.event` under NOETL_EVENT_INGEST_PUBLISH_ONLY, and until
     // now it emitted only a log line — so "are rows still landing in the log"
