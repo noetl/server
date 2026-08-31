@@ -624,4 +624,172 @@ mod tests {
              `primary`-serving tier (noetl/ai-meta#155)."
         );
     }
+
+    /// Every `noetl.event` INSERT in the crate either mirrors, or is registered
+    /// here as deliberately unmirrored with a written reason.
+    ///
+    /// # Why the previous guard could not see the defect it was written for
+    ///
+    /// `every_in_tx_event_insert_is_mirrored` counts inserts in `events.rs` and
+    /// only `events.rs`. That was the file #263 was about, so the guard passed
+    /// while **three other files** wrote the same table without mirroring —
+    /// including `services::internal::project_events`, which had written
+    /// **5,088** events into `noetl.event` on production by 2026-08-31, none of
+    /// them reaching the event-log tier. That is the missing-event class in
+    /// noetl/ai-meta#307: an affected execution has n=30 in Postgres and n=29 in
+    /// the tier, leaving a loop step at `command_started` with 2 of 3
+    /// iterations.
+    ///
+    /// A guard scoped to one file cannot establish a property of a codebase.
+    /// This one walks `src/**/*.rs` at test time — so a NEW file with a new
+    /// insert is caught too, which `include_str!` of a known list can never do.
+    ///
+    /// # The two dispositions
+    ///
+    /// A site either mirrors, or it is `UNMIRRORED_BY_DESIGN` with a reason a
+    /// human wrote. There is no third option and no default: an unregistered
+    /// site fails the test rather than being assumed benign, because "nobody
+    /// listed it" is exactly how the 5,088 happened.
+    #[test]
+    fn every_event_insert_in_the_crate_mirrors_or_is_registered() {
+        use std::collections::BTreeMap;
+
+        /// Sites that write `noetl.event` and DO mirror.
+        const MIRRORS: &[&str] = &["handlers/events.rs", "handlers/event_write.rs"];
+
+        /// Sites that write `noetl.event` and deliberately do not mirror.
+        /// The reason is the point: an entry without one is not a decision.
+        const UNMIRRORED_BY_DESIGN: &[(&str, &str)] = &[
+            // ⚠ NONE. All three of the following are UNDER INVESTIGATION as the
+            // #307 missing-event cause and are registered as *known-unmirrored*,
+            // not as *by design*. Moving one into a by-design entry requires
+            // saying why the tier is allowed to lack those events.
+        ];
+
+        /// Sites that do not mirror and are NOT yet justified. This list may
+        /// only ever SHRINK. Adding to it is the failure mode this test exists
+        /// to make loud.
+        const KNOWN_UNMIRRORED_PENDING_FIX: &[(&str, &str)] = &[
+            (
+                "db/queries/event.rs",
+                "generic insert helper; callers vary, so the mirror belongs at a \
+                 caller or here — undecided (noetl/ai-meta#307)",
+            ),
+            (
+                "handlers/internal.rs",
+                "POST /api/internal/events/materialize — a sink writer. \
+                 noetl_events_materialized_total was 0 on prod 2026-08-31, so it \
+                 contributes no divergence today, but it is the same shape as \
+                 project_events (noetl/ai-meta#307)",
+            ),
+            (
+                "services/internal.rs",
+                "POST /api/internal/events/project — the projector sink. \
+                 noetl_events_projected_total was 5088 on prod 2026-08-31 with \
+                 zero of them mirrored: THIS is the #307 missing-event cause",
+            ),
+        ];
+
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut found: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            let Ok(rd) = std::fs::read_dir(dir) else { return };
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    walk(&p, out);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    out.push(p);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        walk(&root, &mut files);
+        assert!(
+            files.len() > 50,
+            "the walk found only {} .rs files — it is not reaching the tree, and \
+             a guard that scans nothing passes for the wrong reason",
+            files.len()
+        );
+
+        for f in &files {
+            let Ok(src) = std::fs::read_to_string(f) else { continue };
+            // Strip the test module and line comments: this file discusses the
+            // needle in its own prose, and a guard that counts its own comments
+            // measures itself rather than the code.
+            let code = src.split("#[cfg(test)]").next().unwrap_or("");
+            let code: String = code
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            let inserts = code.matches("INSERT INTO noetl.event").count();
+            if inserts == 0 {
+                continue;
+            }
+            let mirrors = code.matches("mirror_rows").count();
+            let rel = f
+                .strip_prefix(&root)
+                .unwrap_or(f)
+                .to_string_lossy()
+                .replace('\\', "/");
+            found.insert(rel, (inserts, mirrors));
+        }
+
+        let mut problems = Vec::new();
+        for (file, (inserts, mirrors)) in &found {
+            let mirrors_registered = MIRRORS.contains(&file.as_str());
+            let by_design = UNMIRRORED_BY_DESIGN.iter().any(|(f, _)| f == file);
+            let pending = KNOWN_UNMIRRORED_PENDING_FIX.iter().any(|(f, _)| f == file);
+
+            if !mirrors_registered && !by_design && !pending {
+                problems.push(format!(
+                    "{file}: {inserts} INSERT INTO noetl.event site(s), {mirrors} mirror \
+                     call(s), and NOT REGISTERED. Either call `mirror_rows` after the \
+                     commit, or add it to UNMIRRORED_BY_DESIGN with the reason the \
+                     event-log tier may lack these events."
+                ));
+            }
+            if mirrors_registered && *mirrors < *inserts {
+                problems.push(format!(
+                    "{file}: registered as mirroring but has {inserts} insert site(s) \
+                     and only {mirrors} mirror call(s)"
+                ));
+            }
+        }
+        for (file, reason) in UNMIRRORED_BY_DESIGN {
+            assert!(
+                !reason.trim().is_empty(),
+                "{file} is registered unmirrored-by-design with an empty reason; \
+                 an entry without a reason is not a decision"
+            );
+        }
+        for (file, _) in KNOWN_UNMIRRORED_PENDING_FIX {
+            if !found.contains_key(*file) {
+                problems.push(format!(
+                    "{file} is listed as a known-unmirrored insert site but no longer \
+                     contains one — if it was fixed, REMOVE it from the list so the \
+                     list keeps meaning something"
+                ));
+            }
+        }
+
+        assert!(
+            problems.is_empty(),
+            "{} `noetl.event` insert-site problem(s):\n  {}\n\nsites found: {:?}",
+            problems.len(),
+            problems.join("\n  "),
+            found
+        );
+
+        assert_eq!(
+            found.len(),
+            5,
+            "expected exactly the 5 known `noetl.event` insert-site files; found {:?}. \
+             A new file writing this table must be registered above.",
+            found.keys().collect::<Vec<_>>()
+        );
+    }
 }
