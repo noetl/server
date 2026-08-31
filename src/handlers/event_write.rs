@@ -69,6 +69,49 @@ pub struct EventRow {
     pub worker_id: Option<String>,
 }
 
+/// Reduce an instant to the precision `noetl.event.created_at` can hold,
+/// **before** it reaches any writer.
+///
+/// # The divergence this removes (noetl/ai-meta#307)
+///
+/// The column is `timestamp` — microseconds. A `DateTime<Utc>` is nanoseconds.
+/// Something therefore reduces, and until now it was whichever writer ran,
+/// because the two disagree:
+///
+/// * **Binary bind** (`push_bind(r.created_at)`, here and in
+///   `handlers::internal`) — sqlx encodes to microseconds by TRUNCATING.
+/// * **SQL text cast** (`row->>'created_at'::timestamp` in
+///   `services::internal::project_events`) — PostgreSQL's text parser ROUNDS.
+///
+/// Meanwhile the mirror payload serialises the *unreduced* nanosecond value, so
+/// the tier held a different number from Postgres by up to 1 µs, in a direction
+/// set by which producer wrote the row. Measured on prod 2026-08-31 across 11
+/// executions: 9 looked like rounding, 1 like truncation, 1 mixed — which is
+/// why no fold-side rule could be right for all of them.
+///
+/// Reducing HERE makes the question moot: once the sub-microsecond remainder is
+/// zero, truncation and rounding are the SAME operation, so every writer stores
+/// the identical number and the mirror carries it unchanged. Authoritative and
+/// tier agree by construction rather than by a normalisation that has to guess.
+///
+/// Truncation is chosen because it is what the binary-bind path — the dominant
+/// authoritative writer — has always done, so new events stay consistent with
+/// the existing log instead of shifting by a microsecond on the day this ships.
+pub fn to_storage_precision(ts: DateTime<Utc>) -> DateTime<Utc> {
+    use chrono::TimeZone;
+    match ts.timestamp_nanos_opt() {
+        // `div_euclid` floors, which for the positive instants this platform
+        // produces is truncation toward the epoch.
+        Some(nanos) => Utc
+            .timestamp_micros(nanos.div_euclid(1_000))
+            .single()
+            .unwrap_or(ts),
+        // Outside the nanosecond-representable window (~1677-2262): leave it
+        // rather than mangle a timestamp we cannot reason about.
+        None => ts,
+    }
+}
+
 impl EventRow {
     /// Minimal constructor; chain the `with_*` setters for the optional columns.
     pub fn new(
@@ -85,7 +128,9 @@ impl EventRow {
             catalog_id,
             event_type: event_type.into(),
             status: status.into(),
-            created_at,
+            // Reduced at construction: this is the one chokepoint every row
+            // passes through, and reducing here is what makes the writers agree.
+            created_at: to_storage_precision(created_at),
             prev_event_id: None,
             node_id: None,
             node_name: None,
@@ -504,6 +549,95 @@ async fn insert_rows(pool: &DbPool, rows: &[EventRow]) -> AppResult<()> {
 
 #[cfg(test)]
 mod tests {
+
+    /// The two producers must reduce `created_at` identically.
+    ///
+    /// noetl/ai-meta#307's timestamp divergence, pinned. The column is
+    /// `timestamp` (microseconds), a `DateTime<Utc>` is nanoseconds, so
+    /// something reduces — and until this fix it was whichever writer ran:
+    /// the binary bind truncates, the SQL text cast rounds.
+    ///
+    /// The fix is not to pick a winner but to remove the choice. The property
+    /// below is why that works: once the remainder is zero, truncation and
+    /// rounding AGREE, so both producers land on the same number whichever
+    /// rule they apply.
+    #[test]
+    fn both_producers_reduce_created_at_identically() {
+        use chrono::TimeZone;
+
+        fn truncates(ns: i64) -> i64 { ns.div_euclid(1_000) }
+        fn rounds(ns: i64) -> i64 { (ns + 500).div_euclid(1_000) }
+
+        // Real sub-microsecond remainders seen on prod 2026-08-31, spanning
+        // both halves of the boundary: a rule that only works below 500 ns
+        // must fail here.
+        let remainders: [u32; 14] =
+            [0, 1, 27, 88, 206, 449, 499, 500, 501, 681, 798, 867, 891, 999];
+
+        let mut unreduced_disagreements = 0;
+        let mut still_disagree = Vec::new();
+
+        for r in remainders {
+            let raw = Utc
+                .timestamp_opt(1_756_184_493, 645_451_000 + r)
+                .single()
+                .expect("valid instant");
+            let raw_ns = raw.timestamp_nanos_opt().expect("in range");
+
+            if truncates(raw_ns) != rounds(raw_ns) {
+                unreduced_disagreements += 1;
+            }
+
+            let ns = to_storage_precision(raw)
+                .timestamp_nanos_opt()
+                .expect("in range");
+            if truncates(ns) != rounds(ns) {
+                still_disagree.push(format!(
+                    "remainder {r} ns: truncate={} round={}",
+                    truncates(ns),
+                    rounds(ns)
+                ));
+            }
+        }
+
+        // Control: unreduced, the producers really do diverge — so this test
+        // exercises a real hazard rather than a vacuous one.
+        assert!(
+            unreduced_disagreements > 0,
+            "the UNREDUCED case must show divergence or this proves nothing; got {unreduced_disagreements}"
+        );
+        assert!(
+            still_disagree.is_empty(),
+            "after reduction the producers still disagree on {} case(s):\n  {}",
+            still_disagree.len(),
+            still_disagree.join("\n  ")
+        );
+    }
+
+    /// `EventRow::new` must apply the reduction. It is the chokepoint every row
+    /// passes through; a row that skips it reaches the writers AND the mirror
+    /// with nanoseconds still attached.
+    #[test]
+    fn event_row_new_reduces_to_storage_precision() {
+        use chrono::TimeZone;
+        let raw = Utc
+            .timestamp_opt(1_756_184_493, 645_451_798)
+            .single()
+            .expect("valid instant");
+        let row = EventRow::new(1, 2, 3, "t", "s", raw);
+        assert_eq!(
+            row.created_at.timestamp_subsec_nanos() % 1_000,
+            0,
+            "EventRow::new must strip the sub-microsecond remainder; got {}",
+            row.created_at
+        );
+        assert_eq!(
+            row.created_at.timestamp_subsec_micros(),
+            645_451,
+            "truncation — matching the binary-bind path the existing log was written with"
+        );
+    }
+
     use super::*;
 
     fn sample_row() -> EventRow {
