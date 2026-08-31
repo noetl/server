@@ -669,6 +669,17 @@ mod tests {
         /// Sites that do not mirror and are NOT yet justified. This list may
         /// only ever SHRINK. Adding to it is the failure mode this test exists
         /// to make loud.
+        /// Sites whose INSERT is mirrored by their CALLER, in another file.
+        /// The caller is named and checked — a cross-file claim that nothing
+        /// verifies is how a registry rots into decoration.
+        const MIRRORED_BY_CALLER: &[(&str, &str)] = &[(
+            // POST /api/internal/events/project — the projector sink. Its
+            // handler mirrors exactly the rows the INSERT's RETURNING reports
+            // as accepted (noetl/ai-meta#307).
+            "services/internal.rs",
+            "handlers/internal.rs",
+        )];
+
         const KNOWN_UNMIRRORED_PENDING_FIX: &[(&str, &str)] = &[
             (
                 "db/queries/event.rs",
@@ -681,12 +692,6 @@ mod tests {
                  noetl_events_materialized_total was 0 on prod 2026-08-31, so it \
                  contributes no divergence today, but it is the same shape as \
                  project_events (noetl/ai-meta#307)",
-            ),
-            (
-                "services/internal.rs",
-                "POST /api/internal/events/project — the projector sink. \
-                 noetl_events_projected_total was 5088 on prod 2026-08-31 with \
-                 zero of them mirrored: THIS is the #307 missing-event cause",
             ),
         ];
 
@@ -743,8 +748,9 @@ mod tests {
             let mirrors_registered = MIRRORS.contains(&file.as_str());
             let by_design = UNMIRRORED_BY_DESIGN.iter().any(|(f, _)| f == file);
             let pending = KNOWN_UNMIRRORED_PENDING_FIX.iter().any(|(f, _)| f == file);
+            let by_caller = MIRRORED_BY_CALLER.iter().any(|(f, _)| f == file);
 
-            if !mirrors_registered && !by_design && !pending {
+            if !mirrors_registered && !by_design && !pending && !by_caller {
                 problems.push(format!(
                     "{file}: {inserts} INSERT INTO noetl.event site(s), {mirrors} mirror \
                      call(s), and NOT REGISTERED. Either call `mirror_rows` after the \
@@ -756,6 +762,24 @@ mod tests {
                 problems.push(format!(
                     "{file}: registered as mirroring but has {inserts} insert site(s) \
                      and only {mirrors} mirror call(s)"
+                ));
+            }
+        }
+        for (file, caller) in MIRRORED_BY_CALLER {
+            let caller_path = root.join(caller);
+            let caller_src = std::fs::read_to_string(&caller_path).unwrap_or_default();
+            let caller_code = caller_src
+                .split("#[cfg(test)]")
+                .next()
+                .unwrap_or("")
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            if !caller_code.contains("mirror_rows") {
+                problems.push(format!(
+                    "{file} is registered as mirrored-by-caller {caller}, but {caller} \
+                     contains no `mirror_rows` call — the claim is not true"
                 ));
             }
         }

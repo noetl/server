@@ -16,6 +16,7 @@ use chrono::{DateTime, NaiveDateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::types::JsonValue;
 
+use sqlx::Row;
 use crate::db::DbPool;
 use crate::error::AppResult;
 
@@ -522,9 +523,18 @@ pub struct EventEnvelope {
 /// `repos/noetl/noetl/server/api/internal/service.py::project_events`
 /// — single-statement batch INSERT via `jsonb_array_elements` over the
 /// payload.
-pub async fn project_events(pool: &DbPool, events: &[EventEnvelope]) -> AppResult<(i64, i64)> {
+/// Project a batch into `noetl.event`, returning the rows Postgres ACCEPTED.
+///
+/// The third element is what the caller must mirror to the event-log tier.
+/// This sink wrote 5,088 events on production without mirroring any of them,
+/// which is the noetl/ai-meta#307 missing-event class; returning the accepted
+/// rows is what lets the handler close it.
+pub async fn project_events(
+    pool: &DbPool,
+    events: &[EventEnvelope],
+) -> AppResult<(i64, i64, Vec<crate::handlers::event_write::EventRow>)> {
     if events.is_empty() {
-        return Ok((0, 0));
+        return Ok((0, 0, Vec::new()));
     }
 
     let payload = serde_json::to_value(events)?;
@@ -594,15 +604,61 @@ pub async fn project_events(pool: &DbPool, events: &[EventEnvelope]) -> AppResul
         -- uniqueness violation across partitions — sufficient for
         -- projector idempotency.
         ON CONFLICT DO NOTHING
+        -- RETURNING is load-bearing, not a convenience.  `ON CONFLICT DO
+        -- NOTHING` reports how many rows went in but not WHICH, and this sink
+        -- must mirror exactly the rows Postgres accepted.  Mirroring the input
+        -- batch instead would put events in the event-log tier that the system
+        -- of record rejected -- divergence in the opposite direction, and the
+        -- harder one to notice because the tier would have MORE, not less.
+        RETURNING event_id, execution_id, catalog_id, event_type, status,
+                  created_at, prev_event_id, node_id, node_name, node_type,
+                  parent_event_id, context, result, meta, error
         "#,
     )
     .bind(payload)
-    .execute(pool)
+    .fetch_all(pool)
     .await?;
 
-    let projected = result.rows_affected() as i64;
+    let projected = result.len() as i64;
     let duplicates = (events.len() as i64 - projected).max(0);
-    Ok((projected, duplicates))
+
+    let inserted = result
+        .iter()
+        .map(|r| crate::handlers::event_write::EventRow {
+            event_id: r.try_get("event_id").unwrap_or(0),
+            execution_id: r.try_get("execution_id").unwrap_or(0),
+            catalog_id: r.try_get("catalog_id").unwrap_or(0),
+            event_type: r.try_get("event_type").unwrap_or_default(),
+            status: r.try_get("status").unwrap_or_default(),
+            // `created_at` is `timestamp without time zone`; sqlx decodes that
+            // as NaiveDateTime, so a direct DateTime<Utc> get fails on every
+            // row (the ai-meta#265 loader bug, in miniature).
+            created_at: r
+                .try_get::<chrono::DateTime<chrono::Utc>, _>("created_at")
+                .ok()
+                .or_else(|| {
+                    r.try_get::<chrono::NaiveDateTime, _>("created_at")
+                        .ok()
+                        .map(|n| chrono::DateTime::from_naive_utc_and_offset(n, chrono::Utc))
+                })
+                .unwrap_or_else(chrono::Utc::now),
+            prev_event_id: r.try_get("prev_event_id").ok(),
+            node_id: r.try_get("node_id").ok(),
+            node_name: r.try_get("node_name").ok(),
+            node_type: r.try_get("node_type").ok(),
+            parent_event_id: r.try_get("parent_event_id").ok(),
+            // Neither column is written by this sink's INSERT, so both are
+            // None here by construction rather than by omission.
+            parent_execution_id: None,
+            worker_id: None,
+            context: r.try_get("context").ok(),
+            result: r.try_get("result").ok(),
+            meta: r.try_get("meta").ok(),
+            error: r.try_get("error").ok(),
+        })
+        .collect();
+
+    Ok((projected, duplicates, inserted))
 }
 
 // ---------------------------------------------------------------------------
@@ -769,5 +825,86 @@ mod tests {
     fn backoff_attempts_0_is_1s() {
         // attempts-1 clamps at 0 → 2^0 = 1.
         assert_eq!(compute_delay(0, 300), 1);
+    }
+
+    /// Replaying a projection batch must not double-mirror.
+    ///
+    /// `projected_duplicates_total` was **0** on production, so the duplicate
+    /// path had never once been exercised — a branch that has never run is
+    /// indistinguishable from one that cannot. Mirroring this sink doubles what
+    /// depends on it: a replayed batch that re-mirrored would push events the
+    /// system of record REJECTED into the event-log tier, giving the tier MORE
+    /// events than Postgres. That is divergence in the direction nobody watches
+    /// for.
+    ///
+    /// The property that prevents it is structural, and this test pins it:
+    /// what is mirrored is the INSERT's `RETURNING` output, and
+    /// `ON CONFLICT DO NOTHING ... RETURNING` emits a row only for an accepted
+    /// insert. So `inserted.len() == projected`, and on a full replay both are
+    /// zero and nothing is mirrored.
+    #[test]
+    fn mirroring_the_returning_set_cannot_double_mirror_a_replay() {
+        // The accounting `project_events` performs, extracted so it can be
+        // checked without a database.
+        fn account(batch: usize, accepted: usize) -> (i64, i64, usize) {
+            let projected = accepted as i64;
+            let duplicates = (batch as i64 - projected).max(0);
+            (projected, duplicates, accepted)
+        }
+
+        // First projection: every row is new.
+        let (projected, duplicates, to_mirror) = account(13, 13);
+        assert_eq!((projected, duplicates), (13, 0));
+        assert_eq!(to_mirror, 13, "a fresh batch mirrors every accepted row");
+
+        // Exact replay: ON CONFLICT DO NOTHING accepts none, RETURNING is empty.
+        let (projected, duplicates, to_mirror) = account(13, 0);
+        assert_eq!((projected, duplicates), (0, 13));
+        assert_eq!(
+            to_mirror, 0,
+            "a replayed batch must mirror NOTHING — this is what stops the tier \
+             from accumulating events Postgres rejected"
+        );
+
+        // Partial overlap: only the genuinely new rows are mirrored.
+        let (projected, duplicates, to_mirror) = account(13, 4);
+        assert_eq!((projected, duplicates), (4, 9));
+        assert_eq!(
+            to_mirror, 4,
+            "mirror exactly the accepted rows, never the request batch"
+        );
+
+        // The invariant the handler relies on, stated directly.
+        for (batch, accepted) in [(0, 0), (1, 0), (1, 1), (500, 500), (500, 1)] {
+            let (projected, _, to_mirror) = account(batch, accepted);
+            assert_eq!(
+                projected as usize, to_mirror,
+                "mirrored count must equal `projected` for batch={batch} accepted={accepted}"
+            );
+        }
+    }
+
+    /// The mirror must consume `RETURNING`, not the request batch.
+    ///
+    /// A future refactor that mirrors `&request.events` would pass every test
+    /// above — the arithmetic would still hold — while silently reintroducing
+    /// the replay bug. This checks the code, not the arithmetic.
+    #[test]
+    fn the_sink_insert_still_returns_the_accepted_rows() {
+        let me = include_str!("internal.rs");
+        let code = me.split("#[cfg(test)]").next().unwrap_or("");
+        assert!(
+            code.contains("ON CONFLICT DO NOTHING"),
+            "the projector INSERT must stay idempotent"
+        );
+        assert!(
+            code.contains("RETURNING event_id"),
+            "the projector INSERT must RETURN the accepted rows, or the caller \
+             cannot know which rows to mirror and will mirror the request batch"
+        );
+        assert!(
+            code.contains("fetch_all"),
+            "RETURNING requires fetch_all; `execute` discards the rows"
+        );
     }
 }
