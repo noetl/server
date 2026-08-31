@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.99.0](https://github.com/noetl/server/compare/v3.98.2...v3.99.0) (2026-08-31)
+
+### Features
+
+* **mirror:** mirror the projector sink to the event-log tier — STAGED, do not deploy unattended ([d9ddf4c](https://github.com/noetl/server/commit/d9ddf4ce10aad58cbdecc2f4d5ce74dbf16a5be1)), closes [noetl/ai-meta#307](https://github.com/noetl/ai-meta/issues/307) [#263](https://github.com/noetl/server/issues/263) [#307](https://github.com/noetl/server/issues/307) [noetl/ai-meta#307](https://github.com/noetl/ai-meta/issues/307) [noetl/ai-meta#263](https://github.com/noetl/ai-meta/issues/263)
+
 ## [3.98.2](https://github.com/noetl/server/compare/v3.98.1...v3.98.2) (2026-08-31)
 
 ### Bug Fixes
