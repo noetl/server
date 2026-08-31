@@ -537,7 +537,31 @@ pub async fn project_events(
         return Ok((0, 0, Vec::new()));
     }
 
-    let payload = serde_json::to_value(events)?;
+    // Reduce every envelope's timestamp to storage precision BEFORE serialising
+    // (noetl/ai-meta#307).
+    //
+    // This path is the second producer, and it reduces differently from the
+    // first: the SQL below casts `row->>'timestamp'` to `timestamp`, and
+    // PostgreSQL's text parser ROUNDS to microseconds, where the binary-bind
+    // path in `handlers::event_write` TRUNCATES. Same column, two rules, so the
+    // value a reader sees depended on which writer produced the row -- and the
+    // mirror carried the unreduced nanoseconds to the tier, so the two stores
+    // disagreed by up to 1 microsecond.
+    //
+    // Once the value carries no sub-microsecond remainder, rounding and
+    // truncation are the same operation and both producers store the identical
+    // number. That is what makes authoritative and tier agree by construction.
+    let events: Vec<EventEnvelope> = events
+        .iter()
+        .map(|e| {
+            let mut e = e.clone();
+            e.timestamp = e
+                .timestamp
+                .map(crate::handlers::event_write::to_storage_precision);
+            e
+        })
+        .collect();
+    let payload = serde_json::to_value(&events)?;
 
     // noetl.event schema (kind 2026-06-02):
     //   - PRIMARY KEY (event_id)
