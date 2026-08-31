@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.98.2](https://github.com/noetl/server/compare/v3.98.1...v3.98.2) (2026-08-31)
+
+### Bug Fixes
+
+* **fold:** round to microseconds, and record that no single rule is correct ([7574650](https://github.com/noetl/server/commit/757465042f6222eab7a96abd5d08c8fcedbd653c)), closes [noetl/ai-meta#307](https://github.com/noetl/ai-meta/issues/307)
+
 ## [3.98.1](https://github.com/noetl/server/compare/v3.98.0...v3.98.1) (2026-08-31)
 
 ### Bug Fixes
