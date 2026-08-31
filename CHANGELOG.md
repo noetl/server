@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.99.2](https://github.com/noetl/server/compare/v3.99.1...v3.99.2) (2026-08-31)
+
+### Bug Fixes
+
+* **mirror:** gate the projector-sink mirror OFF by default ([327ebe6](https://github.com/noetl/server/commit/327ebe6037169992b26cc2da5750f49449189ce7)), closes [server#383](https://github.com/noetl/server/issues/383) [noetl/ai-meta#307](https://github.com/noetl/ai-meta/issues/307) [#383](https://github.com/noetl/server/issues/383) [#384](https://github.com/noetl/server/issues/384) [#263](https://github.com/noetl/server/issues/263) [noetl/ai-meta#307](https://github.com/noetl/ai-meta/issues/307)
+
 ## [3.99.1](https://github.com/noetl/server/compare/v3.99.0...v3.99.1) (2026-08-31)
 
 ### Bug Fixes
