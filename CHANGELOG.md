@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.98.1](https://github.com/noetl/server/compare/v3.98.0...v3.98.1) (2026-08-31)
+
+### Bug Fixes
+
+* **fold:** make the tier reader agree with the Postgres reader ([de4d3f8](https://github.com/noetl/server/commit/de4d3f8b0ca9de8a273a22a63776b659cccc08ce)), closes [noetl/ai-meta#307](https://github.com/noetl/ai-meta/issues/307)
+
 ## [3.98.0](https://github.com/noetl/server/compare/v3.97.1...v3.98.0) (2026-08-30)
 
 ### Features
