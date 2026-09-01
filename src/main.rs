@@ -993,6 +993,7 @@ async fn main() -> anyhow::Result<()> {
     noetl_server::metrics::init_event_ingest_phase_series();
     noetl_server::metrics::init_nonconvergence_sweep_series();
     noetl_server::metrics::init_orphan_sweep_series();
+    noetl_server::metrics::init_reconcile_giveup_series();
     noetl_server::metrics::init_sink_state_series();
     noetl_server::metrics::init_catalog_delete_series();
     noetl_server::metrics::init_parity_and_dedup_series();

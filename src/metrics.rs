@@ -197,6 +197,47 @@ pub const ORPHAN_SWEEP_OUTCOMES: [&str; 5] =
 /// absent rather than zero.  "Is the guardrail doing anything, and is it
 /// terminating things?" should be one scrape, not an inference from a shard
 /// cursor.
+/// `noetl_reconcile_giveup_total{reason}` — executions the reconcile poller
+/// stopped re-driving (noetl/ai-meta#315).
+///
+/// `reason` is `max_noops`: the execution did not advance for
+/// `NOETL_RECONCILE_MAX_NOOPS` consecutive polls.
+///
+/// ⚠ Pinned to 0 at startup by [`init_reconcile_giveup_series`]. A labelled
+/// family is **pruned while empty** by `Registry::gather`, so without the pin a
+/// healthy server and a server too old to carry this metric would both serve
+/// nothing — which is the exact ambiguity that made the 2026-09-01 dispatch
+/// outage invisible for hours.
+pub fn reconcile_giveup_total() -> &'static prometheus::IntCounterVec {
+    static M: std::sync::OnceLock<prometheus::IntCounterVec> = std::sync::OnceLock::new();
+    M.get_or_init(|| {
+        let m = prometheus::IntCounterVec::new(
+            prometheus::Opts::new(
+                "noetl_reconcile_giveup_total",
+                "Executions the reconcile poller stopped re-driving because they were not advancing (noetl/ai-meta#315).",
+            ),
+            &["reason"],
+        )
+        .expect("valid metric");
+        let _ = prometheus::default_registry().register(Box::new(m.clone()));
+        m
+    })
+}
+
+pub const RECONCILE_GIVEUP_REASONS: &[&str] = &["max_noops"];
+
+pub fn init_reconcile_giveup_series() {
+    for reason in RECONCILE_GIVEUP_REASONS {
+        reconcile_giveup_total()
+            .with_label_values(&[reason])
+            .inc_by(0);
+    }
+}
+
+pub fn record_reconcile_giveup(reason: &str) {
+    reconcile_giveup_total().with_label_values(&[reason]).inc();
+}
+
 pub fn init_orphan_sweep_series() {
     for outcome in ORPHAN_SWEEP_OUTCOMES {
         orphan_sweep_total().with_label_values(&[outcome]).inc_by(0);

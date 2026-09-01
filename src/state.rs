@@ -214,6 +214,15 @@ pub struct ExecOrchState {
     /// that 8s wait into an immediate re-dispatch.  In-memory only, like the
     /// guard it shadows; a server restart re-derives the drive from the log.
     pub orchestrate_retrigger_pending: bool,
+    /// Consecutive reconcile polls that did **not** advance this execution
+    /// (noetl/ai-meta#315).
+    ///
+    /// Reset to 0 by any poll that issues a command. When it reaches
+    /// `reconcile_max_noops` the poller stops re-driving and evicts the entry —
+    /// otherwise an execution whose WAL chain can never complete is re-driven
+    /// every 8s forever, and, because `evict` only runs on a terminal event, it
+    /// never leaves this map either.
+    pub consecutive_reconcile_noops: u32,
 }
 
 /// Per-execution chain head for the one-level event chain (RFC #115 Phase 2,

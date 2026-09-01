@@ -699,6 +699,32 @@ pub struct AppConfig {
     #[serde(default)]
     pub nonconvergence_sweep_enabled: bool,
 
+    /// Consecutive reconcile polls with no progress after which the poller
+    /// **stops re-driving** an execution.  Envy maps
+    /// `NOETL_RECONCILE_MAX_NOOPS`.  Default 225 — the poller ticks every 8s, so
+    /// that is ~30 minutes of an execution not advancing.
+    ///
+    /// `0` disables the cap and restores the pre-fix behaviour: re-drive
+    /// forever.  That is what prod was running when a truncated event log left
+    /// **53 executions whose WAL chain could never complete**, each re-driven
+    /// every 8s with a freshly issued `__orchestrate__` command. The system pool
+    /// sat at lag 78-86 and never drained, and a synthetic burst degraded from
+    /// p50 199ms to **1997ms with 23 of 60 requests timing out**
+    /// (noetl/ai-meta#315).
+    ///
+    /// ⚠ This is **not** a substitute for
+    /// [`Self::nonconvergence_sweep_enabled`], and the two bound different
+    /// things.  That sweep terminates the *execution* after a 24h grace; this
+    /// caps the *re-driving* after minutes.  Enabling only the sweep would still
+    /// leave up to a day of pool saturation; enabling only this cap leaves the
+    /// executions non-terminal but stops them costing anything.  They compose.
+    ///
+    /// Hitting the cap is **not destructive**: it evicts a cache entry, emits
+    /// nothing to the event log, and is self-healing — any later real event calls
+    /// `OrchStateCache::entry`, which recreates the slot and resumes driving.
+    #[serde(default = "default_reconcile_max_noops")]
+    pub reconcile_max_noops: u32,
+
     /// Seconds between non-convergence sweep ticks.  Envy maps
     /// `NOETL_NONCONVERGENCE_SWEEP_INTERVAL_SECS`.  Default 300 — this sweep
     /// chases a backlog measured in days, so it does not need the orphan
@@ -951,6 +977,10 @@ fn default_orphan_sweep_lookback_secs() -> u64 {
     48 * 60 * 60
 }
 
+fn default_reconcile_max_noops() -> u32 {
+    225
+}
+
 fn default_nonconvergence_sweep_interval_secs() -> u64 {
     300
 }
@@ -1152,6 +1182,7 @@ impl Default for AppConfig {
             // noetl/ai-meta#227 part B — same discipline as the orphan sweep
             // above: inert by default, so a permanently-stalled execution stays
             // exactly as it is until an operator opts in.
+            reconcile_max_noops: default_reconcile_max_noops(),
             nonconvergence_sweep_enabled: false,
             nonconvergence_sweep_interval_secs: default_nonconvergence_sweep_interval_secs(),
             nonconvergence_grace_secs: default_nonconvergence_grace_secs(),
