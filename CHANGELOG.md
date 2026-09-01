@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.99.3](https://github.com/noetl/server/compare/v3.99.2...v3.99.3) (2026-09-01)
+
+### Bug Fixes
+
+* **reconcile:** bound the re-drive so a stuck execution stops burning the pool ([d5caab5](https://github.com/noetl/server/commit/d5caab5e0f3a520560647a8168d09cdee8cdb361)), closes [#227](https://github.com/noetl/server/issues/227) [noetl/ai-meta#315](https://github.com/noetl/ai-meta/issues/315)
+* **state:** make the canonical digest canonical for sets, not just maps ([5bb2fd9](https://github.com/noetl/server/commit/5bb2fd958d4d1b00e380f0e4b8e274d424ebe70a)), closes [noetl/ai-meta#314](https://github.com/noetl/ai-meta/issues/314)
+
 ## [3.99.2](https://github.com/noetl/server/compare/v3.99.1...v3.99.2) (2026-08-31)
 
 ### Bug Fixes
