@@ -194,8 +194,8 @@ pub struct StepInfo {
     /// (dedup so a dual-worker race emitting two `command.completed`
     /// for the same command_id only counts once).  Always empty for
     /// non-looped steps.
-    #[serde(default, skip_serializing_if = "std::collections::HashSet::is_empty")]
-    pub iteration_command_ids: std::collections::HashSet<String>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub iteration_command_ids: std::collections::BTreeSet<String>,
 
     /// Per-iteration result payloads collected in dispatch order.
     /// Used to assemble the aggregate result the next step sees in
@@ -235,8 +235,8 @@ pub struct StepInfo {
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub cursor_issued: std::collections::HashMap<String, (String, i64)>,
     /// Completed cursor sub-command command_ids (dedup repeated completions).
-    #[serde(default, skip_serializing_if = "std::collections::HashSet::is_empty")]
-    pub cursor_completed: std::collections::HashSet<String>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub cursor_completed: std::collections::BTreeSet<String>,
     /// Per-frame progress, keyed by frame index.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub cursor_frames: std::collections::BTreeMap<i64, CursorFrame>,
@@ -274,12 +274,12 @@ impl StepInfo {
             pending_callback: false,
             uses_callback: false,
             iterations_expected: None,
-            iteration_command_ids: std::collections::HashSet::new(),
+            iteration_command_ids: std::collections::BTreeSet::new(),
             iteration_results: Vec::new(),
             iterations_dispatched: 0,
             is_cursor: false,
             cursor_issued: std::collections::HashMap::new(),
-            cursor_completed: std::collections::HashSet::new(),
+            cursor_completed: std::collections::BTreeSet::new(),
             cursor_frames: std::collections::BTreeMap::new(),
         }
     }
@@ -562,9 +562,7 @@ impl WorkflowState {
                     .and_then(|r| r.get("context"))
                     .or(event.context.as_ref());
                 if let Some(payload) = payload {
-                    if let Some(serde_json::Value::Object(values)) =
-                        payload.get("values")
-                    {
+                    if let Some(serde_json::Value::Object(values)) = payload.get("values") {
                         // Latest-wins fold: a later iteration's value
                         // overwrites the earlier one.  `start`'s
                         // initializer (offset = 0) is shadowed by the
@@ -684,16 +682,15 @@ impl WorkflowState {
                     // noetl/ai-meta#100: incrementally track cursor sub-command
                     // dispatch (phase/frame) from the command.issued meta so the
                     // orchestrator never rescans the log to rebuild frame state.
-                    let cursor_meta = event
-                        .meta
-                        .as_ref()
-                        .and_then(|m| m.get("cursor"))
-                        .map(|c| {
-                            (
-                                c.get("phase").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                                c.get("frame").and_then(|v| v.as_i64()).unwrap_or(0),
-                            )
-                        });
+                    let cursor_meta = event.meta.as_ref().and_then(|m| m.get("cursor")).map(|c| {
+                        (
+                            c.get("phase")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                            c.get("frame").and_then(|v| v.as_i64()).unwrap_or(0),
+                        )
+                    });
                     let cid = extract_command_id(event);
                     let step = self
                         .steps
@@ -1381,7 +1378,10 @@ mod tests {
                 ExecutionState::Cancelled,
                 "{spelling} should transition to Cancelled"
             );
-            assert!(state.state.is_terminal(), "{spelling} state must be terminal");
+            assert!(
+                state.state.is_terminal(),
+                "{spelling} state must be terminal"
+            );
         }
     }
 
@@ -1932,7 +1932,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn test_build_context_data_accessor_does_not_clobber_existing_data_field() {
         // Edge case: the task_sequence flatten path already merges a
@@ -2080,7 +2079,11 @@ mod tests {
             !ws.steps.contains_key(WorkflowState::ORCHESTRATE_META_STEP),
             "the meta-command must not create a workflow step"
         );
-        assert!(ws.steps.is_empty(), "no steps should exist, got {:?}", ws.steps.keys().collect::<Vec<_>>());
+        assert!(
+            ws.steps.is_empty(),
+            "no steps should exist, got {:?}",
+            ws.steps.keys().collect::<Vec<_>>()
+        );
 
         // A real step's command.issued still creates its step (guard is scoped).
         ws.apply_event(&make_event("command.issued", Some("real_step")));
@@ -2362,7 +2365,10 @@ mod pending_callback_tests {
         // or the sweep skips an execution the orchestrator already advanced past.
         let mut e = ev(2, "command.completed", "run_schema", None);
         e.meta = Some(serde_json::json!({"pending_callback": true}));
-        assert!(is_parked_on_callback(&e), "meta must be accepted, as the SQL does");
+        assert!(
+            is_parked_on_callback(&e),
+            "meta must be accepted, as the SQL does"
+        );
     }
 
     #[test]
@@ -2381,7 +2387,10 @@ mod pending_callback_tests {
         st.apply_event(&ev(1, "command.started", "run_schema", None));
         st.apply_event(&ev_wire(2, "command.completed", "run_schema"));
         let step = st.steps.get("run_schema").expect("step present");
-        assert!(step.pending_callback, "the step must park on the wire shape");
+        assert!(
+            step.pending_callback,
+            "the step must park on the wire shape"
+        );
         assert!(step.uses_callback, "and be marked a callback user");
         assert!(
             step.completed_at.is_none(),
@@ -2416,7 +2425,10 @@ mod pending_callback_tests {
         assert!(!step.pending_callback, "the resume must unpark");
         assert_eq!(step.state, StepState::Completed, "and complete the step");
         assert_eq!(step.completed_event_id, Some(3), "completed BY the resume");
-        assert!(step.uses_callback, "sticky, so call.done stays a valid trigger");
+        assert!(
+            step.uses_callback,
+            "sticky, so call.done stays a valid trigger"
+        );
     }
 
     /// A failed Job must unpark too, or the execution can never terminate.
@@ -2427,7 +2439,10 @@ mod pending_callback_tests {
         st.apply_event(&ev(2, "command.completed", "run_schema", Some(parked())));
         st.apply_event(&ev(3, "command.failed", "run_schema", None));
         let step = st.steps.get("run_schema").unwrap();
-        assert!(!step.pending_callback, "a failure must not leave the step parked for ever");
+        assert!(
+            !step.pending_callback,
+            "a failure must not leave the step parked for ever"
+        );
         assert_eq!(step.state, StepState::Failed);
     }
 
@@ -2447,7 +2462,10 @@ mod pending_callback_tests {
         ));
         let step = st.steps.get("plain").unwrap();
         assert!(!step.pending_callback);
-        assert!(!step.uses_callback, "no callback machinery for an ordinary step");
+        assert!(
+            !step.uses_callback,
+            "no callback machinery for an ordinary step"
+        );
         assert_eq!(step.state, StepState::Completed);
         assert_eq!(
             step.completed_event_id,
@@ -2460,7 +2478,12 @@ mod pending_callback_tests {
     /// an older worker replays with the pre-#186 behaviour.
     #[test]
     fn a_missing_marker_is_not_parked() {
-        assert!(!is_parked_on_callback(&ev(1, "command.completed", "s", None)));
+        assert!(!is_parked_on_callback(&ev(
+            1,
+            "command.completed",
+            "s",
+            None
+        )));
         assert!(!is_parked_on_callback(&ev(
             1,
             "command.completed",
@@ -2544,6 +2567,96 @@ mod canonical_digest_tests {
         ws
     }
 
+    /// The set-backed half of the property (noetl/ai-meta#314).
+    ///
+    /// `canonical_state_digest` is canonical for MAPS because `serde_json::Value`
+    /// uses a `BTreeMap`, so object keys come out sorted at every level. A **set**
+    /// gets none of that: it serialises to a JSON *array*, and an array keeps
+    /// whatever iteration order the collection has. With a `HashSet` that order is
+    /// per-process (SipHash, randomly seeded), so two processes folding the same
+    /// events produced arrays with the same elements in different orders and
+    /// therefore different digests.
+    ///
+    /// Measured on prod 2026-09-01: a 30-execution equivalence sweep reported
+    /// **100% input agreement** and only **8/30 digest agreement**. Every one of
+    /// the 22 "divergences" was a pure permutation of
+    /// `/steps/*/iteration_command_ids` — same command ids, reordered, zero
+    /// genuine divergence. While that holds, the digest cannot gate a serve-flip:
+    /// it reports ~73% divergence on identical data, and a REAL divergence would
+    /// be invisible in that noise.
+    ///
+    /// The existing test above uses `ctx` and `ctx_set_marks`, which are both
+    /// maps — so it passed throughout and could never have caught this.
+    #[test]
+    fn a_set_backed_field_serialises_in_a_deterministic_order() {
+        // Enough elements that a hash-ordered collection coming out sorted by
+        // chance is not a thing that happens: 24! orderings.
+        let ids: Vec<String> = (0..24).map(|i| format!("exec:step:{i:04}:i{i}")).collect();
+
+        let mut forward = WorkflowState::new(42, 7);
+        let mut backward = WorkflowState::new(42, 7);
+        let step_f = forward
+            .steps
+            .entry("loop_step".to_string())
+            .or_insert_with(|| StepInfo::new("loop_step"));
+        for id in ids.iter() {
+            step_f.iteration_command_ids.insert(id.clone());
+        }
+        let step_b = backward
+            .steps
+            .entry("loop_step".to_string())
+            .or_insert_with(|| StepInfo::new("loop_step"));
+        for id in ids.iter().rev() {
+            step_b.iteration_command_ids.insert(id.clone());
+        }
+
+        let v = serde_json::to_value(&forward).unwrap();
+        let arr = v["steps"]["loop_step"]["iteration_command_ids"]
+            .as_array()
+            .expect("the set must still serialise as a JSON array — the wire shape is unchanged");
+        let got: Vec<&str> = arr.iter().map(|x| x.as_str().unwrap()).collect();
+        let mut want: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
+        want.sort_unstable();
+        assert_eq!(
+            got, want,
+            "a set-backed field must serialise in sorted order, or its digest depends on              the process that folded it"
+        );
+
+        assert_eq!(
+            canonical_state_digest(&forward),
+            canonical_state_digest(&backward),
+            "the same set built in opposite insertion orders must digest identically —              this is what made 22 of 30 prod executions read as divergent when their              data was identical"
+        );
+    }
+
+    /// The elements still round-trip, so this is a canonicalisation and not a
+    /// quiet data change.
+    #[test]
+    fn converting_the_set_did_not_change_what_it_holds() {
+        let mut ws = WorkflowState::new(1, 1);
+        let step = ws
+            .steps
+            .entry("s".to_string())
+            .or_insert_with(|| StepInfo::new("s"));
+        for i in 0..8 {
+            step.iteration_command_ids.insert(format!("cmd-{i}"));
+        }
+        step.cursor_completed.insert("cur-a".to_string());
+        let json = serde_json::to_string(&ws).unwrap();
+        let back: WorkflowState = serde_json::from_str(&json).unwrap();
+        let s = &back.steps["s"];
+        assert_eq!(
+            s.iteration_command_ids.len(),
+            8,
+            "no element lost on round-trip"
+        );
+        assert!(s.iteration_command_ids.contains("cmd-3"));
+        assert!(s.cursor_completed.contains("cur-a"));
+        // Deduplication is still the point of it being a set.
+        let step = ws.steps.get_mut("s").unwrap();
+        assert!(!step.iteration_command_ids.insert("cmd-3".to_string()));
+    }
+
     /// The same logical state, built in two different insertion orders, must
     /// digest identically.
     ///
@@ -2584,7 +2697,10 @@ mod canonical_digest_tests {
             "key_03".to_string(),
             serde_json::json!({ "n": 3, "deep": { "b": 2, "a": 1 } }),
         );
-        assert_ne!(canonical_state_digest(&base), canonical_state_digest(&nested));
+        assert_ne!(
+            canonical_state_digest(&base),
+            canonical_state_digest(&nested)
+        );
     }
 
     /// The raw form is NOT canonical — asserted so the difference is a tested
