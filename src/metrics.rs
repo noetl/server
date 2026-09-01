@@ -218,8 +218,15 @@ pub fn reconcile_giveup_total() -> &'static prometheus::IntCounterVec {
             ),
             &["reason"],
         )
-        .expect("valid metric");
-        let _ = prometheus::default_registry().register(Box::new(m.clone()));
+        .expect("static counter spec must be valid");
+        // ⚠ `registry()`, NOT `prometheus::default_registry()`. `gather_text()`
+        // gathers from this crate's own registry, so a metric registered on the
+        // default one is never scraped — it exists, it increments, and it is
+        // invisible. Shipped that way in v3.99.3 (noetl/ai-meta#315): the cap
+        // worked while the counter proving it could not appear.
+        registry()
+            .register(Box::new(m.clone()))
+            .expect("counter registration must succeed");
         m
     })
 }
@@ -236,6 +243,34 @@ pub fn init_reconcile_giveup_series() {
 
 pub fn record_reconcile_giveup(reason: &str) {
     reconcile_giveup_total().with_label_values(&[reason]).inc();
+}
+
+#[cfg(test)]
+mod reconcile_giveup_registry_tests {
+    /// The metric must be on the registry `/metrics` actually gathers.
+    ///
+    /// ⚠ This is the test that was missing. v3.99.3 shipped the giveup counter
+    /// registered on `prometheus::default_registry()` while `gather_text()`
+    /// gathers from this crate's own `registry()`, so the series could never
+    /// appear on the scrape — the cap worked and the counter proving it was
+    /// invisible. Every test written for it was a pure-function test of the
+    /// decision logic, which is exactly why none of them caught it.
+    #[test]
+    fn the_giveup_series_reaches_the_scrape() {
+        super::init_reconcile_giveup_series();
+        let text = super::gather_text().expect("gather");
+        assert!(
+            text.contains("noetl_reconcile_giveup_total"),
+            "the giveup counter is not on the registry gather_text() reads, so it can \
+             never be scraped — registering it is not the same as exposing it"
+        );
+        assert!(
+            text.contains(r#"noetl_reconcile_giveup_total{reason="max_noops"} 0"#),
+            "the series must be PINNED at 0: a labelled family is pruned while empty, so \
+             without the pin a healthy server and one too old to carry the metric serve \
+             the same nothing"
+        );
+    }
 }
 
 pub fn init_orphan_sweep_series() {
