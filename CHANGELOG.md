@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.99.4](https://github.com/noetl/server/compare/v3.99.3...v3.99.4) (2026-09-01)
+
+### Bug Fixes
+
+* **metrics:** the giveup counter was registered on the wrong registry ([d13f9e0](https://github.com/noetl/server/commit/d13f9e098986657a6ce8fb463bb03474c81fc9dd)), closes [#315](https://github.com/noetl/server/issues/315) [#387](https://github.com/noetl/server/issues/387) [noetl/ai-meta#315](https://github.com/noetl/ai-meta/issues/315)
+
 ## [3.99.3](https://github.com/noetl/server/compare/v3.99.2...v3.99.3) (2026-09-01)
 
 ### Bug Fixes
