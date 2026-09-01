@@ -635,7 +635,8 @@ async fn handle_event_inner(
         if let Some(command_id) = get_command_id(&request) {
             let __t = std::time::Instant::now();
             let __already =
-                check_already_claimed(&state, execution_id, &command_id, &request.worker_id).await?;
+                check_already_claimed(&state, execution_id, &command_id, &request.worker_id)
+                    .await?;
             crate::metrics::record_event_ingest_phase("claim_check", __t.elapsed().as_secs_f64());
             if __already {
                 // Already claimed by same worker - idempotent success
@@ -1948,10 +1949,11 @@ const ORCH_EVENT_COLS_WITH_PREV: &str = r#"
 /// Re-exported for the Phase-1 fold (ai-meta#265) so a fold from Postgres
 /// builds the SAME `Event` values the orchestrator's own rebuild path does.
 /// A second parser here would be a second definition of what an event IS.
-pub(crate) fn parse_event_rows_for_fold(rows: Vec<sqlx::postgres::PgRow>) -> Vec<crate::db::models::Event> {
+pub(crate) fn parse_event_rows_for_fold(
+    rows: Vec<sqlx::postgres::PgRow>,
+) -> Vec<crate::db::models::Event> {
     parse_event_rows(rows)
 }
-
 
 /// Read `noetl.event.created_at`, coercing a tz-less column.
 ///
@@ -1998,7 +2000,8 @@ pub(crate) fn parse_event_rows_for_fold(rows: Vec<sqlx::postgres::PgRow>) -> Vec
 /// long.
 fn created_at_from_row(r: &sqlx::postgres::PgRow) -> chrono::DateTime<chrono::Utc> {
     match created_at_of(
-        r.try_get::<chrono::DateTime<chrono::Utc>, _>("created_at").ok(),
+        r.try_get::<chrono::DateTime<chrono::Utc>, _>("created_at")
+            .ok(),
         r.try_get::<chrono::NaiveDateTime, _>("created_at").ok(),
     ) {
         Some(ts) => ts,
@@ -2048,7 +2051,8 @@ mod created_at_tests {
         let got = created_at_of(None, Some(naive())).expect("a tz-less row must decode");
         assert_eq!(
             got,
-            Utc.with_ymd_and_hms(2026, 8, 26, 3, 44, 48).unwrap() + chrono::Duration::milliseconds(468),
+            Utc.with_ymd_and_hms(2026, 8, 26, 3, 44, 48).unwrap()
+                + chrono::Duration::milliseconds(468),
             "the tz-less column must be read as UTC, not replaced by the current time"
         );
         // …and emphatically not the current time.
@@ -2731,6 +2735,26 @@ pub(crate) async fn trigger_orchestrator(
 /// and re-evaluates, so processing always resumes — slow under backpressure is
 /// fine; stopping is not.  Cost is bounded: one cheap rebuild per active
 /// execution per tick.
+/// What the reconcile poller should do with an execution it has just polled
+/// (noetl/ai-meta#315).
+///
+/// Returns `(new_noop_count, give_up)`.
+///
+/// Pure and separate from the poller so the cap can be tested exhaustively —
+/// the loop itself needs an `AppState`, a database and a worker pool, so a test
+/// that exercised it end-to-end would be testing everything except this.
+pub(crate) fn reconcile_decision(advanced: bool, noops_before: u32, cap: u32) -> (u32, bool) {
+    if advanced {
+        // Any progress at all resets the budget. The cap is for executions that
+        // cannot advance, not for slow ones.
+        return (0, false);
+    }
+    let n = noops_before.saturating_add(1);
+    // `cap == 0` disables the cap entirely: re-drive forever, which is the
+    // pre-fix behaviour and the negative control the tests need.
+    (n, cap != 0 && n >= cap)
+}
+
 pub fn spawn_orchestrator_reconciler(state: AppState) {
     tokio::spawn(async move {
         const RECONCILE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(8);
@@ -2748,18 +2772,66 @@ pub fn spawn_orchestrator_reconciler(state: AppState) {
                 }
                 // `i64::MAX` as the trigger id keeps the immediate-straggler
                 // shortcut from firing on an already-applied event.
-                match trigger_orchestrator_inner(&state, execution_id, i64::MAX, true).await {
+                let advanced = match trigger_orchestrator_inner(
+                    &state,
+                    execution_id,
+                    i64::MAX,
+                    true,
+                )
+                .await
+                {
                     Ok(n) if n > 0 => {
                         info!(
                             execution_id,
                             commands = n,
                             "reconcile poller advanced a stuck execution"
-                        )
+                        );
+                        true
                     }
-                    Ok(_) => {}
+                    Ok(_) => false,
                     Err(e) => {
-                        warn!(execution_id, %e, "reconcile poller: orchestrator trigger failed")
+                        warn!(execution_id, %e, "reconcile poller: orchestrator trigger failed");
+                        false
                     }
+                };
+
+                // noetl/ai-meta#315 — bound the re-driving.
+                //
+                // `dispatch_offserver_stateless_drive` documents an incomplete WAL
+                // chain as "a benign no-op that the reconcile poller re-drives once
+                // the drain catches up — so progress is guaranteed". That holds only
+                // while the missing events are still COMING. When they never will —
+                // a truncated log, an event write that failed permanently, planned
+                // log retention — the no-op is re-driven every 8s forever, because
+                // `evict` runs only on a terminal event. On 2026-09-01 that was 53
+                // executions pinning the system pool at lag 78-86 and taking a burst
+                // from p50 199ms to 1997ms with 23 of 60 requests timing out.
+                //
+                // Giving up is deliberately NOT destructive: it drops a cache entry,
+                // emits nothing, and self-heals — a later real event calls
+                // `orch_cache.entry`, which recreates the slot and resumes driving.
+                // Terminating the execution is a different job, owned by
+                // `nonconvergence_sweep`, on a 24h grace and default-off.
+                let cap = state.config.reconcile_max_noops;
+                let entry = state.orch_cache.entry(execution_id);
+                let (noops, give_up) = {
+                    let mut g = entry.lock().await;
+                    let (n, give_up) =
+                        reconcile_decision(advanced, g.consecutive_reconcile_noops, cap);
+                    g.consecutive_reconcile_noops = n;
+                    (n, give_up)
+                };
+                if give_up {
+                    warn!(
+                        execution_id,
+                        polls = noops,
+                        "reconcile poller: giving up — this execution has not advanced for \
+                         NOETL_RECONCILE_MAX_NOOPS consecutive polls, so re-driving it is \
+                         only costing system-pool capacity. It stays non-terminal; a later \
+                         real event resumes it (noetl/ai-meta#315)"
+                    );
+                    crate::metrics::record_reconcile_giveup("max_noops");
+                    state.orch_cache.evict(execution_id);
                 }
             }
         }
@@ -3320,7 +3392,10 @@ async fn trigger_orchestrator_inner(
         let version = cache.last_event_id;
         let applied = cache.applied_count;
         let routing = cache.routing_meta.clone();
-        let ws = cache.state.as_ref().expect("gate_outcome is None only with state");
+        let ws = cache
+            .state
+            .as_ref()
+            .expect("gate_outcome is None only with state");
         let saved = crate::services::orch_snapshot::save(
             pool,
             execution_id,
@@ -4161,8 +4236,8 @@ async fn apply_worker_orchestration(
         state.chain_heads.evict(execution_id).await; // RFC #115 §4: drop the chain head too
         state.chain_tails.evict(execution_id); // noetl/ai-meta#156: drop the tail ring too
         state.exec_descriptors.evict(execution_id).await; // RFC #115 Phase 4 remainder
-        // Terminal: nothing left to re-drive, and the slot is gone.  Any pending
-        // flag dies with it.
+                                                          // Terminal: nothing left to re-drive, and the slot is gone.  Any pending
+                                                          // flag dies with it.
         return Ok(commands_generated);
     }
 
@@ -5186,6 +5261,141 @@ mod snapshot_gate_tests {
             crate::metrics::EHDB_PROJECTION_SNAPSHOT_GATE_OUTCOMES.len(),
             emitted.len() + 1,
             "the pinned set must be exactly the four skips plus `written`"
+        );
+    }
+}
+
+#[cfg(test)]
+mod reconcile_cap_tests {
+    use super::reconcile_decision;
+    // =======================================================================
+    // noetl/ai-meta#315 — the reconcile poller must stop re-driving an
+    // execution that cannot advance.
+    // =======================================================================
+
+    #[test]
+    fn a_stuck_execution_is_eventually_given_up_on() {
+        // The 2026-09-01 shape: the WAL chain can never complete, so every poll
+        // is a no-op and the re-drive is forever.
+        const CAP: u32 = 5;
+        let mut noops = 0;
+        let mut gave_up_at = None;
+        for poll in 1..=50 {
+            let (n, give_up) = reconcile_decision(false, noops, CAP);
+            noops = n;
+            if give_up {
+                gave_up_at = Some(poll);
+                break;
+            }
+        }
+        assert_eq!(
+            gave_up_at,
+            Some(CAP as i32),
+            "the poller must stop at the cap; unbounded re-driving is what pinned the \
+             system pool at lag 78-86 and took a burst from p50 199ms to 1997ms"
+        );
+    }
+
+    #[test]
+    fn positive_control_a_healthy_straggler_is_still_re_driven() {
+        // ⚠ The control that makes the cap safe rather than merely quiet. The
+        // poller exists to rescue executions that got stuck behind a missed
+        // straggler; a cap that also stopped driving THOSE would trade a
+        // performance bug for a correctness one, and would look identical on
+        // the give-up metric.
+        const CAP: u32 = 5;
+        let mut noops = 0;
+        for _ in 0..100 {
+            // Four quiet polls, then real progress — repeatedly.
+            for _ in 0..(CAP - 1) {
+                let (n, give_up) = reconcile_decision(false, noops, CAP);
+                assert!(!give_up, "gave up on an execution that keeps advancing");
+                noops = n;
+            }
+            let (n, give_up) = reconcile_decision(true, noops, CAP);
+            assert!(!give_up);
+            assert_eq!(n, 0, "progress must reset the budget, not merely pause it");
+            noops = n;
+        }
+    }
+
+    #[test]
+    fn the_cap_is_consecutive_not_cumulative() {
+        // A long-running execution accrues plenty of quiet polls over its life.
+        // If the counter were cumulative it would eventually give up on a
+        // perfectly healthy execution — a slow leak that only bites the longest
+        // jobs, which are the ones least able to afford it.
+        const CAP: u32 = 3;
+        let mut noops = 0;
+        for _ in 0..1000 {
+            let (n, _) = reconcile_decision(false, noops, CAP);
+            noops = n;
+            let (n, give_up) = reconcile_decision(true, noops, CAP);
+            assert!(!give_up);
+            noops = n;
+        }
+        assert_eq!(noops, 0);
+    }
+
+    #[test]
+    fn negative_control_cap_zero_never_gives_up() {
+        // `0` is the documented escape hatch back to the pre-fix behaviour. It
+        // also proves the tests above are measuring the cap and not something
+        // else about the helper.
+        let mut noops = 0;
+        for _ in 0..100_000 {
+            let (n, give_up) = reconcile_decision(false, noops, 0);
+            assert!(!give_up, "cap=0 must restore unbounded re-driving");
+            noops = n;
+        }
+        assert!(noops > 0);
+    }
+
+    #[test]
+    fn the_counter_cannot_overflow_into_giving_up_early() {
+        // saturating_add, so a pathological count parks at u32::MAX rather than
+        // wrapping to 0 and silently restarting the budget.
+        let (n, give_up) = reconcile_decision(false, u32::MAX, u32::MAX);
+        assert_eq!(n, u32::MAX);
+        assert!(give_up);
+    }
+
+    /// A guard that the poller actually CONSULTS the cap.
+    ///
+    /// The helper is pure and easy to test, which is exactly why it could end up
+    /// thoroughly tested and never called — leaving the loop unbounded while
+    /// every test passed.
+    #[test]
+    fn the_poller_actually_calls_the_decision() {
+        let src = include_str!("events.rs");
+        let start = src
+            .find("pub fn spawn_orchestrator_reconciler(")
+            .expect("reconciler not found — this guard is anchored on its name");
+        let body = &src[start..];
+        let mut depth = 0i32;
+        let mut end = body.len();
+        for (i, c) in body.char_indices() {
+            if c == '{' {
+                depth += 1;
+            } else if c == '}' {
+                depth -= 1;
+                if depth == 0 {
+                    end = i;
+                    break;
+                }
+            }
+        }
+        let body = &body[..end];
+        assert!(
+            body.contains("reconcile_decision("),
+            "the reconcile poller does not consult reconcile_decision — the cap is \
+             implemented and tested but unreachable, which is indistinguishable from \
+             not having it (noetl/ai-meta#315)"
+        );
+        assert!(
+            body.contains("orch_cache.evict(execution_id)"),
+            "giving up must actually evict, or the entry stays in an unbounded map and \
+             is re-driven again on the next tick"
         );
     }
 }
