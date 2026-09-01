@@ -704,7 +704,10 @@ fn payload_divergence(auth: &AuthoritativeEvent, mirrored: &MirroredEvent) -> Op
 
     match mirrored.event_type.as_deref() {
         Some(t) if t == auth.event_type => {}
-        Some(t) => fields.push(format!("event_type: authoritative={:?} ehdb={t:?}", auth.event_type)),
+        Some(t) => fields.push(format!(
+            "event_type: authoritative={:?} ehdb={t:?}",
+            auth.event_type
+        )),
         None => fields.push(format!(
             "event_type: authoritative={:?} ehdb=<absent>",
             auth.event_type
@@ -953,7 +956,10 @@ pub fn run_controls() -> Vec<ControlResult> {
             control: "lag_beyond_window".to_string(),
             expected: ok_outside,
             detail: if ok_outside {
-                format!("still detected past the window; kinds {:?}", outside.kinds())
+                format!(
+                    "still detected past the window; kinds {:?}",
+                    outside.kinds()
+                )
             } else {
                 format!(
                     "TOLERANCE SWALLOWED A REAL DIVERGENCE — kinds {:?}, holds={}, pending={}",
@@ -969,11 +975,17 @@ pub fn run_controls() -> Vec<ControlResult> {
 }
 
 /// Record the control results and return whether every one behaved.
-fn record_controls(results: &[ControlResult]) -> bool {
+fn record_controls(results: &[ControlResult], recording: ParityRecording) -> bool {
     let mut all_ok = true;
     for r in results {
         let result = if r.expected { "expected" } else { "unexpected" };
-        crate::metrics::record_ehdb_crossstore_control(&r.control, result);
+        // noetl/ai-meta#264 — `noetl_ehdb_crossstore_control_total{result="unexpected"}`
+        // is itself alert-wired, so an inspecting caller must not move it either.
+        // The control still RUNS on the inspection path and its verdict still
+        // shapes the HTTP status; only the counter is withheld.
+        if recording.records() {
+            crate::metrics::record_ehdb_crossstore_control(&r.control, result);
+        }
         if !r.expected {
             all_ok = false;
             warn!(
@@ -1122,7 +1134,10 @@ fn parse_tier_body(body: &serde_json::Value) -> Result<Vec<MirroredRecord>, Pari
 
     let mut out = Vec::with_capacity(records.len());
     for r in records {
-        let global_sequence = r.get("global_sequence").and_then(|v| v.as_u64()).unwrap_or(0);
+        let global_sequence = r
+            .get("global_sequence")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
         let payload = r
             .get("payload")
             .and_then(|v| v.as_str())
@@ -1294,15 +1309,65 @@ fn relay_client() -> &'static reqwest::Client {
 ///
 /// Records the outcome + any divergence kinds to the metric surface. Returns the
 /// report so the on-demand endpoint can show its working.
-pub async fn compare_execution(state: &AppState, execution_id: i64) -> ComparisonResult {
+/// Whether a comparison **writes** the parity metrics, or only reads.
+///
+/// The periodic sampler and the HTTP endpoint share one comparator, and before
+/// noetl/ai-meta#264 both of them recorded. So an operator investigating a
+/// divergence alert by GETting the endpoint was **incrementing the counter the
+/// alert fires on** — and nothing in the response said so. On 2026-08-13 a
+/// diagnostic sweep of 20 executions moved
+/// `noetl_ehdb_crossstore_divergence_total` from 3 to 21 with no change in
+/// platform behaviour, which is enough on its own to hold the policy firing or
+/// re-fire it after it had cleared.
+///
+/// That inverts the relationship between a signal and its investigation: the
+/// natural response to the alert makes the alert worse, invisibly, and a second
+/// operator reading the graph afterwards sees a spike with no cause in the
+/// platform. It also makes the counter useless as evidence during exactly the
+/// incident in which someone is reading it.
+///
+/// The split is: **the sampler is the measurement, the endpoint is the
+/// inspection.**
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ParityRecording {
+    /// The periodic sampler. This comparison *is* the measurement, so it counts.
+    Record,
+    /// An HTTP caller looking at one execution. Reads only — no metric moves.
+    Inspect,
+}
+
+impl ParityRecording {
+    pub fn records(self) -> bool {
+        matches!(self, ParityRecording::Record)
+    }
+}
+
+/// Record a parity outcome only when this comparison is the measurement.
+fn record_parity(recording: ParityRecording, tier: &str, outcome: &str) {
+    if recording.records() {
+        crate::metrics::record_ehdb_crossstore_parity(tier, outcome);
+    }
+}
+
+/// Record a divergence only when this comparison is the measurement.
+fn record_divergence(recording: ParityRecording, tier: &str, kind: &str) {
+    if recording.records() {
+        crate::metrics::record_ehdb_crossstore_divergence(tier, kind);
+    }
+}
+
+pub async fn compare_execution(
+    state: &AppState,
+    execution_id: i64,
+    recording: ParityRecording,
+) -> ComparisonResult {
     let Some(base) = worker_query_base() else {
-        crate::metrics::record_ehdb_crossstore_parity(TIER, ParityOutcome::EhdbUnconfigured.as_str());
+        record_parity(recording, TIER, ParityOutcome::EhdbUnconfigured.as_str());
         return ComparisonResult {
             outcome: ParityOutcome::EhdbUnconfigured,
             report: None,
             detail: Some(
-                "NOETL_EHDB_WORKER_QUERY_URL is unset; the server cannot read the tier"
-                    .to_string(),
+                "NOETL_EHDB_WORKER_QUERY_URL is unset; the server cannot read the tier".to_string(),
             ),
             tier_query_source: None,
         };
@@ -1313,17 +1378,17 @@ pub async fn compare_execution(state: &AppState, execution_id: i64) -> Compariso
     let authoritative = match fetch_authoritative(state, execution_id).await {
         Ok(rows) => rows,
         Err(e) => {
-            crate::metrics::record_ehdb_crossstore_parity(TIER, ParityOutcome::Error.as_str());
+            record_parity(recording, TIER, ParityOutcome::Error.as_str());
             return ComparisonResult {
                 outcome: ParityOutcome::Error,
                 report: None,
                 detail: Some(format!("authoritative read failed: {e}")),
-            tier_query_source: None,
+                tier_query_source: None,
             };
         }
     };
     if authoritative.len() > MAX_COMPARE_EVENTS {
-        crate::metrics::record_ehdb_crossstore_parity(TIER, ParityOutcome::SkippedTooLarge.as_str());
+        record_parity(recording, TIER, ParityOutcome::SkippedTooLarge.as_str());
         return ComparisonResult {
             outcome: ParityOutcome::SkippedTooLarge,
             report: None,
@@ -1334,23 +1399,21 @@ pub async fn compare_execution(state: &AppState, execution_id: i64) -> Compariso
         };
     }
     if authoritative.is_empty() {
-        crate::metrics::record_ehdb_crossstore_parity(
-            TIER,
-            ParityOutcome::AuthoritativeEmpty.as_str(),
-        );
+        record_parity(recording, TIER, ParityOutcome::AuthoritativeEmpty.as_str());
         return ComparisonResult {
             outcome: ParityOutcome::AuthoritativeEmpty,
             report: None,
             detail: Some("no authoritative events for this execution".to_string()),
-        tier_query_source: None,
+            tier_query_source: None,
         };
     }
 
     // Tier side.
-    let (mirrored, tier_query_source) = match fetch_tier(relay_client(), &base, execution_id).await {
+    let (mirrored, tier_query_source) = match fetch_tier(relay_client(), &base, execution_id).await
+    {
         Ok(m) => m,
         Err((outcome, detail)) => {
-            crate::metrics::record_ehdb_crossstore_parity(TIER, outcome.as_str());
+            record_parity(recording, TIER, outcome.as_str());
             warn!(
                 target: "noetl_server::ehdb_parity",
                 execution_id,
@@ -1367,7 +1430,7 @@ pub async fn compare_execution(state: &AppState, execution_id: i64) -> Compariso
         }
     };
     if mirrored.len() >= MAX_COMPARE_EVENTS {
-        crate::metrics::record_ehdb_crossstore_parity(TIER, ParityOutcome::SkippedTooLarge.as_str());
+        record_parity(recording, TIER, ParityOutcome::SkippedTooLarge.as_str());
         return ComparisonResult {
             outcome: ParityOutcome::SkippedTooLarge,
             report: None,
@@ -1386,7 +1449,7 @@ pub async fn compare_execution(state: &AppState, execution_id: i64) -> Compariso
     let horizon = match mirror_lag_horizon(state, execution_id, tolerance).await {
         Ok(h) => h,
         Err(e) => {
-            crate::metrics::record_ehdb_crossstore_parity(TIER, ParityOutcome::Error.as_str());
+            record_parity(recording, TIER, ParityOutcome::Error.as_str());
             return ComparisonResult {
                 outcome: ParityOutcome::Error,
                 report: None,
@@ -1396,13 +1459,12 @@ pub async fn compare_execution(state: &AppState, execution_id: i64) -> Compariso
         }
     };
 
-    let report =
-        compare_cross_store_with_horizon(execution_id, &authoritative, &mirrored, horizon);
+    let report = compare_cross_store_with_horizon(execution_id, &authoritative, &mirrored, horizon);
     let outcome = outcome_for(&report);
     if report.pending_authoritative > 0 {
         crate::metrics::add_ehdb_crossstore_pending(TIER, report.pending_authoritative as u64);
     }
-    crate::metrics::record_ehdb_crossstore_parity(TIER, outcome.as_str());
+    record_parity(recording, TIER, outcome.as_str());
     crate::metrics::add_ehdb_crossstore_events_compared(TIER, report.matched as u64);
     // An untaken comparison publishes NO divergence evidence.
     //
@@ -1419,7 +1481,7 @@ pub async fn compare_execution(state: &AppState, execution_id: i64) -> Compariso
     // invisibly.
     if outcome == ParityOutcome::Divergent {
         for kind in report.kinds() {
-            crate::metrics::record_ehdb_crossstore_divergence(TIER, kind);
+            record_divergence(recording, TIER, kind);
         }
     }
     if !report.holds {
@@ -1542,9 +1604,11 @@ pub async fn compare_execution_endpoint(
     }
 
     let controls = run_controls();
-    let controls_ok = record_controls(&controls);
+    let controls_ok = record_controls(&controls, ParityRecording::Inspect);
 
-    let result = compare_execution(&state, execution_id).await;
+    // noetl/ai-meta#264 — inspection, not measurement: this must not move the
+    // counters its own alert reads.
+    let result = compare_execution(&state, execution_id, ParityRecording::Inspect).await;
 
     // A comparison whose controls failed is not evidence, and the HTTP status
     // says so rather than leaving it to a field nobody reads.
@@ -1556,6 +1620,10 @@ pub async fn compare_execution_endpoint(
 
     let mut body = json!({
         "action": "ehdb.parity.crossstore",
+        // noetl/ai-meta#264 — say so in the payload. The old behaviour was not
+        // just wrong, it was invisible: nothing told the caller a metric had
+        // moved, so the spike they caused had no cause they could see.
+        "metrics_recorded": false,
         "tier": TIER,
         "execution_id": execution_id.to_string(),
         "outcome": result.outcome.as_str(),
@@ -1582,7 +1650,7 @@ pub async fn self_test_endpoint(State(state): State<AppState>) -> impl IntoRespo
         return (StatusCode::NOT_IMPLEMENTED, Json(disabled_body()));
     }
     let controls = run_controls();
-    let ok = record_controls(&controls);
+    let ok = record_controls(&controls, ParityRecording::Inspect);
     let status = if ok {
         StatusCode::OK
     } else {
@@ -1644,7 +1712,7 @@ async fn run_sampler_tick(state: &AppState) {
     // Controls first. If the comparator cannot discriminate, the tick's verdicts
     // are worthless and the operator needs to know that before reading them.
     let controls = run_controls();
-    if !record_controls(&controls) {
+    if !record_controls(&controls, ParityRecording::Record) {
         return;
     }
 
@@ -1670,7 +1738,7 @@ async fn run_sampler_tick(state: &AppState) {
     };
 
     for execution_id in candidates {
-        let _ = compare_execution(state, execution_id).await;
+        let _ = compare_execution(state, execution_id, ParityRecording::Record).await;
     }
 }
 
@@ -1727,7 +1795,6 @@ mod tests {
         }
     }
 
-
     // =======================================================================
     // Lag tolerance (noetl/ai-meta#155)
     // =======================================================================
@@ -1767,7 +1834,10 @@ mod tests {
         let mirrored = vec![mirrored_of(1, &auth[0]), mirrored_of(2, &auth[2])];
 
         let r = compare_cross_store_with_horizon(1, &auth, &mirrored, Some(9_003));
-        assert!(!r.holds, "a real loss inside the compared prefix must diverge");
+        assert!(
+            !r.holds,
+            "a real loss inside the compared prefix must diverge"
+        );
         let missing = r
             .divergences
             .iter()
@@ -1799,7 +1869,10 @@ mod tests {
         let r = compare_cross_store_with_horizon(1, &auth, &mirrored, Some(9_002));
         assert!(r.holds, "{:?}", r.divergences);
         assert_eq!(r.pending_authoritative, 1);
-        assert_eq!(r.pending_tier, 1, "the already-mirrored record must be excluded too");
+        assert_eq!(
+            r.pending_tier, 1,
+            "the already-mirrored record must be excluded too"
+        );
         assert_eq!(r.authoritative_count, 2);
         assert_eq!(r.ehdb_count, 2);
     }
@@ -1811,7 +1884,10 @@ mod tests {
         let (auth, mirrored) = control_fixtures();
         // Horizon below every id: the entire execution is in flight.
         let r = compare_cross_store_with_horizon(1, &auth, &mirrored, Some(9_000));
-        assert!(r.holds, "an empty comparison has no divergences by definition");
+        assert!(
+            r.holds,
+            "an empty comparison has no divergences by definition"
+        );
         assert_eq!(r.authoritative_count, 0);
         assert_eq!(r.pending_authoritative, 3);
         assert_eq!(
@@ -1828,7 +1904,11 @@ mod tests {
     fn the_window_does_not_hide_a_wholly_absent_tier() {
         let (auth, _) = control_fixtures();
         let r = compare_cross_store_with_horizon(1, &auth, &[], Some(9_002));
-        assert!(r.kinds().contains("missing_execution"), "{:?}", r.divergences);
+        assert!(
+            r.kinds().contains("missing_execution"),
+            "{:?}",
+            r.divergences
+        );
     }
 
     /// The exact shape observed on prod 2026-08-19, reproduced.
@@ -2141,7 +2221,10 @@ mod tests {
             "result": bare,
         });
 
-        for (name, body) in [("bare (tier service)", &bare), ("wrapped (run_query)", &wrapped)] {
+        for (name, body) in [
+            ("bare (tier service)", &bare),
+            ("wrapped (run_query)", &wrapped),
+        ] {
             let recs = parse_tier_body(body)
                 .unwrap_or_else(|e| panic!("{name} reply must parse, got {e:?}"));
             assert_eq!(recs.len(), 1, "{name}");
@@ -2191,5 +2274,125 @@ mod tests {
         let r = compare_cross_store(1, &auth, &mirrored);
         assert!(!r.holds);
         assert!(r.kinds().contains("unidentified"), "{:?}", r.divergences);
+    }
+
+    // =======================================================================
+    // noetl/ai-meta#264 — the endpoint must not write the counters its own
+    // alert reads.
+    // =======================================================================
+
+    /// Pull one counter series out of the real registry, **scoped to one tier
+    /// label**.
+    ///
+    /// ⚠ Scoping matters. The registry is process-global and these tests run in
+    /// parallel with every other test in the binary, so a helper that summed the
+    /// whole metric family would read other tests' writes as its own. That is not
+    /// hypothetical: an early version summed the family, and mutating the gate
+    /// made a test fail that the mutation had nothing to do with. Each test owns
+    /// a private tier label, so the reads cannot collide.
+    fn counter_value(name: &str, tier: &str) -> f64 {
+        let text = crate::metrics::gather_text().expect("gather");
+        let tier_label = format!("tier=\"{tier}\"");
+        text.lines()
+            .filter(|l| !l.starts_with('#'))
+            .filter(|l| l.starts_with(name) && l.contains(&tier_label))
+            .filter_map(|l| l.rsplit(' ').next())
+            .filter_map(|v| v.parse::<f64>().ok())
+            .sum()
+    }
+
+    #[test]
+    fn inspecting_does_not_move_the_counter_the_alert_reads() {
+        // The alert is `sum(increase(noetl_ehdb_crossstore_divergence_total[10m])) > 0`.
+        // On 2026-08-13 a diagnostic sweep of 20 executions took it 3 -> 21 with
+        // no change in platform behaviour.
+        const T: &str = "inspect_tier_264a";
+        let before = counter_value("noetl_ehdb_crossstore_divergence_total", T);
+        for _ in 0..20 {
+            record_divergence(ParityRecording::Inspect, T, "count_mismatch");
+        }
+        assert_eq!(
+            counter_value("noetl_ehdb_crossstore_divergence_total", T),
+            before,
+            "twenty inspections moved the divergence counter — an operator investigating \
+             the alert would be re-firing it, invisibly"
+        );
+    }
+
+    #[test]
+    fn the_sampler_still_measures() {
+        // ⚠ The positive control. Without it, "inspection does not record" would
+        // also pass on an implementation that never records at all — which would
+        // silence the alert instead of fixing it, and look identical on a graph.
+        const T: &str = "record_tier_264b";
+        let before = counter_value("noetl_ehdb_crossstore_divergence_total", T);
+        record_divergence(ParityRecording::Record, T, "count_mismatch");
+        assert_eq!(
+            counter_value("noetl_ehdb_crossstore_divergence_total", T),
+            before + 1.0,
+            "the sampler is the measurement; if it stops counting the alert goes blind"
+        );
+    }
+
+    #[test]
+    fn inspecting_does_not_move_the_parity_outcome_counter_either() {
+        // `..._parity_total{outcome="pending_mirror"}` feeds a RATIO alert, so
+        // endpoint writes skew it even when they are not divergences.
+        const T: &str = "tier_264c";
+        let before = counter_value("noetl_ehdb_crossstore_parity_total", T);
+        record_parity(ParityRecording::Inspect, T, "ok");
+        assert_eq!(
+            counter_value("noetl_ehdb_crossstore_parity_total", T),
+            before
+        );
+        record_parity(ParityRecording::Record, T, "ok");
+        assert_eq!(
+            counter_value("noetl_ehdb_crossstore_parity_total", T),
+            before + 1.0,
+            "positive control: the recording path must still count"
+        );
+    }
+
+    /// A guard that counts CODE, not names: every metric write inside
+    /// `compare_execution` must go through a gated recorder.
+    ///
+    /// The bug was not that one call site was wrong — it was that the comparator
+    /// recorded unconditionally and two callers shared it. A future
+    /// `crate::metrics::record_...` added straight into the body would rebuild
+    /// exactly that, and would look perfectly ordinary in review.
+    #[test]
+    fn every_metric_write_in_the_comparator_is_gated() {
+        let src = include_str!("ehdb_parity.rs");
+        let start = src
+            .find("pub async fn compare_execution(")
+            .expect("comparator not found — this guard is anchored on its name");
+        let body = &src[start..];
+        let mut depth = 0i32;
+        let mut end = body.len();
+        for (i, c) in body.char_indices() {
+            if c == '{' {
+                depth += 1;
+            } else if c == '}' {
+                depth -= 1;
+                if depth == 0 {
+                    end = i;
+                    break;
+                }
+            }
+        }
+        let body = &body[..end];
+        let ungated = body.matches("crate::metrics::record_").count();
+        assert_eq!(
+            ungated, 0,
+            "found {ungated} ungated metric write(s) inside compare_execution. Route them \
+             through record_parity/record_divergence, which honour ParityRecording — \
+             otherwise the HTTP endpoint writes the counters its own alert reads \
+             (noetl/ai-meta#264)."
+        );
+        assert!(
+            body.contains("record_parity(recording,"),
+            "the guard must be looking at the real comparator body; it found none of the \
+             gated recorders, which means the anchor moved and this test is vacuous"
+        );
     }
 }
