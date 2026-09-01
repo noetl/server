@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.99.5](https://github.com/noetl/server/compare/v3.99.4...v3.99.5) (2026-09-01)
+
+### Bug Fixes
+
+* **parity:** the endpoint must not write the counters its own alert reads ([fc32fef](https://github.com/noetl/server/commit/fc32fef4d4d3f4843d11aeefddcfb52b1473ae91)), closes [noetl/ai-meta#264](https://github.com/noetl/ai-meta/issues/264)
+
 ## [3.99.4](https://github.com/noetl/server/compare/v3.99.3...v3.99.4) (2026-09-01)
 
 ### Bug Fixes
