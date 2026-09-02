@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.100.2](https://github.com/noetl/server/compare/v3.100.1...v3.100.2) (2026-09-02)
+
+### Bug Fixes
+
+* **db:** raise the shared pool so /api/execute stops collapsing at 6 clients ([b52cff7](https://github.com/noetl/server/commit/b52cff7ed4dfdaad0a3edda9174cb717385f179d)), closes [noetl/ai-meta#317](https://github.com/noetl/ai-meta/issues/317) [noetl/ai-meta#317](https://github.com/noetl/ai-meta/issues/317)
+
 ## [3.100.1](https://github.com/noetl/server/compare/v3.100.0...v3.100.1) (2026-09-02)
 
 ### Bug Fixes
