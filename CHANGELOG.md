@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.100.1](https://github.com/noetl/server/compare/v3.100.0...v3.100.1) (2026-09-02)
+
+### Bug Fixes
+
+* **main:** restore the merge-chain formatting my rustfmt run broke ([c6a7660](https://github.com/noetl/server/commit/c6a766007471969cf0a7731948a0d5c6bd72ee9d)), closes [server#390](https://github.com/noetl/server/issues/390) [pre-#390](https://github.com/noetl/pre-/issues/390) [#390](https://github.com/noetl/server/issues/390) [noetl/ai-meta#316](https://github.com/noetl/ai-meta/issues/316)
+
 ## [3.100.0](https://github.com/noetl/server/compare/v3.99.5...v3.100.0) (2026-09-02)
 
 ### Features
