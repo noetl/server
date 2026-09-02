@@ -994,6 +994,7 @@ async fn main() -> anyhow::Result<()> {
     noetl_server::metrics::init_nonconvergence_sweep_series();
     noetl_server::metrics::init_orphan_sweep_series();
     noetl_server::metrics::init_reconcile_giveup_series();
+    noetl_server::metrics::init_db_pool_series();
     noetl_server::metrics::init_sink_state_series();
     noetl_server::metrics::init_catalog_delete_series();
     noetl_server::metrics::init_parity_and_dedup_series();
@@ -1126,6 +1127,18 @@ async fn main() -> anyhow::Result<()> {
     );
     handlers::ehdb_parity::spawn_crossstore_parity_sampler(state.clone());
     handlers::ehdb_projection_parity::spawn_projection_parity_sampler(state.clone());
+    // noetl/ai-meta#317 — sample the shared pool so exhaustion is visible.
+    // Cheap: two atomic reads off the sqlx handle every 15s, no query.
+    {
+        let st = state.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                let p = st.pools.cluster();
+                noetl_server::metrics::set_db_pool(p.size() as i64, p.num_idle() as i64);
+            }
+        });
+    }
 
     // CQRS write-path cutover (noetl/ai-meta#103 phase 2d-3): when
     // `NOETL_EVENT_INGEST_PUBLISH_ONLY` is on, server-originated events publish to
