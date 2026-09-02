@@ -273,6 +273,111 @@ mod reconcile_giveup_registry_tests {
     }
 }
 
+/// `noetl_db_pool_connections{state}` — the shared Postgres pool's occupancy.
+///
+/// ⚠ This pool had **no metric at all** until noetl/ai-meta#317. It is the one
+/// resource that bounds the whole request path — with `shard_count <= 1` every
+/// `/api/execute`, every read and all five background pollers draw from it —
+/// and it was invisible. A pool exhaustion presents as requests hanging for the
+/// full 30 s `acquire_timeout` with **no error logged**, because a waiting
+/// `acquire` has nothing to say. That is indistinguishable from a network
+/// problem unless you can see the pool.
+///
+/// `state` is `total` (connections the pool holds) or `idle` (of those, unused).
+/// `total - idle` is in-flight; `total` pinned at the configured max with
+/// `idle` at 0 is the exhaustion signature.
+pub fn db_pool_connections() -> &'static prometheus::IntGaugeVec {
+    static M: OnceLock<prometheus::IntGaugeVec> = OnceLock::new();
+    M.get_or_init(|| {
+        let g = prometheus::IntGaugeVec::new(
+            Opts::new(
+                "noetl_db_pool_connections",
+                "Shared Postgres pool occupancy by state (noetl/ai-meta#317).",
+            ),
+            &["state"],
+        )
+        .expect("static gauge spec must be valid");
+        // ⚠ `registry()`, not `prometheus::default_registry()` — `gather_text`
+        // reads this crate's registry, and getting that wrong once already
+        // shipped an invisible metric (noetl/ai-meta#315).
+        registry()
+            .register(Box::new(g.clone()))
+            .expect("gauge registration must succeed");
+        g
+    })
+}
+
+pub const DB_POOL_STATES: &[&str] = &["total", "idle"];
+
+/// Pin both series at 0 so an exhausted pool and a build without the metric are
+/// distinguishable — a labelled family is pruned while empty.
+pub fn init_db_pool_series() {
+    for st in DB_POOL_STATES {
+        db_pool_connections().with_label_values(&[st]).set(0);
+    }
+}
+
+pub fn set_db_pool(total: i64, idle: i64) {
+    db_pool_connections()
+        .with_label_values(&["total"])
+        .set(total);
+    db_pool_connections().with_label_values(&["idle"]).set(idle);
+}
+
+#[cfg(test)]
+mod db_pool_metric_tests {
+    /// One test, not two, deliberately.
+    ///
+    /// ⚠ The registry is process-global and tests run in parallel. Split across
+    /// two tests these raced: one called `init_db_pool_series()` (pinning both
+    /// series to 0) while the other asserted the values it had just set, and the
+    /// pinning test won. Same labels, same registry, no isolation possible — so
+    /// the sequence is kept inside a single test.
+    #[test]
+    fn the_pool_gauge_is_pinned_reaches_the_scrape_and_tracks_its_values() {
+        // 1. pinned at 0 — an exhausted pool and a build without the metric must
+        //    not look the same; a labelled family is pruned while empty.
+        super::init_db_pool_series();
+        let text = super::gather_text().expect("gather");
+        assert!(
+            text.contains("noetl_db_pool_connections"),
+            "the pool gauge is not on the registry gather_text() reads — registering is \
+             not the same as exposing"
+        );
+        for st in ["total", "idle"] {
+            assert!(
+                text.contains(&format!(r#"noetl_db_pool_connections{{state="{st}"}} 0"#)),
+                "series for state={st} must be pinned at 0:\n{text}"
+            );
+        }
+
+        // 2. tracks what it is given, so a renderer hard-coding 0 cannot pass.
+        super::set_db_pool(25, 3);
+        let text = super::gather_text().expect("gather");
+        assert!(
+            text.contains(r#"noetl_db_pool_connections{state="total"} 25"#),
+            "{text}"
+        );
+        assert!(
+            text.contains(r#"noetl_db_pool_connections{state="idle"} 3"#),
+            "{text}"
+        );
+
+        // 3. the exhaustion signature the incident would have shown: pool at its
+        //    max with nothing idle.
+        super::set_db_pool(25, 0);
+        let text = super::gather_text().expect("gather");
+        assert!(
+            text.contains(r#"noetl_db_pool_connections{state="total"} 25"#),
+            "{text}"
+        );
+        assert!(
+            text.contains(r#"noetl_db_pool_connections{state="idle"} 0"#),
+            "{text}"
+        );
+    }
+}
+
 pub fn init_orphan_sweep_series() {
     for outcome in ORPHAN_SWEEP_OUTCOMES {
         orphan_sweep_total().with_label_values(&[outcome]).inc_by(0);

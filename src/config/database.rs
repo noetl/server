@@ -66,8 +66,38 @@ fn default_database() -> String {
     "noetl".to_string()
 }
 
+/// Maximum Postgres connections this server process holds.
+///
+/// ⚠ **This is a shared pool.** With `shard_count <= 1` — prod's configuration —
+/// [`crate::db::pool::DbPoolMap::pool_for`] returns the same handle for every
+/// shard *and* for cluster tables, so every `/api/execute`, every read, and
+/// every background task draw from this one budget. As of 2026-09-02 that is
+/// five long-lived pollers (orchestrator reconcile on an 8 s tick, orphan
+/// sweep, non-convergence sweep, cross-store parity sampler, projection parity
+/// sampler) plus all request traffic.
+///
+/// At the previous value of **10** that left roughly five connections for
+/// requests, and `POST /api/execute` — which makes several sequential
+/// round-trips per call — exhausted it at **six concurrent clients**. Every
+/// request then blocked in `acquire()` for the full
+/// [`default_acquire_timeout`] of 30 s, which is exactly where an in-cluster
+/// load run saw them die. It presented as a *collapse* rather than a plateau:
+/// concurrency 1-2 fine, 4 degraded, 6 total stall with **no executions
+/// started and no ERROR logged**, because a waiting `acquire` has nothing to
+/// say (noetl/ai-meta#317).
+///
+/// **25 is chosen to match pgbouncer's `default_pool_size = 25`**, which is the
+/// real ceiling: pgbouncer pools per (database, user) pair, so a server pool
+/// larger than that would not buy concurrency, it would just move the queue one
+/// hop downstream where it is even harder to see. `max_db_connections = 32`
+/// leaves headroom above it for other users.
+///
+/// ⚠ **These two numbers are coupled and must move together.** Raising this
+/// above pgbouncer's `default_pool_size`, or running more than one server
+/// replica without raising pgbouncer, re-creates the same queue somewhere less
+/// observable. Prod runs **one** replica; 25 x 1 <= 25 holds.
 fn default_max_connections() -> u32 {
-    10
+    25
 }
 
 fn default_min_connections() -> u32 {
@@ -532,6 +562,105 @@ mod tests {
                 let cfg = ShardingConfig::from_env().expect("from_env");
                 assert_eq!(cfg.shard_count(), 2);
             },
+        );
+    }
+}
+
+#[cfg(test)]
+mod pool_sizing_tests {
+    use super::*;
+
+    /// pgbouncer pools per (database, user) pair. The server pool must not
+    /// exceed it, or the queue simply moves one hop downstream where it is
+    /// harder to see. Live value on prod 2026-09-02.
+    const PGBOUNCER_DEFAULT_POOL_SIZE: u32 = 25;
+
+    /// Concurrent requests the pool must still serve after every long-lived
+    /// background task has taken a connection.
+    const MIN_REQUEST_HEADROOM: u32 = 15;
+
+    /// Count the long-lived background tasks that draw on the shared pool.
+    ///
+    /// Counts CODE in main.rs, not prose — the bug was that five pollers plus
+    /// request traffic exceeded a pool of ten, and the way that recurs is
+    /// someone adding a sixth poller without touching this file.
+    fn background_pool_consumers() -> u32 {
+        let main_rs = include_str!("../main.rs");
+        main_rs
+            .lines()
+            .map(str::trim_start)
+            .filter(|l| !l.starts_with("//"))
+            .filter(|l| l.contains("spawn_") && l.contains("state.clone()"))
+            .count() as u32
+    }
+
+    /// ⚠ THE REGRESSION GUARD for noetl/ai-meta#317.
+    ///
+    /// At `max_connections = 10` with five background pollers, roughly five
+    /// connections were left for requests, and `POST /api/execute` — several
+    /// sequential round-trips per call — exhausted the pool at SIX concurrent
+    /// clients. Every request then blocked the full 30 s `acquire_timeout`,
+    /// with no execution started and no ERROR logged.
+    #[test]
+    fn the_pool_serves_the_background_tasks_and_still_leaves_headroom() {
+        let bg = background_pool_consumers();
+        assert!(
+            bg > 0,
+            "found no background pool consumers — the guard is anchored on \
+             `spawn_*(state.clone())` in main.rs and has stopped matching, so it \
+             would pass vacuously"
+        );
+        let need = bg + MIN_REQUEST_HEADROOM;
+        assert!(
+            default_max_connections() >= need,
+            "pool of {} cannot serve {bg} background tasks plus {MIN_REQUEST_HEADROOM} \
+             concurrent requests (needs >= {need}). This is exactly noetl/ai-meta#317: \
+             requests block in acquire() for the full 30s timeout with nothing logged.",
+            default_max_connections()
+        );
+    }
+
+    /// The other side of the same coupling: bigger is not free.
+    #[test]
+    fn the_pool_does_not_exceed_the_pgbouncer_per_user_cap() {
+        assert!(
+            default_max_connections() <= PGBOUNCER_DEFAULT_POOL_SIZE,
+            "a server pool of {} above pgbouncer's default_pool_size of {} does not buy \
+             concurrency — it moves the queue one hop downstream, where there is no \
+             metric at all. Raise pgbouncer first, and remember prod runs 1 replica: \
+             N replicas x this value must also fit.",
+            default_max_connections(),
+            PGBOUNCER_DEFAULT_POOL_SIZE
+        );
+    }
+
+    /// ⚠ NEGATIVE CONTROL. Without it the two assertions above are satisfied by
+    /// any value in a wide band, and a nonsense pool (say 1, or 10_000) could
+    /// still pass one of them. This pins that BOTH bounds bite.
+    #[test]
+    fn negative_control_the_old_value_would_fail_the_guard() {
+        let bg = background_pool_consumers();
+        let old = 10u32;
+        assert!(
+            old < bg + MIN_REQUEST_HEADROOM,
+            "the pre-fix value of 10 must FAIL the headroom guard, otherwise the guard \
+             would not have caught the bug it was written for"
+        );
+        assert!(
+            10_000 > PGBOUNCER_DEFAULT_POOL_SIZE,
+            "an absurdly large pool must fail the downstream-cap guard"
+        );
+    }
+
+    /// The acquire timeout is what turns exhaustion into a 30s hang rather than
+    /// a fast failure. Pinned so a change is deliberate and reviewed.
+    #[test]
+    fn the_acquire_timeout_is_pinned() {
+        assert_eq!(
+            default_acquire_timeout(),
+            30,
+            "acquire_timeout is why pool exhaustion presents as a 30s hang that looks \
+             exactly like a network fault; changing it changes the failure SHAPE"
         );
     }
 }
