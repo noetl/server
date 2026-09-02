@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.100.0](https://github.com/noetl/server/compare/v3.99.5...v3.100.0) (2026-09-02)
+
+### Features
+
+* **parity:** give the projection tier a sampler so it is measured, not just inspectable ([9b13b8b](https://github.com/noetl/server/commit/9b13b8b207cfda74c41f951aafb967b062f480a3)), closes [#316](https://github.com/noetl/server/issues/316) [noetl/ai-meta#264](https://github.com/noetl/ai-meta/issues/264) [noetl/ai-meta#316](https://github.com/noetl/ai-meta/issues/316)
+
 ## [3.99.5](https://github.com/noetl/server/compare/v3.99.4...v3.99.5) (2026-09-01)
 
 ### Bug Fixes
