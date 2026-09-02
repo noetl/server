@@ -834,7 +834,10 @@ fn parse_tier_body(body: &serde_json::Value) -> Result<Vec<MirroredRecord>, Pari
     Ok(arr
         .iter()
         .map(|r| MirroredRecord {
-            global_sequence: r.get("global_sequence").and_then(|s| s.as_u64()).unwrap_or(0),
+            global_sequence: r
+                .get("global_sequence")
+                .and_then(|s| s.as_u64())
+                .unwrap_or(0),
             payload: r
                 .get("payload")
                 .and_then(|p| p.as_str())
@@ -852,14 +855,15 @@ fn tier_source_of(body: &serde_json::Value) -> Option<String> {
 
 /// Compare one execution across both stores.
 pub async fn compare_execution(state: &AppState, execution_id: i64) -> ComparisonResult {
-    let done = |outcome: ParityOutcome, detail: Option<String>, age: Option<i64>| ComparisonResult {
-        execution_id,
-        outcome: outcome.as_str(),
-        report: None,
-        detail,
-        snapshot_age_seconds: age,
-        tier_source: None,
-    };
+    let done =
+        |outcome: ParityOutcome, detail: Option<String>, age: Option<i64>| ComparisonResult {
+            execution_id,
+            outcome: outcome.as_str(),
+            report: None,
+            detail,
+            snapshot_age_seconds: age,
+            tier_source: None,
+        };
 
     if !parity_enabled() {
         return done(ParityOutcome::Disabled, None, None);
@@ -873,7 +877,10 @@ pub async fn compare_execution(state: &AppState, execution_id: i64) -> Compariso
 
     let auth = match fetch_authoritative(state, execution_id).await {
         Err(e) => {
-            crate::metrics::record_ehdb_crossstore_parity(TIER, ParityOutcome::TierUnreadable.as_str());
+            crate::metrics::record_ehdb_crossstore_parity(
+                TIER,
+                ParityOutcome::TierUnreadable.as_str(),
+            );
             return done(ParityOutcome::TierUnreadable, Some(e), None);
         }
         Ok(None) => {
@@ -973,9 +980,8 @@ pub async fn compare_execution(state: &AppState, execution_id: i64) -> Compariso
     // the report is computed identically either way, so what the window changes
     // is whether the verdict is taken, not what it would have said.
     let tolerance = parity_lag_tolerance_secs();
-    let within_window = tolerance > 0
-        && auth.age_seconds >= 0
-        && (auth.age_seconds as u64) < tolerance;
+    let within_window =
+        tolerance > 0 && auth.age_seconds >= 0 && (auth.age_seconds as u64) < tolerance;
     let outcome = if report.holds {
         ParityOutcome::Match
     } else if within_window && tolerable(&report) {
@@ -1051,6 +1057,89 @@ pub async fn compare_execution_endpoint(
     }))
 }
 
+/// Background sampler for the **projection** tier (noetl/ai-meta#316).
+///
+/// ⚠⚠ Why this exists. Until now this comparator had **no sampler at all** —
+/// its only callers were the two HTTP endpoints. That has a consequence worse
+/// than the noise it looks like: the tier's divergence series **only moved when
+/// a human queried it**, so a real projection divergence on prod was invisible
+/// unless someone happened to ask about the exact execution that had one. A
+/// permanently-zero series and a genuinely healthy tier read identically.
+///
+/// It also means the flag `NOETL_EHDB_PROJECTION_PARITY_ENABLED`, set `true` on
+/// prod since the tier was stood up, was read by nothing.
+///
+/// Deliberately reuses [`crate::handlers::ehdb_parity::sample_candidates`] and
+/// the cross-store settle / lookback / sample knobs. Both samplers need the
+/// same property — an execution whose newest event is old enough that the
+/// mirror has certainly caught up — and two sets of numbers that have to agree
+/// is a way to be wrong.
+pub fn spawn_projection_parity_sampler(state: AppState) {
+    tokio::spawn(async move {
+        let cfg = &state.config;
+        if !cfg.ehdb_projection_parity_enabled {
+            tracing::info!(
+                target: "noetl_server::ehdb_projection_parity",
+                "EHDB projection parity: sampler DISABLED — the divergence series will \
+                 only move when the endpoint is queried, which is not a health signal"
+            );
+            return;
+        }
+        if cfg.ehdb_projection_parity_interval_secs == 0 {
+            tracing::info!(
+                target: "noetl_server::ehdb_projection_parity",
+                "EHDB projection parity: endpoint enabled, sampler off (interval 0)"
+            );
+            return;
+        }
+        let interval = Duration::from_secs(cfg.ehdb_projection_parity_interval_secs);
+        tracing::info!(
+            target: "noetl_server::ehdb_projection_parity",
+            interval_secs = cfg.ehdb_projection_parity_interval_secs,
+            sample = cfg.ehdb_crossstore_parity_sample_size,
+            settle_secs = cfg.ehdb_crossstore_parity_settle_secs,
+            "EHDB projection parity sampler: ENABLED — the tier is now measured, not just inspectable"
+        );
+        loop {
+            tokio::time::sleep(interval).await;
+            run_projection_sampler_tick(&state).await;
+        }
+    });
+}
+
+/// One projection-parity tick: controls first, then compare settled executions.
+async fn run_projection_sampler_tick(state: &AppState) {
+    // Controls first, for the same reason the cross-store sampler does it: if
+    // the comparator cannot tell a divergent pair from a clean one, its
+    // verdicts this tick are worthless and saying so is the useful output.
+    let controls = run_controls();
+    if !record_controls(&controls) {
+        return;
+    }
+    let cfg = &state.config;
+    let candidates = match crate::handlers::ehdb_parity::sample_candidates(
+        state,
+        cfg.ehdb_crossstore_parity_settle_secs as i64,
+        cfg.ehdb_crossstore_parity_lookback_secs as i64,
+        cfg.ehdb_crossstore_parity_sample_size as i64,
+    )
+    .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(
+                target: "noetl_server::ehdb_projection_parity",
+                error = %e,
+                "EHDB projection parity: candidate query failed"
+            );
+            return;
+        }
+    };
+    for execution_id in candidates {
+        let _ = compare_execution(state, execution_id).await;
+    }
+}
+
 /// `GET /api/ehdb/projection-parity/self-test` — run the controls and say
 /// whether the comparator discriminates.
 ///
@@ -1080,7 +1169,6 @@ mod tests {
         assert_eq!(r.tier_version, Some(auth.version));
         assert_eq!(r.tier_records, 3);
     }
-
 
     /// The lag window forgives LATENESS ONLY.
     ///
@@ -1151,7 +1239,10 @@ mod tests {
         // `pending_mirror` and publish a parity rate of zero.
         let clean = compare_cross_store(&auth, &base);
         assert!(clean.holds);
-        assert!(!tolerable(&clean), "a clean report is a match, not a pending one");
+        assert!(
+            !tolerable(&clean),
+            "a clean report is a match, not a pending one"
+        );
     }
 
     /// The window is off by default, and reads the variable it documents.
@@ -1160,8 +1251,13 @@ mod tests {
         // Zero is the correct default for a SYNCHRONOUS mirror: the tier is
         // durable before `save` returns, so a tier that is behind is genuinely
         // behind and nothing should be forgiven.
-        assert_eq!(PARITY_LAG_TOLERANCE_ENV, "NOETL_EHDB_PROJECTION_PARITY_LAG_TOLERANCE_SECS");
-        assert!(PARITY_OUTCOMES.iter().any(|o| o.as_str() == "pending_mirror"));
+        assert_eq!(
+            PARITY_LAG_TOLERANCE_ENV,
+            "NOETL_EHDB_PROJECTION_PARITY_LAG_TOLERANCE_SECS"
+        );
+        assert!(PARITY_OUTCOMES
+            .iter()
+            .any(|o| o.as_str() == "pending_mirror"));
         assert_eq!(
             PARITY_OUTCOMES.len(),
             10,
@@ -1323,5 +1419,102 @@ mod tests {
         let n = labels.len();
         labels.dedup();
         assert_eq!(labels.len(), n, "outcome labels must be distinct");
+    }
+}
+
+#[cfg(test)]
+mod projection_sampler_tests {
+    use crate::config::AppConfig;
+
+    /// noetl/ai-meta#316 — the sampler must actually be SPAWNED.
+    ///
+    /// ⚠ This is the guard that matters. A sampler that exists, compiles and is
+    /// thoroughly tested but is never spawned leaves the tier in exactly the
+    /// state this issue was opened about: a divergence series that only moves
+    /// when a human queries the endpoint. "The function exists" is precisely
+    /// the claim a naive grep confirms and reachability does not.
+    #[test]
+    fn the_sampler_is_spawned_at_startup() {
+        let main_rs = include_str!("../main.rs");
+        let wired = main_rs
+            .lines()
+            .map(str::trim_start)
+            .filter(|l| !l.starts_with("//"))
+            .any(|l| l.contains("spawn_projection_parity_sampler"));
+        assert!(
+            wired,
+            "spawn_projection_parity_sampler is never called from main — the projection \
+             tier's divergence signal would still only move when someone queries the \
+             endpoint (noetl/ai-meta#316)"
+        );
+    }
+
+    /// The cross-store sampler is still spawned too — this change must add a
+    /// sampler, not move one.
+    #[test]
+    fn the_crossstore_sampler_is_still_spawned() {
+        let main_rs = include_str!("../main.rs");
+        assert!(
+            main_rs.contains("spawn_crossstore_parity_sampler"),
+            "the event-log tier's sampler must survive this change"
+        );
+    }
+
+    /// Default OFF, so enabling it is deliberate and rollback is a flag flip.
+    #[test]
+    fn the_sampler_is_default_off() {
+        let cfg = AppConfig::default();
+        assert!(
+            !cfg.ehdb_projection_parity_enabled,
+            "must default off: turning on a comparator that writes alert-wired metrics \
+             is an opt-in, not a side effect of upgrading"
+        );
+    }
+
+    /// ⚠ The env var `NOETL_EHDB_PROJECTION_PARITY_ENABLED` has been set `true`
+    /// on prod since the tier was stood up and was read by NOTHING. A config
+    /// field with no reader is the same defect class as a metric with no
+    /// recorder: it looks configured and does nothing.
+    #[test]
+    fn the_prod_env_var_now_has_a_reader() {
+        let cfg_src = include_str!("../config/app.rs");
+        assert!(
+            cfg_src.contains("ehdb_projection_parity_enabled"),
+            "the field envy maps NOETL_EHDB_PROJECTION_PARITY_ENABLED onto must exist"
+        );
+        // ⚠⚠ Scan only the NON-TEST portion. `include_str!` yields the whole
+        // file including this module, which mentions the field itself — so the
+        // first version of this guard passed under a mutation that removed the
+        // real reader, because it was counting its own source. A guard that
+        // counts itself is the same family as a counter that counts its own doc
+        // comment.
+        let this = include_str!("ehdb_projection_parity.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap_or("");
+        let read = this
+            .lines()
+            .map(str::trim_start)
+            .filter(|l| !l.starts_with("//") && !l.starts_with('/'))
+            .any(|l| l.contains("ehdb_projection_parity_enabled"));
+        assert!(
+            read,
+            "the flag is declared but nothing reads it — that is the state this issue \
+             was opened about, one level up"
+        );
+    }
+
+    /// An interval of 0 disables the sampler without disabling the endpoint.
+    #[test]
+    fn interval_zero_disables_the_sampler() {
+        let mut cfg = AppConfig::default();
+        cfg.ehdb_projection_parity_enabled = true;
+        cfg.ehdb_projection_parity_interval_secs = 0;
+        assert_eq!(cfg.ehdb_projection_parity_interval_secs, 0);
+        let src = include_str!("ehdb_projection_parity.rs");
+        assert!(
+            src.contains("ehdb_projection_parity_interval_secs == 0"),
+            "the zero-interval escape hatch must be honoured by the spawn path"
+        );
     }
 }

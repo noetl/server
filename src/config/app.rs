@@ -803,6 +803,30 @@ pub struct AppConfig {
     /// **0 disables the sampler while leaving the on-demand endpoints armed** —
     /// the split exists so an operator can gather evidence by hand without
     /// putting a recurring `GROUP BY execution_id` on the database.  Default 300.
+    /// Whether the **projection**-tier parity comparator runs a background
+    /// sampler.  Envy maps `NOETL_EHDB_PROJECTION_PARITY_ENABLED`.
+    ///
+    /// ⚠ That variable has been set `true` on prod since the tier was stood up
+    /// and, until this field existed, was **read by nothing** — a projection
+    /// divergence was invisible unless a human happened to GET the endpoint for
+    /// the exact execution that had one (noetl/ai-meta#316).
+    ///
+    /// Default false: the sampler is opt-in, so enabling it is deliberate and
+    /// the rollback is flipping it back.
+    #[serde(default)]
+    pub ehdb_projection_parity_enabled: bool,
+
+    /// Seconds between projection-parity sampler ticks. Envy maps
+    /// `NOETL_EHDB_PROJECTION_PARITY_INTERVAL_SECS`. `0` disables the sampler
+    /// while leaving the endpoint usable.
+    ///
+    /// The settle / lookback / sample-size knobs are deliberately **shared**
+    /// with the cross-store sampler: both need the same thing — executions
+    /// whose newest event is old enough that the mirror has certainly caught
+    /// up — and two sets of numbers that must agree is a way to be wrong.
+    #[serde(default = "default_ehdb_projection_parity_interval_secs")]
+    pub ehdb_projection_parity_interval_secs: u64,
+
     #[serde(default = "default_ehdb_crossstore_parity_interval_secs")]
     pub ehdb_crossstore_parity_interval_secs: u64,
 
@@ -982,6 +1006,10 @@ fn default_reconcile_max_noops() -> u32 {
 }
 
 fn default_nonconvergence_sweep_interval_secs() -> u64 {
+    300
+}
+
+fn default_ehdb_projection_parity_interval_secs() -> u64 {
     300
 }
 
@@ -1193,6 +1221,8 @@ impl Default for AppConfig {
             // nothing queries either store on its behalf; the pinned metric
             // families still render 0 so an operator can see it exists.
             ehdb_crossstore_parity_enabled: false,
+            ehdb_projection_parity_enabled: false,
+            ehdb_projection_parity_interval_secs: default_ehdb_projection_parity_interval_secs(),
             ehdb_crossstore_parity_interval_secs: default_ehdb_crossstore_parity_interval_secs(),
             ehdb_crossstore_parity_sample_size: default_ehdb_crossstore_parity_sample_size(),
             ehdb_crossstore_parity_settle_secs: default_ehdb_crossstore_parity_settle_secs(),

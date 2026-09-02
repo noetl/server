@@ -1751,7 +1751,7 @@ async fn run_sampler_tick(state: &AppState) {
 /// Comparing it would report a `count` divergence that is a race, not a defect —
 /// and a comparator that cries wolf on healthy executions gets ignored exactly
 /// when it matters.
-async fn sample_candidates(
+pub(crate) async fn sample_candidates(
     state: &AppState,
     settle_secs: i64,
     lookback_secs: i64,
