@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.100.4](https://github.com/noetl/server/compare/v3.100.3...v3.100.4) (2026-09-03)
+
+### Bug Fixes
+
+* **mirror:** drain independent executions concurrently ([1e13e55](https://github.com/noetl/server/commit/1e13e55d274ece39d1d9e70e3864a16436078e29)), closes [noetl/ai-meta#319](https://github.com/noetl/ai-meta/issues/319)
+
+### Performance Improvements
+
+* **execute:** read the catalog row once per execution, not four times ([7e2ceff](https://github.com/noetl/server/commit/7e2ceff85c86b1223c4a74c23c21e83afaefc52f)), closes [noetl/ai-meta#319](https://github.com/noetl/ai-meta/issues/319)
+
 ## [3.100.3](https://github.com/noetl/server/compare/v3.100.2...v3.100.3) (2026-09-03)
 
 ### Bug Fixes
