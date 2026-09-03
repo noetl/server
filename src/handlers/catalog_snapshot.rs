@@ -237,7 +237,7 @@ pub fn build(
 pub async fn record(
     state: &crate::state::AppState,
     execution_id: i64,
-    catalog_id: i64,
+    item: &CatalogItem,
     content: &str,
     workload: &serde_json::Value,
 ) {
@@ -247,38 +247,24 @@ pub async fn record(
         return;
     }
 
-    // One small read for the two fields `resolve_catalog` does not return.
-    // Deliberately its own query rather than widening `get_playbook_yaml`: that
-    // helper is on the hot path for every execution, and this must cost exactly
-    // nothing when the mode is off.
-    // `path` is read back here rather than threaded in from the caller, so the
-    // snapshot names the path as the CATALOG holds it, not as the request spelled
-    // it — the two can differ, and the catalog's is the one that identifies the
-    // row.
-    let row: Result<Option<(String, String, i16)>, _> =
-        sqlx::query_as::<_, (String, String, i16)>(
-            "SELECT path, kind, version FROM noetl.catalog WHERE catalog_id = $1",
-        )
-        .bind(catalog_id)
-        .fetch_optional(state.pools.cluster())
-        .await;
+    let catalog_id = item.catalog_id;
 
-    let (path, kind, version) = match row {
-        Ok(Some(v)) => v,
-        Ok(None) | Err(_) => {
-            crate::metrics::record_catalog_snapshot(mode.as_str(), "catalog_read_failed");
-            tracing::warn!(
-                target: "noetl_server::catalog_snapshot",
-                execution_id, catalog_id,
-                "catalog snapshot skipped: could not read path/kind/version"
-            );
-            return;
-        }
-    };
+    // The path/kind/version this snapshot names come from the caller's single
+    // catalog read (noetl/ai-meta#319 P2), not from a re-read here.
+    //
+    // The re-read existed so the mode would cost exactly nothing when off — but
+    // `digest` is what production runs, so in practice it was a FOURTH read of a
+    // row already in memory, on every execution. The property it protected still
+    // holds, and now holds more strongly: the snapshot names the path as the
+    // CATALOG holds it (the `path` column, not the request's spelling), and it is
+    // now provably the SAME read the execution resolved through — so the snapshot
+    // cannot name a different row than the one that ran. Two reads could disagree
+    // if the catalog changed between them; one cannot.
+    //
+    // Off-mode still costs nothing: this function returns above, and the caller
+    // builds its `CatalogItem` from values it already holds.
 
-    let item = CatalogItem { catalog_id, path, kind, version };
-
-    let snap = build(&item, execution_id, content, workload, mode, max_bytes());
+    let snap = build(item, execution_id, content, workload, mode, max_bytes());
     let outcome = if snap.content_included || !mode.carries_content() {
         "recorded"
     } else {

@@ -61,7 +61,15 @@ fn the_snapshot_call_cannot_fail_the_execution() {
 #[test]
 fn the_snapshot_is_given_the_parsed_content_and_effective_workload() {
     let at = EXECUTE.find("catalog_snapshot::record(").unwrap();
-    let call = &EXECUTE[at..at + 260];
+    // Window widened for noetl/ai-meta#319 P2: the call now passes an inline
+    // `CatalogItem` built from the single resolution, so the argument list is
+    // longer than the old 260 bytes. Cut at the call's own terminator instead of
+    // a byte count, so the window tracks the call rather than needing a bump
+    // every time an argument is added.
+    let call = {
+        let tail = &EXECUTE[at..];
+        &tail[..tail.find(")\n    .await;").expect("the call is awaited")]
+    };
     assert!(
         call.contains("&playbook_yaml"),
         "snapshot must receive the resolved content parse_playbook consumed:\n{call}"
@@ -109,10 +117,20 @@ fn resolution_still_returns_the_incumbent_answer() {
     let tail = &EXECUTE[at..];
     let end = tail.find("} else {").expect("the by-path branch must end");
     let block = &tail[..end];
+    // The incumbent answer is the `ResolvedCatalog` built from the Postgres row
+    // (`entry`), and it is what BOTH the `None` arm and the same-id `Some` arm
+    // return. It used to be spelled `Ok((entry.0, entry.1))`; noetl/ai-meta#319
+    // P2 widened the read into a struct, so the guard pins the property — the
+    // value returned is the one built from `entry` — rather than the old tuple.
     assert!(
-        block.contains("Ok((entry.0, entry.1))"),
-        "resolution no longer returns the incumbent tuple — the read-cutover may \
-         have been taken by accident:\n{block}"
+        EXECUTE.contains("let resolved = ResolvedCatalog {")
+            && EXECUTE.contains("catalog_id: entry.0,"),
+        "the incumbent answer is no longer built from the Postgres row `entry`"
+    );
+    assert!(
+        block.contains("record_served(\"incumbent\");\n                Ok(resolved)"),
+        "the `incumbent` arm no longer returns the row Postgres resolved — the \
+         read-cutover may have been taken by accident:\n{block}"
     );
     for forbidden in ["rel.get_latest", "relation.get_latest", "e.version)"] {
         assert!(
