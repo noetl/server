@@ -105,6 +105,25 @@ const DEFAULT_ENQUEUE_TIMEOUT_MS: u64 = 5_000;
 pub const DRAIN_MAX_ENV: &str = "NOETL_EHDB_EVENTLOG_MIRROR_DRAIN_MAX_BATCHES";
 const DEFAULT_DRAIN_MAX: usize = 64;
 
+/// How many executions one drain pass delivers **concurrently**. Default 8.
+///
+/// The drain used to POST strictly one batch at a time. Throughput was therefore
+/// `1 / relay-round-trip` no matter how many independent executions were waiting,
+/// and on production that was not close to enough: the mean queue lag reached
+/// **170 s**, the queue sat full, and **24.6% of batches** fell through to inline
+/// delivery on the request path — which is the whole p95 tail and the whole
+/// run-to-run bistability on `/api/execute` (noetl/ai-meta#319).
+///
+/// ⚠ Concurrency here is safe for a reason specific to this queue's shape, not
+/// because ordering does not matter. `deliver_pass` coalesces to **at most one
+/// batch per `execution_id`**, and pass *N+1* does not begin until pass *N* has
+/// fully completed. So two requests in flight together are always for two
+/// DIFFERENT executions, and the per-execution order this module exists to
+/// guarantee is untouched. Setting this to 1 restores the old serial behaviour
+/// exactly.
+pub const DRAIN_CONCURRENCY_ENV: &str = "NOETL_EHDB_EVENTLOG_MIRROR_DRAIN_CONCURRENCY";
+const DEFAULT_DRAIN_CONCURRENCY: usize = 8;
+
 /// How long the shutdown flush waits for the queue to empty. Default 10 s, to
 /// match the graceful-shutdown budget in `main`.
 pub const FLUSH_TIMEOUT_ENV: &str = "NOETL_EHDB_EVENTLOG_MIRROR_FLUSH_TIMEOUT_MS";
@@ -346,21 +365,62 @@ async fn deliver_pass(pass: Vec<MirrorBatch>) {
         }
     }
 
+    // Deliver up to `concurrency` executions at once, as a sliding window: spawn
+    // until the window is full, then retire one before spawning the next.
+    //
+    // `order` is first-seen execution order and is preserved as the SPAWN order.
+    // Completion order is not, and does not need to be — see the note on
+    // `DRAIN_CONCURRENCY_ENV`: one batch per execution per pass, and passes do
+    // not overlap.
+    let concurrency = env_usize(DRAIN_CONCURRENCY_ENV, DEFAULT_DRAIN_CONCURRENCY).max(1);
+    let mut inflight: tokio::task::JoinSet<(usize, f64)> = tokio::task::JoinSet::new();
+
     for execution_id in order {
         let Some(batch) = merged.remove(&execution_id) else {
             continue;
         };
-        let n = batch.records.len();
-        let waited = batch.enqueued_at.elapsed();
-        super::ehdb_eventlog_mirror::deliver(&batch).await;
-        // Observed once per event, so the histogram's count is an event count
-        // and lines up with the mirror counter it is read beside.
-        let secs = waited.as_secs_f64();
-        for _ in 0..n {
-            crate::metrics::observe_ehdb_eventlog_mirror_lag(secs);
+        while inflight.len() >= concurrency {
+            retire(inflight.join_next().await);
         }
-        crate::metrics::record_ehdb_eventlog_mirror_queue("drained", n);
-        settled(n);
+        inflight.spawn(async move {
+            let n = batch.records.len();
+            let waited = batch.enqueued_at.elapsed();
+            super::ehdb_eventlog_mirror::deliver(&batch).await;
+            (n, waited.as_secs_f64())
+        });
+    }
+    while let Some(joined) = inflight.join_next().await {
+        retire(Some(joined));
+    }
+}
+
+/// Account one finished delivery.
+///
+/// ⚠ A task that panicked still has to be accounted. `settled(n)` is what
+/// `flush_on_shutdown` waits on, so a lost accounting would leave the shutdown
+/// flush waiting out its full deadline on events that are no longer coming —
+/// and would report them as `shutdown_abandoned`, blaming the queue for a panic
+/// somewhere else. The `deliver` path catches its own errors, so this is the
+/// unexpected case, not the routine one.
+fn retire(joined: Option<Result<(usize, f64), tokio::task::JoinError>>) {
+    let Some(result) = joined else { return };
+    match result {
+        Ok((n, secs)) => {
+            // Observed once per event, so the histogram's count is an event count
+            // and lines up with the mirror counter it is read beside.
+            for _ in 0..n {
+                crate::metrics::observe_ehdb_eventlog_mirror_lag(secs);
+            }
+            crate::metrics::record_ehdb_eventlog_mirror_queue("drained", n);
+            settled(n);
+        }
+        Err(e) => {
+            warn!(
+                target: "noetl_server::ehdb_eventlog_mirror",
+                error = %e,
+                "a mirror delivery task did not complete; its events are unaccounted"
+            );
+        }
     }
 }
 
