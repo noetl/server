@@ -1787,8 +1787,24 @@ async fn publish_command_notification(
     // `shadow` mode NATS is authoritative, so a failure is logged and swallowed.
     if mode.publishes_ehdb() {
         match state.ehdb_command_publisher.as_ref() {
-            Some(publisher) => match publisher.publish(execution_id, event_id, &payload).await {
-                Ok(seq) => {
+            // noetl/ai-meta#319 P3 — bounded on-path wait. The retry budget and the
+            // at-least-once guarantee are unchanged; only the waiter moved, so a
+            // writer restart no longer becomes a 10s user-visible stall.
+            Some(publisher) => match publisher
+                .publish_bounded(execution_id, event_id, &payload)
+                .await
+            {
+                Ok(crate::command_bus::PublishOutcome::Deferred) => {
+                    crate::metrics::record_command_publish(publish_route, pool_segment);
+                    tracing::info!(
+                        execution_id,
+                        event_id,
+                        command_id = %command_id,
+                        "Command publish deferred off the request path; retry continues in the \
+                         background (noetl/ai-meta#319)"
+                    );
+                }
+                Ok(crate::command_bus::PublishOutcome::Landed(seq)) => {
                     // The publish metric used to live only in the NATS arm, so
                     // removing that arm dropped it entirely — a dispatch-rate
                     // signal that would have gone quiet without anything

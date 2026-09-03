@@ -311,6 +311,50 @@ pub const DB_POOL_STATES: &[&str] = &["total", "idle"];
 
 /// Pin both series at 0 so an exhausted pool and a build without the metric are
 /// distinguishable — a labelled family is pruned while empty.
+/// Publishes whose retry moved off the request path, and how many later landed
+/// (noetl/ai-meta#319 P3). `deferred - deferred_landed` is the number still
+/// in flight or exhausted; pinned at 0 so absence is not mistaken for health.
+pub fn ehdb_command_publish_deferred_total() -> &'static prometheus::IntCounter {
+    static M: OnceLock<prometheus::IntCounter> = OnceLock::new();
+    M.get_or_init(|| {
+        let c = prometheus::IntCounter::new(
+            "noetl_ehdb_command_publish_deferred_total",
+            "Publishes whose retry budget continued off the request path (noetl/ai-meta#319).",
+        )
+        .expect("static counter spec must be valid");
+        registry()
+            .register(Box::new(c.clone()))
+            .expect("registration must succeed");
+        c
+    })
+}
+
+pub fn ehdb_command_publish_deferred_landed_total() -> &'static prometheus::IntCounter {
+    static M: OnceLock<prometheus::IntCounter> = OnceLock::new();
+    M.get_or_init(|| {
+        let c = prometheus::IntCounter::new(
+            "noetl_ehdb_command_publish_deferred_landed_total",
+            "Deferred publishes that subsequently landed (noetl/ai-meta#319).",
+        )
+        .expect("static counter spec must be valid");
+        registry()
+            .register(Box::new(c.clone()))
+            .expect("registration must succeed");
+        c
+    })
+}
+
+pub fn record_ehdb_command_publish_deferred() {
+    ehdb_command_publish_deferred_total().inc();
+}
+pub fn record_ehdb_command_publish_deferred_landed() {
+    ehdb_command_publish_deferred_landed_total().inc();
+}
+pub fn init_ehdb_publish_deferred_series() {
+    ehdb_command_publish_deferred_total().inc_by(0);
+    ehdb_command_publish_deferred_landed_total().inc_by(0);
+}
+
 pub fn init_db_pool_series() {
     for st in DB_POOL_STATES {
         db_pool_connections().with_label_values(&[st]).set(0);
