@@ -137,6 +137,23 @@ pub fn parse_writer_addrs(spec: &str) -> BTreeMap<u32, String> {
 /// dominant term in command dispatch latency (noetl/ai-meta#205); it also kept
 /// the writer from ever seeing two records at once, so it could never
 /// group-commit them.
+/// What a bounded publish did (noetl/ai-meta#319 P3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublishOutcome {
+    /// The writer acked within the on-path budget; the sort key is durable.
+    Landed(u64),
+    /// The on-path budget elapsed and the remaining
+    /// [`PUBLISH_DEADLINE`](EhdbCommandPublisher::PUBLISH_DEADLINE) is being spent
+    /// by a background task.
+    ///
+    /// ⚠ This is **not** fire-and-forget. The same retry loop, the same total
+    /// deadline, and the same at-least-once guarantee — only the waiter changed.
+    /// `command.issued` is already durable in the event log before any publish is
+    /// attempted, so the record is not at risk; what is deferred is the bus
+    /// notification, which is exactly what the retry has always been protecting.
+    Deferred,
+}
+
 pub struct EhdbCommandPublisher {
     shard_count: u32,
     addrs: BTreeMap<u32, String>,
@@ -188,6 +205,23 @@ impl EhdbCommandPublisher {
     /// is what actually ends the loop.
     const PUBLISH_ATTEMPTS: u32 = 32;
 
+    /// How long the **request thread** may spend retrying before the remaining
+    /// budget is continued off-path (noetl/ai-meta#319 P3).
+    ///
+    /// [`PUBLISH_DEADLINE`](Self::PUBLISH_DEADLINE) is 10s because it must span a
+    /// writer pod restart (~2.7s measured) — that window is correct and is NOT
+    /// reduced here. What was wrong is *who waits for it*: the whole 10s sat on
+    /// `POST /api/execute`, so one writer hiccup became a 10s user-visible stall.
+    /// Measured consequence: p50 180ms with a **p95 of 17s** at concurrency 1, and
+    /// a bistable collapse — once publishes start failing, every request burns 10s,
+    /// crosses the client timeout, and the run falls from 18 successes to 0.
+    ///
+    /// 500ms covers the common case the doc above describes (a broken socket the
+    /// writer has already recovered, ~100ms). Anything longer is a real outage of
+    /// the writer, and waiting for that on the request path buys the caller
+    /// nothing it cannot get from the retry continuing in the background.
+    const PUBLISH_ONPATH_DEADLINE: std::time::Duration = std::time::Duration::from_millis(500);
+
     /// Publish one command notification onto the EHDB bus. `execution_id` routes
     /// the shard; `event_id` is the sort key; `payload` is the notification JSON.
     /// Returns the writer-assigned sort key. Lazily (re)connects the router.
@@ -214,11 +248,115 @@ impl EhdbCommandPublisher {
     /// dedupes it (the second claimer is told the command is already claimed).
     /// Losing the command has no such safety net, so at-least-once is the right
     /// trade here.
+    /// Bounded publish (noetl/ai-meta#319 P3): wait at most
+    /// [`PUBLISH_ONPATH_DEADLINE`](Self::PUBLISH_ONPATH_DEADLINE) on the caller's
+    /// thread, then continue the remaining
+    /// [`PUBLISH_DEADLINE`](Self::PUBLISH_DEADLINE) in the background.
+    ///
+    /// The delivery guarantee is unchanged — same loop, same total window,
+    /// still at-least-once. Only the waiter moves.
+    pub async fn publish_bounded(
+        self: &std::sync::Arc<Self>,
+        execution_id: i64,
+        event_id: i64,
+        payload: &[u8],
+    ) -> Result<PublishOutcome, String> {
+        let started = std::time::Instant::now();
+        match self
+            .publish_until(
+                execution_id,
+                event_id,
+                payload,
+                Self::PUBLISH_ONPATH_DEADLINE,
+                started,
+            )
+            .await
+        {
+            Ok(seq) => Ok(PublishOutcome::Landed(seq)),
+            Err(e) => {
+                // Budget elapsed (or the attempt cap hit) without an ack. Hand the
+                // REMAINING window to a background task rather than making the
+                // caller wait it out.
+                if started.elapsed() >= Self::PUBLISH_DEADLINE {
+                    return Err(e);
+                }
+                let me = std::sync::Arc::clone(self);
+                let payload = payload.to_vec();
+                crate::metrics::record_ehdb_command_publish_deferred();
+                tracing::warn!(
+                    execution_id,
+                    event_id,
+                    on_path_ms = started.elapsed().as_millis() as u64,
+                    error = %e,
+                    "EHDB publish did not ack within the on-path budget; continuing the retry \
+                     in the background (noetl/ai-meta#319). command.issued is already durable."
+                );
+                tokio::spawn(async move {
+                    match me
+                        .publish_until(
+                            execution_id,
+                            event_id,
+                            &payload,
+                            Self::PUBLISH_DEADLINE,
+                            started,
+                        )
+                        .await
+                    {
+                        Ok(seq) => {
+                            crate::metrics::record_ehdb_command_publish_deferred_landed();
+                            tracing::info!(
+                                execution_id,
+                                event_id,
+                                ehdb_sort_key = seq,
+                                waited_ms = started.elapsed().as_millis() as u64,
+                                "EHDB publish landed off the request path"
+                            );
+                        }
+                        Err(e) => {
+                            crate::metrics::record_ehdb_command_publish_failed(
+                                "deferred_exhausted",
+                            );
+                            tracing::error!(
+                                execution_id,
+                                event_id,
+                                error = %e,
+                                "EHDB publish EXHAUSTED its deadline off the request path — the \
+                                 command was never delivered to the bus. command.issued is durable, \
+                                 so recovery is the reconcile/guardrail path."
+                            );
+                        }
+                    }
+                });
+                Ok(PublishOutcome::Deferred)
+            }
+        }
+    }
+
     pub async fn publish(
         &self,
         execution_id: i64,
         event_id: i64,
         payload: &[u8],
+    ) -> Result<u64, String> {
+        let started = std::time::Instant::now();
+        self.publish_until(
+            execution_id,
+            event_id,
+            payload,
+            Self::PUBLISH_DEADLINE,
+            started,
+        )
+        .await
+    }
+
+    /// The retry loop, parameterised by how long it may run.
+    async fn publish_until(
+        &self,
+        execution_id: i64,
+        event_id: i64,
+        payload: &[u8],
+        deadline: std::time::Duration,
+        started: std::time::Instant,
     ) -> Result<u64, String> {
         let record = EventRecord::new(
             event_id as u64,
@@ -226,7 +364,6 @@ impl EhdbCommandPublisher {
             String::new(),
             String::from_utf8_lossy(payload).into_owned(),
         );
-        let started = std::time::Instant::now();
         let mut last_err = String::new();
         let mut backoff = Self::RETRY_BACKOFF_INITIAL;
         for attempt in 1..=Self::PUBLISH_ATTEMPTS {
@@ -234,7 +371,7 @@ impl EhdbCommandPublisher {
                 Ok(r) => r,
                 Err(e) => {
                     last_err = e;
-                    if !Self::sleep_before_retry(started, &mut backoff).await {
+                    if !Self::sleep_before_retry(started, deadline, &mut backoff).await {
                         break;
                     }
                     continue;
@@ -273,7 +410,7 @@ impl EhdbCommandPublisher {
                         error = %last_err,
                         "EHDB publish failed; redialing the writer and retrying"
                     );
-                    if !Self::sleep_before_retry(started, &mut backoff).await {
+                    if !Self::sleep_before_retry(started, deadline, &mut backoff).await {
                         break;
                     }
                 }
@@ -301,9 +438,10 @@ impl EhdbCommandPublisher {
     /// budget.
     async fn sleep_before_retry(
         started: std::time::Instant,
+        deadline: std::time::Duration,
         backoff: &mut std::time::Duration,
     ) -> bool {
-        let remaining = match Self::PUBLISH_DEADLINE.checked_sub(started.elapsed()) {
+        let remaining = match deadline.checked_sub(started.elapsed()) {
             Some(r) => r,
             None => return false,
         };
