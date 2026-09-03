@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.100.3](https://github.com/noetl/server/compare/v3.100.2...v3.100.3) (2026-09-03)
+
+### Bug Fixes
+
+* **publish:** move the retry budget off the request path ([274cacc](https://github.com/noetl/server/commit/274cacc8f7899043f207515f8d03e0b54b2e60ff)), closes [noetl/ai-meta#319](https://github.com/noetl/ai-meta/issues/319) [#208](https://github.com/noetl/server/issues/208) [#208](https://github.com/noetl/server/issues/208) [noetl/ai-meta#319](https://github.com/noetl/ai-meta/issues/319)
+
 ## [3.100.2](https://github.com/noetl/server/compare/v3.100.1...v3.100.2) (2026-09-02)
 
 ### Bug Fixes
