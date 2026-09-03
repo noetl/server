@@ -239,6 +239,23 @@ static SYSTEM_CATALOG: std::sync::LazyLock<
 /// must be **exempt** from the publish gate: if their own events published, they
 /// could never bootstrap (the drainer would deadlock waiting for itself to
 /// drain). So they always write synchronously, even under the gate.
+/// Record `catalog_id -> is_system` from a path the caller has ALREADY read.
+///
+/// [`is_system_execution`] below memoises the same fact, but only after paying a
+/// `SELECT path FROM noetl.catalog` to learn it. `execute_one` has that path in
+/// hand from resolution, so it seeds the memo directly and the read never happens
+/// (noetl/ai-meta#319 P2).
+///
+/// ⚠ The caller must pass the catalog's `path` COLUMN, not the path the request
+/// spelled. `is_system_path` is a `system/` prefix test and this memo is what the
+/// publish gate consults, so seeding a request-supplied string would let a caller
+/// choose which side of that gate its execution lands on.
+pub(crate) fn memoize_system_path(catalog_id: i64, path: &str) {
+    if let Ok(mut m) = SYSTEM_CATALOG.write() {
+        m.insert(catalog_id, is_system_path(path));
+    }
+}
+
 async fn is_system_execution(state: &AppState, catalog_id: i64) -> bool {
     if let Some(v) = SYSTEM_CATALOG
         .read()

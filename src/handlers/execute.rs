@@ -357,16 +357,30 @@ pub(crate) async fn execute_one(
         }
     }
 
-    // Resolve catalog entry
-    let (catalog_id, path) = resolve_catalog(state, &request).await?;
+    // Resolve catalog entry — ONE read, carrying every column the rest of this
+    // function needs (noetl/ai-meta#319 P2).
+    let catalog = resolve_catalog(state, &request).await?;
+    let catalog_id = catalog.catalog_id;
+    let path = catalog.path.clone();
 
     info!(
         "Starting execution for path={}, catalog_id={}",
         path, catalog_id
     );
 
-    // Get playbook from catalog
-    let playbook_yaml = get_playbook_yaml(state, catalog_id).await?;
+    // Seed the publish-gate's system-path memo from the path we just read, so
+    // `should_publish` does not spend a THIRD read of this same row deciding
+    // whether `system/` owns it.
+    //
+    // ⚠ Seeded with the CATALOG's path, not the request's spelling. The two can
+    // differ (case, a redirected alias), and it is the catalog's that identifies
+    // the row — memoising the request's would let a request spell its way past
+    // the system-pool gate. `resolve_catalog` returns the `path` COLUMN, which is
+    // the same value `is_system_execution`'s own query would have returned.
+    crate::handlers::event_write::memoize_system_path(catalog_id, &path);
+
+    // Get playbook from the row already in hand — no second query.
+    let playbook_yaml = playbook_yaml_from(&catalog)?;
 
     // Parse playbook
     let playbook = crate::playbook::parser::parse_playbook(&playbook_yaml)?;
@@ -440,7 +454,12 @@ pub(crate) async fn execute_one(
     crate::handlers::catalog_snapshot::record(
         state,
         execution_id,
-        catalog_id,
+        &crate::handlers::catalog_snapshot::CatalogItem {
+            catalog_id,
+            path: path.clone(),
+            kind: catalog.kind.clone(),
+            version: catalog.version,
+        },
         &playbook_yaml,
         &workload,
     )
@@ -580,21 +599,74 @@ async fn emit_deduplicated_event(
 }
 
 /// Resolve catalog entry from path or catalog_id.
-async fn resolve_catalog(state: &AppState, request: &ExecuteRequest) -> AppResult<(i64, String)> {
+/// Everything `execute_one` needs from `noetl.catalog`, read **once**.
+///
+/// Before noetl/ai-meta#319 P2 the same catalog row was read **four times** on
+/// every `/api/execute`: `resolve_catalog` (id/path/version), `get_playbook_yaml`
+/// (content/payload), `is_system_execution` (path), and `catalog_snapshot::record`
+/// (path/kind/version). Each was individually reasonable and each cost a full
+/// pgbouncer → cloud-sql-proxy → Cloud SQL round-trip, measured at **13-20 ms**
+/// from inside the server pod — so the redundancy was ~45-60 ms of a ~150 ms
+/// request.
+///
+/// ⚠ This is **not a cache**. The row is still read fresh on every request, from
+/// the same query with the same predicate; only the *repeats* are gone. A newly
+/// registered version, an archive, or an out-of-band content edit is therefore
+/// picked up on the very next request exactly as before — there is no window in
+/// which a stale definition can be served, because nothing is retained.
+#[derive(Debug, Clone)]
+pub(crate) struct ResolvedCatalog {
+    pub catalog_id: i64,
+    pub path: String,
+    pub kind: String,
+    pub version: i16,
+    pub content: Option<String>,
+    pub payload: Option<serde_json::Value>,
+}
+
+async fn resolve_catalog(state: &AppState, request: &ExecuteRequest) -> AppResult<ResolvedCatalog> {
     if let Some(catalog_id) = request.catalog_id {
         // Lookup by catalog_id (Phase F R4-3: noetl.catalog is cluster-wide)
-        let entry = sqlx::query_as::<_, (i64, String)>(
-            "SELECT catalog_id, path FROM noetl.catalog WHERE catalog_id = $1",
+        let entry = sqlx::query_as::<
+            _,
+            (
+                i64,
+                String,
+                String,
+                i16,
+                Option<String>,
+                Option<serde_json::Value>,
+            ),
+        >(
+            "SELECT catalog_id, path, kind, version, content, payload \
+                 FROM noetl.catalog WHERE catalog_id = $1",
         )
         .bind(catalog_id)
         .fetch_optional(state.pools.cluster())
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Catalog entry not found: {}", catalog_id)))?;
 
-        Ok(entry)
+        Ok(ResolvedCatalog {
+            catalog_id: entry.0,
+            path: entry.1,
+            kind: entry.2,
+            version: entry.3,
+            content: entry.4,
+            payload: entry.5,
+        })
     } else if let Some(path) = &request.path {
         // Lookup by path (latest version; Phase F R4-3: cluster-wide)
-        let entry = sqlx::query_as::<_, (i64, String, i16)>(
+        let entry = sqlx::query_as::<
+            _,
+            (
+                i64,
+                String,
+                i16,
+                String,
+                Option<String>,
+                Option<serde_json::Value>,
+            ),
+        >(
             // noetl/ai-meta#237 — an archived entry is retired: it must not
             // resolve by PATH, which is how everything normally runs.
             // Resolution by explicit `catalog_id` (above) deliberately still
@@ -609,7 +681,8 @@ async fn resolve_catalog(state: &AppState, request: &ExecuteRequest) -> AppResul
                 // `version` is selected for the catalog read-source
                 // comparison (RFC step 3 §5). Same query plan; the column is
                 // ignored entirely under the default `postgres` mode.
-                "SELECT catalog_id, path, version FROM noetl.catalog \
+                "SELECT catalog_id, path, version, kind, content, payload \
+                     FROM noetl.catalog \
                      WHERE path = $1{archived} \
                      ORDER BY version DESC LIMIT 1",
                 archived = crate::db::queries::catalog::archived_filter()
@@ -629,9 +702,18 @@ async fn resolve_catalog(state: &AppState, request: &ExecuteRequest) -> AppResul
         // records the outcome; it serves the Postgres answer either way. `tier`
         // is the cutover and is an owner decision — it is NOT taken here, and
         // the relation's answer is never substituted below.
+        let resolved = ResolvedCatalog {
+            catalog_id: entry.0,
+            path: entry.1.clone(),
+            kind: entry.3.clone(),
+            version: entry.2,
+            content: entry.4.clone(),
+            payload: entry.5.clone(),
+        };
+
         let m = crate::handlers::catalog_read::mode();
         if !m.consults_relation() {
-            return Ok((entry.0, entry.1));
+            return Ok(resolved);
         }
 
         let rel = crate::handlers::catalog_read::cached_relation().await;
@@ -658,13 +740,25 @@ async fn resolve_catalog(state: &AppState, request: &ExecuteRequest) -> AppResul
         let served =
             crate::handlers::catalog_read::serve_decision(m, rel.as_ref(), outcome, &entry.1);
         match served {
-            Some(e) => {
+            // ⚠ The relation may name a DIFFERENT row than the incumbent, and the
+            // one-read widening above loaded the INCUMBENT's content. Serving the
+            // relation's id with the incumbent's YAML would run one playbook while
+            // claiming to run another — the exact silent-substitution failure the
+            // fail-closed `serve_decision` exists to prevent. So when the ids
+            // differ, pay a second read for the row actually being served. This
+            // costs nothing under `postgres`/`verify` (the modes that ship): both
+            // return the incumbent, whose content is already in hand.
+            Some(e) if e.catalog_id != resolved.catalog_id => {
                 crate::handlers::catalog_read::record_served("relation");
-                Ok((e.catalog_id, e.path.clone()))
+                load_catalog_by_id(state, e.catalog_id).await
+            }
+            Some(_) => {
+                crate::handlers::catalog_read::record_served("relation");
+                Ok(resolved)
             }
             None => {
                 crate::handlers::catalog_read::record_served("incumbent");
-                Ok((entry.0, entry.1))
+                Ok(resolved)
             }
         }
     } else {
@@ -674,30 +768,57 @@ async fn resolve_catalog(state: &AppState, request: &ExecuteRequest) -> AppResul
     }
 }
 
-/// Get playbook YAML from catalog.
-async fn get_playbook_yaml(state: &AppState, catalog_id: i64) -> AppResult<String> {
-    // Try to get content first (raw YAML), fall back to payload (JSON)
-    // Phase F R4-3: noetl.catalog is cluster-wide.
-    let row: (Option<String>, Option<serde_json::Value>) =
-        sqlx::query_as::<_, (Option<String>, Option<serde_json::Value>)>(
-            "SELECT content, payload FROM noetl.catalog WHERE catalog_id = $1",
-        )
-        .bind(catalog_id)
-        .fetch_optional(state.pools.cluster())
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("Catalog entry not found: {}", catalog_id)))?;
+/// Load one catalog row by id, as `ResolvedCatalog`.
+///
+/// Only reached when the read-source ladder elects to serve a row OTHER than the
+/// incumbent — see the call site. Not on the shipping path.
+async fn load_catalog_by_id(state: &AppState, catalog_id: i64) -> AppResult<ResolvedCatalog> {
+    let entry = sqlx::query_as::<
+        _,
+        (
+            i64,
+            String,
+            String,
+            i16,
+            Option<String>,
+            Option<serde_json::Value>,
+        ),
+    >(
+        "SELECT catalog_id, path, kind, version, content, payload \
+             FROM noetl.catalog WHERE catalog_id = $1",
+    )
+    .bind(catalog_id)
+    .fetch_optional(state.pools.cluster())
+    .await?
+    .ok_or_else(|| AppError::NotFound(format!("Catalog entry not found: {}", catalog_id)))?;
 
-    match row {
-        (Some(content), _) if !content.is_empty() => Ok(content),
-        (_, Some(payload)) => {
-            // Convert JSON payload to YAML string
-            serde_yaml::to_string(&payload).map_err(|e| {
-                AppError::Internal(format!("Failed to convert payload to YAML: {}", e))
-            })
-        }
+    Ok(ResolvedCatalog {
+        catalog_id: entry.0,
+        path: entry.1,
+        kind: entry.2,
+        version: entry.3,
+        content: entry.4,
+        payload: entry.5,
+    })
+}
+
+/// The playbook YAML carried by an already-read catalog row.
+///
+/// Raw `content` wins; a row that stores the definition as a JSON `payload`
+/// instead is converted. Was a second `SELECT content, payload FROM noetl.catalog`
+/// (noetl/ai-meta#319 P2) — the columns now arrive with the resolution, so this is
+/// a **pure function**: same inputs, same result, no I/O, unit-testable without a
+/// database. The row it reads is the row resolution just read, so "the YAML the
+/// parser consumed" and "the row this execution resolved to" cannot drift apart —
+/// with two reads they could, if the catalog changed between them.
+pub(crate) fn playbook_yaml_from(entry: &ResolvedCatalog) -> AppResult<String> {
+    match (&entry.content, &entry.payload) {
+        (Some(content), _) if !content.is_empty() => Ok(content.clone()),
+        (_, Some(payload)) => serde_yaml::to_string(payload)
+            .map_err(|e| AppError::Internal(format!("Failed to convert payload to YAML: {}", e))),
         _ => Err(AppError::NotFound(format!(
             "No playbook content found for catalog_id: {}",
-            catalog_id
+            entry.catalog_id
         ))),
     }
 }
