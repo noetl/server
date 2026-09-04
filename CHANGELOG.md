@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.100.6](https://github.com/noetl/server/compare/v3.100.5...v3.100.6) (2026-09-04)
+
+### Bug Fixes
+
+* **metrics:** publish the shutdown-flush budget on the ARMED line ([6592298](https://github.com/noetl/server/commit/659229893c428111afcecbce40206f856eff8364))
+
 ## [3.100.5](https://github.com/noetl/server/compare/v3.100.4...v3.100.5) (2026-09-04)
 
 ### Bug Fixes
