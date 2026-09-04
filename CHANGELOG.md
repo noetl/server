@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.101.3](https://github.com/noetl/server/compare/v3.101.2...v3.101.3) (2026-09-04)
+
+### Bug Fixes
+
+* **ehdb:** make the proven retry window the default ([2b33f50](https://github.com/noetl/server/commit/2b33f500b3b67db64d601e49961e0d903fb0375e)), closes [ai-meta#267](https://github.com/noetl/ai-meta/issues/267) [noetl/ai-meta#320](https://github.com/noetl/ai-meta/issues/320) [noetl/ai-meta#267](https://github.com/noetl/ai-meta/issues/267)
+
 ## [3.101.2](https://github.com/noetl/server/compare/v3.101.1...v3.101.2) (2026-09-04)
 
 ### Bug Fixes
