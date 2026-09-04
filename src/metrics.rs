@@ -3532,6 +3532,34 @@ pub fn ehdb_eventlog_mirror_async_enabled() -> &'static IntGauge {
     })
 }
 
+/// Gauge: how many executions one drain pass delivers concurrently.
+///
+/// ⚠ This exists because I shipped the knob without it. `DRAIN_CONCURRENCY` is
+/// read **per pass** rather than at startup, and the ARMED log line reports
+/// `capacity` / `drain_max` / `enqueue_timeout_ms` but not this — so after the
+/// noetl/ai-meta#320 mitigation was applied there was **no runtime evidence
+/// anywhere** that the serial drain was actually in effect. The value could only
+/// be inferred from the Deployment spec, which is a different representation and
+/// one that can disagree with the running process.
+///
+/// A rollback knob whose engagement cannot be observed is the same defect class
+/// as the incident it mitigates.
+pub fn ehdb_eventlog_mirror_drain_concurrency() -> &'static IntGauge {
+    static M: OnceLock<IntGauge> = OnceLock::new();
+    M.get_or_init(|| {
+        let g = IntGauge::new(
+            "noetl_ehdb_eventlog_mirror_drain_concurrency",
+            "Executions one async event-log mirror drain pass delivers concurrently; 1 is the \
+             serial drain (noetl/ai-meta#320).",
+        )
+        .expect("static gauge spec must be valid");
+        registry()
+            .register(Box::new(g.clone()))
+            .expect("gauge registration must succeed");
+        g
+    })
+}
+
 /// Pin the async-mirror label set and gauges at 0.
 ///
 /// Unconditional, and not inside the flag check: a pin behind the flag would be
@@ -3546,6 +3574,12 @@ pub fn init_ehdb_eventlog_mirror_queue_series() {
     ehdb_eventlog_mirror_pending_events().set(0);
     ehdb_eventlog_mirror_queue_depth().set(0);
     ehdb_eventlog_mirror_async_enabled().set(0);
+    // Pinned to the CONFIGURED value, not 0: unlike the others this is not a
+    // count that starts empty — 0 is not a legal concurrency, so pinning it at 0
+    // would publish a value the drain can never use and make an un-armed process
+    // look misconfigured rather than idle.
+    ehdb_eventlog_mirror_drain_concurrency()
+        .set(crate::handlers::ehdb_eventlog_mirror_queue::configured_drain_concurrency() as i64);
     // An unlabelled Histogram is still a family with one child, so it is not
     // pruned — but observing nothing leaves every bucket at 0, which is what we
     // want it to read as.
