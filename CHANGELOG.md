@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.101.0](https://github.com/noetl/server/compare/v3.100.7...v3.101.0) (2026-09-04)
+
+### Features
+
+* **ehdb:** add a scoped, inspect-only tier repair endpoint ([ab11f5e](https://github.com/noetl/server/commit/ab11f5e88af32aaea69b07d378a5f407e776b9a9)), closes [noetl/ai-meta#320](https://github.com/noetl/ai-meta/issues/320) [ehdb#352](https://github.com/noetl/ehdb/issues/352) [worker#309](https://github.com/noetl/worker/issues/309) [noetl/ai-meta#264](https://github.com/noetl/ai-meta/issues/264) [noetl/ai-meta#313](https://github.com/noetl/ai-meta/issues/313) [noetl/ai-meta#320](https://github.com/noetl/ai-meta/issues/320)
+
 ## [3.100.7](https://github.com/noetl/server/compare/v3.100.6...v3.100.7) (2026-09-04)
 
 ### Bug Fixes
