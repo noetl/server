@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.101.1](https://github.com/noetl/server/compare/v3.101.0...v3.101.1) (2026-09-04)
+
+### Bug Fixes
+
+* **ehdb:** retry mirror deliveries, and count the ones that are lost ([9f7566a](https://github.com/noetl/server/commit/9f7566a2e17722c75238badeb2db6d6f66c45a8d)), closes [ehdb#352](https://github.com/noetl/ehdb/issues/352) [worker#309](https://github.com/noetl/worker/issues/309) [noetl/ai-meta#320](https://github.com/noetl/ai-meta/issues/320) [noetl/ai-meta#322](https://github.com/noetl/ai-meta/issues/322)
+
 ## [3.101.0](https://github.com/noetl/server/compare/v3.100.7...v3.101.0) (2026-09-04)
 
 ### Features
