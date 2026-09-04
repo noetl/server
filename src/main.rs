@@ -441,9 +441,14 @@ fn build_router(
             "/api/ehdb/projection-parity/self-test",
             get(handlers::ehdb_projection_parity::self_test_endpoint),
         )
+
         .route(
             "/api/ehdb/parity/executions/{execution_id}",
             get(handlers::ehdb_parity::compare_execution_endpoint),
+        )
+        .route(
+            "/api/ehdb/repair/executions/{execution_id}",
+            post(handlers::ehdb_tier_repair::repair_execution_endpoint),
         )
         .route(
             "/api/ehdb/parity/self-test",
