@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.100.7](https://github.com/noetl/server/compare/v3.100.6...v3.100.7) (2026-09-04)
+
+### Bug Fixes
+
+* **metrics:** pin deferred_exhausted, which was absent rather than zero ([ff79c96](https://github.com/noetl/server/commit/ff79c96784c53e4d7ab9253ede63a5403e4a9c81)), closes [noetl/ai-meta#319](https://github.com/noetl/ai-meta/issues/319)
+
 ## [3.100.6](https://github.com/noetl/server/compare/v3.100.5...v3.100.6) (2026-09-04)
 
 ### Bug Fixes
