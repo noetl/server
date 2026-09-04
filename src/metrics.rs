@@ -699,8 +699,25 @@ pub fn ehdb_command_publish_failed_total() -> &'static IntCounterVec {
 /// any signal.  `no_writers` is the severe one: with `NOETL_COMMAND_BUS=ehdb`
 /// and no writer routes resolved, EVERY command is silently not delivered and
 /// every execution stalls — previously visible only as a `tracing::warn!`.
-pub const EHDB_COMMAND_PUBLISH_FAILED_REASONS: [&str; 4] =
-    ["gave_up", "attempt", "no_writers", "shadow_failed"];
+/// ⚠ Every reason the code can record must be listed here.
+///
+/// A reason that is recorded but not pinned stays **ABSENT** from `/metrics`
+/// until the first time it fires, while its siblings read 0 — so "it has never
+/// happened" and "this build has no such metric" are the same scrape. That is
+/// the absent-is-not-zero shape this repo keeps finding, and
+/// `drift-audit.sh metric-pins` compares this list against the literals
+/// `record_ehdb_command_publish_failed` is actually called with.
+///
+/// `deferred_exhausted` was missing here from the day the deferred publish path
+/// shipped (noetl/ai-meta#319 P3) — the one outcome an operator would go looking
+/// for after a writer outage, and the one that would have shown nothing.
+pub const EHDB_COMMAND_PUBLISH_FAILED_REASONS: [&str; 5] = [
+    "gave_up",
+    "attempt",
+    "no_writers",
+    "shadow_failed",
+    "deferred_exhausted",
+];
 
 pub fn init_ehdb_command_publish_failed_series() {
     for reason in EHDB_COMMAND_PUBLISH_FAILED_REASONS {
