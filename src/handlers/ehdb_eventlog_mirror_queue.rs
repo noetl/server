@@ -166,6 +166,14 @@ static PENDING_EVENTS: AtomicI64 = AtomicI64::new(0);
 static QUEUE: OnceLock<Option<mpsc::Sender<MirrorBatch>>> = OnceLock::new();
 
 /// Is the async queue armed in this process?
+/// The configured drain concurrency, for pinning the gauge and for the ARMED log.
+///
+/// Reads the same env the drain reads, through the same helper, so the published
+/// value cannot drift from the applied one.
+pub fn configured_drain_concurrency() -> usize {
+    env_usize(DRAIN_CONCURRENCY_ENV, DEFAULT_DRAIN_CONCURRENCY).max(1)
+}
+
 pub fn enabled() -> bool {
     queue().is_some()
 }
@@ -202,6 +210,7 @@ pub fn init() {
         capacity,
         drain_max,
         enqueue_timeout_ms = env_millis(ENQUEUE_TIMEOUT_ENV, DEFAULT_ENQUEUE_TIMEOUT_MS).as_millis() as u64,
+        drain_concurrency = configured_drain_concurrency(),
         "async event-log mirror queue ARMED — the mirror is off the event-write path"
     );
     tokio::spawn(drain_loop(rx, drain_max));
@@ -372,7 +381,12 @@ async fn deliver_pass(pass: Vec<MirrorBatch>) {
     // Completion order is not, and does not need to be — see the note on
     // `DRAIN_CONCURRENCY_ENV`: one batch per execution per pass, and passes do
     // not overlap.
-    let concurrency = env_usize(DRAIN_CONCURRENCY_ENV, DEFAULT_DRAIN_CONCURRENCY).max(1);
+    let concurrency = configured_drain_concurrency();
+    // Published from the value this pass ACTUALLY used, not from a startup read.
+    // The knob is per-pass, so a gauge set only at init could disagree with the
+    // running behaviour — which is precisely the drift that left the #320
+    // mitigation unobservable.
+    crate::metrics::ehdb_eventlog_mirror_drain_concurrency().set(concurrency as i64);
     let mut inflight: tokio::task::JoinSet<(usize, f64)> = tokio::task::JoinSet::new();
 
     for execution_id in order {
