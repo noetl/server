@@ -265,6 +265,17 @@ pub struct CrossStoreReport {
     /// i.e. every one of them, minus any held back by the lag tolerance window
     /// (`pending_authoritative`). The two sum to the execution's total.
     pub authoritative_count: usize,
+    /// The mirror-expected `event_id`s the tier does not hold.
+    ///
+    /// ⚠ Structured, not only rendered into a `missing_event` divergence detail.
+    /// The repair path needs this set exactly, and recovering it by parsing that
+    /// human-readable string would make a repair — which WRITES to a
+    /// `primary`-serving tier — depend on a message format nothing pins.
+    ///
+    /// Empty on a healthy execution, and `skip_serializing_if` keeps it off the
+    /// wire there, so a clean report is byte-identical to before this existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub missing_event_ids: Vec<i64>,
     /// The subset the tier is expected to hold — see
     /// [`AuthoritativeEvent::mirror_expected`]. This is the number the tier's
     /// record count is compared against; reporting both makes the scoping
@@ -553,6 +564,7 @@ pub fn compare_cross_store_with_horizon(
         .map(|e| e.event_id)
         .filter(|id| !mirrored_ids.contains(id))
         .collect();
+    let missing_event_ids = missing.clone();
     if !missing.is_empty() {
         divergences.push(Divergence {
             kind: DivergenceKind::MissingEvent,
@@ -673,6 +685,7 @@ pub fn compare_cross_store_with_horizon(
     CrossStoreReport {
         execution_id: execution_id.to_string(),
         authoritative_count: authoritative.len(),
+        missing_event_ids,
         authoritative_expected: expected.len(),
         unmirrored_by_design: authoritative.len() - expected.len(),
         ehdb_count: ehdb_comparable,
