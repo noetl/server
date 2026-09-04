@@ -323,9 +323,38 @@ pub fn mirror_payload(row: &EventRow) -> serde_json::Value {
 }
 
 /// One HTTP client for the relay, shared across calls.
+///
+/// **Idle connections are not reused for long, and that is the point**
+/// ([noetl/ai-meta#320](https://github.com/noetl/ai-meta/issues/320)).
+/// `reqwest::Client::new()` keeps idle keep-alive connections for 90 s. The
+/// relay target is a ClusterIP Service in front of a **single** pod that is
+/// killed by its liveness probe several times a day
+/// ([noetl/ai-meta#322](https://github.com/noetl/ai-meta/issues/322)), and
+/// mirror traffic is bursty — executions arrive minutes apart. So the pooled
+/// connection from the last burst is very often a socket to a pod that no
+/// longer exists, and *every* retry draws another dead one from the same pool:
+/// five attempts fail identically inside four seconds against a peer that is
+/// perfectly healthy.
+///
+/// That is the shape of the losses retrying alone could not explain — the
+/// 2026-09-03 muno drops happened at light load with **no** pod churn in the
+/// window, and one drop recurred post-deploy at 13:21:35Z with the system pool
+/// up and Ready for 100 minutes.
+///
+/// A 15 s idle timeout means a bursty producer opens a fresh connection almost
+/// every time. One extra handshake per batch is nothing on a background mirror;
+/// a silently-dead socket costs the tier an event it can never recover.
 fn relay_client() -> &'static reqwest::Client {
     static C: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-    C.get_or_init(reqwest::Client::new)
+    C.get_or_init(|| {
+        reqwest::Client::builder()
+            .pool_idle_timeout(Duration::from_secs(15))
+            .tcp_keepalive(Duration::from_secs(15))
+            .build()
+            // A builder failure would mean no TLS backend; falling back keeps the
+            // mirror working rather than panicking the server at startup.
+            .unwrap_or_else(|_| reqwest::Client::new())
+    })
 }
 
 /// One relay-ready mirror request: the records for one execution, in order.
@@ -787,6 +816,37 @@ mod tests {
 
     /// `dropped` must be in the pinned label set, or a server that has never
     /// dropped and a server built before the counter existed look identical.
+    /// The relay client must not hand back 90-second-old idle sockets.
+    ///
+    /// Asserted on the source because `reqwest::Client` exposes none of its pool
+    /// configuration for inspection. Needles are assembled rather than written
+    /// out, because `include_str!` includes this test: a literal spelling would
+    /// match itself and the guard would pass on its own text.
+    #[test]
+    fn the_relay_client_bounds_idle_connection_reuse() {
+        let me = include_str!("ehdb_eventlog_mirror.rs");
+        assert!(
+            me.len() > 20_000,
+            "the guard extracted an implausibly small source — it is not measuring this file"
+        );
+        let init_at = me
+            .find("fn relay_client()")
+            .expect("the relay client constructor must still exist");
+        let body = &me[init_at..init_at + 1200];
+        let idle = format!("pool_idle{}_timeout(", "");
+        assert!(
+            body.contains(&idle),
+            "relay_client must bound idle connection reuse — the default 90s pool hands dead \
+             sockets to every retry when the single-pod relay target restarts, which is exactly \
+             the loss this fix exists to stop"
+        );
+        let bare = format!("get_or_init(reqwest::Client{}::new)", "");
+        assert!(
+            !body.contains(&bare),
+            "relay_client fell back to the default-pooled client"
+        );
+    }
+
     #[test]
     fn the_loss_label_is_pinned_so_absent_is_not_zero() {
         assert!(
