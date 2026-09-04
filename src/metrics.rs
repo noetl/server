@@ -3359,9 +3359,57 @@ pub fn ehdb_eventlog_mirror_total() -> &'static IntCounterVec {
     })
 }
 
-/// Every outcome label the server-side mirror can emit. Closed set, pinned at 0.
-pub const EHDB_EVENTLOG_MIRROR_OUTCOMES: [&str; 4] =
-    ["mirrored", "unconfigured", "unavailable", "degraded"];
+/// Every **terminal** outcome label the server-side mirror can emit, one per
+/// batch. Closed set, pinned at 0.
+///
+/// `dropped` is the one that matters: it is the count of authoritative events
+/// that will never reach the tier, and before noetl/ai-meta#320 there was no
+/// such label — a discarded batch was filed under `unavailable`, which reads
+/// like a transport blip rather than data loss, and which no alert watched.
+///
+/// `unavailable` and `degraded` are still emitted here when retries are
+/// disabled (`NOETL_EHDB_EVENTLOG_MIRROR_MAX_RETRIES=0`), because with no
+/// retry the first failure *is* terminal. When retries are on, a failing
+/// attempt is counted on
+/// [`record_ehdb_eventlog_mirror_attempt`] instead and only the exhausted
+/// batch lands here, as `dropped`.
+pub const EHDB_EVENTLOG_MIRROR_OUTCOMES: [&str; 6] = [
+    "mirrored",
+    "recovered",
+    "dropped",
+    "unconfigured",
+    "unavailable",
+    "degraded",
+];
+
+/// Per-**attempt** failure labels, so a retry that eventually succeeds is still
+/// visible. Without this the fix would hide the very instability it works
+/// around: a pool flapping every ten minutes and a perfectly healthy one would
+/// both read `mirrored`.
+pub const EHDB_EVENTLOG_MIRROR_ATTEMPT_OUTCOMES: [&str; 2] = ["unavailable", "degraded"];
+
+pub fn ehdb_eventlog_mirror_attempt_total() -> &'static IntCounterVec {
+    static M: OnceLock<IntCounterVec> = OnceLock::new();
+    M.get_or_init(|| {
+        let c = IntCounterVec::new(
+            Opts::new(
+                "noetl_ehdb_eventlog_mirror_attempt_total",
+                "Individual failed mirror delivery attempts by outcome; a batch that \
+                 succeeds on a retry increments this and then `mirror_total{outcome=\"recovered\"}`.",
+            ),
+            &["outcome"],
+        )
+        .expect("valid metric");
+        registry().register(Box::new(c.clone())).ok();
+        c
+    })
+}
+
+pub fn record_ehdb_eventlog_mirror_attempt(outcome: &str, events: usize) {
+    ehdb_eventlog_mirror_attempt_total()
+        .with_label_values(&[outcome])
+        .inc_by(events as u64);
+}
 
 pub fn record_ehdb_eventlog_mirror(outcome: &str, events: usize) {
     ehdb_eventlog_mirror_total()
@@ -3379,6 +3427,11 @@ pub fn record_ehdb_eventlog_mirror(outcome: &str, events: usize) {
 pub fn init_ehdb_eventlog_mirror_series() {
     for outcome in EHDB_EVENTLOG_MIRROR_OUTCOMES {
         ehdb_eventlog_mirror_total()
+            .with_label_values(&[outcome])
+            .inc_by(0);
+    }
+    for outcome in EHDB_EVENTLOG_MIRROR_ATTEMPT_OUTCOMES {
+        ehdb_eventlog_mirror_attempt_total()
             .with_label_values(&[outcome])
             .inc_by(0);
     }
