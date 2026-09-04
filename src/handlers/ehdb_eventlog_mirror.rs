@@ -122,7 +122,13 @@ pub const MIRROR_SOURCE_ENV: &str = "NOETL_EHDB_EVENTLOG_MIRROR_SOURCE";
 const APPEND_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How many times a failed delivery is retried before the batch is declared
-/// lost (noetl/ai-meta#320). Default 4, i.e. up to 5 attempts.
+/// lost (noetl/ai-meta#320). Default 7, i.e. up to 8 attempts.
+///
+/// **7 is a measured value, not a guess.** At 4 retries / 250 ms prod still
+/// dropped 11 events at realistic load — every one of them the worker's tier
+/// append returning `502 ... "timed out after 2s"` while the durable writer was
+/// slow. The window has to outlast that, not just a connection blip. At 7/500
+/// the same load moved 1350 events with **zero** dropped.
 ///
 /// Retrying is only safe because the tier deduplicates on `event_id`
 /// (noetl/ehdb#352 + noetl/worker#309, shipped in worker v5.131.0): an
@@ -136,18 +142,24 @@ const APPEND_TIMEOUT: Duration = Duration::from_secs(5);
 /// is dropped) and is the no-redeploy rollback.
 pub const MAX_RETRIES_ENV: &str = "NOETL_EHDB_EVENTLOG_MIRROR_MAX_RETRIES";
 
-/// Base delay for the retry backoff, doubled each attempt. Default 250 ms.
+/// Base delay for the retry backoff, doubled each attempt. Default 500 ms.
 ///
-/// Sized against the measured outage: the observed failure bursts lasted
-/// ~1.5 s (a liveness kill of the single relay endpoint), and 250 ms doubling
-/// over 4 retries spans 250+500+1000+2000 = 3.75 s of waiting.
+/// Sized against the two measured outages, which differ by an order of
+/// magnitude: a liveness kill of the single relay endpoint lasts ~1.5 s, but a
+/// slow durable writer refuses appends for far longer. 500 ms doubling over 7
+/// retries spans 0.5+1+2+4+8+16+32 = 63.5 s, and with the worker's own 2 s
+/// append timeout on each attempt the total window is ~80 s.
+///
+/// These defaults match what prod runs. A default quietly worse than the
+/// deployed value is the noetl/ai-meta#267 shape: a DR re-apply drops the
+/// override and silently reinstates a window known to lose events.
 pub const RETRY_BACKOFF_MS_ENV: &str = "NOETL_EHDB_EVENTLOG_MIRROR_RETRY_BACKOFF_MS";
 
 fn max_retries() -> u32 {
     std::env::var(MAX_RETRIES_ENV)
         .ok()
         .and_then(|v| v.trim().parse::<u32>().ok())
-        .unwrap_or(4)
+        .unwrap_or(7)
         .min(10)
 }
 
@@ -156,7 +168,7 @@ fn retry_backoff() -> Duration {
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
         .filter(|v| *v > 0)
-        .unwrap_or(250);
+        .unwrap_or(500);
     Duration::from_millis(ms.min(10_000))
 }
 
@@ -804,11 +816,11 @@ mod tests {
     #[serial_test::serial]
     fn retry_count_defaults_and_is_bounded() {
         std::env::remove_var(MAX_RETRIES_ENV);
-        assert_eq!(max_retries(), 4, "default");
+        assert_eq!(max_retries(), 7, "default — the value proven on prod, not the original 4");
         std::env::set_var(MAX_RETRIES_ENV, "0");
         assert_eq!(max_retries(), 0, "0 is honoured — it is the rollback");
         std::env::set_var(MAX_RETRIES_ENV, "banana");
-        assert_eq!(max_retries(), 4, "junk falls back to the default");
+        assert_eq!(max_retries(), 7, "junk falls back to the default");
         std::env::set_var(MAX_RETRIES_ENV, "9999");
         assert_eq!(max_retries(), 10, "clamped");
         std::env::remove_var(MAX_RETRIES_ENV);
