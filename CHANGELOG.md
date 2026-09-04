@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.101.2](https://github.com/noetl/server/compare/v3.101.1...v3.101.2) (2026-09-04)
+
+### Bug Fixes
+
+* **ehdb:** stop the mirror relay reusing dead pooled connections ([64e3c6e](https://github.com/noetl/server/commit/64e3c6e3576987f8c613e2ded27a737eca8fe1fe)), closes [ai-meta#322](https://github.com/noetl/ai-meta/issues/322) [noetl/ai-meta#320](https://github.com/noetl/ai-meta/issues/320)
+
 ## [3.101.1](https://github.com/noetl/server/compare/v3.101.0...v3.101.1) (2026-09-04)
 
 ### Bug Fixes
