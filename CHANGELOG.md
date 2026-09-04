@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.100.5](https://github.com/noetl/server/compare/v3.100.4...v3.100.5) (2026-09-04)
+
+### Bug Fixes
+
+* **metrics:** make the mirror drain concurrency observable ([a6941d9](https://github.com/noetl/server/commit/a6941d9eb26467b919f797b02ef02cb6b6ecb340)), closes [noetl/ai-meta#320](https://github.com/noetl/ai-meta/issues/320)
+
 ## [3.100.4](https://github.com/noetl/server/compare/v3.100.3...v3.100.4) (2026-09-03)
 
 ### Bug Fixes
