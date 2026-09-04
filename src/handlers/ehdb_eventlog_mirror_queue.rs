@@ -210,6 +210,7 @@ pub fn init() {
         capacity,
         drain_max,
         enqueue_timeout_ms = env_millis(ENQUEUE_TIMEOUT_ENV, DEFAULT_ENQUEUE_TIMEOUT_MS).as_millis() as u64,
+        flush_timeout_ms = env_millis(FLUSH_TIMEOUT_ENV, DEFAULT_FLUSH_TIMEOUT_MS).as_millis() as u64,
         drain_concurrency = configured_drain_concurrency(),
         "async event-log mirror queue ARMED — the mirror is off the event-write path"
     );
