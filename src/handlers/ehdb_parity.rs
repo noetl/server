@@ -291,6 +291,29 @@ pub fn collapse_result_representation(v: &serde_json::Value) -> serde_json::Valu
     }
 }
 
+/// Two values that are the same number spelled differently.
+///
+/// `354748240001769472` and `"354748240001769472"` are the same id. Snowflakes
+/// exceed 2^53, so anything that has been through a JavaScript-shaped hop may
+/// carry them quoted, and the two stores do not agree on which.
+pub fn numeric_spelling_agrees(a: &serde_json::Value, b: &serde_json::Value) -> bool {
+    fn as_num(v: &serde_json::Value) -> Option<String> {
+        match v {
+            serde_json::Value::Number(n) => Some(n.to_string()),
+            serde_json::Value::String(s) => {
+                let t = s.trim();
+                (!t.is_empty() && t.chars().all(|c| c.is_ascii_digit() || c == '-'))
+                    .then(|| t.to_string())
+            }
+            _ => None,
+        }
+    }
+    match (as_num(a), as_num(b)) {
+        (Some(x), Some(y)) => x == y,
+        _ => false,
+    }
+}
+
 /// Whether a value is the **externalised** form of a payload.
 ///
 /// `NOETL_PERMANENT_LOG_LEAN` replaces a large command context in `noetl.event`
@@ -318,6 +341,13 @@ pub fn content_field_agrees(
         (None, None) => true,
         (Some(a), Some(b)) => {
             if a == b {
+                return true;
+            }
+            // Numerically equal values spelled differently are equal. A snowflake
+            // id is a JSON number in one store and can arrive quoted from the
+            // other; `ehdb_projection_fold` already carries the same accommodation
+            // for `worker_id`, and it bit this comparator too.
+            if numeric_spelling_agrees(a, b) {
                 return true;
             }
             // Externalised vs inlined: one logical payload, two representations.
@@ -1656,9 +1686,17 @@ async fn fetch_authoritative(
                     put("meta", meta);
                     put("error", error);
                     put("worker_id", worker_id.map(serde_json::Value::String));
+                    // A NUMBER, not a string. The tier payload carries this as a
+                    // JSON number (`EventRow::to_stream_json` serialises the i64
+                    // directly), so stringifying it here reported every child
+                    // execution as divergent on identical values —
+                    // `authoritative="354748240001769472" ehdb=354748240001769472`.
+                    // Introduced by this comparator, and only visible once
+                    // noetl/ai-meta#326 made the column non-NULL: before that the
+                    // field was absent and the spelling never came up.
                     put(
                         "parent_execution_id",
-                        parent_execution_id.map(|v| serde_json::Value::String(v.to_string())),
+                        parent_execution_id.map(serde_json::Value::from),
                     );
                     m
                 });
@@ -2262,6 +2300,52 @@ pub(crate) async fn sample_candidates(
 
 #[cfg(test)]
 mod tests {
+
+    /// A snowflake spelled as a number and as a string is the same id.
+    ///
+    /// Found on the live-path validation of noetl/ai-meta#326: once the column
+    /// became non-NULL, the comparator reported
+    /// `authoritative="354748240001769472" ehdb=354748240001769472` — the same
+    /// value, two spellings — which would have flagged EVERY child execution as
+    /// divergent forever. Absent values had hidden it.
+    #[test]
+    fn a_number_and_its_quoted_form_are_the_same_id() {
+        let n = serde_json::json!(354748240001769472i64);
+        let q = serde_json::json!("354748240001769472");
+        assert!(numeric_spelling_agrees(&n, &q));
+        assert!(content_field_agrees(
+            "parent_execution_id",
+            Some(&n),
+            Some(&q)
+        ));
+        assert!(content_field_agrees(
+            "parent_execution_id",
+            Some(&q),
+            Some(&n)
+        ));
+    }
+
+    /// …and it must not make different ids, or non-numeric text, agree.
+    #[test]
+    fn the_numeric_spelling_rule_does_not_excuse_different_values() {
+        let a = serde_json::json!(1i64);
+        let b = serde_json::json!("2");
+        assert!(!numeric_spelling_agrees(&a, &b));
+        assert!(!content_field_agrees(
+            "parent_execution_id",
+            Some(&a),
+            Some(&b)
+        ));
+        // Non-numeric strings are not coerced.
+        assert!(!numeric_spelling_agrees(
+            &serde_json::json!("w-1"),
+            &serde_json::json!("w-2")
+        ));
+        assert!(!numeric_spelling_agrees(
+            &serde_json::json!(""),
+            &serde_json::json!(0i64)
+        ));
+    }
 
     /// `worker_id` is denormalised into two places and the stores populate them
     /// differently — the column is often NULL while `meta.worker_id` carries the
