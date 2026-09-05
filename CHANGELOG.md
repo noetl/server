@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.103.5](https://github.com/noetl/server/compare/v3.103.4...v3.103.5) (2026-09-05)
+
+### Bug Fixes
+
+* **ehdb:** a snowflake spelled as a number and as a string is the same id ([187b1c0](https://github.com/noetl/server/commit/187b1c0401920a36ac5d7cc01f44814b7b6b7e95)), closes [ai-meta#326](https://github.com/noetl/ai-meta/issues/326) [noetl/ai-meta#325](https://github.com/noetl/ai-meta/issues/325) [noetl/ai-meta#326](https://github.com/noetl/ai-meta/issues/326)
+
 ## [3.103.4](https://github.com/noetl/server/compare/v3.103.3...v3.103.4) (2026-09-05)
 
 ### Bug Fixes
