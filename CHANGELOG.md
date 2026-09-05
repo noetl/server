@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.103.3](https://github.com/noetl/server/compare/v3.103.2...v3.103.3) (2026-09-05)
+
+### Bug Fixes
+
+* **events:** persist every column the mirror sends (ai-meta[#326](https://github.com/noetl/server/issues/326)) ([67c75d2](https://github.com/noetl/server/commit/67c75d2973a87f3fd365f43185074031eb365dd7))
+
 ## [3.103.2](https://github.com/noetl/server/compare/v3.103.1...v3.103.2) (2026-09-05)
 
 ### Bug Fixes
