@@ -1123,6 +1123,150 @@ mod tests {
         );
     }
 
+    /// **No INSERT into `noetl.event` may persist fewer columns than the row
+    /// carries** — whether or not it mirrors (noetl/ai-meta#327).
+    ///
+    /// The sibling guard below asserts it only for writers that *mirror*, and that
+    /// invariant is too narrow: it is stated in terms of a behaviour the writer
+    /// happens to have rather than the property that matters. On an EHDB bus
+    /// `emit_events` PUBLISHES instead of inserting, so the live Postgres writer is
+    /// `services::internal::project_events` — which does not mirror, sat outside
+    /// the narrow invariant, and dropped `parent_execution_id` for every child
+    /// execution on prod (noetl/ai-meta#326).
+    ///
+    /// ⚠ Which writer is REACHABLE is a question about configuration, not about
+    /// code. That is why this guard covers every site rather than the ones a reader
+    /// guesses are live: the previous fix was aimed at two real defects that simply
+    /// were not on the path prod takes.
+    ///
+    /// Sites that legitimately store a subset are listed explicitly, so an
+    /// exclusion is a decision someone wrote down rather than an absence nobody
+    /// noticed — and the list is asserted to be exactly what is expected, so a NEW
+    /// truncating writer fails here instead of joining it silently.
+    #[test]
+    fn no_event_insert_persists_fewer_columns_than_the_row_carries() {
+        use crate::handlers::event_write::EventRow;
+
+        let row = EventRow::new(1, 2, 3, "call.done", "COMPLETED", chrono::Utc::now())
+            .with_nodes("n1", "step-a")
+            .with_node_type("task")
+            .with_parent_event_id(4)
+            .with_prev_event_id(Some(5))
+            .with_parent_execution_id(Some(6))
+            .with_context(serde_json::json!({"k": "v"}))
+            .with_result(serde_json::json!({"r": 1}))
+            .with_meta(serde_json::json!({"m": 1}))
+            .with_error(Some("boom".to_string()))
+            .with_worker_id(Some("w-1".to_string()));
+        let payload = mirror_payload(&row);
+        let not_columns = ["step", "mirror_source", MIRROR_PAYLOAD_VERSION_KEY];
+        let row_columns: Vec<&str> = payload
+            .as_object()
+            .expect("payload is an object")
+            .keys()
+            .map(|k| k.as_str())
+            .filter(|k| !not_columns.contains(k))
+            .collect();
+        assert!(
+            row_columns.len() >= 15,
+            "only {} row-backed columns — the extraction broke and a guard \
+             measuring nothing passes",
+            row_columns.len()
+        );
+
+        // Documented exclusions. Each needs a reason, not just an entry.
+        //
+        //   handlers/internal.rs :: events_materialize — a 10-column sink that is
+        //   NOT live (`noetl_events_materialized_total` reads 0 on prod). Left
+        //   truncating deliberately rather than changed as a side effect of this
+        //   guard; tracked on noetl/ai-meta#327. If anything ever routes to it,
+        //   it reintroduces exactly the #326 loss.
+        //   db/queries/event.rs :: insert_event — drops `error` and
+        //   `prev_event_id`. `prev_event_id` is the one-level event-chain link
+        //   (noetl/ai-meta#115), so a row written here is not walkable. It has
+        //   ~5 callers in `services/event.rs`, so it is reachable CODE; whether
+        //   any of those paths run on prod is unverified, and this guard exists
+        //   precisely because that question cannot be answered by reading. Left
+        //   unchanged rather than fixed as a side effect of noetl/ai-meta#327;
+        //   surfaced there instead.
+        let known_truncating = ["handlers/internal.rs", "db/queries/event.rs"];
+
+        let needle = format!("INSERT INTO noetl.event{}", "");
+        let mut offenders: Vec<String> = Vec::new();
+        let mut scanned = 0;
+        for (file, src) in [
+            ("handlers/events.rs", include_str!("events.rs")),
+            ("handlers/event_write.rs", include_str!("event_write.rs")),
+            ("handlers/internal.rs", include_str!("internal.rs")),
+            (
+                "services/internal.rs",
+                include_str!("../services/internal.rs"),
+            ),
+            (
+                "db/queries/event.rs",
+                include_str!("../db/queries/event.rs"),
+            ),
+        ] {
+            for (i, _) in src.match_indices(&needle) {
+                // Strip `--` comments BEFORE locating the parens, not after: a
+                // comment containing a `)` — e.g. "(emit_events publishes rather
+                // than inserting)" — otherwise closes the column list early and the
+                // guard reports columns missing that are listed just below it.
+                // Observed while writing the noetl/ai-meta#327 fix this verifies.
+                let window: String = src[i..]
+                    .lines()
+                    .take(40)
+                    .map(|l| l.split("--").next().unwrap_or(""))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let open = window.find('(').expect("column list opens");
+                let close = window[open..]
+                    .find(')')
+                    .map(|c| open + c)
+                    .expect("column list closes");
+                let cols: String = window[open + 1..close]
+                    .replace('\\', " ")
+                    .split_whitespace()
+                    .collect();
+                scanned += 1;
+                let missing: Vec<&str> = row_columns
+                    .iter()
+                    .copied()
+                    .filter(|c| !cols.split(',').any(|listed| listed == *c))
+                    .collect();
+                if !missing.is_empty() {
+                    offenders.push(format!("{file} drops {missing:?}"));
+                }
+            }
+        }
+        assert!(
+            scanned >= 5,
+            "only {scanned} INSERT sites scanned — a writer moved and this guard \
+             is measuring less than it thinks"
+        );
+
+        let unexpected: Vec<&String> = offenders
+            .iter()
+            .filter(|o| !known_truncating.iter().any(|k| o.starts_with(k)))
+            .collect();
+        assert!(
+            unexpected.is_empty(),
+            "an INSERT into noetl.event persists fewer columns than the EventRow \
+             carries: {unexpected:?}. On an EHDB bus the live writer is whichever \
+             one the CONFIGURATION reaches, so a truncating writer anywhere is a \
+             latent noetl/ai-meta#326."
+        );
+        // The exclusion list must stay honest: every excluded file must still be
+        // truncating, or the entry is stale and hiding a site that is now clean.
+        for k in known_truncating {
+            assert!(
+                offenders.iter().any(|o| o.starts_with(k)),
+                "{k} is on the known-truncating list but no longer truncates — \
+                 remove the exclusion rather than leaving it to excuse a future one"
+            );
+        }
+    }
+
     #[test]
     fn every_mirrored_insert_persists_what_it_mirrors() {
         use crate::handlers::event_write::EventRow;
