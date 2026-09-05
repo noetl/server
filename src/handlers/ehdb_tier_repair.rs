@@ -129,7 +129,7 @@ pub async fn repair_execution_endpoint(
     Path(execution_id): Path<i64>,
 ) -> impl IntoResponse {
     // Before. Inspect, never Record — see the module note on #264.
-    let before = compare_execution(&state, execution_id, ParityRecording::Inspect).await;
+    let before = compare_execution(&state, execution_id, ParityRecording::Inspect, None).await;
     let Some(report) = before.report.as_ref() else {
         return (
             StatusCode::OK,
@@ -185,7 +185,7 @@ pub async fn repair_execution_endpoint(
     crate::handlers::ehdb_eventlog_mirror::mirror_rows(&state, &rows).await;
 
     // After. Inspect again, for the same reason.
-    let after = compare_execution(&state, execution_id, ParityRecording::Inspect).await;
+    let after = compare_execution(&state, execution_id, ParityRecording::Inspect, None).await;
     let (missing_after, ehdb_after) = match after.report.as_ref() {
         Some(r) => (r.missing_event_ids.len(), r.ehdb_count),
         None => (missing.len(), report.ehdb_count),
@@ -246,7 +246,7 @@ mod tests {
         // [`ParityRecording::Inspect`], and counting that made this read 3.
         assert_eq!(
             src()
-                .matches("compare_execution(&state, execution_id, ParityRecording::Inspect)")
+                .matches("compare_execution(&state, execution_id, ParityRecording::Inspect, None)")
                 .count(),
             2,
             "the before and after comparisons must BOTH be Inspect"

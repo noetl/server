@@ -1515,6 +1515,7 @@ fn parse_tier_body(body: &serde_json::Value) -> Result<Vec<MirroredRecord>, Pari
 async fn fetch_authoritative(
     state: &AppState,
     execution_id: i64,
+    content_wanted: bool,
 ) -> Result<Vec<AuthoritativeEvent>, sqlx::Error> {
     // noetl/ai-meta#258 — the scope depends on WHO mirrors.
     //
@@ -1534,7 +1535,7 @@ async fn fetch_authoritative(
     // has always been — a widened SELECT that ran unconditionally would put
     // `context`/`result` payloads on the wire for every parity tick, which is the
     // cost the flag exists to avoid paying before anyone wants it.
-    let content_on = content_parity_enabled();
+    let content_on = content_wanted;
 
     let rows = sqlx::query_as::<
         _,
@@ -1772,7 +1773,13 @@ pub async fn compare_execution(
     state: &AppState,
     execution_id: i64,
     recording: ParityRecording,
+    content_override: Option<bool>,
 ) -> ComparisonResult {
+    // Resolved ONCE, before the fetch, because the SQL and the comparison must
+    // agree about it: a query that skipped the content columns feeding a
+    // comparison that wanted them would report every field absent on one side —
+    // a configuration bug wearing the costume of data loss.
+    let content_on = content_override.unwrap_or_else(content_parity_enabled);
     let Some(base) = worker_query_base() else {
         record_parity(recording, TIER, ParityOutcome::EhdbUnconfigured.as_str());
         return ComparisonResult {
@@ -1787,7 +1794,7 @@ pub async fn compare_execution(
 
     // Authoritative side. Ask for one more than the cap so a full page is
     // distinguishable from a page that exactly filled it.
-    let authoritative = match fetch_authoritative(state, execution_id).await {
+    let authoritative = match fetch_authoritative(state, execution_id, content_on).await {
         Ok(rows) => rows,
         Err(e) => {
             record_parity(recording, TIER, ParityOutcome::Error.as_str());
@@ -1871,7 +1878,7 @@ pub async fn compare_execution(
         }
     };
 
-    let report = compare_cross_store_with_horizon(execution_id, &authoritative, &mirrored, horizon);
+    let report = compare_inner(execution_id, &authoritative, &mirrored, horizon, content_on);
     let outcome = outcome_for(&report);
     if report.pending_authoritative > 0 {
         crate::metrics::add_ehdb_crossstore_pending(TIER, report.pending_authoritative as u64);
@@ -1983,6 +1990,15 @@ fn worker_query_base() -> Option<String> {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ParityQuery {
+    /// Force the content comparison on (or off) for THIS request only
+    /// (noetl/ai-meta#325).
+    ///
+    /// `None` follows `NOETL_EHDB_CROSSSTORE_PARITY_CONTENT`. The override exists
+    /// because this route records nothing (`ParityRecording::Inspect`), so an
+    /// operator can measure exactly what enabling the flag would surface WITHOUT
+    /// arming the background sampler — and it is the sampler, which records, that
+    /// makes the paging alert fire.
+    pub content: Option<bool>,
     /// Skip the control suite in the response body. The controls still run for
     /// the sampler; this only trims the payload for a caller that wants the
     /// verdict alone.
@@ -2020,7 +2036,7 @@ pub async fn compare_execution_endpoint(
 
     // noetl/ai-meta#264 — inspection, not measurement: this must not move the
     // counters its own alert reads.
-    let result = compare_execution(&state, execution_id, ParityRecording::Inspect).await;
+    let result = compare_execution(&state, execution_id, ParityRecording::Inspect, q.content).await;
 
     // A comparison whose controls failed is not evidence, and the HTTP status
     // says so rather than leaving it to a field nobody reads.
@@ -2150,7 +2166,10 @@ async fn run_sampler_tick(state: &AppState) {
     };
 
     for execution_id in candidates {
-        let _ = compare_execution(state, execution_id, ParityRecording::Record).await;
+        // `None` = follow the env flag. The sampler is the RECORDING path, so a
+        // per-request override must never reach it — that separation is what makes
+        // the on-demand override safe to measure with.
+        let _ = compare_execution(state, execution_id, ParityRecording::Record, None).await;
     }
 }
 
@@ -2195,6 +2214,29 @@ pub(crate) async fn sample_candidates(
 
 #[cfg(test)]
 mod tests {
+
+    /// The per-request override must widen the comparison WITHOUT arming the
+    /// sampler — that separation is the only reason it is safe to measure with.
+    #[test]
+    fn the_per_request_override_never_reaches_the_recording_path() {
+        let me = include_str!("ehdb_parity.rs");
+        assert!(me.len() > 40_000, "guard is not measuring this file");
+        let squashed: String = me.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        // The RECORDING path must pass a literal None.
+        let sampler = format!("ParityRecording::Record{}, None)", "");
+        assert!(
+            squashed.contains(&sampler),
+            "the sampler must pass None so a per-request override can never widen \
+             the path that RECORDS — recording is what makes the alert fire"
+        );
+        // And the on-demand route must be Inspect and honour the parameter.
+        let ondemand = format!("ParityRecording::Inspect{}, q.content)", "");
+        assert!(
+            squashed.contains(&ondemand),
+            "the on-demand route must be Inspect and must honour ?content="
+        );
+    }
 
     // ---- noetl/ai-meta#325: the content comparison --------------------------
 
