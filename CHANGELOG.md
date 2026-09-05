@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.103.1](https://github.com/noetl/server/compare/v3.103.0...v3.103.1) (2026-09-05)
+
+### Bug Fixes
+
+* **ehdb:** the lean-log externalisation is the same representation class ([d80dc48](https://github.com/noetl/server/commit/d80dc48fc95416c252062da589d84f0a342c537c)), closes [noetl/ai-meta#325](https://github.com/noetl/ai-meta/issues/325)
+
 ## [3.103.0](https://github.com/noetl/server/compare/v3.102.0...v3.103.0) (2026-09-05)
 
 ### Features
