@@ -16,9 +16,9 @@ use chrono::{DateTime, NaiveDateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::types::JsonValue;
 
-use sqlx::Row;
 use crate::db::DbPool;
 use crate::error::AppResult;
+use sqlx::Row;
 
 // ---------------------------------------------------------------------------
 // Scheduled cleanup (noetl/ai-meta#96)
@@ -597,7 +597,16 @@ pub async fn project_events(
             stack_trace,
             tenant_id,
             organization_id,
-            created_at
+            created_at,
+            -- noetl/ai-meta#326/#327.  This sink is the LIVE Postgres writer on
+            -- an EHDB bus (`emit_events` publishes rather than inserting), and it
+            -- dropped both of these while the tier received them -- so the system
+            -- of record knew less than its mirror.  The emitter already publishes
+            -- them (`EventRow::to_stream_json`) and they survive into the JSONB
+            -- via the envelope's flattened `extra`, so this is additive: no
+            -- schema change, no new field on the wire.
+            parent_execution_id,
+            worker_id
         )
         SELECT
             (row->>'event_id')::bigint,
@@ -620,7 +629,11 @@ pub async fn project_events(
             COALESCE(NULLIF(row->>'organization_id', ''), 'default'),
             COALESCE(NULLIF(row->>'timestamp', '')::timestamp,
                      NULLIF(row->>'created_at', '')::timestamp,
-                     now())
+                     now()),
+            -- NULLIF so an absent value stays NULL rather than becoming 0 or "";
+            -- nothing is fabricated to fill a column.
+            NULLIF(row->>'parent_execution_id', '')::bigint,
+            NULLIF(row->>'worker_id', '')
         FROM jsonb_array_elements($1::jsonb) AS row
         -- noetl.event is partitioned (15 partitions); event_id alone
         -- is not a partition-spanning unique constraint.  Using
@@ -636,7 +649,8 @@ pub async fn project_events(
         -- harder one to notice because the tier would have MORE, not less.
         RETURNING event_id, execution_id, catalog_id, event_type, status,
                   created_at, prev_event_id, node_id, node_name, node_type,
-                  parent_event_id, context, result, meta, error
+                  parent_event_id, context, result, meta, error,
+                  parent_execution_id, worker_id
         "#,
     )
     .bind(payload)
@@ -671,10 +685,13 @@ pub async fn project_events(
             node_name: r.try_get("node_name").ok(),
             node_type: r.try_get("node_type").ok(),
             parent_event_id: r.try_get("parent_event_id").ok(),
-            // Neither column is written by this sink's INSERT, so both are
-            // None here by construction rather than by omission.
-            parent_execution_id: None,
-            worker_id: None,
+            // Both ARE written by this sink now (noetl/ai-meta#327), and both are
+            // read back, so the row this function returns -- which the caller
+            // MIRRORS -- carries what Postgres actually stored. Leaving them None
+            // while the INSERT persisted them would put the asymmetry back, just
+            // pointing the other way.
+            parent_execution_id: r.try_get("parent_execution_id").ok(),
+            worker_id: r.try_get("worker_id").ok(),
             context: r.try_get("context").ok(),
             result: r.try_get("result").ok(),
             meta: r.try_get("meta").ok(),
