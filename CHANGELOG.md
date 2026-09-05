@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.103.0](https://github.com/noetl/server/compare/v3.102.0...v3.103.0) (2026-09-05)
+
+### Features
+
+* **ehdb:** per-request content override, so the widening can be MEASURED safely ([63cedb8](https://github.com/noetl/server/commit/63cedb8cf1cf29dddf7c0405fddce03bfc729109)), closes [ai-meta#325](https://github.com/noetl/ai-meta/issues/325) [ai-meta#264](https://github.com/noetl/ai-meta/issues/264) [noetl/ai-meta#325](https://github.com/noetl/ai-meta/issues/325)
+
 ## [3.102.0](https://github.com/noetl/server/compare/v3.101.3...v3.102.0) (2026-09-05)
 
 ### Features
