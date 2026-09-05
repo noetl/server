@@ -677,6 +677,19 @@ fn compare_inner(
                                     m.insert(f.to_string(), val.clone());
                                 }
                             }
+                            // Mirror the authoritative side's COALESCE: the value
+                            // lives in two places and the stores denormalise it
+                            // differently. Comparing one location only reported
+                            // 757 false content divergences in a 200-execution
+                            // sweep — a LOCATION difference wearing the costume of
+                            // a missing value.
+                            if !m.get("worker_id").map(|w| !w.is_null()).unwrap_or(false) {
+                                if let Some(w) = v.get("meta").and_then(|mm| mm.get("worker_id")) {
+                                    if !w.is_null() {
+                                        m.insert("worker_id".to_string(), w.clone());
+                                    }
+                                }
+                            }
                             m
                         }),
                     }),
@@ -1594,7 +1607,13 @@ async fn fetch_authoritative(
             CASE WHEN $4 THEN result  END      AS result,
             CASE WHEN $4 THEN meta    END      AS meta,
             CASE WHEN $4 THEN error   END      AS error,
-            CASE WHEN $4 THEN worker_id END    AS worker_id,
+            -- `worker_id` lives in TWO places and the stores denormalise it
+            -- differently: the column is frequently NULL while `meta->>'worker_id'`
+            -- carries the value, and the mirrored payload copies it to the
+            -- top-level field. Comparing the column alone reported 757 false
+            -- content divergences in one 200-execution sweep — a LOCATION
+            -- difference wearing the costume of a missing value.
+            CASE WHEN $4 THEN COALESCE(worker_id, meta->>'worker_id') END AS worker_id,
             CASE WHEN $4 THEN parent_execution_id END AS parent_execution_id
         FROM noetl.event
         WHERE execution_id = $1
@@ -2243,6 +2262,68 @@ pub(crate) async fn sample_candidates(
 
 #[cfg(test)]
 mod tests {
+
+    /// `worker_id` is denormalised into two places and the stores populate them
+    /// differently — the column is often NULL while `meta.worker_id` carries the
+    /// value. Both sides must coalesce, or a LOCATION difference reads as a
+    /// missing value (757 false divergences in one 200-execution sweep).
+    #[test]
+    fn worker_id_is_coalesced_from_meta_on_the_tier_side() {
+        let (mut auth, mut mirrored) = control_fixtures();
+        auth.truncate(1);
+        mirrored.truncate(1);
+        // Authoritative: the COALESCE already happened in SQL, so the map holds
+        // the effective value.
+        let mut m = serde_json::Map::new();
+        m.insert("worker_id".to_string(), serde_json::json!("w-7"));
+        // `meta` is copied verbatim between the stores, so it must be equal on
+        // both sides or this test measures a meta difference instead.
+        m.insert("meta".to_string(), serde_json::json!({"worker_id": "w-7"}));
+        auth[0].content = Some(m);
+        // Tier: top-level absent, value only in meta — exactly the prod shape.
+        let mut v: serde_json::Value = serde_json::from_str(&mirrored[0].payload).unwrap();
+        v.as_object_mut()
+            .unwrap()
+            .insert("meta".to_string(), serde_json::json!({"worker_id": "w-7"}));
+        mirrored[0].payload = v.to_string();
+
+        let r = compare_cross_store_with_content(1, &auth, &mirrored);
+        assert!(
+            !r.kinds().contains(DivergenceKind::Content.as_str()),
+            "the tier's meta.worker_id must satisfy the authoritative worker_id; \
+             kinds {:?}",
+            r.kinds()
+        );
+    }
+
+    /// …and the coalesce must not hide a genuinely different worker.
+    #[test]
+    fn a_differing_worker_id_still_diverges_after_the_coalesce() {
+        let (mut auth, mut mirrored) = control_fixtures();
+        auth.truncate(1);
+        mirrored.truncate(1);
+        let mut m = serde_json::Map::new();
+        m.insert("worker_id".to_string(), serde_json::json!("w-7"));
+        m.insert(
+            "meta".to_string(),
+            serde_json::json!({"worker_id": "w-DIFFERENT"}),
+        );
+        auth[0].content = Some(m);
+        let mut v: serde_json::Value = serde_json::from_str(&mirrored[0].payload).unwrap();
+        v.as_object_mut().unwrap().insert(
+            "meta".to_string(),
+            serde_json::json!({"worker_id": "w-DIFFERENT"}),
+        );
+        mirrored[0].payload = v.to_string();
+
+        let r = compare_cross_store_with_content(1, &auth, &mirrored);
+        assert!(
+            r.kinds().contains(DivergenceKind::Content.as_str()),
+            "two different workers is a real divergence and the coalesce must not \
+             swallow it; kinds {:?}",
+            r.kinds()
+        );
+    }
 
     /// The lean-log externalisation is the SAME representation class as
     /// `reference`, in a different spelling — and missing it produced 622 false
