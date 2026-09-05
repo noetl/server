@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.103.2](https://github.com/noetl/server/compare/v3.103.1...v3.103.2) (2026-09-05)
+
+### Bug Fixes
+
+* **ehdb:** coalesce worker_id from meta on both sides of the comparison ([5297d57](https://github.com/noetl/server/commit/5297d574b73161abe2df82193f04df66bca3190a)), closes [noetl/ai-meta#325](https://github.com/noetl/ai-meta/issues/325)
+
 ## [3.103.1](https://github.com/noetl/server/compare/v3.103.0...v3.103.1) (2026-09-05)
 
 ### Bug Fixes
