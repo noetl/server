@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.102.0](https://github.com/noetl/server/compare/v3.101.3...v3.102.0) (2026-09-05)
+
+### Features
+
+* **ehdb:** widen the cross-store comparator to compare content, behind a flag ([6b3a7a9](https://github.com/noetl/server/commit/6b3a7a9eaf256c0c9b6d444fa7b510b3cdb162c2)), closes [noetl/ai-meta#325](https://github.com/noetl/ai-meta/issues/325)
+
 ## [3.101.3](https://github.com/noetl/server/compare/v3.101.2...v3.101.3) (2026-09-04)
 
 ### Bug Fixes
