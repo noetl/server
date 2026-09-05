@@ -1201,16 +1201,22 @@ pub async fn claim_command(
                 .next()
                 .flatten();
             let claim_row = claim_row.with_prev_event_id(prev_event_id);
+            // noetl/ai-meta#326: this site MIRRORS the full row, so it must PERSIST
+            // the full row. It previously stored 12 of 17 columns while sending all
+            // 17 to the tier, so the tier held `parent_execution_id` and
+            // `noetl.event` did not.
             sqlx::query(
                 r#"
                 INSERT INTO noetl.event (
                     event_id, execution_id, catalog_id, event_type,
                     node_id, node_name, status, result, meta, worker_id,
-                    prev_event_id, created_at
+                    prev_event_id, created_at,
+                    node_type, parent_event_id, parent_execution_id, context, error
                 ) VALUES (
                     $1, $2, $3, $4,
                     $5, $6, $7, $8, $9, $10,
-                    $11, $12
+                    $11, $12,
+                    $13, $14, $15, $16, $17
                 )
                 "#,
             )
@@ -1230,6 +1236,14 @@ pub async fn claim_command(
             .bind(&claim_row.worker_id)
             .bind(claim_row.prev_event_id)
             .bind(claim_row.created_at)
+            // Bound from the SAME row the mirror serialises, so the two cannot
+            // disagree. A genuinely absent value stays NULL — nothing is
+            // fabricated to fill the column.
+            .bind(&claim_row.node_type)
+            .bind(claim_row.parent_event_id)
+            .bind(claim_row.parent_execution_id)
+            .bind(&claim_row.context)
+            .bind(&claim_row.error)
             .execute(&mut *tx)
             .await?;
             claim_event_to_mirror = Some(claim_row);
@@ -1407,8 +1421,13 @@ pub async fn handle_batch_events(
             .map(|(r, prev)| r.with_prev_event_id(*prev))
             .collect();
         let mut qb = sqlx::QueryBuilder::new(
+            // noetl/ai-meta#326: this site MIRRORS the full row, so it must
+            // PERSIST the full row. It previously stored 12 of 17 columns while
+            // sending all 17 to the tier — the tier held `parent_execution_id`
+            // and `noetl.event` did not.
             "INSERT INTO noetl.event (event_id, execution_id, catalog_id, event_type, \
-             node_id, node_name, status, result, meta, worker_id, prev_event_id, created_at) ",
+             node_id, node_name, status, result, meta, worker_id, prev_event_id, created_at, \
+             node_type, parent_event_id, parent_execution_id, context, error) ",
         );
         qb.push_values(event_rows.iter(), |mut b, r| {
             b.push_bind(r.event_id)
@@ -1424,7 +1443,15 @@ pub async fn handle_batch_events(
                 .push_bind(&r.meta)
                 .push_bind(&r.worker_id)
                 .push_bind(r.prev_event_id)
-                .push_bind(r.created_at);
+                .push_bind(r.created_at)
+                // Bound from the SAME rows the mirror serialises below, so the two
+                // cannot disagree. A genuinely absent value stays NULL — nothing is
+                // fabricated to fill a column.
+                .push_bind(&r.node_type)
+                .push_bind(r.parent_event_id)
+                .push_bind(r.parent_execution_id)
+                .push_bind(&r.context)
+                .push_bind(&r.error);
         });
         qb.build().execute(&mut *tx).await?;
         tx.commit().await?;

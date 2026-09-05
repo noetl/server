@@ -435,7 +435,6 @@ pub fn sink_mirror_enabled() -> bool {
         .unwrap_or(false)
 }
 
-
 /// Mirror a batch of authoritative rows into the event-log tier.
 ///
 /// Called from the `emit_events` chokepoint with the rows that are about to
@@ -544,7 +543,11 @@ pub(crate) async fn deliver(batch: &MirrorBatch) {
                 // not read identically. Suppressing that would hide the very
                 // instability the retry exists to survive.
                 crate::metrics::record_ehdb_eventlog_mirror(
-                    if attempt == 0 { "mirrored" } else { "recovered" },
+                    if attempt == 0 {
+                        "mirrored"
+                    } else {
+                        "recovered"
+                    },
                     count,
                 );
                 if attempt > 0 {
@@ -816,7 +819,11 @@ mod tests {
     #[serial_test::serial]
     fn retry_count_defaults_and_is_bounded() {
         std::env::remove_var(MAX_RETRIES_ENV);
-        assert_eq!(max_retries(), 7, "default — the value proven on prod, not the original 4");
+        assert_eq!(
+            max_retries(),
+            7,
+            "default — the value proven on prod, not the original 4"
+        );
         std::env::set_var(MAX_RETRIES_ENV, "0");
         assert_eq!(max_retries(), 0, "0 is honoured — it is the rollback");
         std::env::set_var(MAX_RETRIES_ENV, "banana");
@@ -876,13 +883,20 @@ mod tests {
     #[test]
     fn a_mirrored_record_carries_the_context_the_fold_reads() {
         let row = crate::handlers::event_write::EventRow::new(
-            7, 42, 1, "execution.start", "STARTED", chrono::Utc::now(),
+            7,
+            42,
+            1,
+            "execution.start",
+            "STARTED",
+            chrono::Utc::now(),
         )
         .with_context(serde_json::json!({"workload": {"k": "v"}, "path": "p", "version": "1"}));
         let p = mirror_payload(&row);
 
         assert_eq!(
-            p.get("context").and_then(|c| c.get("path")).and_then(|v| v.as_str()),
+            p.get("context")
+                .and_then(|c| c.get("path"))
+                .and_then(|v| v.as_str()),
             Some("p"),
             "context is absent from the mirrored record — a fold of it cannot equal a fold of \
              noetl.event, and the difference shows up as a digest divergence"
@@ -902,7 +916,12 @@ mod tests {
     #[test]
     fn a_null_context_is_still_v2_and_therefore_still_foldable() {
         let row = crate::handlers::event_write::EventRow::new(
-            8, 42, 1, "step.enter", "RUNNING", chrono::Utc::now(),
+            8,
+            42,
+            1,
+            "step.enter",
+            "RUNNING",
+            chrono::Utc::now(),
         );
         let p = mirror_payload(&row);
         assert!(p.get("context").is_some_and(|c| c.is_null()));
@@ -917,12 +936,20 @@ mod tests {
     #[test]
     fn v2_does_not_disturb_the_comparators_identifying_fields() {
         let row = crate::handlers::event_write::EventRow::new(
-            9, 42, 1, "step.exit", "COMPLETED", chrono::Utc::now(),
+            9,
+            42,
+            1,
+            "step.exit",
+            "COMPLETED",
+            chrono::Utc::now(),
         )
         .with_node("fetch");
         let p = mirror_payload(&row);
         assert_eq!(p.get("event_id").and_then(|v| v.as_i64()), Some(9));
-        assert_eq!(p.get("event_type").and_then(|v| v.as_str()), Some("step.exit"));
+        assert_eq!(
+            p.get("event_type").and_then(|v| v.as_str()),
+            Some("step.exit")
+        );
         assert_eq!(p.get("step").and_then(|v| v.as_str()), Some("fetch"));
         assert_eq!(p.get("status").and_then(|v| v.as_str()), Some("COMPLETED"));
     }
@@ -1000,11 +1027,205 @@ mod tests {
     /// Counting `INSERT INTO noetl.event` rather than naming the two known sites:
     /// a third one added later is the failure this is here to catch, and a test
     /// that lists the sites it already knows about cannot catch it.
+    /// Every mirrored INSERT must PERSIST the columns it MIRRORS.
+    ///
+    /// The sibling guard below counts INSERT sites against mirror sites, so a new
+    /// writer cannot bypass the mirror. It never asked whether a writer that *does*
+    /// mirror stores what it sent — and `handlers::events::handle_batch_events` did
+    /// not: it serialised the full 17-column `EventRow` to the tier and persisted
+    /// **12**, silently dropping `parent_execution_id`, `parent_event_id`,
+    /// `node_type`, `context` and `error` from the system of record
+    /// (noetl/ai-meta#326).
+    ///
+    /// That asymmetry is invisible from either side alone. The tier looks complete
+    /// because it is; Postgres looks complete because nothing compared it to
+    /// anything. It surfaced only when the cross-store comparator was widened to
+    /// read content (noetl/ai-meta#325) — and then it read as the *tier* having
+    /// extra data rather than as the log having lost it.
+    ///
+    /// The mirrored column set is taken by CALLING `mirror_payload` on a fully
+    /// populated row, not by pattern-matching its source: a regex over the producer
+    /// drifts from the producer, which is the failure class this file exists for.
+    /// Column order and bind order must correspond, one for one.
+    ///
+    /// Widening an INSERT is the moment this breaks: five columns and five binds
+    /// appended in different orders compiles, runs, and writes `context` into
+    /// `error` for every event thereafter. There is no type error to catch it —
+    /// both are `Option<Value>` / `Option<String>` shaped enough to swap — and no
+    /// row would look wrong in isolation.
+    ///
+    /// Checks the count, which is what actually goes wrong; the order is asserted
+    /// on the tail the noetl/ai-meta#326 fix appended, where the risk is.
+    #[test]
+    fn insert_column_and_bind_counts_agree() {
+        let src = include_str!("events.rs");
+        let needle = format!("INSERT INTO noetl.event{}", "");
+        let mut checked = 0;
+        for (i, _) in src.match_indices(&needle) {
+            let rest = &src[i..];
+            let open = rest.find('(').expect("column list opens");
+            let close = rest.find(')').expect("column list closes");
+            let cols: Vec<String> = rest[open + 1..close]
+                .lines()
+                .map(|l| l.split("--").next().unwrap_or(""))
+                .collect::<Vec<_>>()
+                .join(" ")
+                .replace('\\', " ")
+                .split(',')
+                .map(|c| c.split_whitespace().collect::<String>())
+                .filter(|c| !c.is_empty())
+                .collect();
+
+            // The bind sequence is whatever `.bind(`/`.push_bind(` calls follow,
+            // up to the statement's execution.
+            let after = &rest[close..];
+            let end = after
+                .find(".execute(")
+                .or_else(|| after.find("});"))
+                .unwrap_or(after.len());
+            let body = &after[..end];
+            let binds = body.matches(".bind(").count() + body.matches(".push_bind(").count();
+
+            assert_eq!(
+                cols.len(),
+                binds,
+                "an INSERT lists {} columns but binds {} values — a widened column \
+                 list with a mismatched bind list writes every subsequent column \
+                 into the wrong field, and nothing type-checks it. Columns: {cols:?}",
+                cols.len(),
+                binds
+            );
+            // The tail appended by noetl/ai-meta#326, in the order it must keep.
+            let tail = [
+                "node_type",
+                "parent_event_id",
+                "parent_execution_id",
+                "context",
+                "error",
+            ];
+            if cols.len() >= tail.len() {
+                let got: Vec<&str> = cols[cols.len() - tail.len()..]
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect();
+                if got.contains(&"parent_execution_id") {
+                    assert_eq!(
+                        got, tail,
+                        "the noetl/ai-meta#326 tail must stay in bind order"
+                    );
+                }
+            }
+            checked += 1;
+        }
+        assert!(
+            checked >= 2,
+            "expected both INSERT sites, checked {checked}"
+        );
+    }
+
+    #[test]
+    fn every_mirrored_insert_persists_what_it_mirrors() {
+        use crate::handlers::event_write::EventRow;
+
+        // Every optional field populated, so the payload carries its full key set.
+        // A field left None here would silently shrink the expectation.
+        let row = EventRow::new(1, 2, 3, "call.done", "COMPLETED", chrono::Utc::now())
+            .with_nodes("n1", "step-a")
+            .with_node_type("task")
+            .with_parent_event_id(4)
+            .with_prev_event_id(Some(5))
+            .with_parent_execution_id(Some(6))
+            .with_context(serde_json::json!({"k": "v"}))
+            .with_result(serde_json::json!({"r": 1}))
+            .with_meta(serde_json::json!({"m": 1}))
+            .with_error(Some("boom".to_string()))
+            .with_worker_id(Some("w-1".to_string()));
+        let payload = mirror_payload(&row);
+        let obj = payload.as_object().expect("payload is an object");
+
+        // Keys the mirror sends that are NOT `noetl.event` columns:
+        //   `step`          — the worker's spelling of node_name
+        //   `mirror_source` — provenance the tier records about the copy
+        //   the version key — the payload's own schema version
+        let not_columns = ["step", "mirror_source", MIRROR_PAYLOAD_VERSION_KEY];
+        let mirrored_columns: Vec<&str> = obj
+            .keys()
+            .map(|k| k.as_str())
+            .filter(|k| !not_columns.contains(k))
+            .collect();
+        assert!(
+            mirrored_columns.len() >= 15,
+            "only {} mirrored columns found — the payload shrank or the extraction \
+             broke, and a guard measuring nothing passes",
+            mirrored_columns.len()
+        );
+        assert!(
+            mirrored_columns.contains(&"parent_execution_id"),
+            "the column noetl/ai-meta#326 is about must be in the expectation"
+        );
+
+        // Assembled so `include_str!` cannot match this test against itself.
+        let needle = format!("INSERT INTO noetl.event{}", "");
+        for (file, src) in [
+            ("handlers/events.rs", include_str!("events.rs")),
+            ("handlers/event_write.rs", include_str!("event_write.rs")),
+        ] {
+            if !src.contains("ehdb_eventlog_mirror::mirror_rows") {
+                continue;
+            }
+            let mut sites = 0;
+            for (i, _) in src.match_indices(&needle) {
+                let rest = &src[i..];
+                let open = rest.find('(').expect("column list opens");
+                let close = rest.find(')').expect("column list closes");
+                assert!(close > open, "{file}: malformed column list");
+                // Strip SQL line comments before collapsing whitespace: a `--`
+                // comment inside the column list would otherwise glue itself to the
+                // next identifier and the guard would report that column missing.
+                // Observed while writing the fix this guard exists to verify.
+                // Two things must be stripped before collapsing whitespace, both
+                // observed while writing the fix this guard verifies:
+                //   `--` SQL comments — otherwise a comment glues to the next
+                //        identifier and that column reads as missing;
+                //   `\`  Rust string line-continuations — same failure, e.g.
+                //        `event_type, \` + newline + `node_id` collapses to
+                //        `event_type,\node_id`.
+                let raw = &rest[open + 1..close];
+                let cols: String = raw
+                    .lines()
+                    .map(|l| l.split("--").next().unwrap_or(""))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .replace('\\', " ")
+                    .split_whitespace()
+                    .collect();
+                sites += 1;
+                let missing: Vec<&str> = mirrored_columns
+                    .iter()
+                    .copied()
+                    .filter(|c| !cols.split(',').any(|listed| listed == *c))
+                    .collect();
+                assert!(
+                    missing.is_empty(),
+                    "{file}: an INSERT that MIRRORS drops {missing:?} from the \
+                     authoritative row. The tier would hold those values and \
+                     `noetl.event` would not — noetl/ai-meta#326. Listed: {cols}"
+                );
+            }
+            assert!(
+                sites > 0,
+                "{file}: no INSERT sites found — guard is not measuring"
+            );
+        }
+    }
+
     #[test]
     fn every_in_tx_event_insert_is_mirrored() {
         let events_rs = include_str!("events.rs");
         let inserts = events_rs.matches("INSERT INTO noetl.event").count();
-        let mirrors = events_rs.matches("ehdb_eventlog_mirror::mirror_rows").count();
+        let mirrors = events_rs
+            .matches("ehdb_eventlog_mirror::mirror_rows")
+            .count();
         assert_eq!(
             inserts, mirrors,
             "handlers/events.rs has {inserts} direct `noetl.event` INSERT site(s) but \
@@ -1199,7 +1420,9 @@ mod tests {
         let mut found: BTreeMap<String, (usize, usize)> = BTreeMap::new();
 
         fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(dir) else { return };
+            let Ok(rd) = std::fs::read_dir(dir) else {
+                return;
+            };
             for e in rd.flatten() {
                 let p = e.path();
                 if p.is_dir() {
@@ -1219,7 +1442,9 @@ mod tests {
         );
 
         for f in &files {
-            let Ok(src) = std::fs::read_to_string(f) else { continue };
+            let Ok(src) = std::fs::read_to_string(f) else {
+                continue;
+            };
             // Strip the test module and line comments: this file discusses the
             // needle in its own prose, and a guard that counts its own comments
             // measures itself rather than the code.
@@ -1331,7 +1556,9 @@ mod tests {
             v == "1" || v == "true" || v == "on" || v == "enabled"
         }
 
-        for off in ["", " ", "0", "false", "no", "off", "disabled", "yes", "maybe"] {
+        for off in [
+            "", " ", "0", "false", "no", "off", "disabled", "yes", "maybe",
+        ] {
             assert!(
                 !parses_as_enabled(off),
                 "{off:?} must NOT enable the sink mirror — anything but an \
