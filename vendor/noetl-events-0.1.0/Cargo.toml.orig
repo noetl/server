@@ -1,0 +1,49 @@
+[package]
+name = "noetl-events"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/noetl/cli"
+homepage = "https://noetl.io"
+description = "NoETL shared event envelope types — wire-format ExecutorEvent + pluggable EventSink shared between the CLI's local-mode runner, the noetl-worker NATS pull consumer, and the noetl-server's POST /api/events endpoint."
+readme = "README.md"
+keywords = ["noetl", "etl", "workflow", "events", "envelope"]
+categories = ["data-structures", "development-tools"]
+# EE-4 (noetl/ai-meta#49 Phase D follow-up): carved out of
+# noetl-executor::events so noetl-server can depend on the
+# canonical event envelope shape directly rather than maintaining
+# a hand-aligned `EventRequest` type that drifts from the
+# producer side every time a field is added.
+#
+# Round 1 (this round): the crate exists inside the noetl/cli
+# workspace; noetl-executor::events re-exports its types verbatim
+# so existing consumers (the cli binary, the noetl-worker crate
+# via `pub use noetl_executor::events::ExecutorEvent`) keep
+# working with no source changes.  Crates.io publish + noetl-server
+# adoption land in EE-4 PR 2 / PR 3.
+
+[dependencies]
+# Wire envelope types: serialize/deserialize against the same
+# `EventEmitRequest` shape the Python server records on its event
+# log.  See noetl/noetl wiki page `handle_event_timing` for the
+# field catalogue.
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# `created_at: DateTime<Utc>` — the executor stamps wall-clock at
+# emit time so the event log preserves per-component ordering even
+# across server-clock skew (per `agents/rules/observability.md`).
+chrono = { version = "0.4", features = ["serde"] }
+
+# Sink trait is async — boxable trait object lets the executor
+# carry the sink as `Arc<dyn EventSink>`.
+async-trait = "0.1"
+
+# Sink emit signature returns `anyhow::Result<()>`.  Errors are
+# typically transport-level (HTTP / NATS publish failures) — the
+# caller decides whether to retry or surface upstream.
+anyhow = "1.0"
+
+[dev-dependencies]
+# Async tests for the sink-side helpers.
+tokio = { version = "1", features = ["macros", "rt"] }

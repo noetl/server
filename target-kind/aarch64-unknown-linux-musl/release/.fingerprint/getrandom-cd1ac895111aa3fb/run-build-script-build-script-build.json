@@ -1,0 +1,1 @@
+{"rustc":12490660700115729643,"features":"","declared_features":"","target":0,"profile":0,"path":0,"deps":[[17989731678791879549,"build_script_build",false,3113943416875269206]],"local":[{"RerunIfChanged":{"output":"aarch64-unknown-linux-musl/release/build/getrandom-cd1ac895111aa3fb/output","paths":["build.rs"]}}],"rustflags":[],"config":0,"compile_kind":0}
