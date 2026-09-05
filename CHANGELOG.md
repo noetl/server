@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.103.4](https://github.com/noetl/server/compare/v3.103.3...v3.103.4) (2026-09-05)
+
+### Bug Fixes
+
+* **events:** project_events persists parent_execution_id and worker_id (ai-meta[#326](https://github.com/noetl/server/issues/326)) ([f407ce5](https://github.com/noetl/server/commit/f407ce570ac501a8ff86ad909a86061373290e97)), closes [ai-meta#327](https://github.com/noetl/ai-meta/issues/327) [ai-meta#115](https://github.com/noetl/ai-meta/issues/115) [ai-meta#327](https://github.com/noetl/ai-meta/issues/327) [noetl/ai-meta#327](https://github.com/noetl/ai-meta/issues/327)
+
 ## [3.103.3](https://github.com/noetl/server/compare/v3.103.2...v3.103.3) (2026-09-05)
 
 ### Bug Fixes
