@@ -291,6 +291,22 @@ pub fn collapse_result_representation(v: &serde_json::Value) -> serde_json::Valu
     }
 }
 
+/// Whether a value is the **externalised** form of a payload.
+///
+/// `NOETL_PERMANENT_LOG_LEAN` replaces a large command context in `noetl.event`
+/// with a pointer: `{"__context_ref__":"noetl://execution/…/__command_context__/…",
+/// "__context_bytes__":1011}`. The tier holds the inlined object instead, because
+/// the mirror copies the event before that substitution.
+///
+/// Same class as `reference` vs inlined `context` on a result — one logical value
+/// in two representations — but a *different spelling*, which is why the earlier
+/// collapse missed it and reported 622 false content divergences.
+pub fn is_externalised_payload(v: &serde_json::Value) -> bool {
+    v.get("__context_ref__")
+        .map(|r| !r.is_null())
+        .unwrap_or(false)
+}
+
 /// Whether two content values agree once null-spelling and result representation
 /// are normalised away.
 pub fn content_field_agrees(
@@ -303,6 +319,19 @@ pub fn content_field_agrees(
         (Some(a), Some(b)) => {
             if a == b {
                 return true;
+            }
+            // Externalised vs inlined: one logical payload, two representations.
+            //
+            // ⚠ EQUIVALENCE, not equality — the `__context_ref__` pointer is never
+            // dereferenced, exactly as the `reference` collapse below does not.
+            // A tier whose inlined copy disagrees with what the pointer resolves
+            // to is invisible to this, and closing that needs the pointer read.
+            match (is_externalised_payload(a), is_externalised_payload(b)) {
+                (true, false) | (false, true) => return true,
+                // Both externalised: they are comparable AS pointers, and a
+                // differing pointer is a real divergence.
+                (true, true) => return a.get("__context_ref__") == b.get("__context_ref__"),
+                (false, false) => {}
             }
             // Only `result` (and the contexts nested inside it) carries the
             // two-representation shape; applying the collapse everywhere would
@@ -2214,6 +2243,61 @@ pub(crate) async fn sample_candidates(
 
 #[cfg(test)]
 mod tests {
+
+    /// The lean-log externalisation is the SAME representation class as
+    /// `reference`, in a different spelling — and missing it produced 622 false
+    /// content divergences in the first measured sweep.
+    #[test]
+    fn an_externalised_context_agrees_with_the_inlined_one() {
+        let ext = serde_json::json!({
+            "__context_ref__": "noetl://execution/1/result/__command_context__/2",
+            "__context_bytes__": 1011
+        });
+        let inlined = serde_json::json!({"args": {}, "render_context": {"_index": 0}});
+        assert!(
+            content_field_agrees("context", Some(&ext), Some(&inlined)),
+            "externalised vs inlined is one logical payload in two representations"
+        );
+        assert!(
+            content_field_agrees("context", Some(&inlined), Some(&ext)),
+            "and it must hold in both directions"
+        );
+    }
+
+    /// …but two POINTERS are comparable as pointers, so a differing one is real.
+    #[test]
+    fn two_different_externalised_pointers_are_a_divergence() {
+        let a = serde_json::json!({"__context_ref__": "noetl://execution/1/x", "__context_bytes__": 10});
+        let b = serde_json::json!({"__context_ref__": "noetl://execution/1/DIFFERENT", "__context_bytes__": 10});
+        assert!(
+            !content_field_agrees("context", Some(&a), Some(&b)),
+            "two externalised payloads pointing at different places is a real \
+             divergence — the collapse must not become a blanket amnesty for \
+             anything carrying the marker"
+        );
+        assert!(content_field_agrees("context", Some(&a), Some(&a)));
+    }
+
+    /// The rule must not leak into fields that never carry the marker.
+    #[test]
+    fn the_externalisation_rule_does_not_excuse_ordinary_differences() {
+        assert!(
+            !content_field_agrees(
+                "worker_id",
+                Some(&serde_json::json!("w-1")),
+                Some(&serde_json::json!("w-2"))
+            ),
+            "a differing worker_id is a real divergence and must survive"
+        );
+        assert!(
+            !content_field_agrees(
+                "context",
+                Some(&serde_json::json!({"a": 1})),
+                Some(&serde_json::json!({"a": 2}))
+            ),
+            "two INLINED contexts that differ are a real divergence"
+        );
+    }
 
     /// The per-request override must widen the comparison WITHOUT arming the
     /// sampler — that separation is the only reason it is safe to measure with.
