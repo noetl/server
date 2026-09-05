@@ -128,6 +128,10 @@ pub struct AuthoritativeEvent {
     pub event_type: String,
     pub node_name: Option<String>,
     pub status: Option<String>,
+    /// Content fields, fetched only when the content comparison is armed
+    /// (noetl/ai-meta#325). `None` when off, so the off path runs the same query
+    /// it always ran.
+    pub content: Option<serde_json::Map<String, serde_json::Value>>,
     /// Whether the tier is **expected** to hold a copy of this event.
     ///
     /// The mirror hook sits on the worker's emit chokepoint
@@ -183,6 +187,136 @@ pub struct MirroredRecord {
     pub payload: String,
 }
 
+/// Arm the **content** comparison (noetl/ai-meta#325). Default **off**.
+///
+/// Off, this module behaves exactly as it did: `payload_divergence` compares the
+/// three identifying fields and nothing else, and every verdict is byte-identical
+/// to before. That default is not timidity — turning this on converts a large
+/// share of today's `match` verdicts into `divergent`, and
+/// `noetl_ehdb_crossstore_divergence_total` feeds a paging alert. Enabling the
+/// flag and re-pointing that alert have to happen together; see
+/// `playbooks/325-content-parity/ALERT-RETUNE.md`.
+pub const CONTENT_PARITY_ENV: &str = "NOETL_EHDB_CROSSSTORE_PARITY_CONTENT";
+
+/// Whether the content comparison is armed.
+pub fn content_parity_enabled() -> bool {
+    std::env::var(CONTENT_PARITY_ENV)
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+/// The content fields, in the order they are reported.
+///
+/// Chosen because the fold reads them: a difference in any of these changes the
+/// rebuilt `WorkflowState`, which is what "the tier can stand in for Postgres"
+/// actually has to mean.
+pub const CONTENT_FIELDS: [&str; 6] = [
+    "context",
+    "result",
+    "meta",
+    "error",
+    "worker_id",
+    "parent_execution_id",
+];
+
+/// `null` and absent are the same thing here.
+///
+/// The authoritative row stores a SQL NULL; the mirrored payload may carry
+/// `null`, or omit the key. Three spellings of "no value" that must not read as
+/// a divergence — the same equivalence `normalise_null_json` applies on the fold
+/// side.
+fn json_present(v: Option<&serde_json::Value>) -> Option<&serde_json::Value> {
+    match v {
+        None | Some(serde_json::Value::Null) => None,
+        // An empty object or array is "no value" too, and the two stores spell it
+        // differently: the authoritative column is a SQL NULL while the mirrored
+        // payload carries `{}`. Treating those as different reported a content
+        // divergence on every event with no context — which is most of them.
+        Some(serde_json::Value::Object(o)) if o.is_empty() => None,
+        Some(serde_json::Value::Array(a)) if a.is_empty() => None,
+        Some(other) => Some(other),
+    }
+}
+
+/// Marker substituted for a result payload, whichever representation it is in.
+const RESULT_PAYLOAD_MARKER: &str = "__noetl_result_payload__";
+
+/// Collapse the two representations of a result payload to one marker.
+///
+/// **This is the correctness core of the content comparison.**  `build_result_object`
+/// (`handlers/events.rs`) writes a result either as an inlined `context` or as a
+/// `reference` pointer, chosen by `result_kind` — and the tier holds the inlined
+/// form where Postgres holds the pointer, systematically, on every execution
+/// measured.  They denote the **same logical result**.  Comparing them raw would
+/// report a content divergence on essentially every execution and say nothing.
+///
+/// So any object carrying exactly one of `context` / `reference` has that key
+/// replaced by [`RESULT_PAYLOAD_MARKER`]; an object carrying **both** is left
+/// alone, because that is not a representation choice and a reader should see it.
+/// Everything else recurses unchanged, so a genuine difference anywhere outside
+/// the payload still survives.
+///
+/// ⚠ This asserts the two forms are **equivalent**, not that they are equal — the
+/// pointer is not dereferenced. A tier holding an inlined payload that does not
+/// match what the reference resolves to is invisible to this rule and needs the
+/// reference resolved to catch. Recorded rather than hidden:
+/// `noetl_ehdb_crossstore_result_representation_total`.
+pub fn collapse_result_representation(v: &serde_json::Value) -> serde_json::Value {
+    match v {
+        serde_json::Value::Object(o) => {
+            let has_ctx = o.contains_key("context");
+            let has_ref = o.contains_key("reference");
+            let mut out = serde_json::Map::new();
+            for (k, val) in o {
+                if (has_ctx ^ has_ref) && (k == "context" || k == "reference") {
+                    out.insert(
+                        RESULT_PAYLOAD_MARKER.to_string(),
+                        serde_json::Value::Bool(true),
+                    );
+                } else {
+                    out.insert(k.clone(), collapse_result_representation(val));
+                }
+            }
+            serde_json::Value::Object(out)
+        }
+        serde_json::Value::Array(a) => {
+            serde_json::Value::Array(a.iter().map(collapse_result_representation).collect())
+        }
+        other => other.clone(),
+    }
+}
+
+/// Whether two content values agree once null-spelling and result representation
+/// are normalised away.
+pub fn content_field_agrees(
+    field: &str,
+    auth: Option<&serde_json::Value>,
+    tier: Option<&serde_json::Value>,
+) -> bool {
+    match (json_present(auth), json_present(tier)) {
+        (None, None) => true,
+        (Some(a), Some(b)) => {
+            if a == b {
+                return true;
+            }
+            // Only `result` (and the contexts nested inside it) carries the
+            // two-representation shape; applying the collapse everywhere would
+            // blunt the comparison on fields that never have it.
+            if field == "result" || field == "context" {
+                collapse_result_representation(a) == collapse_result_representation(b)
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
+}
+
 /// The identifying projection parsed out of one mirrored payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MirroredEvent {
@@ -191,6 +325,9 @@ struct MirroredEvent {
     event_type: Option<String>,
     step: Option<String>,
     status: Option<String>,
+    /// Content fields, parsed only when the content comparison is armed
+    /// (noetl/ai-meta#325). `None` when it is off, so the off path allocates nothing.
+    content: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 /// A way the two stores disagreed.
@@ -214,6 +351,15 @@ pub enum DivergenceKind {
     Order,
     /// A shared `event_id` whose identifying fields differ between the stores.
     Payload,
+    /// A shared `event_id` whose CONTENT differs — `context`, `result`, `meta`,
+    /// `error`, `worker_id` or `parent_execution_id` (noetl/ai-meta#325).
+    ///
+    /// Only ever raised when `NOETL_EHDB_CROSSSTORE_PARITY_CONTENT` is armed.
+    /// Separate from `Payload` because the two answer different questions:
+    /// `Payload` asks "is this the same event", `Content` asks "does it still
+    /// carry the same thing" — and a comparator that only ever answered the
+    /// first is what let a systematically-divergent tier report `match`.
+    Content,
     /// A tier record that cannot be matched at all: its payload does not parse,
     /// or it carries no `event_id`.
     ///
@@ -234,19 +380,21 @@ impl DivergenceKind {
             Self::ExtraEvent => "extra_event",
             Self::Order => "order",
             Self::Payload => "payload",
+            Self::Content => "content",
             Self::Unidentified => "unidentified",
         }
     }
 }
 
 /// Every [`DivergenceKind`] label value, for pinning and for the control suite.
-pub const DIVERGENCE_KINDS: [DivergenceKind; 7] = [
+pub const DIVERGENCE_KINDS: [DivergenceKind; 8] = [
     DivergenceKind::MissingExecution,
     DivergenceKind::Count,
     DivergenceKind::MissingEvent,
     DivergenceKind::ExtraEvent,
     DivergenceKind::Order,
     DivergenceKind::Payload,
+    DivergenceKind::Content,
     DivergenceKind::Unidentified,
 ];
 
@@ -423,6 +571,38 @@ pub fn compare_cross_store_with_horizon(
     mirrored: &[MirroredRecord],
     horizon: Option<i64>,
 ) -> CrossStoreReport {
+    compare_inner(
+        execution_id,
+        authoritative,
+        mirrored,
+        horizon,
+        content_parity_enabled(),
+    )
+}
+
+/// [`compare_cross_store`] with the content comparison **forced on**, whatever
+/// the environment says.
+///
+/// Exists for the control suite (noetl/ai-meta#325): the controls have to prove
+/// the widened comparator discriminates *before* anyone arms it somewhere that
+/// arming it pages. Reading the flag here would make those controls silently
+/// vacuous on exactly the deployments that have not enabled it yet — a control
+/// that cannot fail is the thing this suite exists to prevent.
+pub fn compare_cross_store_with_content(
+    execution_id: i64,
+    authoritative: &[AuthoritativeEvent],
+    mirrored: &[MirroredRecord],
+) -> CrossStoreReport {
+    compare_inner(execution_id, authoritative, mirrored, None, true)
+}
+
+fn compare_inner(
+    execution_id: i64,
+    authoritative: &[AuthoritativeEvent],
+    mirrored: &[MirroredRecord],
+    horizon: Option<i64>,
+    content_on: bool,
+) -> CrossStoreReport {
     let mut divergences: Vec<Divergence> = Vec::new();
 
     // Prefix cut. `cut` is the count of comparable authoritative events.
@@ -446,6 +626,9 @@ pub fn compare_cross_store_with_horizon(
     let authoritative = comparable;
 
     // --- parse the tier side -------------------------------------------------
+    // `content_on` arrives as a parameter, read once by the caller: a flag
+    // sampled per record could make half a verdict about one policy and half
+    // about another.
     let mut parsed: Vec<MirroredEvent> = Vec::with_capacity(mirrored.len());
     for rec in mirrored {
         match serde_json::from_str::<serde_json::Value>(&rec.payload) {
@@ -458,6 +641,15 @@ pub fn compare_cross_store_with_horizon(
                         event_type: read_string(v.get("event_type")),
                         step: read_string(v.get("step")),
                         status: read_string(v.get("status")),
+                        content: content_on.then(|| {
+                            let mut m = serde_json::Map::new();
+                            for f in CONTENT_FIELDS {
+                                if let Some(val) = v.get(f) {
+                                    m.insert(f.to_string(), val.clone());
+                                }
+                            }
+                            m
+                        }),
                     }),
                     None => divergences.push(Divergence {
                         kind: DivergenceKind::Unidentified,
@@ -673,12 +865,23 @@ pub fn compare_cross_store_with_horizon(
         let Some(auth) = auth_by_id.get(&m.event_id) else {
             continue; // already reported as ExtraEvent
         };
-        match payload_divergence(auth, m) {
-            Some(detail) => divergences.push(Divergence {
+        let mut diverged = false;
+        if let Some(detail) = payload_divergence(auth, m) {
+            divergences.push(Divergence {
                 kind: DivergenceKind::Payload,
                 detail,
-            }),
-            None => matched += 1,
+            });
+            diverged = true;
+        }
+        if let Some(detail) = content_divergence(auth, m) {
+            divergences.push(Divergence {
+                kind: DivergenceKind::Content,
+                detail,
+            });
+            diverged = true;
+        }
+        if !diverged {
+            matched += 1;
         }
     }
 
@@ -748,6 +951,56 @@ fn payload_divergence(auth: &AuthoritativeEvent, mirrored: &MirroredEvent) -> Op
     }
 }
 
+/// Compare the CONTENT fields of one shared event (noetl/ai-meta#325).
+///
+/// Returns `None` when the content comparison is not armed on **both** sides —
+/// a one-sided `Some` would mean the query and the parse disagreed about the
+/// flag, and reporting every field as absent-on-one-side would be a
+/// configuration bug dressed up as data loss.
+///
+/// This is the comparison that makes a `match` verdict mean "the tier can stand
+/// in for Postgres". Without it the comparator reads three identifying fields
+/// and is structurally blind to a tier whose every payload differs.
+fn content_divergence(auth: &AuthoritativeEvent, mirrored: &MirroredEvent) -> Option<String> {
+    let (a, b) = match (&auth.content, &mirrored.content) {
+        (Some(a), Some(b)) => (a, b),
+        _ => return None,
+    };
+    let mut fields: Vec<String> = Vec::new();
+    for f in CONTENT_FIELDS {
+        if !content_field_agrees(f, a.get(f), b.get(f)) {
+            fields.push(format!(
+                "{f}: authoritative={} ehdb={}",
+                summarise(a.get(f)),
+                summarise(b.get(f))
+            ));
+        }
+    }
+    if fields.is_empty() {
+        None
+    } else {
+        Some(format!("event_id {}: {}", auth.event_id, fields.join("; ")))
+    }
+}
+
+/// A short, bounded rendering of a content value for the divergence detail.
+///
+/// Bounded on purpose: `context` and `result` carry whole tool payloads, and a
+/// divergence detail that embeds one of them turns a verdict into a log bomb.
+fn summarise(v: Option<&serde_json::Value>) -> String {
+    match v {
+        None | Some(serde_json::Value::Null) => "<absent>".to_string(),
+        Some(other) => {
+            let s = other.to_string();
+            if s.len() <= 160 {
+                s
+            } else {
+                format!("{}… ({} bytes)", &s[..160], s.len())
+            }
+        }
+    }
+}
+
 // ===========================================================================
 // Controls — so a zero is readable.
 // ===========================================================================
@@ -764,7 +1017,7 @@ pub struct ControlResult {
 }
 
 /// Every control label value, for pinning.
-pub const CONTROL_NAMES: [&str; 10] = [
+pub const CONTROL_NAMES: [&str; 12] = [
     "identical",
     "missing_execution",
     "count",
@@ -778,11 +1031,18 @@ pub const CONTROL_NAMES: [&str; 10] = [
     // control can only ever prove half of it.
     "lag_within_window",
     "lag_beyond_window",
+    // noetl/ai-meta#325. Two controls, not one, and the NEGATIVE one is the
+    // load-bearing half: a content comparison that flags the tier's inlined
+    // result against Postgres's `reference` pointer would report a divergence on
+    // essentially every execution and mean nothing.
+    "content",
+    "result_representation",
 ];
 
 fn auth_event(event_id: i64, event_type: &str, step: &str, status: &str) -> AuthoritativeEvent {
     AuthoritativeEvent {
         event_id,
+        content: None,
         event_type: event_type.to_string(),
         node_name: Some(step.to_string()),
         status: Some(status.to_string()),
@@ -979,6 +1239,83 @@ pub fn run_controls() -> Vec<ControlResult> {
                     outside.kinds(),
                     outside.holds,
                     outside.pending_authoritative
+                )
+            },
+        });
+    }
+
+    // --- noetl/ai-meta#325: the content comparison ---------------------------
+    //
+    // These run whether or not `NOETL_EHDB_CROSSSTORE_PARITY_CONTENT` is armed,
+    // because they drive `compare_cross_store` over fixtures that already carry
+    // content. That is deliberate: the widened comparator is provably working
+    // BEFORE anyone turns it on in an environment where turning it on pages.
+    {
+        let (mut auth, mut mirrored) = control_fixtures();
+        let payload = serde_json::json!({"data": {"rows": 3}, "status": "ok"});
+        for a in auth.iter_mut() {
+            let mut m = serde_json::Map::new();
+            m.insert("result".to_string(), payload.clone());
+            a.content = Some(m);
+        }
+        // The tier copy agrees, except on one event where the payload differs.
+        let mut tier_content = vec![payload.clone(); auth.len()];
+        tier_content[1] = serde_json::json!({"data": {"rows": 4}, "status": "ok"});
+        for (rec, c) in mirrored.iter_mut().zip(tier_content.iter()) {
+            let mut v: serde_json::Value = serde_json::from_str(&rec.payload).unwrap();
+            v.as_object_mut()
+                .unwrap()
+                .insert("result".to_string(), c.clone());
+            rec.payload = v.to_string();
+        }
+        let r = compare_cross_store_with_content(1, &auth, &mirrored);
+        let fired = r.kinds().contains(DivergenceKind::Content.as_str());
+        out.push(ControlResult {
+            control: "content".to_string(),
+            expected: fired,
+            detail: if fired {
+                format!("detected; verdict kinds {:?}", r.kinds())
+            } else {
+                format!(
+                    "A CONTENT DIVERGENCE WENT UNSEEN — kinds {:?}, holds={}",
+                    r.kinds(),
+                    r.holds
+                )
+            },
+        });
+    }
+    {
+        // Negative control. Postgres holds a `reference`; the tier holds the
+        // inlined `context`. Same logical result, two representations — this must
+        // NOT be a divergence, or the comparison is unusable on real data.
+        let (mut auth, mut mirrored) = control_fixtures();
+        for a in auth.iter_mut() {
+            let mut m = serde_json::Map::new();
+            m.insert(
+                "result".to_string(),
+                serde_json::json!({"status": "ok", "reference": {"logical_uri": "gs://b/k"}}),
+            );
+            a.content = Some(m);
+        }
+        for rec in mirrored.iter_mut() {
+            let mut v: serde_json::Value = serde_json::from_str(&rec.payload).unwrap();
+            v.as_object_mut().unwrap().insert(
+                "result".to_string(),
+                serde_json::json!({"status": "ok", "context": {"data": {"big": "payload"}}}),
+            );
+            rec.payload = v.to_string();
+        }
+        let r = compare_cross_store_with_content(1, &auth, &mirrored);
+        let clean = !r.kinds().contains(DivergenceKind::Content.as_str());
+        out.push(ControlResult {
+            control: "result_representation".to_string(),
+            expected: clean,
+            detail: if clean {
+                "inlined-vs-reference correctly treated as one logical result".to_string()
+            } else {
+                format!(
+                    "REPRESENTATION REPORTED AS A CONTENT DIVERGENCE — kinds {:?}",
+                    r.kinds()
                 )
             },
         });
@@ -1192,7 +1529,29 @@ async fn fetch_authoritative(
     // hold a different opinion about the boundary than the producer does.
     let server_mirrors = crate::handlers::ehdb_eventlog_mirror::server_mirrors();
 
-    let rows = sqlx::query_as::<_, (i64, String, Option<String>, Option<String>, bool)>(
+    // The content columns are selected only when the comparison is armed
+    // (noetl/ai-meta#325).  Off, this is the same query and the same row shape it
+    // has always been — a widened SELECT that ran unconditionally would put
+    // `context`/`result` payloads on the wire for every parity tick, which is the
+    // cost the flag exists to avoid paying before anyone wants it.
+    let content_on = content_parity_enabled();
+
+    let rows = sqlx::query_as::<
+        _,
+        (
+            i64,
+            String,
+            Option<String>,
+            Option<String>,
+            bool,
+            Option<serde_json::Value>,
+            Option<serde_json::Value>,
+            Option<serde_json::Value>,
+            Option<serde_json::Value>,
+            Option<String>,
+            Option<i64>,
+        ),
+    >(
         r#"
         SELECT
             event_id,
@@ -1200,7 +1559,13 @@ async fn fetch_authoritative(
             node_name,
             status,
             ($3 OR ((meta->>'worker_id') IS NOT NULL
-                    AND event_type <> 'command.claimed')) AS mirror_expected
+                    AND event_type <> 'command.claimed')) AS mirror_expected,
+            CASE WHEN $4 THEN context END      AS context,
+            CASE WHEN $4 THEN result  END      AS result,
+            CASE WHEN $4 THEN meta    END      AS meta,
+            CASE WHEN $4 THEN error   END      AS error,
+            CASE WHEN $4 THEN worker_id END    AS worker_id,
+            CASE WHEN $4 THEN parent_execution_id END AS parent_execution_id
         FROM noetl.event
         WHERE execution_id = $1
         ORDER BY event_id ASC
@@ -1210,18 +1575,52 @@ async fn fetch_authoritative(
     .bind(execution_id)
     .bind(MAX_COMPARE_EVENTS as i64 + 1)
     .bind(server_mirrors)
+    .bind(content_on)
     .fetch_all(state.pools.pool_for(execution_id))
     .await?;
 
     Ok(rows
         .into_iter()
         .map(
-            |(event_id, event_type, node_name, status, mirror_expected)| AuthoritativeEvent {
+            |(
                 event_id,
                 event_type,
                 node_name,
                 status,
                 mirror_expected,
+                context,
+                result,
+                meta,
+                error,
+                worker_id,
+                parent_execution_id,
+            )| {
+                let content = content_on.then(|| {
+                    let mut m = serde_json::Map::new();
+                    let mut put = |k: &str, v: Option<serde_json::Value>| {
+                        if let Some(v) = v {
+                            m.insert(k.to_string(), v);
+                        }
+                    };
+                    put("context", context);
+                    put("result", result);
+                    put("meta", meta);
+                    put("error", error);
+                    put("worker_id", worker_id.map(serde_json::Value::String));
+                    put(
+                        "parent_execution_id",
+                        parent_execution_id.map(|v| serde_json::Value::String(v.to_string())),
+                    );
+                    m
+                });
+                AuthoritativeEvent {
+                    event_id,
+                    event_type,
+                    node_name,
+                    status,
+                    mirror_expected,
+                    content,
+                }
             },
         )
         .collect())
@@ -1796,6 +2195,154 @@ pub(crate) async fn sample_candidates(
 
 #[cfg(test)]
 mod tests {
+
+    // ---- noetl/ai-meta#325: the content comparison --------------------------
+
+    fn content_pair(
+        auth_result: serde_json::Value,
+        tier_result: serde_json::Value,
+    ) -> (Vec<AuthoritativeEvent>, Vec<MirroredRecord>) {
+        let (mut auth, mut mirrored) = control_fixtures();
+        auth.truncate(1);
+        mirrored.truncate(1);
+        let mut m = serde_json::Map::new();
+        m.insert("result".to_string(), auth_result);
+        auth[0].content = Some(m);
+        let mut v: serde_json::Value = serde_json::from_str(&mirrored[0].payload).unwrap();
+        v.as_object_mut()
+            .unwrap()
+            .insert("result".to_string(), tier_result);
+        mirrored[0].payload = v.to_string();
+        (auth, mirrored)
+    }
+
+    /// **The gate the widening exists for.** A tier whose payload differs must no
+    /// longer be able to report `match`.
+    #[test]
+    fn a_content_divergence_the_old_comparator_missed_is_now_caught() {
+        let (auth, mirrored) = content_pair(
+            serde_json::json!({"data": {"rows": 3}}),
+            serde_json::json!({"data": {"rows": 4}}),
+        );
+        // The OLD comparison — three identifying fields — sees nothing.
+        let narrow = compare_cross_store(1, &auth, &mirrored);
+        assert!(
+            !narrow.kinds().contains(DivergenceKind::Content.as_str()),
+            "with the flag off this must behave exactly as before"
+        );
+        // The widened one catches it.
+        let wide = compare_cross_store_with_content(1, &auth, &mirrored);
+        assert!(
+            wide.kinds().contains(DivergenceKind::Content.as_str()),
+            "a differing `result` must raise Content — this is the whole point of \
+             noetl/ai-meta#325; without it a tier can differ in every payload and \
+             still report match"
+        );
+        assert!(!wide.holds);
+    }
+
+    /// Positive control: genuinely-equal payloads must still pass. A comparison
+    /// that flags everything is as useless as one that flags nothing.
+    #[test]
+    fn equal_content_still_reports_a_clean_match() {
+        let same = serde_json::json!({"data": {"rows": 3}, "status": "ok"});
+        let (auth, mirrored) = content_pair(same.clone(), same);
+        let r = compare_cross_store_with_content(1, &auth, &mirrored);
+        assert!(
+            r.holds,
+            "identical content must hold; kinds were {:?}",
+            r.kinds()
+        );
+        assert_eq!(r.matched, 1);
+    }
+
+    /// ⚠ The load-bearing negative: Postgres holds a `reference`, the tier holds
+    /// the inlined `context`. One logical result, two representations. Flagging
+    /// it would report a divergence on essentially every real execution.
+    #[test]
+    fn inlined_versus_reference_is_not_a_content_divergence() {
+        let (auth, mirrored) = content_pair(
+            serde_json::json!({"status": "ok", "reference": {"logical_uri": "gs://b/k"}}),
+            serde_json::json!({"status": "ok", "context": {"data": {"big": "payload"}}}),
+        );
+        let r = compare_cross_store_with_content(1, &auth, &mirrored);
+        assert!(
+            !r.kinds().contains(DivergenceKind::Content.as_str()),
+            "reference-vs-inlined must not read as a content divergence; kinds {:?}",
+            r.kinds()
+        );
+    }
+
+    /// …but the collapse must not become a blanket amnesty: an object carrying
+    /// BOTH keys is not a representation choice, and a difference *beside* the
+    /// payload still has to survive.
+    #[test]
+    fn the_representation_collapse_does_not_swallow_real_differences() {
+        // Same representation shape, different sibling field.
+        let (auth, mirrored) = content_pair(
+            serde_json::json!({"status": "ok", "reference": {"logical_uri": "gs://b/k"}}),
+            serde_json::json!({"status": "FAILED", "context": {"x": 1}}),
+        );
+        let r = compare_cross_store_with_content(1, &auth, &mirrored);
+        assert!(
+            r.kinds().contains(DivergenceKind::Content.as_str()),
+            "a differing sibling field must still be caught even when the payload \
+             representation differs; kinds {:?}",
+            r.kinds()
+        );
+
+        // An object with BOTH keys is left alone by the collapse.
+        let both = serde_json::json!({"reference": {"u": 1}, "context": {"x": 1}});
+        let other = serde_json::json!({"reference": {"u": 2}, "context": {"x": 1}});
+        assert_ne!(
+            collapse_result_representation(&both),
+            collapse_result_representation(&other),
+            "carrying both keys is not a representation choice; the collapse must \
+             not erase a difference inside them"
+        );
+    }
+
+    /// null / absent / `{}` are three spellings of "no value" and must agree.
+    #[test]
+    fn empty_null_and_absent_agree() {
+        for (a, b) in [
+            (None, Some(serde_json::Value::Null)),
+            (None, Some(serde_json::json!({}))),
+            (Some(serde_json::Value::Null), Some(serde_json::json!([]))),
+        ] {
+            assert!(
+                content_field_agrees("meta", a.as_ref(), b.as_ref()),
+                "{a:?} vs {b:?} must agree — the authoritative column is a SQL NULL \
+                 while the mirrored payload carries {{}}"
+            );
+        }
+        assert!(
+            !content_field_agrees("meta", Some(&serde_json::json!({"a": 1})), None),
+            "a real value against absent is a divergence"
+        );
+    }
+
+    /// The flag must default OFF, or merging this pages on a condition that has
+    /// been true all along.
+    #[test]
+    fn the_content_comparison_defaults_off() {
+        assert!(
+            !content_parity_enabled(),
+            "NOETL_EHDB_CROSSSTORE_PARITY_CONTENT must default to false — enabling \
+             it converts a large share of today's `match` into `divergent`, and \
+             that counter feeds a paging alert"
+        );
+        assert!(
+            crate::handlers::ehdb_parity::DIVERGENCE_KINDS
+                .iter()
+                .any(|k| k.as_str() == "content"),
+            "the new kind must be in the pinned set or its series is absent until \
+             it first fires"
+        );
+        assert!(CONTROL_NAMES.contains(&"content"));
+        assert!(CONTROL_NAMES.contains(&"result_representation"));
+    }
+
     use super::*;
 
     #[test]
