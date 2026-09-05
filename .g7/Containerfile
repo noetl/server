@@ -1,0 +1,2 @@
+FROM ghcr.io/noetl/server:3.91.1
+COPY noetl-control-plane /app/noetl-control-plane
