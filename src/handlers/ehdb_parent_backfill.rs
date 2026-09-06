@@ -60,6 +60,36 @@ pub struct BackfillQuery {
     pub apply: bool,
 }
 
+/// What the **authoritative store** independently says about the tier's claim.
+///
+/// Every field here is read from `noetl.event` — never from the tier — so a
+/// mirror bug cannot manufacture its own corroboration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Corroboration {
+    /// The execution owning the child's `parent_event_id`, when it has one.
+    ///
+    /// ⚠ Measured and found **absent on every row in scope**: a child
+    /// execution's `playbook_started` carries no parent *event*. Kept because it
+    /// is the strongest oracle when present — and because it is the only one that
+    /// can *contradict*, which the other two cannot.
+    pub lineage_parent_execution: Option<i64>,
+    /// The claimed parent's own authoritative events mention this child — the
+    /// orchestrator's spawn relationship, recorded on the side that spawned.
+    pub parent_references_child: bool,
+    /// The child's own authoritative `context`/`meta` carry the claimed parent.
+    /// A value found here never left the system of record; only the *column* did.
+    pub self_payload_carries_parent: bool,
+}
+
+impl Corroboration {
+    /// How many independent authoritative oracles back the claim.
+    pub fn count(&self) -> usize {
+        usize::from(self.lineage_parent_execution.is_some())
+            + usize::from(self.parent_references_child)
+            + usize::from(self.self_payload_carries_parent)
+    }
+}
+
 /// Why one candidate was not written.
 ///
 /// ⚠ Every refusal is reported, never silently dropped from the count. A repair
@@ -67,44 +97,49 @@ pub struct BackfillQuery {
 /// to do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Refusal {
-    /// The child event carries no `parent_event_id`, so there is no second source.
-    NoLineage,
-    /// `parent_event_id` resolves to no row — the parent event is gone.
-    LineageUnresolved,
+    /// Nothing in the authoritative store backs the tier's claim, so the value
+    /// would be taken on the mirror's word alone.
+    Uncorroborated,
+    /// The child's `parent_event_id` resolves to a **different** execution than
+    /// the tier claims. ⚠ Never resolved by preferring one.
+    LineageContradicts,
     /// The lineage points inside the same execution: a step parent, not a
-    /// spawning execution.
+    /// spawning execution — so it warrants nothing about a parent execution.
     LineageSameExecution,
-    /// Both sources resolved and disagreed. ⚠ Never resolved by preferring one.
-    SourcesDisagree,
 }
 
 impl Refusal {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::NoLineage => "no_lineage",
-            Self::LineageUnresolved => "lineage_unresolved",
+            Self::Uncorroborated => "uncorroborated",
+            Self::LineageContradicts => "lineage_contradicts",
             Self::LineageSameExecution => "lineage_same_execution",
-            Self::SourcesDisagree => "sources_disagree",
         }
     }
 }
 
-/// The decision for one candidate, given both sources.
+/// The gate: write only what the authoritative store itself backs.
+///
+/// The tier supplies the *value*; `noetl.event` supplies the *warrant*. A claim
+/// with no warrant is refused — there is no "best available" path — and a claim
+/// the store **contradicts** is refused even when another oracle agrees, because
+/// a disagreement among oracles is a reason to stop, not to hold a vote.
 ///
 /// Pure, so the gate is testable without a database or a tier.
-pub fn decide(
-    execution_id: i64,
-    tier_parent: i64,
-    lineage_parent_execution: Option<i64>,
-) -> Result<i64, Refusal> {
-    let lineage = lineage_parent_execution.ok_or(Refusal::NoLineage)?;
-    if lineage == execution_id {
-        return Err(Refusal::LineageSameExecution);
+pub fn decide(execution_id: i64, tier_parent: i64, ev: &Corroboration) -> Result<i64, Refusal> {
+    if let Some(lineage) = ev.lineage_parent_execution {
+        if lineage == execution_id {
+            return Err(Refusal::LineageSameExecution);
+        }
+        if lineage != tier_parent {
+            return Err(Refusal::LineageContradicts);
+        }
+        return Ok(tier_parent);
     }
-    if lineage != tier_parent {
-        return Err(Refusal::SourcesDisagree);
+    if ev.parent_references_child || ev.self_payload_carries_parent {
+        return Ok(tier_parent);
     }
-    Ok(lineage)
+    Err(Refusal::Uncorroborated)
 }
 
 /// `POST /api/ehdb/repair/parent-execution-id/{execution_id}`
@@ -153,19 +188,48 @@ pub async fn backfill_endpoint(
     // Source A. Scoped by BOTH execution_id and the candidate ids — the id list
     // alone would let a comparator bug on one execution reach rows in another.
     let ids: Vec<i64> = candidates.iter().map(|c| c.event_id).collect();
-    let lineage = match sqlx::query_as::<_, (i64, Option<i64>, Option<i64>)>(
+    let claimed: Vec<i64> = candidates
+        .iter()
+        .map(|c| c.tier_parent_execution_id)
+        .collect();
+    let corroboration = match sqlx::query_as::<_, (i64, Option<i64>, Option<i64>, bool, bool)>(
         r#"
+        WITH candidate AS (
+            SELECT unnest($2::bigint[]) AS event_id,
+                   unnest($3::bigint[]) AS claimed_parent
+        )
         SELECT c.event_id,
-               c.parent_event_id,
-               p.execution_id AS lineage_parent_execution_id
-        FROM noetl.event c
-        LEFT JOIN noetl.event p ON p.event_id = c.parent_event_id
-        WHERE c.execution_id = $1
-          AND c.event_id = ANY($2)
+               ev.parent_event_id,
+               p.execution_id AS lineage_parent_execution_id,
+               -- Does the CLAIMED PARENT, in the authoritative log, reference this
+               -- child?  That is the orchestrator's spawn relationship, recorded on
+               -- the side that did the spawning.
+               EXISTS (
+                   SELECT 1 FROM noetl.event pe
+                   WHERE pe.execution_id = c.claimed_parent
+                     AND (COALESCE(pe.context::text, '') ~ ('(^|[^0-9])'
+                              || ev.execution_id::text || '([^0-9]|$)')
+                       OR COALESCE(pe.result::text, '')  ~ ('(^|[^0-9])'
+                              || ev.execution_id::text || '([^0-9]|$)')
+                       OR COALESCE(pe.meta::text, '')    ~ ('(^|[^0-9])'
+                              || ev.execution_id::text || '([^0-9]|$)'))
+               ) AS parent_references_child,
+               -- Does the child's OWN authoritative payload carry the claimed
+               -- parent?  The column was dropped; `context`/`meta` were not, so a
+               -- value found here never left the system of record at all.
+               (COALESCE(ev.context::text, '') ~ ('(^|[^0-9])'
+                        || c.claimed_parent::text || '([^0-9]|$)')
+                OR COALESCE(ev.meta::text, '') ~ ('(^|[^0-9])'
+                        || c.claimed_parent::text || '([^0-9]|$)')) AS self_payload_carries_parent
+        FROM candidate c
+        JOIN noetl.event ev
+          ON ev.event_id = c.event_id AND ev.execution_id = $1
+        LEFT JOIN noetl.event p ON p.event_id = ev.parent_event_id
         "#,
     )
     .bind(execution_id)
     .bind(&ids)
+    .bind(&claimed)
     .fetch_all(&state.db)
     .await
     {
@@ -176,39 +240,43 @@ pub async fn backfill_endpoint(
                 Json(json!({
                     "status": "error",
                     "execution_id": execution_id.to_string(),
-                    "detail": format!("lineage read failed: {e}"),
+                    "detail": format!("corroboration read failed: {e}"),
                 })),
             );
         }
     };
-    let lineage_by_id: std::collections::HashMap<i64, (Option<i64>, Option<i64>)> = lineage
-        .into_iter()
-        .map(|(eid, pev, pex)| (eid, (pev, pex)))
-        .collect();
+    let by_id: std::collections::HashMap<i64, (Option<i64>, Option<i64>, bool, bool)> =
+        corroboration
+            .into_iter()
+            .map(|(eid, pev, pex, refs, selfp)| (eid, (pev, pex, refs, selfp)))
+            .collect();
 
     let mut decisions = Vec::new();
     let mut updated = 0usize;
     let mut refused = 0usize;
     for c in &candidates {
-        let (parent_event_id, lineage_parent) = lineage_by_id
+        let (parent_event_id, lineage_parent, parent_refs_child, self_carries) = by_id
             .get(&c.event_id)
             .copied()
-            .unwrap_or((None, None));
-        // Distinguish "no link recorded" from "link recorded but dangling" —
-        // they are different failures and collapsing them hides which.
-        let decided = match decide(execution_id, c.tier_parent_execution_id, lineage_parent) {
-            Err(Refusal::NoLineage) if parent_event_id.is_some() => Err(Refusal::LineageUnresolved),
-            other => other,
+            .unwrap_or((None, None, false, false));
+        let ev = Corroboration {
+            lineage_parent_execution: lineage_parent,
+            parent_references_child: parent_refs_child,
+            self_payload_carries_parent: self_carries,
         };
+        let decided = decide(execution_id, c.tier_parent_execution_id, &ev);
         let mut row = json!({
             "event_id": c.event_id.to_string(),
             "tier_parent_execution_id": c.tier_parent_execution_id.to_string(),
             "parent_event_id": parent_event_id.map(|v| v.to_string()),
             "lineage_parent_execution_id": lineage_parent.map(|v| v.to_string()),
+            "parent_references_child": parent_refs_child,
+            "self_payload_carries_parent": self_carries,
+            "corroborations": ev.count(),
         });
         match decided {
             Ok(value) => {
-                row["decision"] = json!("agree");
+                row["decision"] = json!("corroborated");
                 row["value"] = json!(value.to_string());
                 if q.apply {
                     // `AND parent_execution_id IS NULL` is what makes this both
@@ -273,26 +341,67 @@ pub async fn backfill_endpoint(
 mod tests {
     use super::*;
 
-    #[test]
-    fn agreeing_sources_are_the_only_path_to_a_write() {
-        assert_eq!(decide(10, 7, Some(7)), Ok(7));
+    fn lineage(id: i64) -> Corroboration {
+        Corroboration {
+            lineage_parent_execution: Some(id),
+            ..Default::default()
+        }
     }
 
     #[test]
-    fn disagreeing_sources_are_refused_not_reconciled() {
+    fn an_agreeing_lineage_warrants_the_write() {
+        assert_eq!(decide(10, 7, &lineage(7)), Ok(7));
+    }
+
+    #[test]
+    fn a_contradicting_lineage_is_refused_not_reconciled() {
         // ⚠ The mutation this pins: "prefer the tier" would return Ok(7) here and
         // write a value the authoritative store's own lineage contradicts.
-        assert_eq!(decide(10, 7, Some(8)), Err(Refusal::SourcesDisagree));
+        assert_eq!(decide(10, 7, &lineage(8)), Err(Refusal::LineageContradicts));
+    }
+
+    /// ⚠ A contradiction is not out-voted. Two oracles saying yes do not license
+    /// writing a value the third says is wrong.
+    #[test]
+    fn a_contradiction_beats_any_number_of_agreements() {
+        let ev = Corroboration {
+            lineage_parent_execution: Some(8),
+            parent_references_child: true,
+            self_payload_carries_parent: true,
+        };
+        assert_eq!(ev.count(), 3);
+        assert_eq!(decide(10, 7, &ev), Err(Refusal::LineageContradicts));
     }
 
     #[test]
-    fn a_single_source_is_never_enough() {
-        assert_eq!(decide(10, 7, None), Err(Refusal::NoLineage));
+    fn the_tiers_word_alone_is_never_enough() {
+        // No authoritative oracle backs the claim: refuse.
+        assert_eq!(
+            decide(10, 7, &Corroboration::default()),
+            Err(Refusal::Uncorroborated)
+        );
+    }
+
+    #[test]
+    fn either_authoritative_oracle_warrants_the_write_on_its_own() {
+        let spawn_side = Corroboration {
+            parent_references_child: true,
+            ..Default::default()
+        };
+        let self_side = Corroboration {
+            self_payload_carries_parent: true,
+            ..Default::default()
+        };
+        assert_eq!(decide(10, 7, &spawn_side), Ok(7));
+        assert_eq!(decide(10, 7, &self_side), Ok(7));
     }
 
     #[test]
     fn a_step_parent_inside_the_same_execution_is_not_a_parent_execution() {
-        assert_eq!(decide(10, 10, Some(10)), Err(Refusal::LineageSameExecution));
+        assert_eq!(
+            decide(10, 10, &lineage(10)),
+            Err(Refusal::LineageSameExecution)
+        );
     }
 
     /// Positive control for the test above: the same shape with a genuinely
@@ -300,7 +409,7 @@ mod tests {
     /// not about the fixture being unwritable for some other reason.
     #[test]
     fn positive_control_for_the_same_execution_refusal() {
-        assert_eq!(decide(10, 11, Some(11)), Ok(11));
+        assert_eq!(decide(10, 11, &lineage(11)), Ok(11));
     }
 
     #[test]
