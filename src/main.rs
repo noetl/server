@@ -450,6 +450,13 @@ fn build_router(
             "/api/ehdb/repair/executions/{execution_id}",
             post(handlers::ehdb_tier_repair::repair_execution_endpoint),
         )
+        // noetl/ai-meta#326.  Repairs the AUTHORITATIVE log from two agreeing
+        // sources -- the opposite direction from the route above, and the reason
+        // it refuses to act on a single one.  Dry run unless `?apply=true`.
+        .route(
+            "/api/ehdb/repair/parent-execution-id/{execution_id}",
+            post(handlers::ehdb_parent_backfill::backfill_endpoint),
+        )
         .route(
             "/api/ehdb/parity/self-test",
             get(handlers::ehdb_parity::self_test_endpoint),

@@ -464,6 +464,50 @@ pub struct Divergence {
     pub detail: String,
 }
 
+/// One event whose `parent_execution_id` the tier holds and the authoritative
+/// log does **not** — the input a backfill acts on (noetl/ai-meta#326).
+///
+/// ⚠ Structured, not recovered by parsing a divergence `detail`, for the same
+/// reason [`CrossStoreReport::missing_event_ids`] is: the backfill **UPDATEs the
+/// system of record**, and making that depend on a human-readable message format
+/// nothing pins is how a rendering tweak becomes a data-corruption bug.
+///
+/// ⚠ **Absent only, never merely different.** A candidate is emitted when the
+/// authoritative side has no value at all. An authoritative value that disagrees
+/// with the tier is a *conflict*, not a gap, and repairing it would be
+/// overwriting the system of record with its mirror — the opposite of what this
+/// exists to do. Such an event is reported as an ordinary content divergence and
+/// deliberately produces no candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct ParentBackfillCandidate {
+    /// The authoritative event missing the value.
+    pub event_id: i64,
+    /// What the tier holds for it. Carried as `i64` because a value that will
+    /// not parse as one is not a candidate at all.
+    pub tier_parent_execution_id: i64,
+}
+
+/// The tier's `parent_execution_id` for an event, when it is usable as a
+/// backfill source: present on the tier, absent authoritatively, and an integer.
+///
+/// Returns `None` for the "both present but different" case on purpose — see
+/// [`ParentBackfillCandidate`].
+pub fn parent_backfill_candidate(
+    auth: Option<&serde_json::Value>,
+    tier: Option<&serde_json::Value>,
+) -> Option<i64> {
+    if json_present(auth).is_some() {
+        return None;
+    }
+    match json_present(tier)? {
+        serde_json::Value::Number(n) => n.as_i64(),
+        // The tier can carry a snowflake id quoted; that is a spelling, not a
+        // different value, and `content_field_agrees` already treats it as one.
+        serde_json::Value::String(s) => s.parse::<i64>().ok(),
+        _ => None,
+    }
+}
+
 /// The verdict for one execution.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CrossStoreReport {
@@ -517,6 +561,12 @@ pub struct CrossStoreReport {
     pub identified: usize,
     /// Shared `event_id`s whose identifying fields agreed.
     pub matched: usize,
+    /// Events the tier can source a missing `parent_execution_id` for.
+    ///
+    /// Empty on a healthy execution and kept off the wire there, so a clean
+    /// report is byte-identical to what it was before this existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parent_backfill_candidates: Vec<ParentBackfillCandidate>,
     pub divergences: Vec<Divergence>,
     /// Every check held.
     pub holds: bool,
@@ -933,6 +983,7 @@ fn compare_inner(
 
     // --- payload identity ----------------------------------------------------
     let mut matched = 0usize;
+    let mut parent_backfill_candidates: Vec<ParentBackfillCandidate> = Vec::new();
     for m in &parsed {
         let Some(auth) = auth_by_id.get(&m.event_id) else {
             continue; // already reported as ExtraEvent
@@ -952,6 +1003,19 @@ fn compare_inner(
             });
             diverged = true;
         }
+        // Collected from the same pair the comparison just looked at, so the
+        // candidate set cannot describe a different event than the verdict does.
+        if let (Some(a), Some(b)) = (&auth.content, &m.content) {
+            if let Some(parent) = parent_backfill_candidate(
+                a.get("parent_execution_id"),
+                b.get("parent_execution_id"),
+            ) {
+                parent_backfill_candidates.push(ParentBackfillCandidate {
+                    event_id: auth.event_id,
+                    tier_parent_execution_id: parent,
+                });
+            }
+        }
         if !diverged {
             matched += 1;
         }
@@ -969,6 +1033,7 @@ fn compare_inner(
         identified: parsed.len(),
         matched,
         holds: divergences.is_empty(),
+        parent_backfill_candidates,
         divergences,
     }
 }
