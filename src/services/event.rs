@@ -23,6 +23,12 @@ pub struct EmitEventRequest {
     pub parent_event_id: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_execution_id: Option<i64>,
+    /// RFC #115 §4.1 chain link. Without it the row is present but **not
+    /// walkable** — noetl/ai-meta#327.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prev_event_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub node_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -112,6 +118,8 @@ impl EventService {
             sanitized_result.as_ref(),
             request.worker_id.as_deref(),
             request.attempt,
+            request.prev_event_id,
+            request.error.as_deref(),
         )
         .await?;
 
@@ -183,6 +191,12 @@ impl EventService {
             None,
             None,
             None,
+            // noetl/ai-meta#327: these wrappers have no chain link to pass.
+            // ⚠ Explicit `None`, not a defaulted parameter — if this path is
+            // ever revived, the caller must be made to supply `prev_event_id`
+            // or the rows it writes will be present but not walkable.
+            None,
+            None,
         )
         .await?;
 
@@ -224,6 +238,12 @@ impl EventService {
             Some(&context),
             Some(&meta),
             None,
+            None,
+            None,
+            // noetl/ai-meta#327: these wrappers have no chain link to pass.
+            // ⚠ Explicit `None`, not a defaulted parameter — if this path is
+            // ever revived, the caller must be made to supply `prev_event_id`
+            // or the rows it writes will be present but not walkable.
             None,
             None,
         )
@@ -272,6 +292,12 @@ impl EventService {
             None,
             None,
             None,
+            // noetl/ai-meta#327: these wrappers have no chain link to pass.
+            // ⚠ Explicit `None`, not a defaulted parameter — if this path is
+            // ever revived, the caller must be made to supply `prev_event_id`
+            // or the rows it writes will be present but not walkable.
+            None,
+            None,
         )
         .await?;
 
@@ -314,6 +340,12 @@ impl EventService {
             Some(&sanitized_command),
             Some(&meta),
             None,
+            None,
+            None,
+            // noetl/ai-meta#327: these wrappers have no chain link to pass.
+            // ⚠ Explicit `None`, not a defaulted parameter — if this path is
+            // ever revived, the caller must be made to supply `prev_event_id`
+            // or the rows it writes will be present but not walkable.
             None,
             None,
         )
@@ -473,6 +505,8 @@ mod tests {
             event_type: "playbook_started".to_string(),
             parent_event_id: None,
             parent_execution_id: None,
+            prev_event_id: Some(999),
+            error: None,
             node_id: Some("playbook".to_string()),
             node_name: Some("test-playbook".to_string()),
             node_type: Some("execution".to_string()),

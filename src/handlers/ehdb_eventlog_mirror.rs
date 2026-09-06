@@ -1181,15 +1181,19 @@ mod tests {
         //   truncating deliberately rather than changed as a side effect of this
         //   guard; tracked on noetl/ai-meta#327. If anything ever routes to it,
         //   it reintroduces exactly the #326 loss.
-        //   db/queries/event.rs :: insert_event — drops `error` and
-        //   `prev_event_id`. `prev_event_id` is the one-level event-chain link
-        //   (noetl/ai-meta#115), so a row written here is not walkable. It has
-        //   ~5 callers in `services/event.rs`, so it is reachable CODE; whether
-        //   any of those paths run on prod is unverified, and this guard exists
-        //   precisely because that question cannot be answered by reading. Left
-        //   unchanged rather than fixed as a side effect of noetl/ai-meta#327;
-        //   surfaced there instead.
-        let known_truncating = ["handlers/internal.rs", "db/queries/event.rs"];
+        //
+        // ⚠ `db/queries/event.rs :: insert_event` WAS on this list and has been
+        // removed, because it no longer truncates (noetl/ai-meta#327): it now
+        // takes and binds `prev_event_id` and `error`. The honesty assertion
+        // below is what forced the removal — leaving a stale entry here is how an
+        // exclusion list comes to excuse a site nobody re-examined.
+        //
+        // Its callers are all methods on `EventService`, which is **never
+        // constructed** anywhere in the binary (`ExecutionService::new` at
+        // main.rs is the working control for that search idiom). So the path is
+        // latent like the one above; the fix is a landmine removal, not a live
+        // repair, and it is deliberately NOT claimed as live-validated.
+        let known_truncating = ["handlers/internal.rs"];
 
         let needle = format!("INSERT INTO noetl.event{}", "");
         let mut offenders: Vec<String> = Vec::new();
