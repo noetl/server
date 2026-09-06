@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.104.2](https://github.com/noetl/server/compare/v3.104.1...v3.104.2) (2026-09-06)
+
+### Bug Fixes
+
+* **ehdb:** report the corroborating event, the blind spot, and the denominator ([31856b3](https://github.com/noetl/server/commit/31856b325233eec5136872c9a80a9ac4a1936e4f)), closes [noetl/ai-meta#326](https://github.com/noetl/ai-meta/issues/326)
+
 ## [3.104.1](https://github.com/noetl/server/compare/v3.104.0...v3.104.1) (2026-09-06)
 
 ### Bug Fixes
