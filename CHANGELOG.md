@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.104.1](https://github.com/noetl/server/compare/v3.104.0...v3.104.1) (2026-09-06)
+
+### Bug Fixes
+
+* **ehdb:** warrant the backfill from what the authoritative store itself holds ([c371c9e](https://github.com/noetl/server/commit/c371c9e2b508d5a73a90616922e148c5ee60ddde)), closes [#327](https://github.com/noetl/server/issues/327) [noetl/ai-meta#326](https://github.com/noetl/ai-meta/issues/326) [noetl/ai-meta#327](https://github.com/noetl/ai-meta/issues/327)
+
 ## [3.104.0](https://github.com/noetl/server/compare/v3.103.5...v3.104.0) (2026-09-06)
 
 ### Features
