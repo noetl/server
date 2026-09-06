@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.104.0](https://github.com/noetl/server/compare/v3.103.5...v3.104.0) (2026-09-06)
+
+### Features
+
+* **ehdb:** backfill parent_execution_id from two agreeing sources ([#326](https://github.com/noetl/server/issues/326)) ([c9a8084](https://github.com/noetl/server/commit/c9a8084eb786b7349bd21548066f82bee0fd91af)), closes [#264](https://github.com/noetl/server/issues/264)
+
 ## [3.103.5](https://github.com/noetl/server/compare/v3.103.4...v3.103.5) (2026-09-05)
 
 ### Bug Fixes
