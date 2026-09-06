@@ -192,7 +192,20 @@ pub async fn backfill_endpoint(
         .iter()
         .map(|c| c.tier_parent_execution_id)
         .collect();
-    let corroboration = match sqlx::query_as::<_, (i64, Option<i64>, Option<i64>, bool, bool)>(
+    let corroboration = match sqlx::query_as::<
+        _,
+        (
+            i64,
+            Option<i64>,
+            Option<i64>,
+            bool,
+            bool,
+            Option<i64>,
+            Option<String>,
+            bool,
+            i64,
+        ),
+    >(
         r#"
         WITH candidate AS (
             SELECT unnest($2::bigint[]) AS event_id,
@@ -220,7 +233,45 @@ pub async fn backfill_endpoint(
                (COALESCE(ev.context::text, '') ~ ('(^|[^0-9])'
                         || c.claimed_parent::text || '([^0-9]|$)')
                 OR COALESCE(ev.meta::text, '') ~ ('(^|[^0-9])'
-                        || c.claimed_parent::text || '([^0-9]|$)')) AS self_payload_carries_parent
+                        || c.claimed_parent::text || '([^0-9]|$)')) AS self_payload_carries_parent,
+               -- ⚠ Evidence, not a boolean.  WHICH event in the parent carries the
+               -- reference, so a reviewer can look at it instead of trusting a
+               -- `true`.  A corroboration nobody can inspect is an assertion.
+               (SELECT pe.event_id FROM noetl.event pe
+                 WHERE pe.execution_id = c.claimed_parent
+                   AND (COALESCE(pe.context::text, '') ~ ('(^|[^0-9])'
+                            || ev.execution_id::text || '([^0-9]|$)')
+                     OR COALESCE(pe.result::text, '')  ~ ('(^|[^0-9])'
+                            || ev.execution_id::text || '([^0-9]|$)')
+                     OR COALESCE(pe.meta::text, '')    ~ ('(^|[^0-9])'
+                            || ev.execution_id::text || '([^0-9]|$)'))
+                 ORDER BY pe.event_id LIMIT 1) AS reference_event_id,
+               (SELECT pe.event_type FROM noetl.event pe
+                 WHERE pe.execution_id = c.claimed_parent
+                   AND (COALESCE(pe.context::text, '') ~ ('(^|[^0-9])'
+                            || ev.execution_id::text || '([^0-9]|$)')
+                     OR COALESCE(pe.result::text, '')  ~ ('(^|[^0-9])'
+                            || ev.execution_id::text || '([^0-9]|$)')
+                     OR COALESCE(pe.meta::text, '')    ~ ('(^|[^0-9])'
+                            || ev.execution_id::text || '([^0-9]|$)'))
+                 ORDER BY pe.event_id LIMIT 1) AS reference_event_type,
+               -- ⚠⚠ THE BLIND SPOT, made visible.  With
+               -- `NOETL_PERMANENT_LOG_LEAN` on, a large payload is stored as a
+               -- `__context_ref__` pointer and the text search above cannot see
+               -- through it.  So a `false` above means EITHER "the parent does not
+               -- reference this child" OR "the reference is behind a pointer".
+               -- Those are different facts and must not read the same.
+               EXISTS (
+                   SELECT 1 FROM noetl.event pe
+                   WHERE pe.execution_id = c.claimed_parent
+                     AND (COALESCE(pe.context::text, '') LIKE '%__context_ref__%'
+                       OR COALESCE(pe.result::text, '')  LIKE '%__context_ref__%')
+               ) AS parent_has_externalised_payload,
+               -- The denominator for the search above: a zero here would mean the
+               -- claimed parent has no events at all, and every `false` would be
+               -- vacuous rather than informative.
+               (SELECT count(*) FROM noetl.event pe
+                 WHERE pe.execution_id = c.claimed_parent) AS parent_event_count
         FROM candidate c
         JOIN noetl.event ev
           ON ev.event_id = c.event_id AND ev.execution_id = $1
@@ -245,20 +296,40 @@ pub async fn backfill_endpoint(
             );
         }
     };
-    let by_id: std::collections::HashMap<i64, (Option<i64>, Option<i64>, bool, bool)> =
-        corroboration
-            .into_iter()
-            .map(|(eid, pev, pex, refs, selfp)| (eid, (pev, pex, refs, selfp)))
-            .collect();
+    type Evidence = (
+        Option<i64>,
+        Option<i64>,
+        bool,
+        bool,
+        Option<i64>,
+        Option<String>,
+        bool,
+        i64,
+    );
+    let by_id: std::collections::HashMap<i64, Evidence> = corroboration
+        .into_iter()
+        .map(|(eid, pev, pex, refs, selfp, rid, rty, ext, n)| {
+            (eid, (pev, pex, refs, selfp, rid, rty, ext, n))
+        })
+        .collect();
 
     let mut decisions = Vec::new();
     let mut updated = 0usize;
     let mut refused = 0usize;
     for c in &candidates {
-        let (parent_event_id, lineage_parent, parent_refs_child, self_carries) = by_id
+        let (
+            parent_event_id,
+            lineage_parent,
+            parent_refs_child,
+            self_carries,
+            reference_event_id,
+            reference_event_type,
+            parent_externalised,
+            parent_event_count,
+        ) = by_id
             .get(&c.event_id)
-            .copied()
-            .unwrap_or((None, None, false, false));
+            .cloned()
+            .unwrap_or((None, None, false, false, None, None, false, 0));
         let ev = Corroboration {
             lineage_parent_execution: lineage_parent,
             parent_references_child: parent_refs_child,
@@ -273,6 +344,13 @@ pub async fn backfill_endpoint(
             "parent_references_child": parent_refs_child,
             "self_payload_carries_parent": self_carries,
             "corroborations": ev.count(),
+            // Evidence a reviewer can go and look at, rather than a bare `true`.
+            "reference_event_id": reference_event_id.map(|v| v.to_string()),
+            "reference_event_type": reference_event_type,
+            // ⚠⚠ Why a `false` above may not mean what it looks like.
+            "parent_has_externalised_payload": parent_externalised,
+            // The denominator: `false` against 0 events is vacuous, not clean.
+            "parent_event_count": parent_event_count,
         });
         match decided {
             Ok(value) => {
