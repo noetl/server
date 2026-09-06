@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.104.3](https://github.com/noetl/server/compare/v3.104.2...v3.104.3) (2026-09-06)
+
+### Bug Fixes
+
+* **ehdb:** search the externalised half of the payload too ([3e1caf8](https://github.com/noetl/server/commit/3e1caf86802a2cb9acf9d5fe60c0c54dc40e665f)), closes [noetl/ai-meta#326](https://github.com/noetl/ai-meta/issues/326)
+
 ## [3.104.2](https://github.com/noetl/server/compare/v3.104.1...v3.104.2) (2026-09-06)
 
 ### Bug Fixes
