@@ -79,6 +79,20 @@ pub struct Corroboration {
     /// The child's own authoritative `context`/`meta` carry the claimed parent.
     /// A value found here never left the system of record; only the *column* did.
     pub self_payload_carries_parent: bool,
+    /// The claimed parent's **externalised** payload references this child.
+    ///
+    /// ⚠ This exists because the first run's `false` was ambiguous. With
+    /// `NOETL_PERMANENT_LOG_LEAN` on, a payload over the floor is replaced by a
+    /// `{"__context_ref__": "noetl://…"}` marker and the real bytes move to
+    /// `noetl.result_store`. A search of `noetl.event` alone therefore cannot
+    /// distinguish "the parent does not reference this child" from "the reference
+    /// is in the half of the payload I did not look at" — and **every** claimed
+    /// parent in the #326 scope had an externalised payload.
+    ///
+    /// Still `noetl.*`, still not the tier: the externalised half is as
+    /// authoritative as the inline half, and splitting a payload does not make
+    /// one of the pieces hearsay.
+    pub parent_externalised_references_child: bool,
 }
 
 impl Corroboration {
@@ -87,6 +101,7 @@ impl Corroboration {
         usize::from(self.lineage_parent_execution.is_some())
             + usize::from(self.parent_references_child)
             + usize::from(self.self_payload_carries_parent)
+            + usize::from(self.parent_externalised_references_child)
     }
 }
 
@@ -136,7 +151,10 @@ pub fn decide(execution_id: i64, tier_parent: i64, ev: &Corroboration) -> Result
         }
         return Ok(tier_parent);
     }
-    if ev.parent_references_child || ev.self_payload_carries_parent {
+    if ev.parent_references_child
+        || ev.self_payload_carries_parent
+        || ev.parent_externalised_references_child
+    {
         return Ok(tier_parent);
     }
     Err(Refusal::Uncorroborated)
@@ -202,6 +220,8 @@ pub async fn backfill_endpoint(
             bool,
             Option<i64>,
             Option<String>,
+            bool,
+            i64,
             bool,
             i64,
         ),
@@ -271,7 +291,19 @@ pub async fn backfill_endpoint(
                -- claimed parent has no events at all, and every `false` would be
                -- vacuous rather than informative.
                (SELECT count(*) FROM noetl.event pe
-                 WHERE pe.execution_id = c.claimed_parent) AS parent_event_count
+                 WHERE pe.execution_id = c.claimed_parent) AS parent_event_count,
+               -- The other half of an externalised payload.  `__context_ref__`
+               -- moves the bytes to `noetl.result_store`; looking only at
+               -- `noetl.event` searches the half that no longer holds them.
+               EXISTS (
+                   SELECT 1 FROM noetl.result_store rs
+                   WHERE rs.execution_id = c.claimed_parent
+                     AND rs.data::text ~ ('(^|[^0-9])'
+                            || ev.execution_id::text || '([^0-9]|$)')
+               ) AS parent_externalised_references_child,
+               -- Its denominator, for the same reason.
+               (SELECT count(*) FROM noetl.result_store rs
+                 WHERE rs.execution_id = c.claimed_parent) AS parent_result_store_rows
         FROM candidate c
         JOIN noetl.event ev
           ON ev.event_id = c.event_id AND ev.execution_id = $1
@@ -305,12 +337,16 @@ pub async fn backfill_endpoint(
         Option<String>,
         bool,
         i64,
+        bool,
+        i64,
     );
     let by_id: std::collections::HashMap<i64, Evidence> = corroboration
         .into_iter()
-        .map(|(eid, pev, pex, refs, selfp, rid, rty, ext, n)| {
-            (eid, (pev, pex, refs, selfp, rid, rty, ext, n))
-        })
+        .map(
+            |(eid, pev, pex, refs, selfp, rid, rty, ext, n, extref, rsn)| {
+                (eid, (pev, pex, refs, selfp, rid, rty, ext, n, extref, rsn))
+            },
+        )
         .collect();
 
     let mut decisions = Vec::new();
@@ -326,14 +362,17 @@ pub async fn backfill_endpoint(
             reference_event_type,
             parent_externalised,
             parent_event_count,
+            parent_ext_refs_child,
+            parent_result_store_rows,
         ) = by_id
             .get(&c.event_id)
             .cloned()
-            .unwrap_or((None, None, false, false, None, None, false, 0));
+            .unwrap_or((None, None, false, false, None, None, false, 0, false, 0));
         let ev = Corroboration {
             lineage_parent_execution: lineage_parent,
             parent_references_child: parent_refs_child,
             self_payload_carries_parent: self_carries,
+            parent_externalised_references_child: parent_ext_refs_child,
         };
         let decided = decide(execution_id, c.tier_parent_execution_id, &ev);
         let mut row = json!({
@@ -349,6 +388,8 @@ pub async fn backfill_endpoint(
             "reference_event_type": reference_event_type,
             // ⚠⚠ Why a `false` above may not mean what it looks like.
             "parent_has_externalised_payload": parent_externalised,
+            "parent_externalised_references_child": parent_ext_refs_child,
+            "parent_result_store_rows": parent_result_store_rows,
             // The denominator: `false` against 0 events is vacuous, not clean.
             "parent_event_count": parent_event_count,
         });
@@ -446,9 +487,24 @@ mod tests {
             lineage_parent_execution: Some(8),
             parent_references_child: true,
             self_payload_carries_parent: true,
+            parent_externalised_references_child: true,
         };
-        assert_eq!(ev.count(), 3);
+        assert_eq!(ev.count(), 4);
         assert_eq!(decide(10, 7, &ev), Err(Refusal::LineageContradicts));
+    }
+
+    /// ⚠ The externalised half of a split payload is as authoritative as the
+    /// inline half. Without this arm, a `false` from the `noetl.event` search
+    /// means "not referenced" **or** "referenced in the bytes I did not read" —
+    /// and in the #326 scope every claimed parent had an externalised payload.
+    #[test]
+    fn the_externalised_half_of_a_payload_warrants_the_write_too() {
+        let ev = Corroboration {
+            parent_externalised_references_child: true,
+            ..Default::default()
+        };
+        assert_eq!(ev.count(), 1);
+        assert_eq!(decide(10, 7, &ev), Ok(7));
     }
 
     #[test]
