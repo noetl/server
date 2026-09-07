@@ -25,15 +25,26 @@ pub async fn insert_event(
     result: Option<&serde_json::Value>,
     worker_id: Option<&str>,
     attempt: Option<i32>,
+    // noetl/ai-meta#327.  `prev_event_id` is the RFC #115 §4.1 chain link: a row
+    // written without it is NOT WALKABLE, so a log assembled through this path
+    // cannot be traversed one hop at a time even though every row is present.
+    // `error` is the other column the row can carry and this INSERT could not.
+    //
+    // ⚠ Added as parameters rather than defaulted, so a caller that has the
+    // values cannot silently fail to pass them.
+    prev_event_id: Option<i64>,
+    error: Option<&str>,
 ) -> AppResult<i64> {
     let row: (i64,) = sqlx::query_as(
         r#"
         INSERT INTO noetl.event (
             event_id, execution_id, catalog_id, parent_event_id, parent_execution_id,
             event_type, node_id, node_name, node_type, status,
-            context, meta, result, worker_id, attempt, created_at
+            context, meta, result, worker_id, attempt, created_at,
+            prev_event_id, error
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
+                $17, $18)
         RETURNING id
         "#,
     )
@@ -53,6 +64,8 @@ pub async fn insert_event(
     .bind(worker_id)
     .bind(attempt)
     .bind(Utc::now())
+    .bind(prev_event_id)
+    .bind(error)
     .fetch_one(pool)
     .await?;
 
