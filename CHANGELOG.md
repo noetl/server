@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.104.4](https://github.com/noetl/server/compare/v3.104.3...v3.104.4) (2026-09-07)
+
+### Bug Fixes
+
+* **event:** insert_event can record the chain link and the error ([#327](https://github.com/noetl/server/issues/327)) ([921dae2](https://github.com/noetl/server/commit/921dae28661ae0651e617c92ed6b72eb8b439cdb)), closes [#115](https://github.com/noetl/server/issues/115) [#326](https://github.com/noetl/server/issues/326)
+
 ## [3.104.3](https://github.com/noetl/server/compare/v3.104.2...v3.104.3) (2026-09-06)
 
 ### Bug Fixes
