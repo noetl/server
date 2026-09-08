@@ -477,10 +477,16 @@ pub async fn handle_event(
     // off-server chain head's read→advance stays atomic per execution and never
     // forks across replicas.  Inert / owned executions fall through to local
     // processing; a failed forward degrades to local (no event dropped).
-    if let crate::affinity::AffinityRoute::Forwarded(resp) =
-        state.0.affinity.route_event(&headers, &request.0).await
-    {
-        return Ok(Json(resp));
+    // noetl/ai-meta#332: a failed forward is now a 503, NOT a local write. Under
+    // embedded per-shard state the owning shard holds the only copy of this
+    // execution's log, so handling it here would fork that log silently.
+    match state.0.affinity.route_event(&headers, &request.0).await {
+        crate::affinity::AffinityRoute::Forwarded(resp) => return Ok(Json(resp)),
+        crate::affinity::AffinityRoute::OwnerUnavailable(detail) => {
+            crate::metrics::record_event_ingest(&request.0.event_type, "owner_unavailable", 0.0);
+            return Err(AppError::OwnerUnavailable(detail));
+        }
+        crate::affinity::AffinityRoute::ProcessLocally => {}
     }
 
     let event_type_for_metrics = request.0.event_type.clone();
