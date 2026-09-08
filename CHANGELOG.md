@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.106.0](https://github.com/noetl/server/compare/v3.105.0...v3.106.0) (2026-09-08)
+
+### Features
+
+* **ehdb:** embed the engine in SHADOW at N=1, default-off ([#332](https://github.com/noetl/server/issues/332) step 5) ([f9f9831](https://github.com/noetl/server/commit/f9f9831b5f7d153512b5c97fec9e946f87adca27))
+
 ## [3.105.0](https://github.com/noetl/server/compare/v3.104.5...v3.105.0) (2026-09-08)
 
 ### Features
