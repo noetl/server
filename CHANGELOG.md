@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.104.5](https://github.com/noetl/server/compare/v3.104.4...v3.104.5) (2026-09-08)
+
+### Bug Fixes
+
+* **affinity:** a failed forward fails closed, not into a local write ([#332](https://github.com/noetl/server/issues/332)) ([90e361e](https://github.com/noetl/server/commit/90e361edf52466f23df43dd9359680ffb00e347a)), closes [#389](https://github.com/noetl/server/issues/389)
+
 ## [3.104.4](https://github.com/noetl/server/compare/v3.104.3...v3.104.4) (2026-09-07)
 
 ### Bug Fixes
