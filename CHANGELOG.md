@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.105.0](https://github.com/noetl/server/compare/v3.104.5...v3.105.0) (2026-09-08)
+
+### Features
+
+* **sharding:** explicit partition table so a rebalance is bounded ([#332](https://github.com/noetl/server/issues/332)) ([df35769](https://github.com/noetl/server/commit/df357699f28537ecf2405a4f0eedceff7e79ddb5))
+
 ## [3.104.5](https://github.com/noetl/server/compare/v3.104.4...v3.104.5) (2026-09-08)
 
 ### Bug Fixes
