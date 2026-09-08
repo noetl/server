@@ -191,10 +191,12 @@ impl ExecutionAffinity {
                             execution_id,
                             owner = %url,
                             error = %e,
-                            "execution-affinity: owner response undecodable; degrading to local processing"
+                            "execution-affinity: owner response undecodable; FAILING CLOSED (noetl/ai-meta#332)"
                         );
                         crate::metrics::record_execution_affinity("forward_decode_err");
-                        AffinityRoute::ProcessLocally
+                        AffinityRoute::OwnerUnavailable(format!(
+                            "owner {url} response undecodable: {e}"
+                        ))
                     }
                 }
             }
@@ -203,23 +205,78 @@ impl ExecutionAffinity {
                     execution_id,
                     owner = %url,
                     status = %resp.status(),
-                    "execution-affinity: owner returned non-success; degrading to local processing"
+                    "execution-affinity: owner returned non-success; FAILING CLOSED (noetl/ai-meta#332)"
                 );
                 crate::metrics::record_execution_affinity("forward_http_err");
-                AffinityRoute::ProcessLocally
+                AffinityRoute::OwnerUnavailable(format!("owner {url} returned {}", resp.status()))
             }
             Err(e) => {
                 tracing::warn!(
                     execution_id,
                     owner = %url,
                     error = %e,
-                    "execution-affinity: owner unreachable; degrading to local processing"
+                    "execution-affinity: owner unreachable; FAILING CLOSED (noetl/ai-meta#332)"
                 );
                 crate::metrics::record_execution_affinity("forward_unavailable");
-                AffinityRoute::ProcessLocally
+                AffinityRoute::OwnerUnavailable(format!("owner {url} unreachable: {e}"))
             }
         }
     }
+}
+
+/// Why a request is handled on this replica rather than forwarded.
+///
+/// Extracted so the routing table is testable without a peer, a runtime or a
+/// socket — the pre-forward decision is pure, and only the forward itself is I/O.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalReason {
+    /// Affinity is not active (single shard, or no peer template). The N=1 case.
+    Inactive,
+    /// Already forwarded once — this replica is the terminus. Never loop.
+    ForwardedTerminus,
+    /// The id does not parse; the normal handler rejects it with its own error.
+    UnparseableId,
+    /// This replica owns the execution.
+    Owned,
+    /// Affinity is active but no owner URL could be built.
+    NoOwnerUrl,
+}
+
+/// The pre-forward decision: handle here, or forward to the owner.
+///
+/// ⚠ Every `Local(..)` arm here is a case where handling locally is *correct* —
+/// none of them is a fallback. The failure cases live past this function, and
+/// after noetl/ai-meta#332 they fail closed rather than landing back here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreForward {
+    Local(LocalReason),
+    Forward,
+}
+
+/// Pure routing table. See [`PreForward`].
+pub fn pre_forward(
+    active: bool,
+    already_forwarded: bool,
+    parses: bool,
+    owns: bool,
+    has_owner_url: bool,
+) -> PreForward {
+    if !active {
+        return PreForward::Local(LocalReason::Inactive);
+    }
+    if already_forwarded {
+        return PreForward::Local(LocalReason::ForwardedTerminus);
+    }
+    if !parses {
+        return PreForward::Local(LocalReason::UnparseableId);
+    }
+    if owns {
+        return PreForward::Local(LocalReason::Owned);
+    }
+    if !has_owner_url {
+        return PreForward::Local(LocalReason::NoOwnerUrl);
+    }
+    PreForward::Forward
 }
 
 /// Outcome of [`ExecutionAffinity::route_event`].
@@ -228,6 +285,16 @@ pub enum AffinityRoute {
     Forwarded(crate::handlers::events::EventResponse),
     /// Run the normal handler body on this replica.
     ProcessLocally,
+    /// The owner could not be reached — **fail closed** (noetl/ai-meta#332).
+    ///
+    /// ⚠ This variant replaces what used to be a degrade-to-local. That degrade
+    /// was correct while Postgres was the system of record and every replica
+    /// could write it: a failed forward cost ordering, not data. Under embedded
+    /// per-shard state the owning shard holds the only copy of that execution's
+    /// log, so processing locally forks it — permanently, silently, on a
+    /// transient network error. The guarantee single-owner routing exists to
+    /// provide is exactly what the degrade spent.
+    OwnerUnavailable(String),
 }
 
 /// Parse a StatefulSet pod ordinal from a hostname (`name-N` → `N`).
@@ -244,6 +311,143 @@ pub fn shard_index_from_hostname(hostname: &str) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
+    // ---- noetl/ai-meta#332: fail-closed forwarding ----
+
+    /// ⚠⚠ THE change, gated at the source — because `route_event` performs I/O
+    /// and cannot be unit-tested without a live peer.
+    ///
+    /// The obvious test (build an `OwnerUnavailable` and assert it matches
+    /// `OwnerUnavailable`) is a tautology: it cannot fail, and it would stay
+    /// green if every failure arm were reverted to `ProcessLocally`. That is the
+    /// noetl/ai-meta#389 shape — a test structurally unable to see the wiring.
+    ///
+    /// So this reads the function body: every arm of the forward's `match` must
+    /// fail closed. Under embedded per-shard state a local write on a failed
+    /// forward forks the owning shard's log, permanently and silently.
+    #[test]
+    fn every_forward_failure_arm_fails_closed() {
+        let src = include_str!("affinity.rs");
+        let body = src.split("#[cfg(test)]").next().unwrap();
+        let start = body
+            .find("pub async fn route_event")
+            .expect("route_event not found — the extraction broke");
+        let region = &body[start..];
+        let region = &region[..region.find("\n}").map(|i| i + 2).unwrap_or(region.len())];
+
+        // Assert the extraction before asserting about it: a region that missed
+        // the match arms would report a clean pass over nothing.
+        let failure_markers = region
+            .matches("record_execution_affinity(\"forward_")
+            .count();
+        assert!(
+            failure_markers >= 3,
+            "expected >=3 forward-outcome arms in route_event, found {failure_markers} — \
+             the slice is wrong and a guard measuring nothing passes"
+        );
+
+        // The three FAILURE arms are the ones whose metric label is not `_ok`.
+        for label in [
+            "forward_decode_err",
+            "forward_http_err",
+            "forward_unavailable",
+        ] {
+            let at = region
+                .find(label)
+                .unwrap_or_else(|| panic!("arm {label} missing — did the outcome labels change?"));
+            let after = &region[at..];
+            let arm_end = after
+                .find("\n            }")
+                .unwrap_or(after.len().min(400));
+            let arm = &after[..arm_end];
+            assert!(
+                arm.contains("OwnerUnavailable"),
+                "the `{label}` arm does not fail closed. A failed forward that \
+                 processes locally forks the owning shard's event log — the exact \
+                 guarantee single-owner routing exists to provide (noetl/ai-meta#332)."
+            );
+            assert!(
+                !arm.contains("ProcessLocally"),
+                "the `{label}` arm still degrades to local processing"
+            );
+        }
+    }
+
+    /// ⚠ The other half, and the one that makes the first half safe: an event
+    /// this replica OWNS still writes locally. A fail-closed change that turned
+    /// every write into a 503 would "pass" the test above and break the system.
+    #[test]
+    fn an_owned_execution_still_writes_locally() {
+        assert_eq!(
+            pre_forward(true, false, true, /* owns */ true, true),
+            PreForward::Local(LocalReason::Owned),
+            "the owner must still process its own executions"
+        );
+    }
+
+    /// N=1 — the state this lands in. Nothing forwards, so nothing can fail
+    /// closed, which is why it is safe to land now.
+    #[test]
+    fn at_one_shard_everything_is_local() {
+        assert_eq!(
+            pre_forward(/* active */ false, false, true, true, false),
+            PreForward::Local(LocalReason::Inactive)
+        );
+        // owns() is unconditionally true at shard_count<=1, so even if something
+        // flipped `active`, the decision is still local.
+        assert_eq!(
+            pre_forward(true, false, true, true, true),
+            PreForward::Local(LocalReason::Owned)
+        );
+    }
+
+    /// The full routing table, so a reordering of the guards is caught.
+    #[test]
+    fn the_routing_table_is_exhaustive_and_ordered() {
+        use LocalReason::*;
+        let cases = [
+            // active, forwarded, parses, owns, url  => expected
+            (
+                (false, false, true, false, true),
+                PreForward::Local(Inactive),
+            ),
+            (
+                (true, true, true, false, true),
+                PreForward::Local(ForwardedTerminus),
+            ),
+            (
+                (true, false, false, false, true),
+                PreForward::Local(UnparseableId),
+            ),
+            ((true, false, true, true, true), PreForward::Local(Owned)),
+            (
+                (true, false, true, false, false),
+                PreForward::Local(NoOwnerUrl),
+            ),
+            ((true, false, true, false, true), PreForward::Forward),
+        ];
+        for ((a, f, p, o, u), want) in cases {
+            assert_eq!(pre_forward(a, f, p, o, u), want, "case {a},{f},{p},{o},{u}");
+        }
+    }
+
+    /// The loop guard must EXIST: a request already forwarded once terminates
+    /// here even when `owns()` disagrees (shard-map skew). Without it, a skew
+    /// becomes an infinite forward loop between two replicas.
+    ///
+    /// ⚠ Note what this does NOT pin. I first wrote it as "the guard outranks
+    /// ownership" and mutation-tested the reordering — moving the guard below the
+    /// `owns` check does not change any outcome, because the dangerous case has
+    /// `owns == false` and falls through to the guard either way. The ordering is
+    /// readability; the guard's presence is the property.
+    #[test]
+    fn an_already_forwarded_request_terminates_here() {
+        assert_eq!(
+            pre_forward(true, /* already_forwarded */ true, true, /* owns */ false, true),
+            PreForward::Local(LocalReason::ForwardedTerminus),
+            "an already-forwarded request must terminate here, never forward again"
+        );
+    }
+
     use super::*;
 
     fn affinity(

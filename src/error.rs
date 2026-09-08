@@ -54,6 +54,17 @@ pub enum AppError {
     #[error("NATS error: {0}")]
     Nats(String),
 
+    /// The shard that owns this execution could not be reached
+    /// (noetl/ai-meta#332).
+    ///
+    /// ⚠ This is deliberately **not** recoverable here. Under embedded per-shard
+    /// state the owning shard holds the only copy of that execution's event log,
+    /// so handling the write locally would fork the log — permanently, silently,
+    /// on a transient network error. A 503 hands the retry decision to the
+    /// caller, which is the only actor that can make it safely.
+    #[error("Owning shard unavailable: {0}")]
+    OwnerUnavailable(String),
+
     /// Serialization error
     #[error("Serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
@@ -128,6 +139,10 @@ impl IntoResponse for AppError {
             }
             AppError::Nats(msg) => {
                 tracing::error!(error = %msg, "NATS error");
+                (StatusCode::SERVICE_UNAVAILABLE, msg.clone())
+            }
+            AppError::OwnerUnavailable(msg) => {
+                tracing::warn!(error = %msg, "owning shard unavailable; failing closed");
                 (StatusCode::SERVICE_UNAVAILABLE, msg.clone())
             }
             AppError::Serialization(e) => {
