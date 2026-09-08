@@ -189,18 +189,77 @@ pub enum ShardConfigError {
 /// at its current value (`0`), the output for a given
 /// `(execution_id, shard_count)` is fixed forever.  Both
 /// constraints are tested.
+/// Fixed partition count (noetl/ai-meta#332).
+///
+/// # Why a partition table at all
+///
+/// Ownership was `hash(id) % shard_count` directly. That is fine while the shard
+/// map only picks a connection pool — and near-worst-case once a shard owns
+/// **embedded state**, because going from N to N+1 remaps roughly *every* key,
+/// i.e. moves nearly all the data.
+///
+/// With a fixed `PARTITION_COUNT`, an execution's partition is decided once and
+/// **never changes**. Resizing only reassigns partitions between shards, so a
+/// rebalance is a bounded, resumable, observable unit of work instead of a scan —
+/// the Kafka/Flink model.
+///
+/// # Why 4096, and the constraint it carries
+///
+/// ⚠ `shard_for` must stay **bit-identical** to the two other implementations of
+/// this same mapping that live in another repo — `ehdb-l0::dataset` and
+/// `ehdb-reference::affinity`, both `shard_for_execution`. The server and the
+/// command bus disagreeing about ownership is the one disagreement that cannot
+/// be tolerated, and they cannot be changed in the same commit as this.
+///
+/// The two-level mapping is bit-identical to the old one **iff `shard_count`
+/// divides `PARTITION_COUNT`**, because `(h % P) % n == h % n` exactly when
+/// `n | P`. 4096 makes every power of two up to 4096 a legal shard count, which
+/// covers every count anyone would run, and
+/// [`assert_partition_compatible`] refuses the ones it does not cover rather
+/// than silently splitting the mapping in two.
+pub const PARTITION_COUNT: u32 = 4096;
+
+/// The partition an execution belongs to — **independent of `shard_count`**.
+///
+/// This is the value that must never change for a given execution: it is what
+/// makes a rebalance a handoff of partitions rather than a re-hash of keys.
+pub fn partition_for(execution_id: i64) -> u32 {
+    let mut h = XxHash64::with_seed(SHARD_HASH_SEED);
+    // i64 is hashed as 8 little-endian bytes — explicit so the
+    // result is stable even if `Hasher::write_i64` ever changes
+    // its endianness on some platform.
+    h.write(&execution_id.to_le_bytes());
+    (h.finish() % PARTITION_COUNT as u64) as u32
+}
+
+/// Which shard currently owns a partition.
+///
+/// The assignment, and the only thing a rebalance changes.
+pub fn shard_for_partition(partition: u32, shard_count: u32) -> u32 {
+    if shard_count <= 1 {
+        return 0;
+    }
+    partition % shard_count
+}
+
+/// Is `shard_count` one this mapping can serve without diverging from the
+/// EHDB-side implementations?
+///
+/// ⚠ True exactly when `shard_count` divides [`PARTITION_COUNT`]. A count that
+/// does not divide it would make this server assign ownership differently from
+/// the command bus — a split-brain about who owns an execution, which is
+/// strictly worse than not scaling.
+pub fn partition_compatible(shard_count: u32) -> bool {
+    shard_count <= 1 || PARTITION_COUNT.is_multiple_of(shard_count)
+}
+
 pub fn shard_for(execution_id: i64, shard_count: u32) -> u32 {
     if shard_count <= 1 {
         // Degenerate case: only one shard exists.  Don't bother
         // hashing.
         return 0;
     }
-    let mut h = XxHash64::with_seed(SHARD_HASH_SEED);
-    // i64 is hashed as 8 little-endian bytes — explicit so the
-    // result is stable even if `Hasher::write_i64` ever changes
-    // its endianness on some platform.
-    h.write(&execution_id.to_le_bytes());
-    (h.finish() % shard_count as u64) as u32
+    shard_for_partition(partition_for(execution_id), shard_count)
 }
 
 /// The pool segment whose commands carry the sharded off-server state cache
@@ -255,6 +314,127 @@ pub fn command_subject(
 
 #[cfg(test)]
 mod tests {
+
+    // ---- noetl/ai-meta#332: the partition table ----
+
+    /// ⚠⚠ THE gate. This mapping is implemented THREE times — here, in
+    /// `ehdb-l0::dataset::shard_for_execution`, and in
+    /// `ehdb-reference::affinity::shard_for_execution` — across two repos that
+    /// cannot be changed in one commit. The server and the command bus
+    /// disagreeing about who owns an execution is the one disagreement that
+    /// cannot be tolerated: both would write, and the log forks.
+    ///
+    /// So this reimplements the OTHER side's formula verbatim and asserts the
+    /// partition table did not change a single answer.
+    #[test]
+    fn the_partition_table_is_bit_identical_to_the_ehdb_side_mapping() {
+        fn ehdb_side(execution_id: i64, shard_count: u32) -> u32 {
+            // Verbatim from ehdb-l0/src/dataset.rs:232 (numeric branch).
+            if shard_count <= 1 {
+                return 0;
+            }
+            let mut h = XxHash64::with_seed(SHARD_HASH_SEED);
+            h.write(&execution_id.to_le_bytes());
+            (h.finish() % shard_count as u64) as u32
+        }
+        let mut compared = 0usize;
+        for n in [1u32, 2, 4, 8, 16, 32, 64, 256, 1024, 4096] {
+            assert!(partition_compatible(n), "{n} must be a legal shard count");
+            for id in [
+                0i64,
+                1,
+                -1,
+                42,
+                354004132048150528,
+                355518721797660672,
+                i64::MAX,
+                i64::MIN,
+                9_007_199_254_740_993,
+            ] {
+                compared += 1;
+                assert_eq!(
+                    shard_for(id, n),
+                    ehdb_side(id, n),
+                    "server and EHDB disagree on owner for id={id} n={n} — \
+                     they would both write, and the log forks"
+                );
+            }
+        }
+        // Assert the sweep actually ran: a loop that compared nothing passes.
+        assert!(
+            compared >= 80,
+            "only {compared} comparisons — the sweep is broken"
+        );
+    }
+
+    /// ⚠ The compatibility constraint is real and must refuse, not warn. A count
+    /// that does not divide PARTITION_COUNT splits the mapping in two.
+    #[test]
+    fn a_shard_count_that_does_not_divide_the_partition_count_is_refused() {
+        for bad in [3u32, 5, 6, 7, 10, 100, 1000] {
+            assert!(!partition_compatible(bad), "{bad} does not divide 4096");
+        }
+        for good in [1u32, 2, 4, 8, 4096] {
+            assert!(partition_compatible(good));
+        }
+        // And the divergence it would cause is real, not theoretical:
+        fn ehdb_side(id: i64, n: u32) -> u32 {
+            let mut h = XxHash64::with_seed(SHARD_HASH_SEED);
+            h.write(&id.to_le_bytes());
+            (h.finish() % n as u64) as u32
+        }
+        let diverging = (0i64..2000)
+            .filter(|&id| shard_for(id, 3) != ehdb_side(id, 3))
+            .count();
+        assert!(
+            diverging > 0,
+            "if an illegal count did NOT diverge, the constraint would be \
+             unnecessary and this guard would be cargo-cult"
+        );
+    }
+
+    /// The property the whole partition table exists for: an execution's
+    /// partition does not move when the shard count changes. Only the
+    /// *assignment* moves, which is what makes a rebalance bounded.
+    #[test]
+    fn a_partition_never_changes_when_the_shard_count_does() {
+        for id in [7i64, 12345, 354004132048150528] {
+            let p = partition_for(id);
+            for n in [1u32, 2, 4, 8, 16] {
+                assert_eq!(partition_for(id), p, "the partition must be N-independent");
+                // and the owner is a pure function of (partition, n)
+                assert_eq!(shard_for(id, n), shard_for_partition(p, n));
+            }
+        }
+    }
+
+    /// N=1 is the state this lands in: every execution on shard 0, no movement.
+    #[test]
+    fn at_one_shard_everything_is_partition_zero_owner_zero() {
+        for id in [0i64, 42, i64::MIN, 354004132048150528] {
+            assert_eq!(shard_for(id, 1), 0);
+            assert_eq!(shard_for(id, 0), 0);
+        }
+    }
+
+    /// Rebalancing is bounded: going 2 -> 4 shards must move a *fraction* of
+    /// partitions, not all of them. (Plain `hash % n` moves ~all keys; this is
+    /// the defect the table fixes, so it deserves a number.)
+    #[test]
+    fn resizing_moves_a_bounded_fraction_of_partitions() {
+        let moved = (0..PARTITION_COUNT)
+            .filter(|&p| shard_for_partition(p, 2) != shard_for_partition(p, 4))
+            .count();
+        let frac = moved as f64 / PARTITION_COUNT as f64;
+        assert!(
+            frac <= 0.5 + 1e-9,
+            "2->4 moved {frac:.3} of partitions; a bounded rebalance is the point"
+        );
+        assert!(
+            moved > 0,
+            "0 moved would mean the assignment ignores shard_count"
+        );
+    }
     use super::*;
 
     // ---- shard_for ---------------------------------------------------
