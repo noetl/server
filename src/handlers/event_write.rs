@@ -205,7 +205,11 @@ impl EventRow {
     /// posts it to `/api/internal/events/project`.  Keep the DB column names +
     /// `created_at` (NOT `timestamp`) so the materialized row is byte-identical
     /// to the synchronous INSERT.
-    fn to_stream_json(&self) -> Value {
+    // noetl/ai-meta#332 step 5: the embedded shadow serialises rows with the
+    // SAME function the networked publish path uses, so a shadow record is shaped
+    // exactly like a published one.  A shadow storing a different shape would
+    // prove nothing about the engine's fitness to replace that path.
+    pub(crate) fn to_stream_json(&self) -> Value {
         json!({
             "event_id": self.event_id,
             "execution_id": self.execution_id,
@@ -582,14 +586,19 @@ mod tests {
     fn both_producers_reduce_created_at_identically() {
         use chrono::TimeZone;
 
-        fn truncates(ns: i64) -> i64 { ns.div_euclid(1_000) }
-        fn rounds(ns: i64) -> i64 { (ns + 500).div_euclid(1_000) }
+        fn truncates(ns: i64) -> i64 {
+            ns.div_euclid(1_000)
+        }
+        fn rounds(ns: i64) -> i64 {
+            (ns + 500).div_euclid(1_000)
+        }
 
         // Real sub-microsecond remainders seen on prod 2026-08-31, spanning
         // both halves of the boundary: a rule that only works below 500 ns
         // must fail here.
-        let remainders: [u32; 14] =
-            [0, 1, 27, 88, 206, 449, 499, 500, 501, 681, 798, 867, 891, 999];
+        let remainders: [u32; 14] = [
+            0, 1, 27, 88, 206, 449, 499, 500, 501, 681, 798, 867, 891, 999,
+        ];
 
         let mut unreduced_disagreements = 0;
         let mut still_disagree = Vec::new();

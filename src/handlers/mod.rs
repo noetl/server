@@ -18,6 +18,7 @@ pub mod cross_region;
 pub mod dashboard;
 pub mod database;
 pub mod ehdb;
+pub mod ehdb_embedded;
 pub mod ehdb_eventlog_mirror;
 pub mod ehdb_eventlog_mirror_queue;
 pub mod ehdb_parity;

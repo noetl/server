@@ -96,9 +96,15 @@ gcp_auth = "0.12"
 
 # NATS messaging
 # EHDB command bus (L1 T4, flag-gated behind NOETL_COMMAND_BUS; default off).
-# The networked publish path to the per-shard writer (noetl/ehdb ehdb-feed).
-ehdb-feed = { git = "https://github.com/noetl/ehdb", rev = "e4572492b8373bd3bf8e347d09f2f3fbd9808dd5" }
-ehdb-l0 = { git = "https://github.com/noetl/ehdb", rev = "e4572492b8373bd3bf8e347d09f2f3fbd9808dd5" }
+# noetl/ai-meta#332 — GIT-TAG SEMVER, not a rev pin.
+#
+# The rev pins let two consumers drift 70 commits apart on the same engine.
+# Tolerable while they talked over a wire protocol; a corruption vector once both
+# open engines against one on-disk layout.  A tag is a decision someone made;
+# a rev is wherever a branch happened to be.  ehdb-l0's FORMAT_VERSION gate is
+# the belt to this braces: it refuses a layout it cannot read.
+ehdb-feed = { git = "https://github.com/noetl/ehdb", tag = "v0.2.0" }
+ehdb-l0 = { git = "https://github.com/noetl/ehdb", tag = "v0.2.0" }
 # Value type for the JetStream KV puts in `src/coherence.rs` (multi-replica
 # watermark/descriptor coherence, RFC #115 program-scale).  Matches the version
 # async-nats already pulls in transitively.
@@ -177,6 +183,7 @@ prometheus = "0.13"
 twox-hash = "1.6"
 
 [dev-dependencies]
+tempfile = "3"
 tokio-test = "0.4"
 # Process-global env var tests serialise via #[serial] so concurrent
 # test threads don't race on NOETL_INTERNAL_API_TOKEN; see
