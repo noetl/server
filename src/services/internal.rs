@@ -660,7 +660,7 @@ pub async fn project_events(
     let projected = result.len() as i64;
     let duplicates = (events.len() as i64 - projected).max(0);
 
-    let inserted = result
+    let inserted: Vec<crate::handlers::event_write::EventRow> = result
         .iter()
         .map(|r| crate::handlers::event_write::EventRow {
             event_id: r.try_get("event_id").unwrap_or(0),
@@ -698,6 +698,20 @@ pub async fn project_events(
             error: r.try_get("error").ok(),
         })
         .collect();
+
+    // noetl/ai-meta#332 step 5 — SHADOW ONLY.
+    //
+    // Append what Postgres just accepted to the embedded engine and compare the
+    // counts.  Nothing downstream reads this: `inserted` is returned unchanged,
+    // Postgres remains the system of record, and the flag defaults OFF so this
+    // whole block is unreachable until someone arms it.
+    //
+    // ⚠ Errors are recorded and swallowed ON PURPOSE.  A shadow that can fail a
+    // real write is a liability, not evidence — the point is to learn whether the
+    // embedded engine agrees, at zero risk to serving.  The `append_failed`
+    // counter is how a silently-degraded shadow stays visible; a bare swallow
+    // here would be the `serve_ingest` mistake again.
+    crate::handlers::ehdb_embedded::shadow_append(inserted.as_slice());
 
     Ok((projected, duplicates, inserted))
 }

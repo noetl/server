@@ -3210,6 +3210,50 @@ pub fn ehdb_crossstore_parity_total() -> &'static IntCounterVec {
     })
 }
 
+/// Counter: embedded-engine shadow outcomes (noetl/ai-meta#332 step 5).
+///
+/// ⚠ Labels are a closed set pinned at 0 in [`init_embedded_shadow_series`], so
+/// "never diverged" reads as `0` rather than as an absent series — and "the
+/// shadow never ran" is visible as `opened` staying 0 rather than as silence.
+pub fn embedded_shadow_total() -> &'static prometheus::IntCounterVec {
+    static M: std::sync::OnceLock<prometheus::IntCounterVec> = std::sync::OnceLock::new();
+    M.get_or_init(|| {
+        let m = prometheus::IntCounterVec::new(
+            prometheus::Opts::new(
+                "noetl_ehdb_embedded_shadow_total",
+                "Embedded EHDB engine shadow outcomes (open/append/compare)",
+            ),
+            &["outcome"],
+        )
+        .expect("valid metric");
+        registry().register(Box::new(m.clone())).ok();
+        m
+    })
+}
+
+/// The closed label set. Adding an outcome means adding it here, or its series
+/// is absent until it first fires.
+pub const EMBEDDED_SHADOW_OUTCOMES: [&str; 6] = [
+    "opened",
+    "open_failed",
+    "agreed",
+    "diverged",
+    "skipped",
+    "append_failed",
+];
+
+/// Record one embedded-shadow outcome.
+pub fn record_embedded_shadow(outcome: &str) {
+    embedded_shadow_total().with_label_values(&[outcome]).inc();
+}
+
+/// Pin every embedded-shadow label at 0.
+pub fn init_embedded_shadow_series() {
+    for o in EMBEDDED_SHADOW_OUTCOMES {
+        embedded_shadow_total().with_label_values(&[o]).inc_by(0);
+    }
+}
+
 /// Record one cross-store parity verdict.
 pub fn record_ehdb_crossstore_parity(tier: &str, outcome: &str) {
     ehdb_crossstore_parity_total()

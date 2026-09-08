@@ -1012,6 +1012,8 @@ async fn main() -> anyhow::Result<()> {
     noetl_server::metrics::init_catalog_delete_series();
     noetl_server::metrics::init_parity_and_dedup_series();
     noetl_server::metrics::init_ehdb_crossstore_series();
+    // noetl/ai-meta#332 step 5 — pinned so an unrun shadow reads 0, not absent.
+    noetl_server::metrics::init_embedded_shadow_series();
     noetl_server::metrics::init_ehdb_eventlog_mirror_series();
     noetl_server::metrics::init_ehdb_eventlog_mirror_queue_series();
     noetl_server::metrics::init_ehdb_projection_series();
