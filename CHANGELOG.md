@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.106.1](https://github.com/noetl/server/compare/v3.106.0...v3.106.1) (2026-09-09)
+
+### Bug Fixes
+
+* move the embedded shadow hook to the emit_events chokepoint ([65432fd](https://github.com/noetl/server/commit/65432fdd2b63156cf3bb7090d7e7df2d1ba08f9f)), closes [noetl/ai-meta#332](https://github.com/noetl/ai-meta/issues/332) [noetl/ai-meta#326](https://github.com/noetl/ai-meta/issues/326) [noetl/ai-meta#332](https://github.com/noetl/ai-meta/issues/332)
+* move the embedded shadow hook to the emit_events chokepoint ([#420](https://github.com/noetl/server/issues/420)) ([7f9c6bf](https://github.com/noetl/server/commit/7f9c6bfd587bfd19ecbc969c07dafd31cf66be89)), closes [noetl/ai-meta#332](https://github.com/noetl/ai-meta/issues/332)
+
 ## [3.106.0](https://github.com/noetl/server/compare/v3.105.0...v3.106.0) (2026-09-08)
 
 ### Features
