@@ -3243,6 +3243,49 @@ pub const EMBEDDED_SHADOW_OUTCOMES: [&str; 6] = [
 ];
 
 /// Record one embedded-shadow outcome.
+/// Outcomes of an embedded READ comparison (noetl/ai-meta#332).
+///
+/// ⚠ `out_of_coverage` is its own outcome, not folded into agreed or diverged:
+/// an execution older than the engine's volume is neither.
+pub const EMBEDDED_READ_OUTCOMES: [&str; 4] = [
+    "agreed",
+    "diverged",
+    "out_of_coverage",
+    "engine_unavailable",
+];
+
+pub fn embedded_read_total() -> &'static prometheus::IntCounterVec {
+    static M: std::sync::OnceLock<prometheus::IntCounterVec> = std::sync::OnceLock::new();
+    M.get_or_init(|| {
+        let m = prometheus::IntCounterVec::new(
+            prometheus::Opts::new(
+                "noetl_ehdb_embedded_read_total",
+                "Embedded-vs-authoritative event-log READ comparisons by outcome",
+            ),
+            &["outcome"],
+        )
+        .expect("valid metric");
+        let _ = registry().register(Box::new(m.clone()));
+        m
+    })
+}
+
+pub fn record_embedded_read(outcome: &str) {
+    embedded_read_total().with_label_values(&[outcome]).inc();
+}
+
+/// Pin every outcome at 0 **unconditionally**.
+///
+/// ⚠ `Registry::gather` prunes label families with no children, so without this
+/// "never diverged" and "this build has no such metric" are the same scrape.
+/// Unconditional on purpose: server#315 pinned inside a config branch and left
+/// the series absent on exactly the configuration whose value mattered.
+pub fn init_embedded_read_series() {
+    for o in EMBEDDED_READ_OUTCOMES {
+        embedded_read_total().with_label_values(&[o]).inc_by(0);
+    }
+}
+
 pub fn record_embedded_shadow(outcome: &str) {
     embedded_shadow_total().with_label_values(&[outcome]).inc();
 }
