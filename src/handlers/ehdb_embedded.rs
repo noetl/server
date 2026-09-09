@@ -154,8 +154,21 @@ fn engine() -> Option<&'static Arc<std::sync::Mutex<L0Engine<D1EventLog>>>> {
     EMBEDDED.get_or_init(open_embedded).as_ref()
 }
 
-/// Append the rows Postgres accepted to the embedded engine, and record whether
-/// the two agree.
+/// Append the batch that is about to become authoritative to the embedded
+/// engine, and record whether the engine accepted all of it.
+///
+/// Called from `handlers::event_write::emit_events` — the one chokepoint every
+/// server-originated event passes through, on both sides of the CQRS gate
+/// (noetl/ai-meta#332). ⚠ Not from `services::internal::project_events`, where
+/// it lived until 2026-09-08: that is the materializer, and prod's scheduled
+/// traffic is system executions, which `should_publish` excludes by design and
+/// which therefore never reach it. The shadow sat armed and unexercised for a
+/// full window, reporting the same all-zero series a healthy shadow reports.
+///
+/// ⚠ The comparison is `appended` vs `rows.len()` — *"did the engine accept
+/// every record the log is about to take"*. It is **not** a comparison against
+/// what Postgres ultimately stored: at this call site the write has not happened
+/// yet. A batch whose subsequent write fails is counted here and not in the log.
 ///
 /// ⚠ Never returns an error and never panics on a poisoned lock. This runs on
 /// the live write path; a shadow that can fail a real write is a liability, not
@@ -206,7 +219,6 @@ pub fn shadow_append(rows: &[crate::handlers::event_write::EventRow]) {
     crate::metrics::record_embedded_shadow(v.label());
 }
 
-#[cfg(test)]
 #[cfg(test)]
 mod tests {
     use super::*;
