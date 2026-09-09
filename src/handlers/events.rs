@@ -1283,6 +1283,13 @@ pub async fn claim_command(
     // let alone mirrored, until this record is already in the tier.
     if let Some(ev) = claim_event_to_mirror {
         crate::handlers::ehdb_eventlog_mirror::mirror_rows(&state, std::slice::from_ref(&ev)).await;
+        // noetl/ai-meta#332 -- the embedded shadow rides the SAME bypass as the
+        // mirror. `emit_events` is not the only writer: this site writes
+        // `noetl.event` directly, in-transaction, on the branch `should_publish`
+        // takes when it returns false -- the only branch a system-pool execution
+        // can take. Measured on prod: the shadow held 12 of 14 events for an
+        // hourly `system/scheduled_cleanup`, missing exactly the rows written here.
+        crate::handlers::ehdb_embedded::shadow_append(std::slice::from_ref(&ev));
     }
 
     Ok(Json(ClaimResponse {
@@ -1469,6 +1476,8 @@ pub async fn handle_batch_events(
         // half of it would leave the tier's completeness dependent on which
         // ingest route a future system playbook happens to use.
         crate::handlers::ehdb_eventlog_mirror::mirror_rows(&state, &event_rows).await;
+        // noetl/ai-meta#332 -- same bypass, same reason as the claim site above.
+        crate::handlers::ehdb_embedded::shadow_append(&event_rows);
     }
 
     // Trigger orchestrator for any command.completed in the batch,
