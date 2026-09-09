@@ -699,19 +699,22 @@ pub async fn project_events(
         })
         .collect();
 
-    // noetl/ai-meta#332 step 5 — SHADOW ONLY.
+    // noetl/ai-meta#332 — the embedded shadow used to append HERE, and must not.
     //
-    // Append what Postgres just accepted to the embedded engine and compare the
-    // counts.  Nothing downstream reads this: `inserted` is returned unchanged,
-    // Postgres remains the system of record, and the flag defaults OFF so this
-    // whole block is unreachable until someone arms it.
+    // This is the materializer, reached only via `POST /api/internal/events/project`
+    // when the CQRS gate publishes.  Measured on prod 2026-09-08: across 25 minutes
+    // and a full hourly execution the shadow never opened, because
+    // `should_publish` excludes system executions by design and prod's scheduled
+    // traffic is `system/orchestrate` — so those events took the synchronous
+    // INSERT and never arrived here.  All six shadow series read 0, which is
+    // byte-identical to a healthy shadow on a quiet system.
     //
-    // ⚠ Errors are recorded and swallowed ON PURPOSE.  A shadow that can fail a
-    // real write is a liability, not evidence — the point is to learn whether the
-    // embedded engine agrees, at zero risk to serving.  The `append_failed`
-    // counter is how a silently-degraded shadow stays visible; a bare swallow
-    // here would be the `serve_ingest` mistake again.
-    crate::handlers::ehdb_embedded::shadow_append(inserted.as_slice());
+    // The hook now lives at `handlers::event_write::emit_events`, the one
+    // chokepoint every server-originated event passes through on BOTH sides of
+    // the gate.  ⚠ It must not also live here: with the gate on, an event passes
+    // through `emit_events` and then reaches this function via the materializer,
+    // so a second append would double-count it and manufacture a divergence the
+    // engine did not cause.
 
     Ok((projected, duplicates, inserted))
 }

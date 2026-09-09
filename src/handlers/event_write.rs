@@ -470,6 +470,34 @@ pub async fn emit_events(state: &AppState, pool: &DbPool, rows: &[EventRow]) -> 
     crate::handlers::ehdb_eventlog_mirror::mirror_rows(state, rows).await;
     crate::metrics::record_event_ingest_phase("emit_mirror", __t.elapsed().as_secs_f64());
 
+    // noetl/ai-meta#332 — embedded EHDB engine, SHADOW ONLY.
+    //
+    // Deliberately HERE, sharing the mirror's position for the same reasons: it
+    // is after terminal dedup and chain stamping, so `rows` is exactly the set
+    // that becomes authoritative, and it is *before* the publish/insert fork, so
+    // one call site covers both branches.
+    //
+    // ⚠ It used to live in `services::internal::project_events` — the
+    // materializer — and that made it unreachable in production. `should_publish`
+    // excludes system executions by design, and prod's scheduled traffic is
+    // `system/orchestrate`, so those events never reached the materializer at
+    // all: measured 2026-09-08, 25 minutes and a full execution with every shadow
+    // series at 0. The failure was invisible because an unreachable shadow
+    // reports `agreed=0, diverged=0` — indistinguishable from a healthy one on a
+    // quiet system. `opened` is the only series that tells them apart.
+    //
+    // ⚠ Pre-fork means the shadow appends before the authoritative write is
+    // known to have succeeded, so a batch whose INSERT/publish then fails is
+    // counted by the shadow and not by the log. That is the same property
+    // `mirror_rows` has one line above, accepted for the same reason: covering
+    // both branches from one site is worth more than exactness on a path that
+    // returns `Err` to the caller anyway.
+    //
+    // ⚠ Errors are recorded and swallowed ON PURPOSE. A shadow that can fail a
+    // real write is a liability, not evidence. `append_failed` is how a
+    // silently-degraded shadow stays visible.
+    crate::handlers::ehdb_embedded::shadow_append(rows);
+
     // All rows in a batch share the same execution + catalog, so one decision
     // covers the batch.
     let __t = std::time::Instant::now();
@@ -789,6 +817,181 @@ mod tests {
         let r = EventRow::new(1, 1, 1, "step.enter", "ENTERED", Utc::now()).with_node("s");
         assert_eq!(r.node_id.as_deref(), Some("s"));
         assert_eq!(r.node_name.as_deref(), Some("s"));
+    }
+
+    // ---------------------------------------------------------------------
+    // noetl/ai-meta#332 — the embedded shadow must be REACHABLE from here.
+    // ---------------------------------------------------------------------
+
+    /// Strip `//` comment lines before searching source.
+    ///
+    /// ⚠ Without this a guard can match its own doc comment and stay green
+    /// while the code it guards is gone — a mistake already made once on this
+    /// repo (noetl/ai-meta#332, the `#[non_exhaustive]` guard).
+    fn code_only(src: &str) -> String {
+        src.lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The body of `emit_events`, comments removed.
+    ///
+    /// ⚠ Asserts its own extraction. A slice that silently came back empty
+    /// would make every assertion below pass over zero bytes — the shape that
+    /// produced three false green results in one session.
+    fn emit_events_body() -> String {
+        let src = include_str!("event_write.rs");
+        let non_test = src.split("#[cfg(test)]").next().unwrap();
+        let start = non_test
+            .find("pub async fn emit_events")
+            .expect("emit_events not found — the extraction broke");
+        let region = &non_test[start..];
+        let end = region.find("\n}\n").map(|i| i + 3).unwrap_or(region.len());
+        let body = code_only(&region[..end]);
+        assert!(
+            body.len() > 1500,
+            "emit_events body extracted as {} bytes — implausibly small; a guard \
+             measuring nothing passes",
+            body.len()
+        );
+        assert!(
+            body.contains("should_publish") && body.contains("insert_rows"),
+            "the extracted region is missing the publish/insert fork, so it is not \
+             the whole function and the ordering assertion below would be vacuous"
+        );
+        body
+    }
+
+    /// ⚠⚠ THE wiring, gated at the source — `emit_events` needs an `AppState`
+    /// and a live pool, so it cannot be driven from a unit test.
+    ///
+    /// The tempting test (call `shadow_append` directly and assert it appends)
+    /// is the noetl/ai-meta#326 mistake exactly: it passes whether or not
+    /// anything on the write path ever calls it. This asserts the call site.
+    #[test]
+    fn shadow_append_is_called_from_the_emit_chokepoint() {
+        let body = emit_events_body();
+        assert!(
+            body.contains("ehdb_embedded::shadow_append("),
+            "emit_events does not call shadow_append. The embedded shadow is then \
+             unreachable on the production path, and — this is why it went \
+             unnoticed for a full window — an unreachable shadow reports \
+             `agreed=0, diverged=0, append_failed=0`, which is byte-identical to \
+             a healthy shadow on a quiet system (noetl/ai-meta#332)."
+        );
+    }
+
+    /// The call must sit BEFORE the publish/insert fork.
+    ///
+    /// After the fork it would have to be duplicated into both branches, and the
+    /// gate-off branch is the one prod does not exercise — the classic place for
+    /// the second copy to rot. Same argument the mirror one line above makes.
+    #[test]
+    fn shadow_append_precedes_the_publish_insert_fork() {
+        let body = emit_events_body();
+        let shadow = body
+            .find("ehdb_embedded::shadow_append(")
+            .expect("shadow_append call missing — see the previous test");
+        let fork = body
+            .find("should_publish(state")
+            .expect("publish/insert fork not found — extraction broke");
+        assert!(
+            shadow < fork,
+            "shadow_append is called AFTER the publish/insert decision, so it \
+             covers only one branch of the gate. It belongs beside `mirror_rows`, \
+             which is placed pre-fork for this same reason."
+        );
+    }
+
+    /// The shadow must not be able to fail the authoritative write.
+    ///
+    /// A `?` on this call would turn a storage problem in a diagnostic into a
+    /// 5xx on a real event — the liability the whole design forbids. Pinned at
+    /// the source because the type system permits it the moment someone changes
+    /// `shadow_append`'s return type.
+    #[test]
+    fn the_shadow_cannot_fail_the_serving_path() {
+        let body = emit_events_body();
+        let at = body
+            .find("ehdb_embedded::shadow_append(")
+            .expect("shadow_append call missing");
+        let stmt = &body[at..body[at..].find('\n').map(|i| at + i).unwrap_or(body.len())];
+        assert!(
+            !stmt.contains('?'),
+            "the shadow_append call propagates with `?`: {stmt:?}. A shadow that \
+             can fail a real write is a liability, not evidence."
+        );
+        assert!(
+            stmt.trim_end().ends_with(");"),
+            "expected a bare statement call, found {stmt:?} — if its result is \
+             now consumed, re-check that no failure can reach the caller."
+        );
+        // ⚠ The above cannot fail while `shadow_append` returns `()`, because a
+        // `?` on a unit value does not compile — a guard nothing can trip. So
+        // pin the property that makes it true: the signature itself. Change the
+        // return type to a `Result` and this fires, which is exactly the moment
+        // the call site could start propagating into the serving path.
+        let shadow_src = code_only(
+            include_str!("ehdb_embedded.rs")
+                .split("#[cfg(test)]")
+                .next()
+                .unwrap(),
+        );
+        let sig = shadow_src
+            .find("pub fn shadow_append(")
+            .expect("shadow_append signature not found — extraction broke");
+        let sig_line = &shadow_src[sig..shadow_src[sig..]
+            .find('{')
+            .map(|i| sig + i)
+            .unwrap_or(shadow_src.len())];
+        assert!(
+            !sig_line.contains("->"),
+            "shadow_append now returns a value ({sig_line:?}). It must return `()`: \
+             a fallible shadow on the write path can fail a real event, which is \
+             the liability this whole design forbids."
+        );
+    }
+
+    /// It must be called from exactly ONE place.
+    ///
+    /// With the CQRS gate on, an event passes `emit_events` and then reaches
+    /// `project_events` via the materializer. A hook in both would append the
+    /// same event twice and report a divergence the engine did not cause —
+    /// a self-inflicted finding on the one signal we armed to trust.
+    #[test]
+    fn the_shadow_has_exactly_one_call_site() {
+        // ⚠ The non-test region only. This guard's own assertions mention the
+        // call by name, so counting the whole file counts the guard — which
+        // first reported 6 call sites and failed for the wrong reason.
+        let event_write = code_only(
+            include_str!("event_write.rs")
+                .split("#[cfg(test)]")
+                .next()
+                .unwrap(),
+        );
+        let internal = code_only(
+            include_str!("../services/internal.rs")
+                .split("#[cfg(test)]")
+                .next()
+                .unwrap(),
+        );
+        assert!(
+            event_write.contains("pub async fn emit_events"),
+            "non-test slice of event_write.rs lost emit_events — extraction broke"
+        );
+        assert_eq!(
+            event_write.matches("ehdb_embedded::shadow_append(").count(),
+            1,
+            "expected exactly one call site in event_write.rs's non-test code"
+        );
+        assert_eq!(
+            internal.matches("ehdb_embedded::shadow_append(").count(),
+            0,
+            "services::internal::project_events still calls shadow_append. With the \
+             gate on it runs AFTER emit_events for the same event, so the batch is \
+             appended twice and the shadow reports a divergence it caused itself."
+        );
     }
 }
 
