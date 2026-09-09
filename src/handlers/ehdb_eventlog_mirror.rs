@@ -1057,6 +1057,49 @@ mod tests {
     /// Checks the count, which is what actually goes wrong; the order is asserted
     /// on the tail the noetl/ai-meta#326 fix appended, where the risk is.
     #[test]
+    /// The embedded shadow must cover **every** site the mirror covers.
+    ///
+    /// ⚠ Both exist for the same reason: `emit_events` is NOT the only writer of
+    /// `noetl.event`. Two sites in `handlers::events` write the table directly,
+    /// in-transaction, on the branch `should_publish` takes when it returns false
+    /// -- the only branch a system-pool execution can take (noetl/ai-meta#263).
+    ///
+    /// Measured on prod 2026-09-09 before the fix: the embedded engine held 12 of
+    /// 14 events for an hourly `system/scheduled_cleanup`, missing exactly the
+    /// rows written at those sites. The write path could not see it -- every
+    /// append it made succeeded, so `append_failed` stayed 0. It surfaced only
+    /// when the READ comparison was built (noetl/ai-meta#332).
+    ///
+    /// Counting both, rather than naming the sites: a guard that names them
+    /// drifts the moment a third bypass is added, which is the failure class this
+    /// file already exists for.
+    #[test]
+    fn the_embedded_shadow_covers_every_site_the_mirror_covers() {
+        let src = include_str!("events.rs");
+        let code = src.split("#[cfg(test)]").next().unwrap();
+        assert!(
+            code.contains("pub async fn handle_event"),
+            "non-test slice lost handle_event -- the extraction broke and a guard \
+             measuring nothing passes"
+        );
+        let mirrors = code.matches("ehdb_eventlog_mirror::mirror_rows(").count();
+        let shadows = code.matches("ehdb_embedded::shadow_append(").count();
+        assert!(
+            mirrors >= 2,
+            "expected >=2 mirror sites in events.rs, found {mirrors} -- the slice \
+             is wrong or the bypass moved"
+        );
+        assert_eq!(
+            mirrors, shadows,
+            "events.rs mirrors {mirrors} direct-write site(s) but shadows {shadows}. \
+             Every site that writes noetl.event outside the emit chokepoint must \
+             append to the embedded engine too, or the engine silently holds an \
+             incomplete log for exactly the system-pool executions that take that \
+             branch -- invisible from the write side, because those appends never \
+             happen at all."
+        );
+    }
+
     fn insert_column_and_bind_counts_agree() {
         let src = include_str!("events.rs");
         let needle = format!("INSERT INTO noetl.event{}", "");
