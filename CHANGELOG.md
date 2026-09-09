@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.107.1](https://github.com/noetl/server/compare/v3.107.0...v3.107.1) (2026-09-09)
+
+### Bug Fixes
+
+* the embedded shadow must cover the emit-chokepoint BYPASS sites ([1a2df77](https://github.com/noetl/server/commit/1a2df7732ce97e0b873c969f7f194ede66af3b70)), closes [#421](https://github.com/noetl/server/issues/421) [noetl/ai-meta#263](https://github.com/noetl/ai-meta/issues/263) [noetl/ai-meta#332](https://github.com/noetl/ai-meta/issues/332) [noetl/ai-meta#263](https://github.com/noetl/ai-meta/issues/263)
+* the embedded shadow must cover the emit-chokepoint bypass sites ([#422](https://github.com/noetl/server/issues/422)) ([08161f3](https://github.com/noetl/server/commit/08161f3fde340fabe965451c5837245b14529bf9)), closes [ai-meta#263](https://github.com/noetl/ai-meta/issues/263) [noetl/ai-meta#332](https://github.com/noetl/ai-meta/issues/332)
+
 ## [3.107.0](https://github.com/noetl/server/compare/v3.106.1...v3.107.0) (2026-09-09)
 
 ### Features
