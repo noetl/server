@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.107.0](https://github.com/noetl/server/compare/v3.106.1...v3.107.0) (2026-09-09)
+
+### Features
+
+* verify the embedded engine's READ path against Postgres ([b8a2fac](https://github.com/noetl/server/commit/b8a2fac56ffdd02fe037be61fe2815c01f10445e)), closes [noetl/ai-meta#325](https://github.com/noetl/ai-meta/issues/325) [server#315](https://github.com/noetl/server/issues/315) [noetl/ai-meta#332](https://github.com/noetl/ai-meta/issues/332)
+* verify the embedded engine's READ path against Postgres ([#421](https://github.com/noetl/server/issues/421)) ([22eb30f](https://github.com/noetl/server/commit/22eb30f865e525ea6e2950f5c8690f7068ed5ec2)), closes [noetl/ai-meta#332](https://github.com/noetl/ai-meta/issues/332)
+
 ## [3.106.1](https://github.com/noetl/server/compare/v3.106.0...v3.106.1) (2026-09-09)
 
 ### Bug Fixes
