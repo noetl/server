@@ -4082,6 +4082,48 @@ pub fn ehdb_projection_read_total() -> &'static IntCounterVec {
     })
 }
 
+/// Why a serve-on-behind grant was refused (noetl/ai-meta#332).
+///
+/// ⚠ `stored_ahead` is the one that must never be missing from a scrape: it is
+/// the silently-wrong case, and an absent series would read as "never happened".
+pub const PROJECTION_SERVE_REFUSALS: [&str; 4] = [
+    "stored_ahead",
+    "digest_mismatch",
+    "no_stored_record",
+    "spine_refused",
+];
+
+pub fn ehdb_projection_serve_refusal_total() -> &'static IntCounterVec {
+    static M: std::sync::OnceLock<IntCounterVec> = std::sync::OnceLock::new();
+    M.get_or_init(|| {
+        let m = IntCounterVec::new(
+            prometheus::Opts::new(
+                "noetl_ehdb_projection_serve_refusal_total",
+                "Serve-on-behind grants refused, by reason",
+            ),
+            &["reason"],
+        )
+        .expect("valid metric");
+        let _ = registry().register(Box::new(m.clone()));
+        m
+    })
+}
+
+pub fn record_ehdb_projection_serve_refusal(reason: &str) {
+    ehdb_projection_serve_refusal_total()
+        .with_label_values(&[reason])
+        .inc();
+}
+
+/// Pin every refusal reason at 0, unconditionally.
+pub fn init_projection_serve_refusal_series() {
+    for r in PROJECTION_SERVE_REFUSALS {
+        ehdb_projection_serve_refusal_total()
+            .with_label_values(&[r])
+            .inc_by(0);
+    }
+}
+
 pub fn record_ehdb_projection_read(outcome: &str) {
     ehdb_projection_read_total()
         .with_label_values(&[outcome])
