@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.108.0](https://github.com/noetl/server/compare/v3.107.1...v3.108.0) (2026-09-10)
+
+### Features
+
+* D3 serve decision -- behind serves with forward fold, ahead is unrepresentable ([4821ba8](https://github.com/noetl/server/commit/4821ba8f3b3d60839688c4e69901313cbdc88886)), closes [noetl/ai-meta#332](https://github.com/noetl/ai-meta/issues/332) [noetl/ai-meta#265](https://github.com/noetl/ai-meta/issues/265)
+* D3 serve-on-behind — wire ServeGrant into the projection read path ([#423](https://github.com/noetl/server/issues/423)) ([06fcfe7](https://github.com/noetl/server/commit/06fcfe704a45255227fd31f822542e9bb69bbb26)), closes [noetl/ai-meta#332](https://github.com/noetl/ai-meta/issues/332)
+* wire ServeGrant into the D3 read path, behind a default-off flag ([4cef1f1](https://github.com/noetl/server/commit/4cef1f14b1a020698659889197fb1be70d80cffe)), closes [noetl/ai-meta#326](https://github.com/noetl/ai-meta/issues/326) [ai-meta#307](https://github.com/noetl/ai-meta/issues/307) [noetl/ai-meta#332](https://github.com/noetl/ai-meta/issues/332) [noetl/ai-meta#307](https://github.com/noetl/ai-meta/issues/307) [noetl/ai-meta#265](https://github.com/noetl/ai-meta/issues/265)
+
 ## [3.107.1](https://github.com/noetl/server/compare/v3.107.0...v3.107.1) (2026-09-09)
 
 ### Bug Fixes
