@@ -180,10 +180,20 @@ pub async fn load_latest(pool: &DbPool, execution_id: i64) -> AppResult<Option<L
     if source.is_wal() {
         let (body, verdict) =
             crate::handlers::ehdb_projection_fold::wal_projection_state(execution_id).await;
-        crate::metrics::record_ehdb_projection_read(match verdict {
-            crate::handlers::ehdb_projection_fold::ReFoldVerdict::Match => "served_tier",
-            v => v.as_str(),
-        });
+        // ⚠ `body.is_some()` on a NON-Match verdict means serve-on-behind granted
+        // (ai-meta#332): the snapshot was verified at its own version and
+        // `rebuild_state` will fold forward from it. `wal_projection_state`
+        // already recorded `stale_within_window` for that case, so recording the
+        // raw verdict here too would double-count one read as both served and
+        // refused.
+        let served_on_behind = body.is_some()
+            && verdict != crate::handlers::ehdb_projection_fold::ReFoldVerdict::Match;
+        if !served_on_behind {
+            crate::metrics::record_ehdb_projection_read(match verdict {
+                crate::handlers::ehdb_projection_fold::ReFoldVerdict::Match => "served_tier",
+                v => v.as_str(),
+            });
+        }
         let Some(body) = body else {
             if verdict.is_fault() {
                 tracing::warn!(

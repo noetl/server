@@ -1019,6 +1019,7 @@ async fn main() -> anyhow::Result<()> {
     // noetl/ai-meta#332 step 5 — pinned so an unrun shadow reads 0, not absent.
     noetl_server::metrics::init_embedded_shadow_series();
     noetl_server::metrics::init_embedded_read_series();
+    noetl_server::metrics::init_projection_serve_refusal_series();
     noetl_server::metrics::init_ehdb_eventlog_mirror_series();
     noetl_server::metrics::init_ehdb_eventlog_mirror_queue_series();
     noetl_server::metrics::init_ehdb_projection_series();

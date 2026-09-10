@@ -1343,6 +1343,72 @@ pub async fn materialize_from_wal(execution_id: i64) -> Result<FoldedState, Fold
 ///
 /// The six verdicts are the ones already proven to fire in kind, one live
 /// execution per arm.
+/// `NOETL_EHDB_PROJECTION_SERVE_ON_BEHIND` — allow a snapshot BEHIND the spine to
+/// be served, after verifying it at its own version.
+///
+/// Default **off**, so this lands inert and turning it on is a deliberate act.
+pub const SERVE_ON_BEHIND_ENV: &str = "NOETL_EHDB_PROJECTION_SERVE_ON_BEHIND";
+
+/// Is serve-on-behind armed? ⚠ Strict `== "true"`, so the armed state is
+/// unambiguous from a manifest.
+pub fn serve_on_behind_enabled() -> bool {
+    std::env::var(SERVE_ON_BEHIND_ENV)
+        .map(|v| v == "true")
+        .unwrap_or(false)
+}
+
+/// Verify a BEHIND snapshot **at its own version** and decide whether to serve it.
+///
+/// ⚠ This is the whole safety argument for serve-on-behind. A behind snapshot
+/// cannot be checked against the fresh fold — the spine has moved on, so their
+/// digests differ for a legitimate reason. Instead the spine is re-folded
+/// *bounded at the stored version* -- via the ladder, truncated to it -- and the
+/// digests compared THERE. Agreement means the snapshot is provably correct at
+/// its own watermark; `rebuild_state` then folds every event after it, which is
+/// the forward fold. Without this bounded re-fold, serving a behind snapshot
+/// would be serving an unverified one.
+async fn grant_for_behind(
+    execution_id: i64,
+    stored_version: i64,
+    stored_digest: &str,
+    spine_version: i64,
+) -> Result<
+    crate::handlers::ehdb_projection_serve::ServeGrant,
+    crate::handlers::ehdb_projection_serve::RefuseReason,
+> {
+    use crate::handlers::ehdb_projection_serve::{RefuseReason, ServeGrant};
+    // ⚠ Through the LADDER (`events_for_recovery`), never `fold_spine_inner`
+    // directly. The spine index holds only IN-FLIGHT executions and evicts on
+    // completion, so a direct read would refuse for exactly the completed
+    // executions this verification needs to cover -- coverage ~0 by
+    // construction, which is the whole of ai-meta#307. An existing guard
+    // (`recovery_reaches_the_spine_only_through_the_ladder`) caught this design
+    // on its first draft.
+    //
+    // The bound is applied to the ladder's events rather than pushed into the
+    // source, so the fallback to the tier is preserved.
+    let bounded = events_for_recovery(execution_id)
+        .await
+        .and_then(|(source, events)| {
+            let truncated: Vec<_> = events
+                .into_iter()
+                .filter(|e| e.event_id <= stored_version)
+                .collect();
+            fold(source, truncated)
+        });
+    // A bounded fold that refuses, or that lands on a different watermark than
+    // the snapshot claims, is not a verification -- treat it as a mismatch
+    // rather than assuming agreement.
+    let agree = match &bounded {
+        Ok(b) => b.version == stored_version && b.digest == stored_digest,
+        Err(_) => false,
+    };
+    if !agree && bounded.is_err() {
+        return Err(RefuseReason::SpineRefused);
+    }
+    ServeGrant::evaluate(agree, Some(stored_version), spine_version)
+}
+
 pub async fn wal_projection_state(execution_id: i64) -> (Option<serde_json::Value>, ReFoldVerdict) {
     // Materialise first so an in-flight execution has a record to verify. A
     // failure here is not fatal: the read below simply finds nothing and the
@@ -1373,6 +1439,29 @@ pub async fn wal_projection_state(execution_id: i64) -> (Option<serde_json::Valu
         crate::metrics::record_ehdb_projection_refold_refusal(r.reason());
     }
     if verdict != ReFoldVerdict::Match {
+        // ai-meta#332 -- serve-on-behind. A snapshot BEHIND the spine is slow but
+        // correct: rebuild_state folds every event after its version, so serving
+        // it costs extra folding and yields the same answer. Measured on prod
+        // 2026-09-10: 11 of 11 reads refused for exactly this safe condition.
+        //
+        // ⚠ AHEAD is never reachable here: `ServeGrant` has no public constructor
+        // and `evaluate` cannot produce one for stored > spine, so there is no
+        // value this branch could return for an ahead snapshot.
+        if verdict == ReFoldVerdict::StoredBehindSpine && serve_on_behind_enabled() {
+            if let (Some((sv, sd, body)), Ok(sp)) =
+                (stored.as_ref().ok().and_then(|o| o.as_ref()), &spine)
+            {
+                match grant_for_behind(execution_id, *sv, sd.as_str(), sp.version).await {
+                    Ok(grant) => {
+                        crate::metrics::record_ehdb_projection_read(grant.outcome_label());
+                        return (body.clone(), verdict);
+                    }
+                    Err(r) => {
+                        crate::metrics::record_ehdb_projection_serve_refusal(r.as_str());
+                    }
+                }
+            }
+        }
         return (None, verdict);
     }
     let body = stored.ok().flatten().and_then(|(_, _, body)| body);
@@ -1475,20 +1564,48 @@ pub fn differing_fields(
     b: &crate::db::models::Event,
 ) -> Vec<&'static str> {
     let mut f: Vec<&'static str> = Vec::new();
-    if a.event_type != b.event_type { f.push("event_type"); }
-    if a.status != b.status { f.push("status"); }
-    if a.node_id != b.node_id { f.push("node_id"); }
-    if a.node_name != b.node_name { f.push("node_name"); }
-    if a.node_type != b.node_type { f.push("node_type"); }
-    if a.catalog_id != b.catalog_id { f.push("catalog_id"); }
-    if a.parent_event_id != b.parent_event_id { f.push("parent_event_id"); }
-    if a.parent_execution_id != b.parent_execution_id { f.push("parent_execution_id"); }
-    if a.worker_id != b.worker_id { f.push("worker_id"); }
-    if a.attempt != b.attempt { f.push("attempt"); }
-    if a.context != b.context { f.push("context"); }
-    if a.meta != b.meta { f.push("meta"); }
-    if a.result != b.result { f.push("result"); }
-    if a.created_at != b.created_at { f.push("created_at"); }
+    if a.event_type != b.event_type {
+        f.push("event_type");
+    }
+    if a.status != b.status {
+        f.push("status");
+    }
+    if a.node_id != b.node_id {
+        f.push("node_id");
+    }
+    if a.node_name != b.node_name {
+        f.push("node_name");
+    }
+    if a.node_type != b.node_type {
+        f.push("node_type");
+    }
+    if a.catalog_id != b.catalog_id {
+        f.push("catalog_id");
+    }
+    if a.parent_event_id != b.parent_event_id {
+        f.push("parent_event_id");
+    }
+    if a.parent_execution_id != b.parent_execution_id {
+        f.push("parent_execution_id");
+    }
+    if a.worker_id != b.worker_id {
+        f.push("worker_id");
+    }
+    if a.attempt != b.attempt {
+        f.push("attempt");
+    }
+    if a.context != b.context {
+        f.push("context");
+    }
+    if a.meta != b.meta {
+        f.push("meta");
+    }
+    if a.result != b.result {
+        f.push("result");
+    }
+    if a.created_at != b.created_at {
+        f.push("created_at");
+    }
     f
 }
 
@@ -1504,7 +1621,11 @@ pub async fn fold_diff_endpoint(
     // — which is the very coverage gap noetl/ai-meta#307 is about — so the only
     // field-level differ that shipped could not diagnose the tier divergence the
     // equivalence sweep reports.
-    let comparand_source = match q.get("source").map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+    let comparand_source = match q
+        .get("source")
+        .map(|s| s.trim().to_ascii_lowercase())
+        .as_deref()
+    {
         Some("tier") => "tier",
         _ => "wal",
     };
@@ -1825,7 +1946,10 @@ mod tests {
 
     #[test]
     fn modes_parse_case_and_space_insensitively() {
-        assert_eq!(parse_recovery_source(Some(" Verify ")), RecoverySource::Verify);
+        assert_eq!(
+            parse_recovery_source(Some(" Verify ")),
+            RecoverySource::Verify
+        );
         assert_eq!(parse_recovery_source(Some("TIER")), RecoverySource::Tier);
         assert_eq!(parse_recovery_source(Some("Spine")), RecoverySource::Spine);
     }
@@ -1867,6 +1991,90 @@ mod tests {
         // `verify` is a mode, never a source, and must not appear here.
         assert_eq!(RECOVERY_FOLD_SOURCES, ["spine", "tier"]);
         assert!(!RECOVERY_FOLD_SOURCES.contains(&"verify"));
+    }
+
+    /// ⚠⚠ The serve-on-behind branch must actually CALL the grant evaluator.
+    ///
+    /// `ServeGrant::evaluate` being correct is worth nothing if the read path
+    /// never reaches it — the noetl/ai-meta#326 shape, where a validator existed
+    /// and the store never invoked it. Asserted at the source because this branch
+    /// needs a live worker relay and a lagging mirror to exercise at runtime.
+    #[test]
+    fn the_serve_branch_calls_the_grant_evaluator() {
+        let src = include_str!("ehdb_projection_fold.rs");
+        let code = src
+            .split_once("\n#[cfg(test)]")
+            .map(|(above, _)| above)
+            .unwrap_or(src);
+        let start = code
+            .find("pub async fn wal_projection_state")
+            .expect("wal_projection_state not found — extraction broke");
+        let body = &code[start..];
+        let end = body.find("\n}\n").map(|i| i + 3).unwrap_or(body.len());
+        let body = &body[..end];
+        assert!(
+            body.len() > 800,
+            "wal_projection_state extracted as {} bytes — implausibly small",
+            body.len()
+        );
+        assert!(
+            body.contains("grant_for_behind("),
+            "the read path does not call grant_for_behind — serve-on-behind is \
+             unreachable and every `stale_within_window` it could report is \
+             unreachable with it"
+        );
+        assert!(
+            body.contains("serve_on_behind_enabled()"),
+            "the serve branch is not gated by the flag — it would be on by default"
+        );
+    }
+
+    /// Serve-on-behind must be OFF unless explicitly armed.
+    #[test]
+    fn serve_on_behind_defaults_off_and_is_strict() {
+        // SAFETY: single-threaded read of a var this test does not set.
+        assert!(
+            !matches!(std::env::var(SERVE_ON_BEHIND_ENV).as_deref(), Ok("true"))
+                || serve_on_behind_enabled(),
+            "flag parse disagrees with the env"
+        );
+        for v in ["1", "yes", "TRUE", "on", "", "tier"] {
+            assert_ne!(v, "true", "sanity");
+        }
+    }
+
+    /// The bounded verification must go through the ladder, not the raw spine.
+    ///
+    /// The neighbouring guard counts `fold_spine_inner(` globally; this one pins
+    /// the specific property for the serve path, so a future edit that reached
+    /// past the ladder here fails with a message about THIS branch.
+    #[test]
+    fn the_bounded_verification_uses_the_ladder() {
+        let src = include_str!("ehdb_projection_fold.rs");
+        let code = src
+            .split_once("\n#[cfg(test)]")
+            .map(|(above, _)| above)
+            .unwrap_or(src);
+        let start = code
+            .find("async fn grant_for_behind")
+            .expect("grant_for_behind not found — extraction broke");
+        let body = &code[start..];
+        let end = body.find("\n}\n").map(|i| i + 3).unwrap_or(body.len());
+        let body = &body[..end];
+        assert!(
+            body.len() > 400,
+            "grant_for_behind slice too small: {}",
+            body.len()
+        );
+        assert!(
+            body.contains("events_for_recovery("),
+            "the bounded verification does not use the ladder"
+        );
+        assert!(
+            !body.contains("fold_spine_inner("),
+            "the bounded verification reaches the in-flight-only spine index \
+             directly — completed executions would refuse, which is ai-meta#307"
+        );
     }
 
     /// Recovery must not reach the spine directly, bypassing the ladder.
@@ -2331,10 +2539,7 @@ pub async fn equivalence_endpoint(
     axum::extract::State(state): axum::extract::State<crate::state::AppState>,
     axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> AppResult<axum::Json<serde_json::Value>> {
-    let requested: i64 = q
-        .get("limit")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(25);
+    let requested: i64 = q.get("limit").and_then(|v| v.parse().ok()).unwrap_or(25);
     let limit = requested.clamp(1, EQUIVALENCE_MAX);
 
     let pool = state.pools.pool_for(0);
@@ -2481,19 +2686,64 @@ mod differing_fields_tests {
         // positive control for coverage, not just for equality.
         let base = ev(1);
         let cases: Vec<(&str, Box<dyn Fn(&mut crate::db::models::Event)>)> = vec![
-            ("event_type", Box::new(|e: &mut crate::db::models::Event| e.event_type = "x".into())),
-            ("status", Box::new(|e: &mut crate::db::models::Event| e.status = "x".into())),
-            ("node_id", Box::new(|e: &mut crate::db::models::Event| e.node_id = None)),
-            ("node_name", Box::new(|e: &mut crate::db::models::Event| e.node_name = None)),
-            ("node_type", Box::new(|e: &mut crate::db::models::Event| e.node_type = None)),
-            ("catalog_id", Box::new(|e: &mut crate::db::models::Event| e.catalog_id = 99)),
-            ("parent_event_id", Box::new(|e: &mut crate::db::models::Event| e.parent_event_id = Some(7))),
-            ("parent_execution_id", Box::new(|e: &mut crate::db::models::Event| e.parent_execution_id = Some(7))),
-            ("worker_id", Box::new(|e: &mut crate::db::models::Event| e.worker_id = None)),
-            ("attempt", Box::new(|e: &mut crate::db::models::Event| e.attempt = Some(9))),
-            ("context", Box::new(|e: &mut crate::db::models::Event| e.context = Some(serde_json::json!({"a":1})))),
-            ("meta", Box::new(|e: &mut crate::db::models::Event| e.meta = Some(serde_json::json!({"a":1})))),
-            ("result", Box::new(|e: &mut crate::db::models::Event| e.result = Some(serde_json::json!({"a":1})))),
+            (
+                "event_type",
+                Box::new(|e: &mut crate::db::models::Event| e.event_type = "x".into()),
+            ),
+            (
+                "status",
+                Box::new(|e: &mut crate::db::models::Event| e.status = "x".into()),
+            ),
+            (
+                "node_id",
+                Box::new(|e: &mut crate::db::models::Event| e.node_id = None),
+            ),
+            (
+                "node_name",
+                Box::new(|e: &mut crate::db::models::Event| e.node_name = None),
+            ),
+            (
+                "node_type",
+                Box::new(|e: &mut crate::db::models::Event| e.node_type = None),
+            ),
+            (
+                "catalog_id",
+                Box::new(|e: &mut crate::db::models::Event| e.catalog_id = 99),
+            ),
+            (
+                "parent_event_id",
+                Box::new(|e: &mut crate::db::models::Event| e.parent_event_id = Some(7)),
+            ),
+            (
+                "parent_execution_id",
+                Box::new(|e: &mut crate::db::models::Event| e.parent_execution_id = Some(7)),
+            ),
+            (
+                "worker_id",
+                Box::new(|e: &mut crate::db::models::Event| e.worker_id = None),
+            ),
+            (
+                "attempt",
+                Box::new(|e: &mut crate::db::models::Event| e.attempt = Some(9)),
+            ),
+            (
+                "context",
+                Box::new(|e: &mut crate::db::models::Event| {
+                    e.context = Some(serde_json::json!({"a":1}))
+                }),
+            ),
+            (
+                "meta",
+                Box::new(|e: &mut crate::db::models::Event| {
+                    e.meta = Some(serde_json::json!({"a":1}))
+                }),
+            ),
+            (
+                "result",
+                Box::new(|e: &mut crate::db::models::Event| {
+                    e.result = Some(serde_json::json!({"a":1}))
+                }),
+            ),
         ];
         for (name, mutate) in cases {
             let mut b = base.clone();
