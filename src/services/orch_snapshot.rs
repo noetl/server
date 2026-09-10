@@ -186,9 +186,9 @@ pub async fn load_latest(pool: &DbPool, execution_id: i64) -> AppResult<Option<L
         // already recorded `stale_within_window` for that case, so recording the
         // raw verdict here too would double-count one read as both served and
         // refused.
-        if !(body.is_some()
-            && verdict != crate::handlers::ehdb_projection_fold::ReFoldVerdict::Match)
-        {
+        let served_on_behind = body.is_some()
+            && verdict != crate::handlers::ehdb_projection_fold::ReFoldVerdict::Match;
+        if !served_on_behind {
             crate::metrics::record_ehdb_projection_read(match verdict {
                 crate::handlers::ehdb_projection_fold::ReFoldVerdict::Match => "served_tier",
                 v => v.as_str(),
@@ -251,7 +251,9 @@ pub async fn load_latest(pool: &DbPool, execution_id: i64) -> AppResult<Option<L
     // populated incumbent, and this means neither store has a snapshot yet —
     // the normal state of every short execution.
     if source.needs_incumbent_first() && facts.is_none() {
-        crate::metrics::record_ehdb_projection_read(tier_read::DemoteReason::NoIncumbent.as_str());
+        crate::metrics::record_ehdb_projection_read(
+            tier_read::DemoteReason::NoIncumbent.as_str(),
+        );
         return Ok(incumbent.unwrap_or(None));
     }
 
@@ -323,7 +325,10 @@ async fn demote(
 }
 
 /// The incumbent read: `noetl.projection_snapshot`, exactly as before #265.
-async fn load_incumbent(pool: &DbPool, execution_id: i64) -> AppResult<Option<LoadedSnapshot>> {
+async fn load_incumbent(
+    pool: &DbPool,
+    execution_id: i64,
+) -> AppResult<Option<LoadedSnapshot>> {
     let row = sqlx::query(
         r#"
         SELECT version, snapshot, meta, updated_at, checksum
@@ -346,9 +351,9 @@ async fn load_incumbent(pool: &DbPool, execution_id: i64) -> AppResult<Option<Lo
     let updated_at: chrono::DateTime<chrono::Utc> = row
         .try_get("updated_at")
         .unwrap_or_else(|_| chrono::Utc::now());
-    let snapshot: serde_json::Value = row.try_get("snapshot").map_err(|e| {
-        AppError::Internal(format!("orch_snapshot.load_incumbent: snapshot col: {e}"))
-    })?;
+    let snapshot: serde_json::Value = row
+        .try_get("snapshot")
+        .map_err(|e| AppError::Internal(format!("orch_snapshot.load_incumbent: snapshot col: {e}")))?;
     let meta: serde_json::Value = row.try_get("meta").unwrap_or(serde_json::Value::Null);
     let checksum: Option<String> = row.try_get("checksum").ok();
     let applied_count = meta
@@ -384,6 +389,7 @@ async fn load_incumbent(pool: &DbPool, execution_id: i64) -> AppResult<Option<Lo
     }))
 }
 
+
 /// Diagnostic: run the recovery read BOTH ways and compare what control flow
 /// would receive (ai-meta#265 Phase 3, re-scoped).
 ///
@@ -403,7 +409,10 @@ async fn load_incumbent(pool: &DbPool, execution_id: i64) -> AppResult<Option<Lo
 /// The comparison is on the **canonical digest of the state control flow would
 /// actually use**, not on the stored records — which is the end-to-end form the
 /// 8/8 fold-equivalence result was only the input to.
-pub async fn recovery_read_comparison(pool: &DbPool, execution_id: i64) -> serde_json::Value {
+pub async fn recovery_read_comparison(
+    pool: &DbPool,
+    execution_id: i64,
+) -> serde_json::Value {
     use noetl_orchestrate_core::state::canonical_state_digest;
 
     // --- what recovery returns today (Postgres) -----------------------------
@@ -413,7 +422,8 @@ pub async fn recovery_read_comparison(pool: &DbPool, execution_id: i64) -> serde
     // --- what recovery would return from the durable EHDB projection --------
     let (body, verdict) =
         crate::handlers::ehdb_projection_fold::wal_projection_state(execution_id).await;
-    let wal_state: Option<WorkflowState> = body.and_then(|b| serde_json::from_value(b).ok());
+    let wal_state: Option<WorkflowState> =
+        body.and_then(|b| serde_json::from_value(b).ok());
     let wal_digest = wal_state.as_ref().map(canonical_state_digest);
 
     let agree = matches!((&pg_digest, &wal_digest), (Some(a), Some(b)) if a == b);
@@ -514,10 +524,7 @@ mod tests {
         let sources: &[(&str, &str)] = &[
             ("services/orch_snapshot.rs", self_code),
             ("handlers/events.rs", include_str!("../handlers/events.rs")),
-            (
-                "handlers/internal.rs",
-                include_str!("../handlers/internal.rs"),
-            ),
+            ("handlers/internal.rs", include_str!("../handlers/internal.rs")),
         ];
         let mut readers: Vec<&str> = Vec::new();
         for (name, src) in sources {
