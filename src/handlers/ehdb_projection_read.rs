@@ -107,11 +107,19 @@ pub enum ReadSource {
     /// from the projection tier materialised out of the **WAL spine**, verified
     /// against a fresh re-fold before it is allowed to drive anything.
     ///
-    /// Postgres is not consulted at all on this path — not as a source and not
-    /// as a fallback. Every non-`Match` verdict refuses, and refusing means
-    /// *this pass does not advance the execution*; the reconciler re-drives.
-    /// A fallback that silently read a different store on error would
-    /// re-establish the second source of truth this work exists to remove.
+    /// Postgres is never a *source* on this path and never a *fallback*: a
+    /// fallback that silently read a different store on error would re-establish
+    /// the second source of truth this work exists to remove. Every non-`Match`
+    /// verdict refuses, and refusing means *this pass does not advance the
+    /// execution*; the reconciler re-drives.
+    ///
+    /// ⚠ Postgres **is** read as the VERIFIER (ai-meta#332 AC14), and the
+    /// distinction is the whole point. Serving state the tier produced is the
+    /// thing being changed; checking that state against the authority it
+    /// mirrors is what makes serving it safe. This doc previously said Postgres
+    /// was "not consulted at all", which was true and was the defect: the
+    /// re-fold read the same tier it was checking, so a mirror missing events
+    /// agreed with itself and was served as `Match`.
     Wal,
 }
 

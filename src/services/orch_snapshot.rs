@@ -169,9 +169,11 @@ pub async fn load_latest(pool: &DbPool, execution_id: i64) -> AppResult<Option<L
     // ai-meta#265 Phase 3 — the WAL-sourced control-flow read.
     //
     // Resolve from the projection tier materialised out of the WAL spine, and
-    // serve ONLY when a fresh re-fold agrees. Postgres is not read here at all,
-    // in either direction: a fallback on the error path is exactly how a second
-    // source of truth gets re-established.
+    // serve ONLY when a fresh re-fold agrees. Postgres is never a SOURCE here
+    // and never a fallback on the error path — that is exactly how a second
+    // source of truth gets re-established. It is, since ai-meta#332 AC14, the
+    // VERIFIER: the re-fold this serve depends on folds `noetl.event`, because
+    // a re-fold of the tier cannot see the tier missing events.
     //
     // `Ok(None)` on refusal means the caller rebuilds without a snapshot, which
     // for an in-flight execution is bounded by the events-since window. The
@@ -179,7 +181,7 @@ pub async fn load_latest(pool: &DbPool, execution_id: i64) -> AppResult<Option<L
     // here; this function's contract is "the latest snapshot, or none".
     if source.is_wal() {
         let (body, verdict) =
-            crate::handlers::ehdb_projection_fold::wal_projection_state(execution_id).await;
+            crate::handlers::ehdb_projection_fold::wal_projection_state(pool, execution_id).await;
         // ⚠ `body.is_some()` on a NON-Match verdict means serve-on-behind granted
         // (ai-meta#332): the snapshot was verified at its own version and
         // `rebuild_state` will fold forward from it. `wal_projection_state`
@@ -421,7 +423,7 @@ pub async fn recovery_read_comparison(
 
     // --- what recovery would return from the durable EHDB projection --------
     let (body, verdict) =
-        crate::handlers::ehdb_projection_fold::wal_projection_state(execution_id).await;
+        crate::handlers::ehdb_projection_fold::wal_projection_state(pool, execution_id).await;
     let wal_state: Option<WorkflowState> =
         body.and_then(|b| serde_json::from_value(b).ok());
     let wal_digest = wal_state.as_ref().map(canonical_state_digest);
