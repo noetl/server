@@ -167,6 +167,20 @@ pub async fn fold_from_postgres(
     pool: &DbPool,
     execution_id: i64,
 ) -> Result<FoldedState, FoldRefusal> {
+    let events = events_from_postgres(pool, execution_id).await?;
+    fold(FoldSource::Postgres, events)
+}
+
+/// Read `noetl.event` for one execution, parsed, ordered by `event_id`.
+///
+/// Split out of [`fold_from_postgres`] so the AC14 verification leg can truncate
+/// at a watermark before folding, rather than issuing a differently-shaped query
+/// than the full fold uses. Same columns, same parse, same order — the two
+/// callers cannot drift apart into "the verifier read something else".
+pub async fn events_from_postgres(
+    pool: &DbPool,
+    execution_id: i64,
+) -> Result<Vec<crate::db::models::Event>, FoldRefusal> {
     let rows = sqlx::query(
         r#"
         SELECT event_id, execution_id, catalog_id,
@@ -186,8 +200,7 @@ pub async fn fold_from_postgres(
     if rows.is_empty() {
         return Err(FoldRefusal::NoEvents);
     }
-    let events = super::events::parse_event_rows_for_fold(rows);
-    fold(FoldSource::Postgres, events)
+    Ok(super::events::parse_event_rows_for_fold(rows))
 }
 
 /// Fold from Postgres with `context` **blanked** — the controlled experiment
@@ -1356,6 +1369,52 @@ pub fn serve_on_behind_enabled() -> bool {
         .map(|v| v == "true")
         .unwrap_or(false)
 }
+/// Does the bounded re-fold agree with what the snapshot claims?
+///
+/// The serve decision in one pure function, so it can be mutation-tested. It
+/// could not be before: it lived inline behind a `DbPool`, and a mutation
+/// replacing the whole comparison with `true` — issuing a grant with no
+/// verification whatsoever — survived the entire suite.
+///
+/// Agreement requires BOTH the version and the digest. Version alone is not
+/// evidence: `version` is `max(event_id)`, so a mirror missing MIDDLE events
+/// reports the same version as the authority (ai-meta#332 AC14).
+///
+/// ⚠ A refusal is not agreement. Two folds that both failed have compared
+/// nothing, and `Err(_) => false` is what keeps "we could not check" from
+/// reading as "we checked and it was fine".
+fn bounded_fold_agrees(
+    bounded: &Result<FoldedState, FoldRefusal>,
+    stored_version: i64,
+    stored_digest: &str,
+) -> bool {
+    match bounded {
+        Ok(b) => b.version == stored_version && b.digest == stored_digest,
+        Err(_) => false,
+    }
+}
+
+/// Fold `events` truncated to a watermark — the bounded verification, as a
+/// pure function.
+///
+/// Split out of [`grant_for_behind`] so the boundary is testable without a
+/// database. It was not, and a mutation flipping `<=` to `<` survived the whole
+/// suite: the event AT the stored version would be dropped, every bounded fold
+/// would land one version short, and serve-on-behind would refuse 100% of the
+/// time while looking correct.
+///
+/// ⚠ Inclusive on purpose. `stored_version` is the `event_id` the snapshot
+/// claims to have folded, so verifying it means folding *through* that event.
+fn bounded_fold_at(
+    events: Vec<crate::db::models::Event>,
+    stored_version: i64,
+) -> Result<FoldedState, FoldRefusal> {
+    let truncated: Vec<_> = events
+        .into_iter()
+        .filter(|e| e.event_id <= stored_version)
+        .collect();
+    fold(FoldSource::Postgres, truncated)
+}
 
 /// Verify a BEHIND snapshot **at its own version** and decide whether to serve it.
 ///
@@ -1368,6 +1427,7 @@ pub fn serve_on_behind_enabled() -> bool {
 /// the forward fold. Without this bounded re-fold, serving a behind snapshot
 /// would be serving an unverified one.
 async fn grant_for_behind(
+    pool: &DbPool,
     execution_id: i64,
     stored_version: i64,
     stored_digest: &str,
@@ -1377,65 +1437,68 @@ async fn grant_for_behind(
     crate::handlers::ehdb_projection_serve::RefuseReason,
 > {
     use crate::handlers::ehdb_projection_serve::{RefuseReason, ServeGrant};
-    // ⚠ Through the LADDER (`events_for_recovery`), never `fold_spine_inner`
-    // directly. The spine index holds only IN-FLIGHT executions and evicts on
-    // completion, so a direct read would refuse for exactly the completed
-    // executions this verification needs to cover -- coverage ~0 by
-    // construction, which is the whole of ai-meta#307. An existing guard
-    // (`recovery_reaches_the_spine_only_through_the_ladder`) caught this design
-    // on its first draft.
+    // ai-meta#332 AC14 -- the verification leg reads **Postgres**, never the
+    // store being verified.
     //
-    // The bound is applied to the ladder's events rather than pushed into the
-    // source, so the fallback to the tier is preserved.
-    let bounded = events_for_recovery(execution_id)
+    // It used to fold the recovery ladder here. On prod that ladder resolves to
+    // the tier on 100% of calls (`recovery_fold{source=spine}` = 25,390
+    // `spine_incomplete`, 0 folded), so the "verification" compared a
+    // tier-derived fold against a tier-derived record: the same events on both
+    // sides of the equals sign. A tier missing events agrees with itself and is
+    // granted a serve.
+    //
+    // Postgres is the authority the tier mirrors, so folding it is the only
+    // comparison that can see a gap in the mirror. It costs a query the caller
+    // is already making -- `rebuild_state` re-reads this execution's whole event
+    // set from Postgres immediately after (the WAL path hands it `version: 0`),
+    // so this is not a new dependency on the hot path, only an honest one.
+    let bounded = events_from_postgres(pool, execution_id)
         .await
-        .and_then(|(source, events)| {
-            let truncated: Vec<_> = events
-                .into_iter()
-                .filter(|e| e.event_id <= stored_version)
-                .collect();
-            fold(source, truncated)
-        });
-    // A bounded fold that refuses, or that lands on a different watermark than
-    // the snapshot claims, is not a verification -- treat it as a mismatch
-    // rather than assuming agreement.
-    let agree = match &bounded {
-        Ok(b) => b.version == stored_version && b.digest == stored_digest,
-        Err(_) => false,
-    };
+        .and_then(|events| bounded_fold_at(events, stored_version));
+    let agree = bounded_fold_agrees(&bounded, stored_version, stored_digest);
     if !agree && bounded.is_err() {
         return Err(RefuseReason::SpineRefused);
     }
     ServeGrant::evaluate(agree, Some(stored_version), spine_version)
 }
 
-pub async fn wal_projection_state(execution_id: i64) -> (Option<serde_json::Value>, ReFoldVerdict) {
+pub async fn wal_projection_state(
+    pool: &DbPool,
+    execution_id: i64,
+) -> (Option<serde_json::Value>, ReFoldVerdict) {
     // Materialise first so an in-flight execution has a record to verify. A
     // failure here is not fatal: the read below simply finds nothing and the
     // verdict says so.
     let _ = materialize_from_wal(execution_id).await;
 
-    // The independent re-fold. Goes through the SAME ladder as the materialise
-    // above: a refold pinned to the spine while the record was materialised
-    // from the tier would refuse on every execution the tier answered for —
-    // reporting the fix itself as a divergence.
+    // The independent re-fold — ai-meta#332 AC14.
     //
-    // Still a genuine re-fold, not a reuse: it re-reads and re-computes rather
-    // than comparing the materialised digest with itself. That distinction is
-    // the whole difference from ai-meta#265 A3, where the digest compared was
-    // the same value moved.
-    let spine = events_for_recovery(execution_id)
-        .await
-        .and_then(|(source, events)| fold(source, events));
+    // Folds **Postgres**, the authority the tier mirrors. It previously folded
+    // the recovery ladder, which on prod resolves to the tier on 100% of calls
+    // (`recovery_fold{source="spine"}` = 25,390 `spine_incomplete`, 0 folded).
+    // That made this a store checking itself: both sides of the comparison were
+    // built from the same tier events, so a tier missing events produced equal
+    // versions AND equal digests — `Match` — and was served as correct.
+    //
+    // ⚠ `version` is `max(event_id)`, so a mirror missing MIDDLE events carries
+    // the SAME version as the authority. Only the digest separates them, and a
+    // digest is only evidence when the two sides were built from different
+    // reads. Execution 356712944081313792 is the worked example: 30 events in
+    // Postgres, 26 in the tier, identical version.
+    //
+    // This is not a new Postgres dependency on the serve path. `rebuild_state`
+    // re-reads this execution's entire event set from Postgres immediately
+    // after, because the snapshot returned here carries `version: 0`.
+    let truth = fold_from_postgres(pool, execution_id).await;
     let stored = stored_projection_full(execution_id).await;
     let pair = stored
         .as_ref()
         .ok()
         .and_then(|o| o.as_ref())
         .map(|(v, d, _)| (*v, d.as_str()));
-    let verdict = verdict_for(pair, &spine);
+    let verdict = verdict_for(pair, &truth);
     crate::metrics::record_ehdb_projection_refold(verdict.as_str());
-    if let Err(r) = &spine {
+    if let Err(r) = &truth {
         crate::metrics::record_ehdb_projection_refold_refusal(r.reason());
     }
     if verdict != ReFoldVerdict::Match {
@@ -1449,9 +1512,9 @@ pub async fn wal_projection_state(execution_id: i64) -> (Option<serde_json::Valu
         // value this branch could return for an ahead snapshot.
         if verdict == ReFoldVerdict::StoredBehindSpine && serve_on_behind_enabled() {
             if let (Some((sv, sd, body)), Ok(sp)) =
-                (stored.as_ref().ok().and_then(|o| o.as_ref()), &spine)
+                (stored.as_ref().ok().and_then(|o| o.as_ref()), &truth)
             {
-                match grant_for_behind(execution_id, *sv, sd.as_str(), sp.version).await {
+                match grant_for_behind(pool, execution_id, *sv, sd.as_str(), sp.version).await {
                     Ok(grant) => {
                         crate::metrics::record_ehdb_projection_read(grant.outcome_label());
                         return (body.clone(), verdict);
@@ -2043,13 +2106,311 @@ mod tests {
         }
     }
 
-    /// The bounded verification must go through the ladder, not the raw spine.
+    /// ai-meta#332 AC14 — a tier missing MIDDLE events must be refused, not
+    /// served as correct.
     ///
-    /// The neighbouring guard counts `fold_spine_inner(` globally; this one pins
-    /// the specific property for the serve path, so a future edit that reached
-    /// past the ladder here fails with a message about THIS branch.
+    /// Modelled on prod execution `356712944081313792` (`test/simple_loop`,
+    /// COMPLETED): 30 events in `noetl.event`, 26 in the tier, and — because
+    /// `version` is `max(event_id)` and the missing events are in the middle —
+    /// **the same version on both sides**. Version comparison cannot see this
+    /// gap; only a digest computed from an independent read can.
+    ///
+    /// The control at the bottom is the point of the test: it reproduces what
+    /// the shipped code did, and shows it returning `Match`.
     #[test]
-    fn the_bounded_verification_uses_the_ladder() {
+    fn a_tier_missing_middle_events_is_refused_not_served() {
+        let ev = |id: i64, node: &str| {
+            event_from_tier_payload(&serde_json::json!({
+                "event_id": id, "execution_id": 356712944081313792i64, "catalog_id": 7,
+                "event_type": "step.enter", "node_name": node, "status": "ok",
+                // ⚠ Pin `created_at`. `event_from_tier_payload` substitutes
+                // `Utc::now()` when it is absent, so an unpinned fixture folds
+                // to a DIFFERENT digest on every call and the control below
+                // would "fail" for a reason that has nothing to do with the gap.
+                "created_at": format!("2026-09-11T08:0{}:00Z", id % 10)
+            }))
+            .expect("fixture parses")
+        };
+
+        // Postgres — the authority: 30 events.
+        let pg_events: Vec<_> = (1..=30).map(|i| ev(i, &format!("s{i}"))).collect();
+        // The tier — the same execution with 4 MIDDLE events never mirrored.
+        let missing = [12i64, 13, 14, 15];
+        let tier_events: Vec<_> = pg_events
+            .iter()
+            .filter(|e| !missing.contains(&e.event_id))
+            .cloned()
+            .collect();
+        assert_eq!(pg_events.len(), 30);
+        assert_eq!(tier_events.len(), 26, "the 356712944081313792 shape");
+
+        let pg = fold(FoldSource::Postgres, pg_events).expect("postgres folds");
+        let tier = fold(FoldSource::EhdbTier, tier_events).expect("tier folds");
+
+        // ⚠ The property that makes this gap invisible to a version check.
+        assert_eq!(
+            tier.version, pg.version,
+            "missing MIDDLE events leave max(event_id) unchanged — the tier \
+             carries the same version as the authority"
+        );
+        assert_ne!(
+            tier.applied_count, pg.applied_count,
+            "the counts differ even though the versions do not"
+        );
+        assert_ne!(
+            tier.digest, pg.digest,
+            "the digests must differ, or this fixture does not model a real gap"
+        );
+
+        // THE FIX: verified against Postgres, the gap is a fault and is refused.
+        let verdict = verdict_for(Some((tier.version, tier.digest.as_str())), &Ok(pg));
+        assert_eq!(
+            verdict,
+            ReFoldVerdict::DigestMismatch,
+            "a tier missing events must not be served as if correct"
+        );
+        assert!(
+            verdict.is_fault(),
+            "and it must page — this is a mirror losing events, not lag"
+        );
+
+        // CONTROL — what the shipped code compared: the tier against itself.
+        // On prod the recovery ladder resolves to the tier on 100% of calls, so
+        // this was not a corner case, it was the whole path.
+        let tier_again = fold(
+            FoldSource::EhdbTier,
+            (1..=30)
+                .filter(|i| !missing.contains(i))
+                .map(|i| ev(i, &format!("s{i}")))
+                .collect(),
+        )
+        .expect("tier folds");
+        assert_eq!(
+            verdict_for(Some((tier.version, tier.digest.as_str())), &Ok(tier_again)),
+            ReFoldVerdict::Match,
+            "the pre-fix comparison called this gap a MATCH — this control is \
+             why the verification leg had to stop reading the tier"
+        );
+    }
+
+    /// The serve decision agrees ONLY on a full match, and never on a refusal.
+    ///
+    /// Four-sided, because a one-sided assertion is satisfied by a function
+    /// that always refuses (safe, and it would make serve-on-behind dead) and a
+    /// function that always agrees (the mutation that survived until this test
+    /// existed: `let agree = true`, a grant issued with no verification).
+    #[test]
+    fn a_grant_requires_version_and_digest_and_never_a_refusal() {
+        let ok = |v: i64, d: &str| {
+            Ok(FoldedState {
+                source: FoldSource::Postgres,
+                version: v,
+                applied_count: 30,
+                digest: d.to_string(),
+            })
+        };
+
+        // 1. The healthy case must actually be reachable.
+        assert!(
+            bounded_fold_agrees(&ok(100, "aaa"), 100, "aaa"),
+            "a bounded fold that matches on both fields must agree, or \
+             serve-on-behind can never grant and the flag is inert"
+        );
+
+        // 2. The 356712944081313792 shape: SAME version, different content.
+        assert!(
+            !bounded_fold_agrees(&ok(100, "aaa"), 100, "bbb"),
+            "same version with a different digest is the missing-middle-events \
+             gap — it must NOT be granted a serve"
+        );
+
+        // 3. Version alone is not enough in the other direction either.
+        assert!(!bounded_fold_agrees(&ok(99, "aaa"), 100, "aaa"));
+
+        // 4. A refusal is not agreement.
+        for r in [
+            FoldRefusal::NoEvents,
+            FoldRefusal::SpineIncomplete,
+            FoldRefusal::FoldFailed,
+            FoldRefusal::SourceUnavailable("db down".into()),
+        ] {
+            assert!(
+                !bounded_fold_agrees(&Err(r), 100, "aaa"),
+                "\"could not check\" must never read as \"checked and fine\""
+            );
+        }
+    }
+
+    /// `fold` is order-SENSITIVE, so every reader of it must order explicitly.
+    ///
+    /// `fold` does not sort, and `WorkflowState::from_events` applies events in
+    /// the order given. So the `ORDER BY` in [`events_from_postgres`] is not
+    /// cosmetic — it is the thing that makes the fold correct.
+    ///
+    /// A mutation flipping that `ORDER BY` to `DESC` survived the whole suite,
+    /// because the query needs a database and nothing asserted the ordering.
+    /// This pairs a real order-sensitivity demonstration (the positive control,
+    /// so the guard below is not decorative) with a source-text guard on the
+    /// query itself.
+    #[test]
+    fn the_postgres_read_orders_events_and_the_fold_depends_on_it() {
+        // ⚠ The fixture must model a STATE TRANSITION on one node. A first
+        // draft used `step.enter` on twelve distinct nodes and the two orders
+        // digested identically — distinct keys build the same map either way,
+        // and the canonical digest sorts keys. Order is only observable where a
+        // later event changes what an earlier one set.
+        let ev = |id: i64, kind: &str| {
+            event_from_tier_payload(&serde_json::json!({
+                "event_id": id, "execution_id": 9, "catalog_id": 7,
+                "event_type": kind, "node_name": "s",
+                "status": "ok", "created_at": "2026-09-11T08:00:00Z",
+                "meta": {"command_id": "c0"}
+            }))
+            .expect("fixture parses")
+        };
+        let ascending: Vec<_> = vec![
+            ev(1, "step.enter"),
+            ev(2, "command.issued"),
+            ev(3, "command.completed"),
+        ];
+        let descending: Vec<_> = ascending.iter().rev().cloned().collect();
+
+        let a = fold(FoldSource::Postgres, ascending).expect("folds");
+        let d = fold(FoldSource::Postgres, descending).expect("folds");
+
+        // Same events, same version, same count — and a different state.
+        assert_eq!(a.version, d.version, "max(event_id) is order-independent");
+        assert_eq!(a.applied_count, d.applied_count);
+        assert_ne!(
+            a.digest, d.digest,
+            "if this ever becomes equal, the fold has become order-independent              and the guard below is free to relax — until then it must not"
+        );
+
+        // The guard the demonstration justifies.
+        let src = include_str!("ehdb_projection_fold.rs");
+        let code = src
+            .split_once("\n#[cfg(test)]")
+            .map(|(above, _)| above)
+            .unwrap_or(src);
+        let start = code
+            .find("pub async fn events_from_postgres")
+            .expect("events_from_postgres not found — extraction broke");
+        let body = &code[start..];
+        let end = body.find("\n}\n").map(|i| i + 3).unwrap_or(body.len());
+        let body = &body[..end];
+        assert!(body.len() > 300, "slice too small: {}", body.len());
+        assert!(
+            body.contains("ORDER BY event_id ASC"),
+            "the verification leg's query does not order ascending — the fold \
+             would apply this execution's events in the wrong sequence"
+        );
+    }
+
+    /// The bounded fold is INCLUSIVE of the stored version.
+    ///
+    /// Written because a mutation flipping `<=` to `<` survived the entire
+    /// suite. Nothing exercised the boundary, because the truncation lived
+    /// inside a function that needed a `DbPool`; extracting `bounded_fold_at`
+    /// is what made the property assertable.
+    ///
+    /// Two-sided: it pins what the fold MUST include and what it must EXCLUDE,
+    /// so neither an off-by-one nor a filter that stopped filtering passes.
+    #[test]
+    fn the_bounded_fold_includes_the_stored_version_and_nothing_after() {
+        let ev = |id: i64| {
+            event_from_tier_payload(&serde_json::json!({
+                "event_id": id, "execution_id": 9, "catalog_id": 7,
+                "event_type": "step.enter", "node_name": format!("s{id}"),
+                "status": "ok", "created_at": "2026-09-11T08:00:00Z"
+            }))
+            .expect("fixture parses")
+        };
+        let events: Vec<_> = (1..=30).map(ev).collect();
+
+        let at20 = bounded_fold_at(events.clone(), 20).expect("folds");
+        assert_eq!(
+            at20.version, 20,
+            "the event AT the watermark must be folded — `<` instead of `<=`              lands on 19 and every serve-on-behind grant refuses"
+        );
+        assert_eq!(at20.applied_count, 20, "exactly events 1..=20");
+
+        // The whole set is not truncated away, and events after the watermark
+        // are genuinely excluded.
+        let at30 = bounded_fold_at(events.clone(), 30).expect("folds");
+        assert_eq!(at30.version, 30);
+        assert_ne!(
+            at20.digest, at30.digest,
+            "the truncation must actually change the folded state, or this              test would pass against a filter that does nothing"
+        );
+
+        // A watermark below every event folds nothing rather than inventing a
+        // state at step 0.
+        assert!(matches!(
+            bounded_fold_at(events, 0),
+            Err(FoldRefusal::NoEvents) | Err(FoldRefusal::FoldFailed)
+        ));
+    }
+
+    /// The READ PATH's verification leg must also be independent of the tier.
+    ///
+    /// Sibling of `the_bounded_verification_is_independent_of_the_tier`, which
+    /// pins the same property for the serve-on-behind branch. This one pins it
+    /// for `wal_projection_state` itself — the leg that decides `Match`, and so
+    /// the one that was serving 2,212 prod reads off a tier-vs-tier comparison
+    /// with the serve-on-behind flag still OFF.
+    ///
+    /// Two guards rather than one because they fail for different reasons and a
+    /// reader fixing one should not have to infer the other.
+    #[test]
+    fn the_read_path_verifies_against_postgres_not_the_tier() {
+        let src = include_str!("ehdb_projection_fold.rs");
+        let code = src
+            .split_once("\n#[cfg(test)]")
+            .map(|(above, _)| above)
+            .unwrap_or(src);
+        let start = code
+            .find("pub async fn wal_projection_state")
+            .expect("wal_projection_state not found — extraction broke");
+        let body = &code[start..];
+        let end = body.find("\n}\n").map(|i| i + 3).unwrap_or(body.len());
+        let body = &body[..end];
+        // ⚠ Assert the extraction before asserting about it: a slice that
+        // silently came back empty would pass every negative check below.
+        assert!(
+            body.len() > 400,
+            "wal_projection_state slice too small: {}",
+            body.len()
+        );
+        assert!(
+            body.contains("fold_from_postgres("),
+            "the read path's re-fold does not read Postgres — the verdict would \
+             be the tier confirming itself"
+        );
+        assert!(
+            !body.contains("events_for_recovery("),
+            "the read path's re-fold went back through the recovery ladder, \
+             which falls back to the TIER it is verifying"
+        );
+    }
+
+    /// The bounded verification must read **Postgres**, not the store it is
+    /// verifying.
+    ///
+    /// ⚠ This guard INVERTED on 2026-09-11 (ai-meta#332 AC14). It used to
+    /// require `events_for_recovery(` — the recovery ladder — on the reasoning
+    /// that the ladder's tier fallback gives completed executions coverage the
+    /// in-flight-only spine index cannot (ai-meta#307). That reasoning was
+    /// right about coverage and wrong about what was being measured: prod shows
+    /// `recovery_fold{source="spine"}` = 25,390 `spine_incomplete` against **0**
+    /// folded, so the ladder resolves to the tier on 100% of calls. The
+    /// "verification" was therefore folding tier events to check a tier record —
+    /// a store confirming itself, which a mirror missing events passes.
+    ///
+    /// The property this guard protects is unchanged: the serve decision must
+    /// rest on evidence independent of the thing being served. Only the source
+    /// that satisfies it changed.
+    #[test]
+    fn the_bounded_verification_is_independent_of_the_tier() {
         let src = include_str!("ehdb_projection_fold.rs");
         let code = src
             .split_once("\n#[cfg(test)]")
@@ -2067,8 +2428,16 @@ mod tests {
             body.len()
         );
         assert!(
-            body.contains("events_for_recovery("),
-            "the bounded verification does not use the ladder"
+            body.contains("events_from_postgres("),
+            "the bounded verification does not read Postgres — it cannot be \
+             independent of the tier it is verifying"
+        );
+        assert!(
+            !body.contains("events_for_recovery("),
+            "the bounded verification went back through the recovery ladder, \
+             which falls back to the TIER — the store being verified. On prod \
+             the spine refuses 100% of the time, so this is tier-vs-tier: a \
+             mirror missing events agrees with itself and is served"
         );
         assert!(
             !body.contains("fold_spine_inner("),
