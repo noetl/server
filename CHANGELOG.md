@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.108.1](https://github.com/noetl/server/compare/v3.108.0...v3.108.1) (2026-09-11)
+
+### Bug Fixes
+
+* **ehdb:** verify the D3 projection against Postgres, not against itself ([b2f6410](https://github.com/noetl/server/commit/b2f6410c94a8ade01234d1c8acc36ce71f20f353)), closes [noetl/ai-meta#332](https://github.com/noetl/ai-meta/issues/332)
+* **ehdb:** verify the D3 projection against Postgres, not against itself ([#424](https://github.com/noetl/server/issues/424)) ([f82f69f](https://github.com/noetl/server/commit/f82f69f7c8c5a54fd2f7935917dbecb254b00fd2)), closes [noetl/ai-meta#332](https://github.com/noetl/ai-meta/issues/332)
+
 ## [3.108.0](https://github.com/noetl/server/compare/v3.107.1...v3.108.0) (2026-09-10)
 
 ### Features
