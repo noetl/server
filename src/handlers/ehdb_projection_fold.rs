@@ -265,27 +265,24 @@ pub async fn events_from_postgres(
 /// anyone "fixes" the mirror by adding one field.
 pub async fn fold_from_postgres_without_context(
     pool: &DbPool,
+    result_store: &crate::services::result_store::ResultStoreService,
     execution_id: i64,
 ) -> Result<FoldedState, FoldRefusal> {
-    let rows = sqlx::query(
-        r#"
-        SELECT event_id, execution_id, catalog_id,
-               parent_event_id, parent_execution_id,
-               event_type, node_id, node_name, node_type, status,
-               context, meta, result, worker_id,
-               NULLIF(meta->>'attempt', '')::int AS attempt,
-               created_at
-        FROM noetl.event WHERE execution_id = $1 ORDER BY event_id ASC
-        "#,
-    )
-    .bind(execution_id)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| FoldRefusal::SourceUnavailable(e.to_string()))?;
-    if rows.is_empty() {
-        return Err(FoldRefusal::NoEvents);
-    }
-    let mut events = super::events::parse_event_rows_for_fold(rows);
+    // ⚠ HYDRATED before blanking (noetl/ai-meta#343).
+    //
+    // This is the controlled experiment behind `context_explains_the_gap`: blank
+    // `context` on the Postgres side, and if the digest then matches the tier,
+    // `context` was the whole difference. Reading the RAW row broke the
+    // experiment in one direction only — it blanks `context` but leaves
+    // `result` carrying a `reference` where the tier carries inlined content,
+    // so the two digests still differ for a reason the experiment is not
+    // testing. `context_explains_the_gap` was therefore biased to `false`: it
+    // could report "context does not explain it" on an execution where context
+    // was the entire remaining gap.
+    //
+    // A control that can only fail is not a control. Hydrate first, blank
+    // second, so the ONE deliberate difference is the one under test.
+    let mut events = events_from_postgres_hydrated(pool, result_store, execution_id).await?;
     for e in &mut events {
         e.context = None;
     }
@@ -911,7 +908,7 @@ pub async fn compare_sources(
         )),
         _ => None,
     };
-    let no_ctx = fold_from_postgres_without_context(pool, execution_id)
+    let no_ctx = fold_from_postgres_without_context(pool, result_store, execution_id)
         .await
         .ok();
     let context_explains_the_gap = match (&no_ctx, &tier_ok) {
@@ -1767,25 +1764,43 @@ pub async fn fold_diff_endpoint(
         _ => "wal",
     };
     let pool = state.pools.pool_for(execution_id);
+    let result_store = crate::services::result_store::ResultStoreService::new(
+        pool.clone(),
+        state.snowflake.clone(),
+    );
 
     // --- incumbent side -----------------------------------------------------
-    let rows = sqlx::query(
-        r#"
-        SELECT event_id, execution_id, catalog_id,
-               parent_event_id, parent_execution_id,
-               event_type, node_id, node_name, node_type, status,
-               context, meta, result, worker_id,
-               NULLIF(meta->>'attempt', '')::int AS attempt,
-               created_at
-        FROM noetl.event WHERE execution_id = $1 ORDER BY event_id ASC
-        "#,
-    )
-    .bind(execution_id)
-    .fetch_all(pool)
-    .await
-    .unwrap_or_default();
-    let pg_events = super::events::parse_event_rows_for_fold(rows);
-    let pg = fold_with_body(FoldSource::Postgres, pg_events.clone());
+    // ⚠ HYDRATED (noetl/ai-meta#343). This is the THIRD site to need this fix,
+    // after noetl/server#425 (`fold_from_postgres`) and noetl/server#426
+    // (`compare_sources`), and it is the one that mattered most: this differ is
+    // what anybody reaches for to explain *why* two sources disagree.
+    //
+    // It ran its own copy of the `events_from_postgres` query and never
+    // hydrated, so under `NOETL_PERMANENT_LOG_LEAN=true` every execution with
+    // an externalised result reported `result` as differing — a `reference`
+    // digested against the tier's inlined content. The differ therefore
+    // reported the measurement artefact on top of the real difference, and the
+    // real one could not be read out from under it.
+    //
+    // Reading through `events_from_postgres_hydrated` also deletes the copy:
+    // the query has ONE definition again, so a fourth site cannot silently
+    // drift from it. That is the actual defect class here — three identical
+    // SELECTs, each fixed separately.
+    let pg_read = events_from_postgres_hydrated(pool, &result_store, execution_id).await;
+    // The endpoint answered with a body even when the Postgres read failed, and
+    // that is worth keeping — a differ that 500s when one side is unreadable
+    // says less than one that names the side. But the failure must land in the
+    // refusal channel rather than being flattened into "zero events", which is
+    // what `.unwrap_or_default()` did: an unreadable execution and a genuinely
+    // empty one produced the same body.
+    let pg_events: Vec<crate::db::models::Event> = match &pg_read {
+        Ok(evs) => evs.clone(),
+        Err(_) => Vec::new(),
+    };
+    let pg = match pg_read {
+        Ok(evs) => fold_with_body(FoldSource::Postgres, evs),
+        Err(r) => Err(r),
+    };
 
     // --- comparand side -----------------------------------------------------
     let comparand_events: Result<Vec<crate::db::models::Event>, FoldRefusal> =
@@ -3066,6 +3081,316 @@ mod tests {
             !c.digests_agree,
             "absence of disagreement is not agreement — this is the vacuous \
              pass the whole comparator discipline exists to refuse"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // noetl/ai-meta#343 — the unhydrated-comparator CLASS, not one instance.
+    // ---------------------------------------------------------------------
+
+    /// The file's production source, with **every** `#[cfg(test)] mod …` block
+    /// removed.
+    ///
+    /// ⚠⚠ The idiom the rest of this file uses — `split_once("\n#[cfg(test)]")`
+    /// — is wrong *here* and has been since `equivalence_endpoint` landed. This
+    /// module has TWO test modules (`tests` and `differing_fields_tests`) with
+    /// ~150 lines of production code BETWEEN them, so cutting at the first one
+    /// silently drops `recently_completed`, `equivalence_holds`,
+    /// `equivalence_endpoint` and `recovery_compare_endpoint` out of the
+    /// population every structural guard measures.
+    ///
+    /// A guard whose denominator excludes part of the population cannot fail
+    /// for anything in the excluded part — it reads as a pass because it never
+    /// looked. This removes each test module by its own closing brace instead,
+    /// so the denominator is the whole file, and
+    /// [`the_production_slice_sees_past_the_first_test_module`] pins that.
+    fn production_src() -> String {
+        let src = include_str!("ehdb_projection_fold.rs");
+        let mut out = String::new();
+        let mut rest: &str = src;
+        while let Some(i) = rest.find("\n#[cfg(test)]\nmod ") {
+            out.push_str(&rest[..i + 1]);
+            let after = &rest[i + 1..];
+            // A top-level `mod` closes with `}` in column 0; every brace inside
+            // it is indented, so this finds the module's own terminator.
+            match after.find("\n}\n") {
+                Some(j) => rest = &after[j + 3..],
+                None => {
+                    rest = "";
+                    break;
+                }
+            }
+        }
+        out.push_str(rest);
+        out
+    }
+
+    /// The slicer's own positive control.
+    ///
+    /// If `production_src` silently degraded to the old "cut at the first
+    /// `#[cfg(test)]`" behaviour, every guard below would still pass — they
+    /// would simply be measuring a smaller file. So assert directly that it
+    /// keeps production code declared *after* the first test module, and that
+    /// it drops test code. Without this the denominator guard is decorative.
+    #[test]
+    fn the_production_slice_sees_past_the_first_test_module() {
+        let prod = production_src();
+        assert!(
+            prod.contains("pub async fn recovery_compare_endpoint"),
+            "production_src lost code declared after the first test module — \
+             this is the exact blind spot it exists to close"
+        );
+        assert!(
+            prod.contains("pub async fn fold_diff_endpoint"),
+            "production_src lost code declared before the first test module"
+        );
+        assert!(
+            !prod.contains("fn the_production_slice_sees_past_the_first_test_module"),
+            "production_src kept test code — the slice is not removing modules"
+        );
+        // Negative control on the OLD idiom: prove it really was blind, so this
+        // guard is anchored to a demonstrated defect rather than a claim.
+        let src = include_str!("ehdb_projection_fold.rs");
+        let old = src
+            .split_once("\n#[cfg(test)]")
+            .map(|(above, _)| above)
+            .unwrap_or(src);
+        assert!(
+            !old.contains("pub async fn recovery_compare_endpoint"),
+            "the old idiom is no longer blind — if the file was restructured so \
+             all production code precedes the tests, simplify this helper; \
+             until then it must stay"
+        );
+    }
+
+    /// Drop `//` comment lines.
+    ///
+    /// ⚠ Every "this code must NOT contain X" assertion has to read CODE. The
+    /// first run of [`the_field_level_differ_hydrates`] failed against its own
+    /// explanatory comment — the comment saying `.unwrap_or_default()` had been
+    /// removed *was* the match. This codebase has hit the same shape before,
+    /// where `mirror_rows(` matched the module's own doc comment and the guard
+    /// passed for the wrong reason. A negative assertion over prose is not a
+    /// negative assertion.
+    fn code_only(body: &str) -> String {
+        body.lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The full-column read of `noetl.event` that every fold is built on.
+    const FULL_EVENT_SELECT: &str =
+        "FROM noetl.event WHERE execution_id = $1 ORDER BY event_id ASC";
+
+    /// **The denominator guard.** Every full-column event read in this file is
+    /// either hydrated or explicitly allowlisted with a reason.
+    ///
+    /// noetl/ai-meta#343's actual defect was not one unhydrated comparator — it
+    /// was FOUR copies of one SELECT, fixed one at a time as each was
+    /// discovered: `fold_from_postgres` (noetl/server#425), `compare_sources`
+    /// (noetl/server#426), then `fold_diff_endpoint` and
+    /// `fold_from_postgres_without_context` here. Each fix left the others
+    /// lying, and each time the instrument that would have shown the problem
+    /// was itself one of the copies.
+    ///
+    /// So this guard pins the POPULATION, not the instances: a fifth copy fails
+    /// the test on arrival and has to justify itself in the allowlist. It
+    /// prints the count it measured, because a scan that does not publish its
+    /// denominator is the failure mode one layer up.
+    #[test]
+    fn every_full_event_read_is_hydrated_or_allowlisted() {
+        let prod = production_src();
+        let found = prod.matches(FULL_EVENT_SELECT).count();
+
+        // The allowlist. One entry, with its reason stated here rather than in
+        // a comment somewhere else where it could rot away from the check.
+        //
+        // `determinism_endpoint` folds Postgres against ITSELF — two reads of
+        // the same rows, to separate "the fold is non-deterministic" from "two
+        // reads differ". Hydration is not merely unnecessary there, it would be
+        // actively wrong: it introduces a second store into a test whose whole
+        // point is that only one is involved.
+        let allowlisted = 1;
+        let canonical = 1; // `events_from_postgres`, which the hydrated reader wraps.
+
+        assert_eq!(
+            found,
+            canonical + allowlisted,
+            "expected {} full-column `noetl.event` reads ({} canonical + {} \
+             allowlisted), found {}. A NEW copy of this query is the \
+             noetl/ai-meta#343 defect recurring: if it compares against the \
+             tier it must read through `events_from_postgres_hydrated`, and if \
+             it genuinely must be raw, add it to the allowlist above WITH the \
+             reason.",
+            canonical + allowlisted,
+            canonical,
+            allowlisted,
+            found
+        );
+
+        // …and the allowlisted one is the one we think it is. Without this the
+        // count could be satisfied by any two readers at all.
+        let det = prod
+            .find("pub async fn determinism_endpoint")
+            .expect("determinism_endpoint not found — extraction broke");
+        let det_body = &prod[det..];
+        let det_end = det_body
+            .find("\n}\n")
+            .map(|i| i + 3)
+            .unwrap_or(det_body.len());
+        assert!(
+            det_body[..det_end].contains(FULL_EVENT_SELECT),
+            "the allowlisted raw reader is no longer inside determinism_endpoint"
+        );
+    }
+
+    /// The field-level differ — the endpoint an operator opens to find out
+    /// *why* two sources disagree — must hydrate.
+    ///
+    /// This is the noetl/ai-meta#343 headline. It ran its own raw SELECT, so
+    /// against `?source=tier` it named `result` as differing on every execution
+    /// with an externalised result, burying the real difference under a
+    /// `reference`-vs-inlined artefact. The prior session read those
+    /// `diff_paths` and could not explain why `compare_sources` still called
+    /// the execution divergent at equal event counts — because the two
+    /// instruments were reading different things.
+    #[test]
+    fn the_field_level_differ_hydrates() {
+        let prod = production_src();
+        let start = prod
+            .find("pub async fn fold_diff_endpoint")
+            .expect("fold_diff_endpoint not found — extraction broke");
+        let body = &prod[start..];
+        let end = body.find("\n}\n").map(|i| i + 3).unwrap_or(body.len());
+        let body = &body[..end];
+        assert!(
+            body.len() > 3000,
+            "fold_diff_endpoint extracted as {} bytes — implausibly small, the \
+             slice broke and every assertion below would be vacuous",
+            body.len()
+        );
+        assert!(
+            body.contains("events_from_postgres_hydrated("),
+            "the field-level differ does not hydrate. It compares against the \
+             tier, which holds inlined content, so a raw read reports `result` \
+             as differing on every execution with an externalised result and \
+             the real difference cannot be seen underneath it."
+        );
+        let code = code_only(body);
+        assert!(
+            !code.contains("sqlx::query("),
+            "the field-level differ runs its own SQL again. The defect class is \
+             COPIES of this query drifting apart — read through \
+             `events_from_postgres_hydrated` so there is one definition."
+        );
+        assert!(
+            !code.contains("unwrap_or_default()"),
+            "an unreadable Postgres side must land in the refusal channel, not \
+             be flattened into zero events — otherwise `not_comparable` and \
+             `genuinely empty` produce the same body"
+        );
+    }
+
+    /// The `context_explains_the_gap` control must hydrate BEFORE it blanks.
+    ///
+    /// It is a controlled experiment: blank `context` and nothing else, and if
+    /// the digest then matches the tier, `context` was the whole difference.
+    /// Reading the raw row broke it in one direction — `result` still carried a
+    /// `reference` against the tier's inlined content — so the experiment could
+    /// report "context does not explain it" on an execution where context
+    /// explained all of it. **A control that can only fail is not a control.**
+    #[test]
+    fn the_without_context_control_hydrates_before_blanking() {
+        let prod = production_src();
+        let start = prod
+            .find("pub async fn fold_from_postgres_without_context")
+            .expect("fold_from_postgres_without_context not found — extraction broke");
+        let body = &prod[start..];
+        let end = body.find("\n}\n").map(|i| i + 3).unwrap_or(body.len());
+        let body = &body[..end];
+        assert!(
+            body.contains("events_from_postgres_hydrated("),
+            "the without-context control reads Postgres raw, so it blanks \
+             `context` while leaving `result` as a reference — it tests a \
+             difference it did not intend and is biased to `false`"
+        );
+        let hydrate_at = body
+            .find("events_from_postgres_hydrated(")
+            .expect("checked above");
+        let blank_at = body
+            .find("e.context = None")
+            .expect("the control no longer blanks context — that IS the control");
+        assert!(
+            hydrate_at < blank_at,
+            "hydration must run BEFORE the blanking, or the deliberate \
+             difference is not the only difference"
+        );
+        assert!(
+            !code_only(body).contains("sqlx::query("),
+            "the without-context control still runs its own copy of the query"
+        );
+    }
+
+    /// The behavioural half: prove the artefact the hydration removes is one
+    /// this differ would actually report.
+    ///
+    /// The structural guards above say the endpoint *calls* the hydrator. This
+    /// says *why that matters* — that `differing_fields` names `result` when one
+    /// side holds a reference envelope and the other the inlined content. If
+    /// this ever stops being true the hydration guards are protecting nothing
+    /// and should be re-derived rather than kept out of habit.
+    #[test]
+    fn reference_versus_inlined_result_is_reported_as_a_result_difference() {
+        let base = crate::db::models::Event {
+            id: 0,
+            event_id: 1,
+            execution_id: 1,
+            catalog_id: 2,
+            parent_event_id: None,
+            parent_execution_id: None,
+            event_type: "step.completed".to_string(),
+            node_id: Some("n".into()),
+            node_name: Some("step".into()),
+            node_type: Some("task".into()),
+            status: "ok".to_string(),
+            context: None,
+            meta: None,
+            result: None,
+            worker_id: Some("w".into()),
+            attempt: Some(1),
+            created_at: chrono::DateTime::parse_from_rfc3339("2026-08-30T15:00:05.354081798Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+        };
+        let mut a = base.clone();
+        let mut b = base.clone();
+
+        // The shape `PERMANENT_LOG_LEAN=true` produces: Postgres keeps a
+        // pointer, the mirrored tier keeps the content.
+        a.result = Some(serde_json::json!({
+            "context": { "result": { "reference": "resultstore://649253106579931866" } }
+        }));
+        b.result = Some(serde_json::json!({
+            "context": { "result": { "context": { "rows": 3 } } }
+        }));
+
+        let fields = differing_fields(&a, &b);
+        assert!(
+            fields.contains(&"result"),
+            "reference-vs-inlined no longer reports as a `result` difference — \
+             the artefact the hydration removes has changed shape, so re-derive \
+             the guards above instead of trusting them; got {fields:?}"
+        );
+
+        // Negative control: once hydrated, the two agree and the differ is
+        // silent. A differ that reports a difference between identical events
+        // would make every assertion above vacuous.
+        let hydrated = b.clone();
+        assert!(
+            differing_fields(&hydrated, &b).is_empty(),
+            "the differ reports a difference between identical events — it \
+             cannot be trusted to report the absence of one"
         );
     }
 }
