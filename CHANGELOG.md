@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.109.0](https://github.com/noetl/server/compare/v3.108.4...v3.109.0) (2026-09-12)
+
+### Features
+
+* **ehdb:** record WHY a mirror send failed, before changing any timeout ([b5ab9d8](https://github.com/noetl/server/commit/b5ab9d8008d506e09aa833c10e13cc7348d61413)), closes [noetl/ai-meta#343](https://github.com/noetl/ai-meta/issues/343)
+
+### Bug Fixes
+
+* **ehdb:** make `not_comparable` a first-class parity outcome ([97016d6](https://github.com/noetl/server/commit/97016d61dba6ffc482273c663e3cbea80500cf5f)), closes [noetl/ai-meta#343](https://github.com/noetl/ai-meta/issues/343) [#342](https://github.com/noetl/server/issues/342)
+
 ## [3.108.4](https://github.com/noetl/server/compare/v3.108.3...v3.108.4) (2026-09-12)
 
 ### Bug Fixes
