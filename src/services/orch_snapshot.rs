@@ -153,7 +153,11 @@ pub async fn save(
 ///
 /// Returns `None` when no snapshot exists yet (early in a run, before the
 /// first save) — the caller then rebuilds from the full (still-small) log.
-pub async fn load_latest(pool: &DbPool, execution_id: i64) -> AppResult<Option<LoadedSnapshot>> {
+pub async fn load_latest(
+    pool: &DbPool,
+    result_store: &crate::services::result_store::ResultStoreService,
+    execution_id: i64,
+) -> AppResult<Option<LoadedSnapshot>> {
     use crate::handlers::ehdb_projection_read as tier_read;
 
     let source = tier_read::read_source();
@@ -181,7 +185,12 @@ pub async fn load_latest(pool: &DbPool, execution_id: i64) -> AppResult<Option<L
     // here; this function's contract is "the latest snapshot, or none".
     if source.is_wal() {
         let (body, verdict) =
-            crate::handlers::ehdb_projection_fold::wal_projection_state(pool, execution_id).await;
+            crate::handlers::ehdb_projection_fold::wal_projection_state(
+                pool,
+                result_store,
+                execution_id,
+            )
+            .await;
         // ⚠ `body.is_some()` on a NON-Match verdict means serve-on-behind granted
         // (ai-meta#332): the snapshot was verified at its own version and
         // `rebuild_state` will fold forward from it. `wal_projection_state`
@@ -413,6 +422,7 @@ async fn load_incumbent(
 /// 8/8 fold-equivalence result was only the input to.
 pub async fn recovery_read_comparison(
     pool: &DbPool,
+    result_store: &crate::services::result_store::ResultStoreService,
     execution_id: i64,
 ) -> serde_json::Value {
     use noetl_orchestrate_core::state::canonical_state_digest;
@@ -423,7 +433,12 @@ pub async fn recovery_read_comparison(
 
     // --- what recovery would return from the durable EHDB projection --------
     let (body, verdict) =
-        crate::handlers::ehdb_projection_fold::wal_projection_state(pool, execution_id).await;
+        crate::handlers::ehdb_projection_fold::wal_projection_state(
+                pool,
+                result_store,
+                execution_id,
+            )
+            .await;
     let wal_state: Option<WorkflowState> =
         body.and_then(|b| serde_json::from_value(b).ok());
     let wal_digest = wal_state.as_ref().map(canonical_state_digest);

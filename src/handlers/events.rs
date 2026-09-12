@@ -1823,7 +1823,7 @@ fn with_ref_accessors(
 /// `context` is replaced with the resolved store payload (`{data: {...}}`),
 /// then the `reference` block is dropped so the result reads like an inline
 /// one.
-async fn hydrate_result_references(
+pub(crate) async fn hydrate_result_references(
     events: &mut [crate::db::models::Event],
     result_store: &crate::services::result_store::ResultStoreService,
     keep_refs: bool,
@@ -2244,7 +2244,7 @@ async fn rebuild_state(
     keep_refs: bool,
 ) -> AppResult<RebuildResult> {
     use crate::services::orch_snapshot;
-    match orch_snapshot::load_latest(pool, execution_id).await? {
+    match orch_snapshot::load_latest(pool, result_store, execution_id).await? {
         Some(snap) => {
             // Events after the snapshot: newer by id, OR (straggler) below the
             // version watermark but emitted within the margin of the snapshot.

@@ -158,16 +158,62 @@ pub struct FoldedState {
     pub digest: String,
 }
 
-/// Fold from `noetl.event`.
+/// Fold from `noetl.event`, **raw** — references NOT resolved.
 ///
-/// Reads the same columns and builds the same `Event` values the orchestrator's
-/// own rebuild path does, so a digest from here is the digest of the state the
-/// orchestrator would have used.
+/// ⚠ This doc used to claim it "builds the same `Event` values the
+/// orchestrator's own rebuild path does, so a digest from here is the digest of
+/// the state the orchestrator would have used". That was false: `rebuild_state`
+/// calls `hydrate_result_references` at all eight of its fold sites, and this
+/// does not. Under `NOETL_PERMANENT_LOG_LEAN=true` the raw row carries a
+/// `reference` where the orchestrator (and the mirrored tier) carry content.
+///
+/// Use [`fold_from_postgres_hydrated`] for any comparison against the tier or
+/// against orchestrator state. This raw form is for callers that specifically
+/// want the persisted bytes.
 pub async fn fold_from_postgres(
     pool: &DbPool,
     execution_id: i64,
 ) -> Result<FoldedState, FoldRefusal> {
     let events = events_from_postgres(pool, execution_id).await?;
+    fold(FoldSource::Postgres, events)
+}
+
+/// As [`events_from_postgres`], but with **result references hydrated** — the
+/// view the orchestrator actually folds.
+///
+/// ⚠ This distinction is the whole point. With `NOETL_PERMANENT_LOG_LEAN=true`
+/// the persisted row carries `result.context.result.reference` (a pointer)
+/// where the mirrored tier record carries the inlined `result.context.result.context`.
+/// Folding the raw row therefore digests a *pointer* and compares it against
+/// *content*, and reports divergence on every execution with an externalised
+/// result — a false positive, not a mirror defect.
+///
+/// Measured on prod 2026-09-12 over the 40 most recent executions: **12 of 40
+/// (30%)** were exactly this shape, with byte-identical field counts on both
+/// sides and `diff_paths` containing nothing but the reference/context pair.
+///
+/// `rebuild_state` hydrates at all 8 of its fold sites; this leg did not, while
+/// [`fold_from_postgres`]'s own doc claimed it "builds the same `Event` values
+/// the orchestrator's own rebuild path does". That claim is what this restores.
+pub async fn events_from_postgres_hydrated(
+    pool: &DbPool,
+    result_store: &crate::services::result_store::ResultStoreService,
+    execution_id: i64,
+) -> Result<Vec<crate::db::models::Event>, FoldRefusal> {
+    let mut events = events_from_postgres(pool, execution_id).await?;
+    // `keep_refs = false`: drop the reference envelope once resolved, so the
+    // result reads like an inline one — which is the tier's shape.
+    super::events::hydrate_result_references(&mut events, result_store, false).await;
+    Ok(events)
+}
+
+/// [`fold_from_postgres`] over the hydrated event set.
+pub async fn fold_from_postgres_hydrated(
+    pool: &DbPool,
+    result_store: &crate::services::result_store::ResultStoreService,
+    execution_id: i64,
+) -> Result<FoldedState, FoldRefusal> {
+    let events = events_from_postgres_hydrated(pool, result_store, execution_id).await?;
     fold(FoldSource::Postgres, events)
 }
 
@@ -1428,6 +1474,7 @@ fn bounded_fold_at(
 /// would be serving an unverified one.
 async fn grant_for_behind(
     pool: &DbPool,
+    result_store: &crate::services::result_store::ResultStoreService,
     execution_id: i64,
     stored_version: i64,
     stored_digest: &str,
@@ -1452,7 +1499,7 @@ async fn grant_for_behind(
     // is already making -- `rebuild_state` re-reads this execution's whole event
     // set from Postgres immediately after (the WAL path hands it `version: 0`),
     // so this is not a new dependency on the hot path, only an honest one.
-    let bounded = events_from_postgres(pool, execution_id)
+    let bounded = events_from_postgres_hydrated(pool, result_store, execution_id)
         .await
         .and_then(|events| bounded_fold_at(events, stored_version));
     let agree = bounded_fold_agrees(&bounded, stored_version, stored_digest);
@@ -1464,6 +1511,7 @@ async fn grant_for_behind(
 
 pub async fn wal_projection_state(
     pool: &DbPool,
+    result_store: &crate::services::result_store::ResultStoreService,
     execution_id: i64,
 ) -> (Option<serde_json::Value>, ReFoldVerdict) {
     // Materialise first so an in-flight execution has a record to verify. A
@@ -1489,7 +1537,7 @@ pub async fn wal_projection_state(
     // This is not a new Postgres dependency on the serve path. `rebuild_state`
     // re-reads this execution's entire event set from Postgres immediately
     // after, because the snapshot returned here carries `version: 0`.
-    let truth = fold_from_postgres(pool, execution_id).await;
+    let truth = fold_from_postgres_hydrated(pool, result_store, execution_id).await;
     let stored = stored_projection_full(execution_id).await;
     let pair = stored
         .as_ref()
@@ -1514,7 +1562,16 @@ pub async fn wal_projection_state(
             if let (Some((sv, sd, body)), Ok(sp)) =
                 (stored.as_ref().ok().and_then(|o| o.as_ref()), &truth)
             {
-                match grant_for_behind(pool, execution_id, *sv, sd.as_str(), sp.version).await {
+                match grant_for_behind(
+                    pool,
+                    result_store,
+                    execution_id,
+                    *sv,
+                    sd.as_str(),
+                    sp.version,
+                )
+                .await
+                {
                     Ok(grant) => {
                         crate::metrics::record_ehdb_projection_read(grant.outcome_label());
                         return (body.clone(), verdict);
@@ -2292,8 +2349,12 @@ mod tests {
             .split_once("\n#[cfg(test)]")
             .map(|(above, _)| above)
             .unwrap_or(src);
+        // ⚠ Match the exact signature. `events_from_postgres_hydrated` now
+        // precedes it in the file, and a prefix search lands on that wrapper —
+        // whose body has no SQL at all, so every assertion below would be
+        // measuring the wrong function.
         let start = code
-            .find("pub async fn events_from_postgres")
+            .find("pub async fn events_from_postgres(")
             .expect("events_from_postgres not found — extraction broke");
         let body = &code[start..];
         let end = body.find("\n}\n").map(|i| i + 3).unwrap_or(body.len());
@@ -2351,6 +2412,118 @@ mod tests {
         ));
     }
 
+    /// The hydrated reader must actually hydrate, and must NOT keep the refs.
+    ///
+    /// The call-site guards prove *which* function the verification legs call.
+    /// They cannot prove that function does anything — a
+    /// `..._hydrated` that forgot to hydrate would satisfy every one of them
+    /// while restoring the exact false-divergence class this fix removes.
+    ///
+    /// `keep_refs = false` is load-bearing: keeping the reference envelope
+    /// leaves the pointer beside the content, which still digests differently
+    /// from the tier's inlined-only shape.
+    #[test]
+    fn the_hydrated_reader_hydrates_and_drops_the_reference_envelope() {
+        let src = include_str!("ehdb_projection_fold.rs");
+        let code = src
+            .split_once("\n#[cfg(test)]")
+            .map(|(above, _)| above)
+            .unwrap_or(src);
+        let start = code
+            .find("pub async fn events_from_postgres_hydrated(")
+            .expect("hydrated reader not found — extraction broke");
+        let body = &code[start..];
+        let end = body.find("\n}\n").map(|i| i + 3).unwrap_or(body.len());
+        let body = &body[..end];
+        assert!(
+            body.len() > 200,
+            "hydrated reader slice too small: {}",
+            body.len()
+        );
+        assert!(
+            body.contains("hydrate_result_references("),
+            "the hydrated reader does not call the hydrator — the verification \
+             leg would digest a reference against inlined content again"
+        );
+        assert!(
+            body.contains("result_store, false"),
+            "the hydrator must be called with keep_refs = false; keeping the \
+             envelope leaves the pointer beside the content and still diverges \
+             from the tier's inlined shape"
+        );
+    }
+
+    /// An externalised `reference` and an inlined `context` fold to DIFFERENT
+    /// digests — which is why the Postgres leg must hydrate.
+    ///
+    /// This is the mechanism behind 30% of the divergence measured on prod
+    /// (12 of the 40 most recent executions, 2026-09-12): byte-identical field
+    /// counts on both sides, and `diff_paths` containing nothing but
+    ///
+    /// ```text
+    /// /steps/<step>/result/context/result/reference  (only in Postgres)
+    /// /steps/<step>/result/context/result/context    (only in the tier)
+    /// ```
+    ///
+    /// With `NOETL_PERMANENT_LOG_LEAN=true` the persisted row keeps a pointer
+    /// where the mirrored record keeps the content. Neither store is wrong;
+    /// comparing them without resolving the pointer is.
+    ///
+    /// Two-sided on purpose: the same shape on both sides must AGREE, or this
+    /// test would pass against a fold that simply digests everything to
+    /// different values.
+    #[test]
+    fn a_reference_and_its_inlined_content_do_not_fold_alike() {
+        let ev = |id: i64, inner: serde_json::Value| {
+            event_from_tier_payload(&serde_json::json!({
+                "event_id": id, "execution_id": 42, "catalog_id": 7,
+                "event_type": "command.completed", "node_name": "s",
+                "status": "ok", "created_at": "2026-09-12T06:00:00Z",
+                "meta": {"command_id": "c0"},
+                // ⚠ Two fixture corrections, both from the fold folding the
+                // two sides IDENTICALLY:
+                //   1. `command.issued` never sets `step.result`, so the
+                //      payload had no route into the digest at all;
+                //   2. the carrier is the `result` column of the event that
+                //      COMPLETES the step — the prod state-diff path is
+                //      `/steps/<step>/result/context/result/reference`.
+                // A fixture that cannot exhibit the failure proves nothing.
+                "result": {"context": {"result": inner}}
+            }))
+            .expect("fixture parses")
+        };
+        let as_reference = || {
+            vec![ev(
+                1,
+                serde_json::json!({"reference": {"ref": "noetl://result/42/abc"}}),
+            )]
+        };
+        let as_inlined = || vec![ev(1, serde_json::json!({"context": {"rows": [1, 2, 3]}}))];
+
+        let pg = fold(FoldSource::Postgres, as_reference()).expect("folds");
+        let tier = fold(FoldSource::EhdbTier, as_inlined()).expect("folds");
+
+        assert_eq!(pg.version, tier.version, "same event, so same version");
+        assert_eq!(
+            pg.applied_count, tier.applied_count,
+            "same event COUNT — this is why a count check cannot see this class"
+        );
+        assert_ne!(
+            pg.digest, tier.digest,
+            "a pointer and its content must fold differently, or the premise of \
+             the hydration fix is wrong"
+        );
+
+        // The two-sided half: identical shapes agree, so the inequality above is
+        // about reference-vs-content and not about folding being unstable.
+        let a = fold(FoldSource::Postgres, as_inlined()).expect("folds");
+        let b = fold(FoldSource::EhdbTier, as_inlined()).expect("folds");
+        assert_eq!(
+            a.digest, b.digest,
+            "the same content must fold to the same digest regardless of source"
+        );
+    }
+
     /// The READ PATH's verification leg must also be independent of the tier.
     ///
     /// Sibling of `the_bounded_verification_is_independent_of_the_tier`, which
@@ -2382,9 +2555,10 @@ mod tests {
             body.len()
         );
         assert!(
-            body.contains("fold_from_postgres("),
-            "the read path's re-fold does not read Postgres — the verdict would \
-             be the tier confirming itself"
+            body.contains("fold_from_postgres_hydrated("),
+            "the read path's re-fold must read Postgres **hydrated** — the raw \
+             row carries a reference where the tier carries content, and \
+             comparing those is a false divergence, not a mirror defect"
         );
         assert!(
             !body.contains("events_for_recovery("),
@@ -2428,9 +2602,11 @@ mod tests {
             body.len()
         );
         assert!(
-            body.contains("events_from_postgres("),
-            "the bounded verification does not read Postgres — it cannot be \
-             independent of the tier it is verifying"
+            body.contains("events_from_postgres_hydrated("),
+            "the bounded verification must read Postgres **hydrated**. Reading \
+             the raw row digests a `reference` where the tier holds inlined \
+             content, so it reports divergence on every execution with an \
+             externalised result — 30% of a 40-execution prod sample"
         );
         assert!(
             !body.contains("events_for_recovery("),
@@ -2982,8 +3158,16 @@ pub async fn recovery_compare_endpoint(
     axum::extract::Path(execution_id): axum::extract::Path<i64>,
 ) -> AppResult<axum::Json<serde_json::Value>> {
     let pool = state.pools.pool_for(execution_id);
+    // Same construction every other handler uses (e.g. `advance_snapshot`) —
+    // the comparison must hydrate references exactly as `rebuild_state` does,
+    // or it digests a pointer against content.
+    let result_store = crate::services::result_store::ResultStoreService::new(
+        pool.clone(),
+        state.snowflake.clone(),
+    );
     Ok(axum::Json(
-        crate::services::orch_snapshot::recovery_read_comparison(pool, execution_id).await,
+        crate::services::orch_snapshot::recovery_read_comparison(pool, &result_store, execution_id)
+            .await,
     ))
 }
 
