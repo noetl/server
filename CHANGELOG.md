@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.108.4](https://github.com/noetl/server/compare/v3.108.3...v3.108.4) (2026-09-12)
+
+### Bug Fixes
+
+* **ehdb:** hydrate the field-level differ and the without-context control ([c4159ec](https://github.com/noetl/server/commit/c4159ecd7b0680d5bde6c70db21425f12cf62c39)), closes [noetl/ai-meta#343](https://github.com/noetl/ai-meta/issues/343) [#425](https://github.com/noetl/server/issues/425) [#426](https://github.com/noetl/server/issues/426)
+
 ## [3.108.3](https://github.com/noetl/server/compare/v3.108.2...v3.108.3) (2026-09-12)
 
 ### Bug Fixes
