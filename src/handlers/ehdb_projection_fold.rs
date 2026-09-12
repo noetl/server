@@ -846,6 +846,54 @@ pub fn verdict_for(
     }
 }
 
+/// The outcome of one comparison, as **three** values.
+///
+/// noetl/ai-meta#343: `digests_agree: bool` cannot express "could not be
+/// compared", so an execution the tier refused to return read as `false` —
+/// indistinguishable from one that was read and disagreed. Three prod
+/// executions in a 40-execution sample were in exactly that state, refused by
+/// the tier-service frame cap at 1,174,874 bytes, and every surface reported
+/// them as divergent.
+///
+/// The two failures need opposite responses — a divergence is a mirror gap to
+/// repair, an unreadable execution is a transport limit to page around — so
+/// collapsing them is not a rounding error, it sends the investigation the
+/// wrong way. A two-valued verdict on a three-valued question always spends its
+/// third state somewhere, and here it was spending it on "diverged".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComparisonVerdict {
+    /// Both sides folded and the digests match.
+    Agree,
+    /// Both sides folded and the digests differ.
+    Diverged,
+    /// At least one side could not be read. **Not** a divergence.
+    NotComparable,
+}
+
+impl ComparisonVerdict {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Agree => "agree",
+            Self::Diverged => "diverged",
+            Self::NotComparable => "not_comparable",
+        }
+    }
+}
+
+/// Pure, so the rule is asserted by a test rather than only by the callers that
+/// happen to apply it — the same discipline `equivalence_holds` follows.
+pub fn comparison_verdict(
+    postgres: Option<&FoldedState>,
+    tier: Option<&FoldedState>,
+) -> ComparisonVerdict {
+    match (postgres, tier) {
+        (Some(a), Some(b)) if a.digest == b.digest => ComparisonVerdict::Agree,
+        (Some(_), Some(_)) => ComparisonVerdict::Diverged,
+        _ => ComparisonVerdict::NotComparable,
+    }
+}
+
 /// Both folds, and whether they agree — the Phase 1 question in one reply.
 #[derive(Debug, Serialize)]
 pub struct FoldComparison {
@@ -866,6 +914,10 @@ pub struct FoldComparison {
     /// `true` when blanking `context` on the Postgres side reproduces the
     /// tier's digest exactly.
     pub context_explains_the_gap: bool,
+    /// The three-valued outcome. Prefer this over [`Self::digests_agree`] when
+    /// counting: `digests_agree == false` conflates "diverged" with "could not
+    /// be read" (noetl/ai-meta#343).
+    pub verdict: ComparisonVerdict,
 }
 
 pub async fn compare_sources(
@@ -917,6 +969,7 @@ pub async fn compare_sources(
     };
     Ok(FoldComparison {
         execution_id,
+        verdict: comparison_verdict(postgres.as_ref(), tier_ok.as_ref()),
         postgres_without_context: no_ctx,
         context_explains_the_gap,
         postgres,
@@ -3073,6 +3126,8 @@ mod tests {
             tier: None,
             tier_refusal: Some(FoldRefusal::NoEvents),
             digests_agree: false,
+            // Two refusals: not comparable, and specifically NOT divergent.
+            verdict: ComparisonVerdict::NotComparable,
             disagreement: None,
             postgres_without_context: None,
             context_explains_the_gap: false,
@@ -3332,6 +3387,122 @@ mod tests {
         );
     }
 
+    // ---------------------------------------------------------------------
+    // noetl/ai-meta#343 blocker 2 — an unreadable execution must never be
+    // counted as a divergent one, and must never leave the denominator.
+    // ---------------------------------------------------------------------
+
+    fn state_with_digest(digest: &str) -> FoldedState {
+        FoldedState {
+            source: FoldSource::Postgres,
+            version: 1,
+            applied_count: 1,
+            digest: digest.to_string(),
+        }
+    }
+
+    /// ⭐ The rule, as a truth table. All four shapes, so the third state cannot
+    /// be quietly folded into one of the other two.
+    #[test]
+    fn an_unreadable_side_is_not_comparable_not_divergent() {
+        let a = state_with_digest("aaa");
+        let b = state_with_digest("bbb");
+        assert_eq!(
+            comparison_verdict(Some(&a), Some(&a)),
+            ComparisonVerdict::Agree
+        );
+        assert_eq!(
+            comparison_verdict(Some(&a), Some(&b)),
+            ComparisonVerdict::Diverged
+        );
+        assert_eq!(
+            comparison_verdict(Some(&a), None),
+            ComparisonVerdict::NotComparable,
+            "an unreadable TIER must not be reported as a divergence — on prod              this is the frame cap refusing a >1MiB reply, which needs paging,              not a mirror repair"
+        );
+        assert_eq!(
+            comparison_verdict(None, Some(&a)),
+            ComparisonVerdict::NotComparable,
+            "an unreadable POSTGRES side is not a divergence either"
+        );
+        assert_eq!(
+            comparison_verdict(None, None),
+            ComparisonVerdict::NotComparable,
+            "two refusals are not a match — absence of disagreement is not              agreement"
+        );
+    }
+
+    /// `digests_agree` alone cannot express the third state, which is why it
+    /// must not be what anybody counts.
+    ///
+    /// Both a divergence and an unreadable execution give `digests_agree ==
+    /// false`; only the verdict separates them. If this ever stops being true
+    /// the enum is redundant and should go — but while it is true, counting the
+    /// bool is the bug.
+    #[test]
+    fn the_boolean_cannot_distinguish_what_the_verdict_can() {
+        let a = state_with_digest("aaa");
+        let b = state_with_digest("bbb");
+        let diverged = comparison_verdict(Some(&a), Some(&b));
+        let unreadable = comparison_verdict(Some(&a), None);
+        // The bool the old code counted: identical for both.
+        assert_eq!(
+            diverged == ComparisonVerdict::Agree,
+            unreadable == ComparisonVerdict::Agree,
+            "fixture broken — these must be indistinguishable as booleans"
+        );
+        // The verdict: different.
+        assert_ne!(
+            diverged, unreadable,
+            "the verdict collapses divergent and unreadable — it adds nothing              over the boolean it replaced"
+        );
+    }
+
+    /// The sweep must bucket EVERY examined execution and publish that it did.
+    ///
+    /// Before #343 an execution neither side could read fell out of
+    /// `agreed + disagreed` with only a refusal-map entry, so the totals
+    /// silently did not reconcile with `examined` and `equivalence_holds` was
+    /// computed over a population the response never stated. A scan that does
+    /// not publish its denominator is exactly the failure this codebase keeps
+    /// re-finding.
+    #[test]
+    fn the_sweep_buckets_every_execution_and_publishes_the_reconciliation() {
+        let prod = production_src();
+        let start = prod
+            .find("pub async fn equivalence_endpoint")
+            .expect("equivalence_endpoint not found — extraction broke");
+        let body = &prod[start..];
+        let end = body.find("\n}\n").map(|i| i + 3).unwrap_or(body.len());
+        let body = &body[..end];
+        assert!(
+            body.len() > 1500,
+            "equivalence_endpoint extracted as {} bytes — implausibly small",
+            body.len()
+        );
+        let code = code_only(body);
+        assert!(
+            code.contains("ComparisonVerdict::NotComparable => not_comparable += 1"),
+            "the sweep does not count unreadable executions — they leave the \
+             denominator silently, which is worse than reporting them wrong"
+        );
+        assert!(
+            code.contains("agreed + disagreed + not_comparable + comparison_errors == ids.len()"),
+            "the sweep does not reconcile its buckets against what it examined; \
+             without that a fifth shape can appear and be counted nowhere"
+        );
+        assert!(
+            code.contains("\"not_comparable\": not_comparable"),
+            "the count is computed but not published — a denominator nobody can \
+             read is not published"
+        );
+        assert!(
+            !code.contains("if c.digests_agree {"),
+            "the sweep still branches on the boolean, which cannot express \
+             `not_comparable`"
+        );
+    }
+
     /// The behavioural half: prove the artefact the hydration removes is one
     /// this differ would actually report.
     ///
@@ -3469,6 +3640,13 @@ pub async fn equivalence_endpoint(
     let ids = recently_completed(pool, limit).await?;
 
     let (mut agreed, mut disagreed) = (0usize, 0usize);
+    // noetl/ai-meta#343 — counted, never dropped. An execution neither side
+    // could read used to fall out of `agreed + disagreed` with nothing but a
+    // refusal-map entry to show for it, so the totals silently did not add up
+    // to `examined` and the sweep's verdict was computed over a population it
+    // never published.
+    let mut not_comparable = 0usize;
+    let mut comparison_errors = 0usize;
     let mut tier_refusals: std::collections::BTreeMap<String, usize> = Default::default();
     let mut pg_refusals: std::collections::BTreeMap<String, usize> = Default::default();
     let mut context_explained = 0usize;
@@ -3486,6 +3664,7 @@ pub async fn equivalence_endpoint(
                 *pg_refusals
                     .entry(format!("comparison_error: {e}"))
                     .or_default() += 1;
+                comparison_errors += 1;
                 continue;
             }
         };
@@ -3495,25 +3674,34 @@ pub async fn equivalence_endpoint(
         if let Some(r) = &c.postgres_refusal {
             *pg_refusals.entry(r.reason().to_string()).or_default() += 1;
         }
-        if c.digests_agree {
-            agreed += 1;
-        } else if c.postgres.is_some() && c.tier.is_some() {
-            disagreed += 1;
-            if c.context_explains_the_gap {
-                context_explained += 1;
-            }
-            if disagreements.len() < 10 {
-                disagreements.push(serde_json::json!({
-                    "execution_id": *id,
-                    "detail": c.disagreement,
-                    // When blanking `context` on the Postgres side reproduces
-                    // the tier digest exactly, the record predates the mirror
-                    // carrying it — a stale record, not a diverged one.
-                    "context_explains_the_gap": c.context_explains_the_gap,
-                }));
+        match c.verdict {
+            ComparisonVerdict::NotComparable => not_comparable += 1,
+            ComparisonVerdict::Agree => agreed += 1,
+            ComparisonVerdict::Diverged => {
+                disagreed += 1;
+                if c.context_explains_the_gap {
+                    context_explained += 1;
+                }
+                if disagreements.len() < 10 {
+                    disagreements.push(serde_json::json!({
+                        "execution_id": *id,
+                        "detail": c.disagreement,
+                        // When blanking `context` on the Postgres side reproduces
+                        // the tier digest exactly, the record predates the mirror
+                        // carrying it — a stale record, not a diverged one.
+                        "context_explains_the_gap": c.context_explains_the_gap,
+                    }));
+                }
             }
         }
     }
+
+    // **The denominator, published.** Every examined execution lands in exactly
+    // one bucket, and this says so in the response rather than leaving a reader
+    // to subtract. If it is ever `false`, a shape exists that none of the three
+    // buckets describes — which is the state this sweep was already in for
+    // unreadable executions, silently.
+    let accounted_for = agreed + disagreed + not_comparable + comparison_errors == ids.len();
 
     Ok(axum::Json(serde_json::json!({
         "action": "ehdb.projection.recovery.equivalence",
@@ -3522,6 +3710,13 @@ pub async fn equivalence_endpoint(
         "examined": ids.len(),
         "agreed": agreed,
         "disagreed": disagreed,
+        // ⚠ NOT a divergence. At least one side could not be read — on prod the
+        // cause is the tier-service frame cap refusing replies over 1 MiB
+        // (noetl/ai-meta#343 blocker 2). Reported separately because the two
+        // need opposite responses.
+        "not_comparable": not_comparable,
+        "comparison_errors": comparison_errors,
+        "accounted_for": accounted_for,
         // Both conditions, and the first one is the one that matters: a sweep
         // where everything refused agrees with nothing.
         "equivalent": equivalence_holds(agreed, disagreed),
