@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.108.3](https://github.com/noetl/server/compare/v3.108.2...v3.108.3) (2026-09-12)
+
+### Bug Fixes
+
+* **ehdb:** make a dropped mirror batch recoverable instead of lost ([89a35cb](https://github.com/noetl/server/commit/89a35cb42d88fc0bb0cf58a85696d29df9412dd0)), closes [noetl/ai-meta#342](https://github.com/noetl/ai-meta/issues/342) [noetl/ai-meta#342](https://github.com/noetl/ai-meta/issues/342) [noetl/ai-meta#332](https://github.com/noetl/ai-meta/issues/332)
+* **ehdb:** make a dropped mirror batch recoverable instead of lost ([#426](https://github.com/noetl/server/issues/426)) ([aec8d32](https://github.com/noetl/server/commit/aec8d326252ad54e05d01fec30fbecf80ce607a3)), closes [noetl/ai-meta#342](https://github.com/noetl/ai-meta/issues/342)
+
 ## [3.108.2](https://github.com/noetl/server/compare/v3.108.1...v3.108.2) (2026-09-12)
 
 ### Bug Fixes
