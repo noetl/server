@@ -1009,6 +1009,11 @@ async fn main() -> anyhow::Result<()> {
     noetl_server::metrics::init_event_ingest_phase_series();
     noetl_server::metrics::init_nonconvergence_sweep_series();
     noetl_server::metrics::init_orphan_sweep_series();
+    // noetl/ai-meta#342 — pin the repair-sweep series so a healthy sweep reads 0
+    // rather than being absent. Unconditional: pinning inside the armed branch
+    // would leave the series missing on exactly the configuration whose silence
+    // someone would be trying to read.
+    noetl_server::metrics::pin_ehdb_mirror_repair_outcomes();
     noetl_server::metrics::init_reconcile_giveup_series();
     noetl_server::metrics::init_db_pool_series();
     noetl_server::metrics::init_ehdb_publish_deferred_series();
@@ -1301,6 +1306,10 @@ async fn main() -> anyhow::Result<()> {
     let result_store_service = ResultStoreService::new(db_pool.clone(), state.snowflake.clone());
 
     // Build the router
+    // noetl/ai-meta#342 — the mirror-repair sweep. A no-op unless armed, so the
+    // decision lives in one place (the flag), not split across a call site.
+    noetl_server::handlers::ehdb_mirror_repair_sweep::spawn(state.clone());
+
     let app = build_router(
         state,
         db_pool,

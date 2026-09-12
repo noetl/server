@@ -871,8 +871,21 @@ pub struct FoldComparison {
     pub context_explains_the_gap: bool,
 }
 
-pub async fn compare_sources(pool: &DbPool, execution_id: i64) -> AppResult<FoldComparison> {
-    let pg = fold_from_postgres(pool, execution_id).await;
+pub async fn compare_sources(
+    pool: &DbPool,
+    result_store: &crate::services::result_store::ResultStoreService,
+    execution_id: i64,
+) -> AppResult<FoldComparison> {
+    // ⚠ HYDRATED, like the verification path (noetl/ai-meta#342).
+    //
+    // This is the instrument everyone reads to decide whether the tier agrees
+    // with Postgres, and it folded the RAW row while the tier holds inlined
+    // content — so it reported a `reference`-vs-content difference as
+    // divergence. Fixing only the serve path left the *measurement* lying:
+    // v3.108.2 deployed and this endpoint's divergence count did not move by a
+    // single execution, because this function was never on the path that
+    // changed. An instrument that cannot see a fix cannot validate one.
+    let pg = fold_from_postgres_hydrated(pool, result_store, execution_id).await;
     let tier = fold_from_tier(execution_id).await;
     let (postgres, postgres_refusal) = match pg {
         Ok(f) => (Some(f), None),
@@ -1049,7 +1062,11 @@ pub async fn compare_sources_endpoint(
     axum::extract::Path(execution_id): axum::extract::Path<i64>,
 ) -> AppResult<axum::Json<serde_json::Value>> {
     let pool = state.pools.pool_for(execution_id);
-    let cmp = compare_sources(pool, execution_id).await?;
+    let result_store = crate::services::result_store::ResultStoreService::new(
+        pool.clone(),
+        state.snowflake.clone(),
+    );
+    let cmp = compare_sources(pool, &result_store, execution_id).await?;
     Ok(axum::Json(serde_json::json!({
         "action": "ehdb.projection.fold.compare",
         "result": cmp,
@@ -2524,6 +2541,42 @@ mod tests {
         );
     }
 
+    /// The DIAGNOSTIC must hydrate too, or it cannot validate the fix.
+    ///
+    /// ⚠⚠ Written after a live miss. v3.108.2 shipped hydration on the serve
+    /// path, deployed cleanly — and the divergence count this endpoint reports
+    /// did not move by a single execution out of 40, because `compare_sources`
+    /// was never on the path that changed. The fix was right and the instrument
+    /// was still lying.
+    ///
+    /// An instrument that cannot see a fix cannot validate one, so it is held to
+    /// the same rule as the legs it measures.
+    #[test]
+    fn the_diagnostic_comparison_hydrates_like_the_serve_path() {
+        let src = include_str!("ehdb_projection_fold.rs");
+        let code = src
+            .split_once("\n#[cfg(test)]")
+            .map(|(above, _)| above)
+            .unwrap_or(src);
+        let start = code
+            .find("pub async fn compare_sources(")
+            .expect("compare_sources not found — extraction broke");
+        let body = &code[start..];
+        let end = body.find("\n}\n").map(|i| i + 3).unwrap_or(body.len());
+        let body = &body[..end];
+        assert!(
+            body.len() > 400,
+            "compare_sources slice too small: {}",
+            body.len()
+        );
+        assert!(
+            body.contains("fold_from_postgres_hydrated("),
+            "the diagnostic folds the RAW Postgres row — it will report a \
+             reference-vs-content difference as divergence, and will not move \
+             when the serve path is fixed"
+        );
+    }
+
     /// The READ PATH's verification leg must also be independent of the tier.
     ///
     /// Sibling of `the_bounded_verification_is_independent_of_the_tier`, which
@@ -3098,7 +3151,11 @@ pub async fn equivalence_endpoint(
 
     for id in &ids {
         let pool = state.pools.pool_for(*id);
-        let c = match compare_sources(pool, *id).await {
+        let result_store = crate::services::result_store::ResultStoreService::new(
+            pool.clone(),
+            state.snowflake.clone(),
+        );
+        let c = match compare_sources(pool, &result_store, *id).await {
             Ok(c) => c,
             Err(e) => {
                 *pg_refusals

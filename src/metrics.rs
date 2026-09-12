@@ -3498,6 +3498,76 @@ pub fn record_ehdb_eventlog_mirror_attempt(outcome: &str, events: usize) {
         .inc_by(events as u64);
 }
 
+/// Outcomes of the background mirror-repair sweep (noetl/ai-meta#342).
+///
+/// ⚠ Pinned so a healthy sweep reads 0 rather than being absent — an absent
+/// series is indistinguishable from a build that cannot report at all.
+pub const EHDB_MIRROR_REPAIR_OUTCOMES: [&str; 5] = [
+    "repaired",
+    "partial",
+    "already_complete",
+    "not_comparable",
+    "authoritative_read_failed",
+];
+
+pub fn ehdb_mirror_repair_total() -> &'static IntCounterVec {
+    static M: OnceLock<IntCounterVec> = OnceLock::new();
+    M.get_or_init(|| {
+        let counter = IntCounterVec::new(
+            Opts::new(
+                "noetl_ehdb_mirror_repair_total",
+                "Background mirror-repair sweep outcomes, by outcome \
+                 (noetl/ai-meta#342).",
+            ),
+            &["outcome"],
+        )
+        .expect("static counter spec must be valid");
+        registry()
+            .register(Box::new(counter.clone()))
+            .expect("counter registration must succeed");
+        counter
+    })
+}
+
+/// Gauge: executions hinted as having lost a mirror batch and not yet repaired.
+///
+/// ⚠ A *hint* count, not a gap count. The sweep finds gaps by comparison
+/// regardless of this number, so 0 here means "nothing queued for the fast
+/// path", NOT "the tier is complete".
+pub fn ehdb_mirror_repair_pending() -> &'static IntGauge {
+    static M: OnceLock<IntGauge> = OnceLock::new();
+    M.get_or_init(|| {
+        let g = IntGauge::new(
+            "noetl_ehdb_mirror_repair_pending",
+            "Executions hinted to the mirror-repair sweep and not yet drained \
+             (noetl/ai-meta#342).",
+        )
+        .expect("static gauge spec must be valid");
+        registry()
+            .register(Box::new(g.clone()))
+            .expect("gauge registration must succeed");
+        g
+    })
+}
+
+pub fn record_ehdb_mirror_repair(outcome: &str) {
+    ehdb_mirror_repair_total()
+        .with_label_values(&[outcome])
+        .inc();
+}
+
+pub fn set_ehdb_mirror_repair_pending(n: u64) {
+    ehdb_mirror_repair_pending().set(n as i64);
+}
+
+/// Pin every repair outcome at 0 so a healthy sweep is readable.
+pub fn pin_ehdb_mirror_repair_outcomes() {
+    for o in EHDB_MIRROR_REPAIR_OUTCOMES {
+        ehdb_mirror_repair_total().with_label_values(&[o]).inc_by(0);
+    }
+    ehdb_mirror_repair_pending().set(0);
+}
+
 pub fn record_ehdb_eventlog_mirror(outcome: &str, events: usize) {
     ehdb_eventlog_mirror_total()
         .with_label_values(&[outcome])
