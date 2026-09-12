@@ -576,6 +576,13 @@ pub(crate) async fn deliver(batch: &MirrorBatch) {
                     // every queue metric read healthy and this path filed its
                     // discards under `unavailable`, which no alert watched.
                     crate::metrics::record_ehdb_eventlog_mirror("dropped", count);
+                    // noetl/ai-meta#342 — the drop is no longer terminal. Hint
+                    // the repair sweep so the gap closes in seconds rather than
+                    // waiting for the next scan. ⚠ This is a latency hint only:
+                    // the sweep re-derives the gap by comparing the tier against
+                    // Postgres, so losing this hint (restart, overflow) delays
+                    // the repair, it does not lose it.
+                    crate::handlers::ehdb_mirror_repair_sweep::hint(execution_id);
                     error!(
                         target: "noetl_server::ehdb_eventlog_mirror",
                         execution_id,

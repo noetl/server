@@ -21,6 +21,7 @@ pub mod ehdb;
 pub mod ehdb_embedded;
 pub mod ehdb_embedded_verify;
 pub mod ehdb_eventlog_mirror;
+pub mod ehdb_mirror_repair_sweep;
 pub mod ehdb_eventlog_mirror_queue;
 pub mod ehdb_parity;
 pub mod ehdb_parent_backfill;

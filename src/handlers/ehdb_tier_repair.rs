@@ -128,25 +128,42 @@ pub async fn repair_execution_endpoint(
     State(state): State<AppState>,
     Path(execution_id): Path<i64>,
 ) -> impl IntoResponse {
+    let (_outcome, body) = repair_execution(&state, execution_id).await;
+    (StatusCode::OK, Json(body))
+}
+
+/// Repair one execution's tier coverage. **The one implementation**, shared by
+/// the endpoint and the background sweep (noetl/ai-meta#342).
+///
+/// Returns `(outcome, report)`. The outcome string is the same vocabulary the
+/// endpoint reports, so the sweep's metrics and the endpoint's JSON cannot drift
+/// into describing different things.
+///
+/// ⚠ Extracted rather than duplicated. A second repair implementation would be a
+/// second thing to keep true, on the write path of a tier that serves reads.
+pub async fn repair_execution(
+    state: &AppState,
+    execution_id: i64,
+) -> (&'static str, serde_json::Value) {
     // Before. Inspect, never Record — see the module note on #264.
-    let before = compare_execution(&state, execution_id, ParityRecording::Inspect, None).await;
+    let before = compare_execution(state, execution_id, ParityRecording::Inspect, None).await;
     let Some(report) = before.report.as_ref() else {
         return (
-            StatusCode::OK,
-            Json(json!({
+            "not_comparable",
+            json!({
                 "action": "ehdb.tier.repair",
                 "execution_id": execution_id.to_string(),
                 "outcome": "not_comparable",
                 "detail": before.detail,
-            })),
+            }),
         );
     };
 
     let missing = report.missing_event_ids.clone();
     if missing.is_empty() {
         return (
-            StatusCode::OK,
-            Json(json!({
+            "already_complete",
+            json!({
                 "action": "ehdb.tier.repair",
                 "execution_id": execution_id.to_string(),
                 "outcome": "already_complete",
@@ -154,21 +171,21 @@ pub async fn repair_execution_endpoint(
                 "repaired": 0,
                 "authoritative_expected": report.authoritative_expected,
                 "ehdb_before": report.ehdb_count,
-            })),
+            }),
         );
     }
 
-    let rows = match fetch_rows(&state, execution_id, &missing).await {
+    let rows = match fetch_rows(state, execution_id, &missing).await {
         Ok(r) => r,
         Err(e) => {
             return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({
+                "authoritative_read_failed",
+                json!({
                     "action": "ehdb.tier.repair",
                     "execution_id": execution_id.to_string(),
                     "outcome": "authoritative_read_failed",
                     "detail": e.to_string(),
-                })),
+                }),
             );
         }
     };
@@ -182,18 +199,18 @@ pub async fn repair_execution_endpoint(
     // Re-mirror exactly the rows we hold. `mirror_rows` is the same chokepoint the
     // live path uses, so a repaired record is byte-identical to a first-delivery
     // one — a second mirror implementation would be a second thing to keep true.
-    crate::handlers::ehdb_eventlog_mirror::mirror_rows(&state, &rows).await;
+    crate::handlers::ehdb_eventlog_mirror::mirror_rows(state, &rows).await;
 
     // After. Inspect again, for the same reason.
-    let after = compare_execution(&state, execution_id, ParityRecording::Inspect, None).await;
+    let after = compare_execution(state, execution_id, ParityRecording::Inspect, None).await;
     let (missing_after, ehdb_after) = match after.report.as_ref() {
         Some(r) => (r.missing_event_ids.len(), r.ehdb_count),
         None => (missing.len(), report.ehdb_count),
     };
 
     (
-        StatusCode::OK,
-        Json(json!({
+        repair_outcome(missing_after),
+        json!({
             "action": "ehdb.tier.repair",
             "execution_id": execution_id.to_string(),
             "outcome": repair_outcome(missing_after),
@@ -205,7 +222,7 @@ pub async fn repair_execution_endpoint(
             "remirrored": rows.len(),
             "unrecoverable": unrecoverable,
             "unrecoverable_count": unrecoverable.len(),
-        })),
+        }),
     )
 }
 
@@ -246,7 +263,7 @@ mod tests {
         // [`ParityRecording::Inspect`], and counting that made this read 3.
         assert_eq!(
             src()
-                .matches("compare_execution(&state, execution_id, ParityRecording::Inspect, None)")
+                .matches("compare_execution(state, execution_id, ParityRecording::Inspect, None)")
                 .count(),
             2,
             "the before and after comparisons must BOTH be Inspect"
@@ -285,7 +302,7 @@ mod tests {
     #[test]
     fn it_mirrors_through_the_same_chokepoint_the_live_path_uses() {
         assert!(
-            src().contains("ehdb_eventlog_mirror::mirror_rows(&state, &rows)"),
+            src().contains("ehdb_eventlog_mirror::mirror_rows(state, &rows)"),
             "a second mirror implementation would be a second thing to keep true, \
              and a repaired record must be byte-identical to a first delivery"
         );
