@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.109.1](https://github.com/noetl/server/compare/v3.109.0...v3.109.1) (2026-09-12)
+
+### Bug Fixes
+
+* **ehdb:** hydrate result references before a repair re-mirrors ([bb40845](https://github.com/noetl/server/commit/bb40845a907235e0ba8559eb3a2834458db7e1bc)), closes [#342](https://github.com/noetl/server/issues/342) [noetl/server#427](https://github.com/noetl/server/issues/427)
+
 ## [3.109.0](https://github.com/noetl/server/compare/v3.108.4...v3.109.0) (2026-09-12)
 
 ### Features
