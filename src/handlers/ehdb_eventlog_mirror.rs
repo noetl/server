@@ -496,6 +496,57 @@ pub async fn mirror_rows(state: &AppState, rows: &[EventRow]) {
 /// The delivery half of [`mirror_rows`], split out so the queue's drain task
 /// runs **the same code** the inline path runs. Two deliverers would be two
 /// failure postures, two metric spellings, and one of them would drift.
+/// Which kind of transport failure this is, as a low-cardinality metric label.
+///
+/// ⚠ Order matters. `is_request()` is true for a great many errors including
+/// timeouts, so the specific predicates have to be asked first or everything
+/// collapses into `request` and the metric answers nothing — the same shape as
+/// the coarse `unavailable` label it exists to refine.
+///
+/// Kept total (an `other` arm rather than an `Option`) so a reqwest version
+/// that adds a category degrades to a countable bucket instead of vanishing.
+pub(crate) fn send_error_kind(e: &reqwest::Error) -> &'static str {
+    if e.is_timeout() {
+        "timeout"
+    } else if e.is_connect() {
+        "connect"
+    } else if e.is_body() {
+        "body"
+    } else if e.is_decode() {
+        "decode"
+    } else if e.is_redirect() {
+        "redirect"
+    } else if e.is_request() {
+        "request"
+    } else {
+        "other"
+    }
+}
+
+/// The error and every `source()` under it, joined.
+///
+/// `reqwest::Error`'s own `Display` for a timeout is
+/// `error sending request for url (…)` — the URL and nothing about the cause.
+/// The cause is in the source chain (`hyper` → `io`), which is where the
+/// distinction between "timed out", "connection refused" and "connection reset
+/// by peer" actually lives. Logging only the top frame is why #343's transport
+/// failure had to stay a hypothesis.
+pub(crate) fn error_chain(e: &reqwest::Error) -> String {
+    let mut parts = vec![e.to_string()];
+    let mut src: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(e);
+    // Bounded: a cyclic chain would otherwise hang the write path.
+    for _ in 0..8 {
+        match src {
+            Some(s) => {
+                parts.push(s.to_string());
+                src = s.source();
+            }
+            None => break,
+        }
+    }
+    parts.join(" <- ")
+}
+
 pub(crate) async fn deliver(batch: &MirrorBatch) {
     let execution_id = batch.execution_id;
     let count = batch.records.len();
@@ -519,7 +570,19 @@ pub(crate) async fn deliver(batch: &MirrorBatch) {
             .await
         {
             Err(e) => {
-                last_detail = e.to_string();
+                // noetl/ai-meta#343 — say WHAT the failure was.
+                //
+                // `attempt_total{outcome="unavailable"}` counts a timeout, a
+                // refused connection and a mid-body reset identically, and
+                // `e.to_string()` for a timeout is the bare
+                // `error sending request for url (…)` with no source chain. So
+                // the #343 investigation could not separate "the 5 s
+                // APPEND_TIMEOUT is too short for a ~1.17 MB payload" from "the
+                // relay dropped the connection", and both remedies are wrong
+                // for the other cause.
+                let kind = send_error_kind(&e);
+                crate::metrics::record_ehdb_eventlog_mirror_send_error(kind);
+                last_detail = format!("{kind}: {}", error_chain(&e));
                 AttemptOutcome::Retryable("unavailable")
             }
             Ok(r) => {
@@ -1796,6 +1859,199 @@ mod tests {
         assert!(
             code.contains("sink_mirror_enabled()"),
             "the call must be gated, not unconditional"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // noetl/ai-meta#343 — make the transport error SAY WHAT IT IS.
+    // ---------------------------------------------------------------------
+
+    fn send_error_count(kind: &str) -> u64 {
+        crate::metrics::ehdb_eventlog_mirror_send_error_total()
+            .with_label_values(&[kind])
+            .get()
+    }
+
+    /// A relay that accepts the connection and then never replies.
+    ///
+    /// This is the shape the #343 hypothesis is about — the writer is *up* and
+    /// the socket *connects*, it is the reply that does not arrive inside
+    /// `APPEND_TIMEOUT`. A test that used a refused port would exercise the
+    /// wrong branch and pass for the wrong reason.
+    async fn black_hole_relay() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                // Hold the socket open, answer nothing.
+                held.push(sock);
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// ⭐ **The discriminator.** A relay that accepts and never answers must be
+    /// counted as `timeout`, not as the coarse `unavailable`.
+    ///
+    /// This is the measurement the #343 investigation lacked: with only
+    /// `attempt_total{outcome="unavailable"}`, a 5 s `APPEND_TIMEOUT` against a
+    /// ~1.17 MB payload and a relay dropping connections are the same number.
+    /// They need opposite fixes, so the metric has to tell them apart BEFORE
+    /// anybody changes a timeout value.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_relay_that_never_answers_is_counted_as_a_timeout() {
+        std::env::set_var(MAX_RETRIES_ENV, "0");
+        std::env::set_var(RETRY_BACKOFF_MS_ENV, "1");
+        let base = black_hole_relay().await;
+
+        let before_timeout = send_error_count("timeout");
+        let before_connect = send_error_count("connect");
+        deliver(&batch(&base, &[1, 2])).await;
+
+        assert_eq!(
+            send_error_count("timeout") - before_timeout,
+            1,
+            "a relay that accepts and never replies must be recorded as \
+             `timeout` — this is the whole point of the label"
+        );
+        // Negative control: it must not ALSO land in a second bucket, or the
+        // metric cannot be used to attribute a cause.
+        assert_eq!(
+            send_error_count("connect") - before_connect,
+            0,
+            "a timeout was also counted as a connect failure — the classifier \
+             is not exclusive and the attribution is worthless"
+        );
+        std::env::remove_var(MAX_RETRIES_ENV);
+        std::env::remove_var(RETRY_BACKOFF_MS_ENV);
+    }
+
+    /// The other side of the discriminator: nothing listening at all.
+    ///
+    /// Without this, `a_relay_that_never_answers_is_counted_as_a_timeout` would
+    /// pass just as well if the classifier returned `"timeout"` for everything.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_refused_connection_is_counted_as_connect_not_timeout() {
+        std::env::set_var(MAX_RETRIES_ENV, "0");
+        std::env::set_var(RETRY_BACKOFF_MS_ENV, "1");
+        // Bind then drop, so the port is known-closed rather than guessed.
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        drop(l);
+        let base = format!("http://{addr}");
+
+        let before_connect = send_error_count("connect");
+        let before_timeout = send_error_count("timeout");
+        deliver(&batch(&base, &[3])).await;
+
+        assert_eq!(
+            send_error_count("connect") - before_connect,
+            1,
+            "a refused connection must be recorded as `connect`"
+        );
+        assert_eq!(
+            send_error_count("timeout") - before_timeout,
+            0,
+            "a refused connection was counted as a timeout — raising \
+             APPEND_TIMEOUT would then be the obvious and entirely wrong fix"
+        );
+        std::env::remove_var(MAX_RETRIES_ENV);
+        std::env::remove_var(RETRY_BACKOFF_MS_ENV);
+    }
+
+    /// `is_request()` is true for most reqwest errors, timeouts included, so
+    /// asking it before the specific predicates collapses every cause into
+    /// `request` — a metric with seven labels that only ever reports one.
+    #[test]
+    fn the_classifier_asks_the_specific_predicates_first() {
+        let src = include_str!("ehdb_eventlog_mirror.rs");
+        let code = src.split("\n#[cfg(test)]").next().unwrap_or(src);
+        let start = code
+            .find("pub(crate) fn send_error_kind")
+            .expect("send_error_kind not found — extraction broke");
+        let body = &code[start..];
+        let end = body.find("\n}\n").map(|i| i + 3).unwrap_or(body.len());
+        let body = &body[..end];
+        let t = body.find("is_timeout()").expect("no is_timeout check");
+        let c = body.find("is_connect()").expect("no is_connect check");
+        let r = body.find("is_request()").expect("no is_request check");
+        assert!(
+            t < r && c < r,
+            "is_request() is checked before is_timeout()/is_connect(); it \
+             matches both, so every cause would report as `request`"
+        );
+    }
+
+    /// The drop path must record the cause, not merely compute it.
+    #[test]
+    fn the_send_failure_path_records_the_kind() {
+        let src = include_str!("ehdb_eventlog_mirror.rs");
+        let code = src.split("\n#[cfg(test)]").next().unwrap_or(src);
+        let start = code
+            .find("pub(crate) async fn deliver")
+            .expect("deliver not found — extraction broke");
+        let body = &code[start..];
+        let end = body.find("\n}\n").map(|i| i + 3).unwrap_or(body.len());
+        let body = &body[..end];
+        assert!(
+            body.len() > 2000,
+            "deliver extracted as {} bytes",
+            body.len()
+        );
+        let code_only: String = body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            code_only.contains("record_ehdb_eventlog_mirror_send_error("),
+            "deliver classifies the error but never records it — a \
+             discriminator nobody can read is not a discriminator"
+        );
+        assert!(
+            code_only.contains("error_chain(&e)"),
+            "the log detail must carry the source chain; reqwest's own Display \
+             for a timeout names only the URL, which is what left #343 unable \
+             to tell a timeout from a reset"
+        );
+    }
+
+    /// Absence and zero must not read alike.
+    ///
+    /// `Registry::gather` prunes empty families, so an un-pinned labelled
+    /// metric does not appear on /metrics until it first fires — and
+    /// "`timeout` is missing" then looks exactly like "`timeout` is 0". The
+    /// whole point of this counter is to be readable on a HEALTHY prod, where
+    /// most kinds legitimately never fire.
+    #[test]
+    fn every_send_error_kind_is_pinned_at_zero() {
+        crate::metrics::init_ehdb_eventlog_mirror_series();
+        // Read the RENDERED surface, not the registry object — /metrics is what
+        // an operator and an alert actually see, and it is the rendering step
+        // that prunes empty families.
+        let text = crate::metrics::gather_text().expect("metrics render");
+        assert!(
+            text.contains("noetl_ehdb_eventlog_mirror_send_error_total"),
+            "the send-error family is absent from the rendered /metrics — it is \
+             pruned until pinned, which is the defect this test exists for"
+        );
+        for kind in crate::metrics::EHDB_EVENTLOG_MIRROR_SEND_ERROR_KINDS {
+            let needle = format!("noetl_ehdb_eventlog_mirror_send_error_total{{kind=\"{kind}\"}}");
+            assert!(
+                text.contains(&needle),
+                "kind `{kind}` is not pinned; it will be absent from /metrics \
+                 until it first fires, and absence reads as zero"
+            );
+        }
+        // Negative control: a kind that does NOT exist must be absent, or the
+        // assertions above would pass against any text at all.
+        assert!(
+            !text.contains("noetl_ehdb_eventlog_mirror_send_error_total{kind=\"nonsense\"}"),
+            "a kind nobody defined is present — this check cannot distinguish \
+             pinned from unpinned"
         );
     }
 }

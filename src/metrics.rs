@@ -3475,6 +3475,49 @@ pub const EHDB_EVENTLOG_MIRROR_OUTCOMES: [&str; 6] = [
 /// both read `mirrored`.
 pub const EHDB_EVENTLOG_MIRROR_ATTEMPT_OUTCOMES: [&str; 2] = ["unavailable", "degraded"];
 
+/// Why a mirror send failed at the transport, as distinct from the coarse
+/// `unavailable` outcome (noetl/ai-meta#343).
+///
+/// ⚠ `attempt_total{outcome="unavailable"}` counts *every* send failure
+/// identically: a 5 s timeout, a refused connection and a mid-body reset all
+/// increment the same series. The prior session could not tell them apart —
+/// `reqwest` renders a timeout as `error sending request for url (…)` with **no
+/// source chain**, so neither the metric nor the log said which had happened,
+/// and the leading hypothesis (the 5 s `APPEND_TIMEOUT` against a ~1.17 MB
+/// payload) stayed a hypothesis.
+///
+/// This is the discriminator, and it is deliberately the FIRST change in that
+/// investigation: raising a timeout before the error says what it is converts a
+/// guess into a mitigation nobody can evaluate afterwards.
+pub const EHDB_EVENTLOG_MIRROR_SEND_ERROR_KINDS: [&str; 7] = [
+    "timeout", "connect", "request", "body", "decode", "redirect", "other",
+];
+
+/// Counter: transport-level send failures by cause.
+pub fn ehdb_eventlog_mirror_send_error_total() -> &'static IntCounterVec {
+    static M: OnceLock<IntCounterVec> = OnceLock::new();
+    M.get_or_init(|| {
+        let c = IntCounterVec::new(
+            Opts::new(
+                "noetl_ehdb_eventlog_mirror_send_error_total",
+                "Mirror delivery send failures by reqwest error kind — the \
+                 discriminator `attempt_total{outcome=\"unavailable\"}` lacks \
+                 (noetl/ai-meta#343). Counts ATTEMPTS, not events.",
+            ),
+            &["kind"],
+        )
+        .expect("valid metric");
+        registry().register(Box::new(c.clone())).ok();
+        c
+    })
+}
+
+pub fn record_ehdb_eventlog_mirror_send_error(kind: &str) {
+    ehdb_eventlog_mirror_send_error_total()
+        .with_label_values(&[kind])
+        .inc();
+}
+
 pub fn ehdb_eventlog_mirror_attempt_total() -> &'static IntCounterVec {
     static M: OnceLock<IntCounterVec> = OnceLock::new();
     M.get_or_init(|| {
@@ -3590,6 +3633,16 @@ pub fn init_ehdb_eventlog_mirror_series() {
     for outcome in EHDB_EVENTLOG_MIRROR_ATTEMPT_OUTCOMES {
         ehdb_eventlog_mirror_attempt_total()
             .with_label_values(&[outcome])
+            .inc_by(0);
+    }
+    // ⚠ Pinned at 0 unconditionally. `Registry::gather` prunes empty families,
+    // so an un-pinned labelled metric is ABSENT until it first fires — and an
+    // absent series and a zero series read identically to anyone diffing
+    // /metrics, which is how a diagnostic gets mistaken for "no failures".
+    // Pinning makes `timeout 0` a measurement instead of a silence.
+    for kind in EHDB_EVENTLOG_MIRROR_SEND_ERROR_KINDS {
+        ehdb_eventlog_mirror_send_error_total()
+            .with_label_values(&[kind])
             .inc_by(0);
     }
 }
