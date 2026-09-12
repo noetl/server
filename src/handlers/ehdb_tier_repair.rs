@@ -141,6 +141,59 @@ pub async fn repair_execution_endpoint(
 ///
 /// ⚠ Extracted rather than duplicated. A second repair implementation would be a
 /// second thing to keep true, on the write path of a tier that serves reads.
+/// Resolve `result` references on rows about to be re-mirrored, in place.
+///
+/// Delegates to `events::hydrate_result_references` — the ONE hydrator, the
+/// same one `rebuild_state` uses at all eight of its fold sites. A second
+/// implementation here is exactly how this area accumulated four copies of one
+/// Postgres read, each fixed separately (noetl/server#425, #426, #427).
+///
+/// `EventRow` and `Event` are different types, so this adapts rather than
+/// reimplements: shells carrying only the fields the hydrator reads
+/// (`result`, and `execution_id` for its warnings) go in, and the resolved
+/// `result` comes back by index. Returns how many were resolved.
+async fn hydrate_rows(state: &AppState, execution_id: i64, rows: &mut [EventRow]) -> usize {
+    let result_store = crate::services::result_store::ResultStoreService::new(
+        state.pools.pool_for(execution_id).clone(),
+        state.snowflake.clone(),
+    );
+    let mut shells: Vec<crate::db::models::Event> = rows
+        .iter()
+        .map(|r| crate::db::models::Event {
+            id: 0,
+            event_id: r.event_id,
+            execution_id: r.execution_id,
+            catalog_id: r.catalog_id,
+            parent_event_id: r.parent_event_id,
+            parent_execution_id: r.parent_execution_id,
+            event_type: r.event_type.clone(),
+            node_id: r.node_id.clone(),
+            node_name: r.node_name.clone(),
+            node_type: r.node_type.clone(),
+            status: r.status.clone(),
+            context: None,
+            meta: None,
+            result: r.result.clone(),
+            worker_id: None,
+            attempt: None,
+            created_at: r.created_at,
+        })
+        .collect();
+
+    // `keep_refs = false`: drop the reference envelope once resolved, so the
+    // row reads as inline — which is the shape the live mirror delivers.
+    crate::handlers::events::hydrate_result_references(&mut shells, &result_store, false).await;
+
+    let mut changed = 0usize;
+    for (row, shell) in rows.iter_mut().zip(shells.into_iter()) {
+        if row.result != shell.result {
+            row.result = shell.result;
+            changed += 1;
+        }
+    }
+    changed
+}
+
 pub async fn repair_execution(
     state: &AppState,
     execution_id: i64,
@@ -175,7 +228,7 @@ pub async fn repair_execution(
         );
     }
 
-    let rows = match fetch_rows(state, execution_id, &missing).await {
+    let mut rows = match fetch_rows(state, execution_id, &missing).await {
         Ok(r) => r,
         Err(e) => {
             return (
@@ -196,9 +249,24 @@ pub async fn repair_execution(
     // being measured".
     let unrecoverable = unrecoverable_ids(&missing, rows.iter().map(|r| r.event_id));
 
-    // Re-mirror exactly the rows we hold. `mirror_rows` is the same chokepoint the
-    // live path uses, so a repaired record is byte-identical to a first-delivery
-    // one — a second mirror implementation would be a second thing to keep true.
+    // ⚠ HYDRATE FIRST (noetl/ai-meta#343).
+    //
+    // The comment that stood here claimed a repaired record was "byte-identical
+    // to a first-delivery one". It was not, and prod proved it: the live path
+    // mirrors the EventRow the writer holds in memory, whose `result` carries
+    // inlined content, while this path re-reads the PERSISTED row, whose
+    // `result` carries a `reference` under NOETL_PERMANENT_LOG_LEAN=true.
+    //
+    // So a repair closed the COUNT gap and opened a CONTENT gap, and repairing
+    // again could not fix it — it rewrote the same reference. Measured on prod
+    // 2026-09-12, on the two executions the #342 sweep had repaired: every
+    // event still differing on `result` was in the re-mirrored set (3 of 39 and
+    // 3 of 26, zero outside it), and a comparable execution that was never
+    // repaired showed none. Three of each because only results over the inline
+    // budget are externalised.
+    //
+    // Hydrating here restores the property the comment asserted.
+    let hydrated = hydrate_rows(state, execution_id, &mut rows).await;
     crate::handlers::ehdb_eventlog_mirror::mirror_rows(state, &rows).await;
 
     // After. Inspect again, for the same reason.
@@ -214,6 +282,11 @@ pub async fn repair_execution(
             "action": "ehdb.tier.repair",
             "execution_id": execution_id.to_string(),
             "outcome": repair_outcome(missing_after),
+            // How many re-mirrored rows carried an externalised result that had
+            // to be resolved before sending. Reported because a repair that
+            // closes the count and leaves content divergent looks identical to
+            // a clean one from `missing_after` alone (noetl/ai-meta#343).
+            "hydrated": hydrated,
             "authoritative_expected": report.authoritative_expected,
             "ehdb_before": report.ehdb_count,
             "ehdb_after": ehdb_after,
@@ -349,6 +422,91 @@ mod tests {
         assert!(
             src().contains("idempotent by") && src().contains("construction, not by bookkeeping"),
             "the repair must state that its idempotence comes from the tier dedupe"
+        );
+    }
+
+    /// ⭐ **The repair must hydrate BEFORE it re-mirrors.**
+    ///
+    /// The live mirror sends the `EventRow` the writer holds in memory, whose
+    /// `result` carries inlined content. This path re-reads the PERSISTED row,
+    /// whose `result` carries a `reference` under
+    /// `NOETL_PERMANENT_LOG_LEAN=true`. Without hydration a repair therefore
+    /// closes the COUNT gap and opens a CONTENT gap — and repairing again
+    /// cannot fix it, because it rewrites the same reference.
+    ///
+    /// Prod, 2026-09-12, on the two executions the noetl/ai-meta#342 sweep had
+    /// repaired: every event still differing on `result` was in the re-mirrored
+    /// set — 3 of 39 and 3 of 26, **zero outside it** — while a comparable
+    /// execution that was never repaired showed none.
+    #[test]
+    fn the_repair_hydrates_before_it_remirrors() {
+        let code: String = src()
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let h = code
+            .find("hydrate_rows(state, execution_id, &mut rows)")
+            .expect(
+                "the repair no longer hydrates — a repaired record is NOT \
+                 byte-identical to a first delivery, and the count gap closing \
+                 will hide a content gap that repair cannot clear",
+            );
+        let m = code
+            .find("mirror_rows(state, &rows)")
+            .expect("the repair no longer re-mirrors");
+        assert!(
+            h < m,
+            "hydration must run BEFORE the re-mirror; after it, the rows have \
+             already gone to the tier carrying references"
+        );
+    }
+
+    /// It must delegate to the ONE hydrator, not grow a second copy.
+    ///
+    /// This area accumulated FOUR copies of a single Postgres read, each fixed
+    /// separately as it was discovered (noetl/server#425, #426, #427). A
+    /// hand-rolled reference resolver here would be the fifth copy of that
+    /// mistake in a different shape.
+    #[test]
+    fn the_repair_reuses_the_one_hydrator() {
+        let code: String = src()
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            code.contains("events::hydrate_result_references("),
+            "the repair does not call the shared hydrator"
+        );
+        assert!(
+            !code.contains("parse_noetl_ref("),
+            "the repair is resolving references itself instead of delegating — \
+             that is a second implementation of the rule"
+        );
+        assert!(
+            code.contains("&result_store, false)"),
+            "the repair must hydrate with keep_refs=false so the row reads as \
+             INLINE, which is the shape the live mirror delivers; keeping the \
+             envelope reproduces the divergence this fixes"
+        );
+    }
+
+    /// The count must be reported, not merely computed.
+    ///
+    /// A repair that closes `missing_after` while leaving content divergent
+    /// reads identically to a clean one from the outcome alone — which is how
+    /// this went unnoticed through an entire session of #342 follow-up.
+    #[test]
+    fn the_repair_reports_how_many_rows_it_hydrated() {
+        let code: String = src()
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            code.contains("\"hydrated\": hydrated"),
+            "the hydrated count is computed but not reported"
         );
     }
 }
