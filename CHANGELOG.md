@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.108.2](https://github.com/noetl/server/compare/v3.108.1...v3.108.2) (2026-09-12)
+
+### Bug Fixes
+
+* **ehdb:** hydrate result references on the verification fold ([7a2687c](https://github.com/noetl/server/commit/7a2687ccd622411f0c7dee1ba8175916f32f0c34)), closes [noetl/ai-meta#332](https://github.com/noetl/ai-meta/issues/332)
+* **ehdb:** hydrate result references on the verification fold ([#425](https://github.com/noetl/server/issues/425)) ([53ba6db](https://github.com/noetl/server/commit/53ba6db982bc8124ca59b03b7ed2af48d497d41d)), closes [noetl/ai-meta#332](https://github.com/noetl/ai-meta/issues/332)
+
 ## [3.108.1](https://github.com/noetl/server/compare/v3.108.0...v3.108.1) (2026-09-11)
 
 ### Bug Fixes
