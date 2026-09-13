@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.109.2](https://github.com/noetl/server/compare/v3.109.1...v3.109.2) (2026-09-13)
+
+### Bug Fixes
+
+* **orchestrate:** dedup iterations_dispatched — the WAL fold double-counted it ([3cf6424](https://github.com/noetl/server/commit/3cf64245d4f71a4a2f4105be0ec13e1a4ca77a2f)), closes [noetl/ai-meta#335](https://github.com/noetl/ai-meta/issues/335)
+
 ## [3.109.1](https://github.com/noetl/server/compare/v3.109.0...v3.109.1) (2026-09-12)
 
 ### Bug Fixes
