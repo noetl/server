@@ -2904,3 +2904,83 @@ mod double_apply_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod digest_invariance_tests {
+    use super::*;
+
+    fn ev(t: &str, step: &str, cid: &str, id: i64) -> Event {
+        let mut meta = serde_json::Map::new();
+        meta.insert("command_id".to_string(), serde_json::json!(cid));
+        Event {
+            event_id: id, execution_id: 1, catalog_id: 2,
+            event_type: t.to_string(), node_name: Some(step.to_string()),
+            status: String::new(), context: None, result: None,
+            meta: Some(serde_json::Value::Object(meta)),
+            timestamp: DateTime::from_timestamp(0, 0).unwrap(),
+            parent_execution_id: None, attempt: None,
+        }
+    }
+
+    /// ⭐ **Replaying a duplicated event list must not change the canonical
+    /// digest.** This is the property behind noetl/ai-meta#335, stated at the
+    /// level that matters.
+    ///
+    /// The WAL path can deliver an event twice. If one side of the projection
+    /// serve comparison receives duplicates and the other does not, ANY
+    /// accumulator without a dedup guard shifts the digest — and the serve path
+    /// then reports `digest_mismatch` at equal version, which reads like
+    /// corruption rather than a replay artefact. Prod was sitting at
+    /// `digest_mismatch 326 / match 2` when this was written.
+    ///
+    /// Measured counterfactual (2026-09-13), which is why this test exists at
+    /// the digest level rather than on one field:
+    ///
+    /// ```text
+    ///   with the #335 guard:  once=c23ce0ec…  twice=c23ce0ec…  equal
+    ///   guard reverted:       once=c23ce0ec…  twice=3366c70a…  DIFFERENT
+    /// ```
+    ///
+    /// ⚠ The fixture must be a REAL iterator. Two earlier drafts of this probe
+    /// passed in both directions because `iterations_expected` was never set, so
+    /// `is_iterator()` was false and nothing incremented — a vacuous pass in the
+    /// exact shape this guards against. The two assertions below refuse that.
+    #[test]
+    fn duplicated_events_must_not_change_the_digest() {
+        // ⚠ The step MUST be a real iterator or `iterations_dispatched` never
+        // increments and the probe is vacuous in BOTH directions — which is
+        // exactly how my first two attempts "passed". `iterations_expected`
+        // arrives via `event.result.context.iterations_expected` on step.enter.
+        let mut enter = ev("step.enter", "loop_step", "c1", 2);
+        enter.result = Some(serde_json::json!({
+            "status": "ok",
+            "context": { "iterations_expected": 3 }
+        }));
+        let base = vec![
+            ev("playbook_started", "start", "c0", 1),
+            enter,
+            ev("command.issued", "loop_step", "c2", 3),
+            ev("command.completed", "loop_step", "c2", 4),
+        ];
+        let once = WorkflowState::from_events(&base).expect("fold");
+        // make it an iterator so iterations_dispatched participates
+        let mut doubled: Vec<Event> = Vec::new();
+        for e in &base { doubled.push(e.clone()); doubled.push(e.clone()); }
+        let twice = WorkflowState::from_events(&doubled).expect("fold");
+
+        // Prove the fixture CAN exhibit the condition before trusting either result.
+        assert!(
+            once.steps["loop_step"].is_iterator(),
+            "fixture is not an iterator — the probe would be vacuous"
+        );
+        assert!(
+            once.steps["loop_step"].iterations_dispatched >= 1,
+            "iterations_dispatched never incremented — vacuous"
+        );
+        let d1 = canonical_state_digest(&once);
+        let d2 = canonical_state_digest(&twice);
+        // Printed so a failure shows both digests, not just "not equal".
+        println!("digest once={} twice={} equal={}", &d1[..16], &d2[..16], d1 == d2);
+        assert_eq!(d1, d2, "duplicated replay changed the canonical digest");
+    }
+}
