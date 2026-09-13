@@ -217,6 +217,25 @@ pub struct StepInfo {
     #[serde(default, skip_serializing_if = "crate::state::is_zero")]
     pub iterations_dispatched: i32,
 
+    /// Command ids already counted into [`Self::iterations_dispatched`].
+    ///
+    /// ⚠⚠ **`#[serde(skip)]` is load-bearing, not tidiness.**
+    /// `canonical_state_digest` hashes `serde_json::to_value(state)` over the
+    /// whole `WorkflowState`, so ANY serialised field added to `StepInfo`
+    /// changes the digest of every execution with an iterator step — which
+    /// would flip every cross-store parity comparison to divergent. Skipping it
+    /// keeps the digest byte-identical.
+    ///
+    /// Skipping is also *correct* rather than merely convenient: `apply_event`
+    /// is reachable only from [`WorkflowState::from_events`], which always
+    /// replays from the first event, so this set is rebuilt on every fold and
+    /// never needs to survive serialisation. If a caller ever applies events
+    /// incrementally on top of a deserialised state, this dedup goes blind and
+    /// the guard below must be revisited — `the_dedup_set_is_never_serialised`
+    /// pins the assumption.
+    #[serde(skip)]
+    pub counted_iteration_commands: std::collections::BTreeSet<String>,
+
     /// True when this step is a `mode: cursor` loop (noetl/ai-meta#100).  Set
     /// from the `step.enter` context marker `__cursor_loop`.  Cursor steps are
     /// NOT completed by individual claim/body `command.completed` events — the
@@ -277,6 +296,7 @@ impl StepInfo {
             iteration_command_ids: std::collections::BTreeSet::new(),
             iteration_results: Vec::new(),
             iterations_dispatched: 0,
+            counted_iteration_commands: std::collections::BTreeSet::new(),
             is_cursor: false,
             cursor_issued: std::collections::HashMap::new(),
             cursor_completed: std::collections::BTreeSet::new(),
@@ -699,8 +719,29 @@ impl WorkflowState {
                     step.state = StepState::CommandIssued;
                     // #76: track dispatched iteration count for
                     // sequential-mode guard in orchestrator.rs.
+                    // noetl/ai-meta#335 — dedup on `command_id`.
+                    //
+                    // The WAL fold path applies every event TWICE, and this was
+                    // the one additive accumulator in `apply_event` without a
+                    // guard (its sibling `body_issued` is protected by
+                    // `cursor_issued.insert(cid).is_none()`). Double-counting is
+                    // not cosmetic: the sequential-dispatch gate in
+                    // orchestrator.rs only issues the next iteration when
+                    // `iterations_dispatched == completed`, so an inflated count
+                    // never matches and the loop **silently stops dispatching**.
+                    //
+                    // Events with no command id keep the previous behaviour —
+                    // there is nothing to dedup on, and inventing a key would be
+                    // worse than the double count.
                     if step.is_iterator() {
-                        step.iterations_dispatched += 1;
+                        match cid.as_ref() {
+                            Some(cid) => {
+                                if step.counted_iteration_commands.insert(cid.clone()) {
+                                    step.iterations_dispatched += 1;
+                                }
+                            }
+                            None => step.iterations_dispatched += 1,
+                        }
                     }
                     if let (Some((phase, frame)), Some(cid)) = (cursor_meta, cid) {
                         if step
@@ -2736,5 +2777,130 @@ mod canonical_digest_tests {
         // `first` is whatever this process's seed produced. No assertion on its
         // value — asserting it would bake one process's seed into the suite.
         let _ = first;
+    }
+}
+
+#[cfg(test)]
+mod double_apply_tests {
+    use super::*;
+
+    fn ev(t: &str, step: &str, cid: &str, id: i64) -> Event {
+        let mut meta = serde_json::Map::new();
+        meta.insert("command_id".to_string(), serde_json::json!(cid));
+        meta.insert("loop".to_string(), serde_json::json!(true));
+        Event {
+            event_id: id,
+            execution_id: 1,
+            catalog_id: 2,
+            event_type: t.to_string(),
+            node_name: Some(step.to_string()),
+            status: String::new(),
+            context: None,
+            result: None,
+            meta: Some(serde_json::Value::Object(meta)),
+            // Fixed epoch — the core has no clock (deterministic fixtures).
+            timestamp: DateTime::from_timestamp(0, 0).unwrap(),
+            parent_execution_id: None,
+            attempt: None,
+        }
+    }
+
+    /// Build a state whose `loop_step` is genuinely an iterator.
+    ///
+    /// ⚠ `is_iterator()` is `iterations_expected.is_some()`. My first draft
+    /// omitted this, so `iterations_dispatched` stayed 0 and the dedup test
+    /// passed **vacuously** (0 == 0) — it was the two controls failing that
+    /// exposed it. A fixture that cannot exhibit the failure makes the test
+    /// decorative.
+    fn iterator_state() -> WorkflowState {
+        let mut ws = WorkflowState::new(1, 2);
+        ws.apply_event(&ev("step.enter", "loop_step", "cmd-0", 9));
+        ws.steps
+            .entry("loop_step".to_string())
+            .or_insert_with(|| StepInfo::new("loop_step"))
+            .iterations_expected = Some(5);
+        assert!(
+            ws.steps["loop_step"].is_iterator(),
+            "fixture must be an iterator or nothing increments"
+        );
+        ws
+    }
+
+    /// ⭐ **noetl/ai-meta#335.** The WAL fold applies every event twice, and
+    /// `iterations_dispatched` was the one additive accumulator with no guard.
+    ///
+    /// This is not cosmetic. The sequential-dispatch gate in `orchestrator.rs`
+    /// only issues the next iteration when `iterations_dispatched == completed`,
+    /// so an inflated count never matches and the loop **silently stops
+    /// dispatching** — no error, no event, just a stalled loop.
+    #[test]
+    fn applying_the_same_issued_event_twice_counts_one_iteration() {
+        let e = ev("command.issued", "loop_step", "cmd-1", 10);
+        let mut ws = iterator_state();
+        ws.apply_event(&e);
+        let once = ws
+            .steps
+            .get("loop_step")
+            .map(|s| s.iterations_dispatched)
+            .unwrap_or(-1);
+        ws.apply_event(&e); // the double-apply
+        let twice = ws
+            .steps
+            .get("loop_step")
+            .map(|s| s.iterations_dispatched)
+            .unwrap_or(-1);
+        assert!(once >= 1, "fixture did not increment at all ({once}) — vacuous");
+        assert_eq!(
+            once, twice,
+            "re-applying the SAME command.issued incremented \
+             iterations_dispatched again ({once} -> {twice}); the sequential gate \
+             compares it against `completed`, so an inflated count stalls the loop"
+        );
+    }
+
+    /// Positive control: two DIFFERENT commands must still count two.
+    ///
+    /// Without this, a dedup that swallowed everything would pass the test
+    /// above and break every sequential loop in the opposite direction.
+    #[test]
+    fn two_distinct_issued_commands_count_two_iterations() {
+        let mut ws = iterator_state();
+        ws.apply_event(&ev("command.issued", "loop_step", "cmd-1", 10));
+        ws.apply_event(&ev("command.issued", "loop_step", "cmd-2", 11));
+        let n = ws
+            .steps
+            .get("loop_step")
+            .map(|s| s.iterations_dispatched)
+            .unwrap_or(-1);
+        assert!(
+            n >= 2,
+            "distinct commands must each count; got {n}. A dedup that over-matches \
+             stalls loops just as surely as one that under-matches."
+        );
+    }
+
+    /// ⚠⚠ **The digest must not move.** `canonical_state_digest` hashes the whole
+    /// serialised `WorkflowState`, so any SERIALISED field added to `StepInfo`
+    /// changes the digest of every execution with an iterator step — which would
+    /// flip every cross-store parity comparison to divergent. The dedup set is
+    /// `#[serde(skip)]` for exactly that reason, and this pins it.
+    #[test]
+    fn the_dedup_set_is_never_serialised() {
+        let mut ws = iterator_state();
+        ws.apply_event(&ev("command.issued", "loop_step", "cmd-1", 10));
+        let json = serde_json::to_string(&ws).expect("serialise");
+        assert!(
+            !json.contains("counted_iteration_commands"),
+            "the dedup set is serialised — it is now part of \
+             canonical_state_digest and every iterator execution will read as \
+             divergent against the tier"
+        );
+        // And the set is genuinely populated, so the assertion above is not
+        // passing merely because nothing was tracked.
+        assert!(
+            !ws.steps["loop_step"].counted_iteration_commands.is_empty(),
+            "the dedup set is empty — the test cannot tell 'not serialised' from \
+             'never populated'"
+        );
     }
 }
