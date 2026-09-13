@@ -1619,8 +1619,26 @@ pub async fn wal_projection_state(
     if verdict != ReFoldVerdict::Match {
         // ai-meta#332 -- serve-on-behind. A snapshot BEHIND the spine is slow but
         // correct: rebuild_state folds every event after its version, so serving
-        // it costs extra folding and yields the same answer. Measured on prod
-        // 2026-09-10: 11 of 11 reads refused for exactly this safe condition.
+        // it costs extra folding and yields the same answer.
+        //
+        // ⚠⚠ The measurement that used to sit here -- "prod 2026-09-10: 11 of 11
+        // reads refused for exactly this safe condition" -- no longer describes
+        // prod, and believing it would send someone to arm a flag that changes
+        // nothing. Re-measured 2026-09-13:
+        //
+        //   projection_refold_total{verdict="digest_mismatch"}    222
+        //   projection_refold_total{verdict="match"}                2
+        //   projection_refold_total{verdict="stored_behind_spine"}   0   <-- what
+        //                                                                   THIS
+        //                                                                   branch
+        //                                                                   gates
+        //
+        // So `SERVE_ON_BEHIND` is currently INERT: the refusals are
+        // `DigestMismatch` (stored_version == spine.version, digests differ --
+        // a content disagreement, not staleness), and this branch cannot reach
+        // them. Check `projection_refold_total` before concluding that arming
+        // the flag will make the tier serve; a stale count in a comment is how
+        // ai-meta#257's inert-and-silent flip happened.
         //
         // ⚠ AHEAD is never reachable here: `ServeGrant` has no public constructor
         // and `evaluate` cannot produce one for stored > spine, so there is no
