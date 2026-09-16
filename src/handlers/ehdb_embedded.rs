@@ -527,7 +527,10 @@ mod tests {
 
         // root absent: create_dir_all would make it inside the parent, so the
         // parent has to be the mount point.
-        assert!(root_is_durable(false, true, true), "fresh pod, volume mounted");
+        assert!(
+            root_is_durable(false, true, true),
+            "fresh pod, volume mounted"
+        );
 
         // ⚠ The defect. `/data` exists as an ordinary directory on the image or
         // gets created on the container layer, nothing is mounted, and
@@ -538,7 +541,10 @@ mod tests {
              SUCCEEDS today and the shadow accrues against the pod's \
              ephemeral-storage limit until the kubelet evicts it"
         );
-        assert!(!root_is_durable(false, false, false), "nothing there at all");
+        assert!(
+            !root_is_durable(false, false, false),
+            "nothing there at all"
+        );
         assert!(
             !root_is_durable(false, false, true),
             "a mount flag on a parent that does not exist is incoherent; refuse"
