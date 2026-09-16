@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.109.5](https://github.com/noetl/server/compare/v3.109.4...v3.109.5) (2026-09-16)
+
+### Bug Fixes
+
+* **result:** resolve a canonical ref through ObjectBackend, not a Postgres query ([27f5479](https://github.com/noetl/server/commit/27f54795f01cfe7bdd96bdb6276b86ab3e9012cb)), closes [noetl/ai-meta#343](https://github.com/noetl/ai-meta/issues/343) [noetl/server#437](https://github.com/noetl/server/issues/437) [#437](https://github.com/noetl/server/issues/437) [noetl/ai-meta#343](https://github.com/noetl/ai-meta/issues/343) [noetl/ai-meta#347](https://github.com/noetl/ai-meta/issues/347)
+
 ## [3.109.4](https://github.com/noetl/server/compare/v3.109.3...v3.109.4) (2026-09-16)
 
 ### Bug Fixes
