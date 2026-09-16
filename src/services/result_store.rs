@@ -600,27 +600,71 @@ impl ResultStoreService {
             // result reference — treat as not-found rather than an error.
             Err(_) => return Ok(None),
         };
-        let logical_tail = format!(
-            "{}/{}/{}/{}",
-            coords.step, coords.frame, coords.row, coords.attempt
+
+        // noetl/server#438 — read through `ObjectBackend`, not SQL.
+        //
+        // This used to be a `LIKE`-suffix query against `noetl.object_store`,
+        // which meant it was **blind on production**: prod runs
+        // `NOETL_OBJECT_STORE_BACKEND=gcs` (bucket
+        // `shastaratech-noetl-prod-results`, and the server's own
+        // `noetl_object_store_ops_total{backend="gcs"}` shows the traffic), so
+        // the table it searched holds none of the results it was asked for.
+        // Every canonical reference resolved to `None` → HTTP 404, silently,
+        // because a miss and a genuinely-absent result are the same answer at
+        // the call site.
+        //
+        // It passed its tests because kind runs the Postgres backend — the same
+        // "validated one environment short of the real one" trap that produced
+        // the failed fixes in noetl/ai-meta#343 and was caught there before
+        // merge (noetl/server#437). This is that fix applied to the path it was
+        // deliberately not widened to at the time.
+        //
+        // A canonical ref is the EASY case: it carries
+        // `(execution_id, step, frame, row, attempt)`, so the §7 key is exact —
+        // one `get`, no listing and no prefix walk. The placement half of the
+        // key comes from the same derivation the legacy fallback uses, pinned
+        // against nine real object keys (five prod, four kind).
+        let backend = object_backend();
+        let tail = format!(
+            "{}/{}/{}.json",
+            coords.frame, coords.row, coords.attempt
         );
-        let obj = crate::db::queries::object_store::get_result_tier_json(
-            &self.pool,
-            coords.execution_id,
-            &logical_tail,
-        )
-        .await?;
-        match obj {
-            Some(o) => {
-                let value: serde_json::Value = serde_json::from_slice(&o.bytes).map_err(|e| {
-                    AppError::Internal(format!(
-                        "result_store.resolve_canonical: decode JSON tier: {e}"
-                    ))
-                })?;
-                Ok(Some(value))
+        for prefix in Self::tier_step_prefixes(coords.execution_id, &coords.step) {
+            let key = format!("{prefix}{tail}");
+            if let Some(obj) = backend.get(&self.pool, &key).await? {
+                return Ok(Some(Self::decode_tier_json(&obj.bytes)?));
             }
-            None => Ok(None),
         }
+
+        // Postgres-backend fallback: the placement-independent key SUFFIX.
+        // Needs no cell or date derivation, so it still resolves when the
+        // derived prefix is wrong — the same belt-and-braces the legacy path
+        // carries. Meaningless for GCS (no suffix search), hence backend-gated.
+        if matches!(
+            backend,
+            crate::services::object_backend::ObjectBackend::Postgres
+        ) {
+            let logical_tail = format!(
+                "{}/{}/{}/{}",
+                coords.step, coords.frame, coords.row, coords.attempt
+            );
+            if let Some(o) = crate::db::queries::object_store::get_result_tier_json(
+                &self.pool,
+                coords.execution_id,
+                &logical_tail,
+            )
+            .await?
+            {
+                return Ok(Some(Self::decode_tier_json(&o.bytes)?));
+            }
+        }
+        Ok(None)
+    }
+
+    fn decode_tier_json(bytes: &[u8]) -> AppResult<serde_json::Value> {
+        serde_json::from_slice(bytes).map_err(|e| {
+            AppError::Internal(format!("result_store: decode JSON tier: {e}"))
+        })
     }
 }
 
@@ -713,6 +757,27 @@ mod tests {
                 "derived prefix does not match the real kind key for execution {eid} step {step}"
             );
         }
+    }
+
+    /// noetl/server#438 — a canonical ref resolves to an EXACT key, and it is
+    /// the same derivation the legacy fallback uses plus the frame/row/attempt
+    /// tail. Pinned against a real production object key so the two paths
+    /// cannot drift apart: if this ever stops matching, canonical resolution
+    /// goes silently blind again, which is exactly how #438 happened.
+    #[test]
+    fn the_canonical_key_is_the_step_prefix_plus_the_frame_row_attempt_tail() {
+        let reg = registry("prod", "usc1", "usc1-a", 256);
+        // Read from gs://shastaratech-noetl-prod-results on 2026-09-16.
+        let want = "noetl/env=prod/region=usc1/cell=usc1-a/shard=s0004/tenant=default/project=default/date=2026-09-15/execution=358337687603650560/results/hotelbeds_dispatch/0/0/1.json";
+        let prefix = tier_step_prefixes_in(&reg, 358337687603650560, "hotelbeds_dispatch")
+            .into_iter()
+            .next()
+            .expect("a prefix is derived");
+        assert_eq!(
+            format!("{prefix}{}/{}/{}.json", 0, 0, 1),
+            want,
+            "the canonical key must reconstruct a real production object key"
+        );
     }
 
     /// Neighbouring dates are probed because the date is the one segment that is

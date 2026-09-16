@@ -151,6 +151,44 @@ fn every_result_store_read_site_goes_through_the_fallback() {
 }
 
 #[test]
+fn no_tier_read_reaches_the_object_table_without_going_through_the_backend() {
+    // noetl/server#438. Production keeps result-tier objects in **GCS**
+    // (`NOETL_OBJECT_STORE_BACKEND=gcs`), so any tier read written as SQL
+    // against `noetl.object_store` is blind there — it searches a table the
+    // results are not in, finds nothing, and returns not-found. Silently,
+    // because a miss and an absent result are the same answer to the caller.
+    //
+    // Both tier reads (`resolve` via `resolve_legacy_from_tier`, and
+    // `resolve_canonical`) now go through `ObjectBackend`, which serves GCS and
+    // Postgres alike. The SQL helpers remain ONLY as a Postgres-backend second
+    // attempt, and each of their call sites must be gated on the backend
+    // actually being Postgres.
+    //
+    // This guard is the reason: a third tier read added later, written the
+    // obvious way, would work in kind and be dead on prod — which is exactly
+    // how #438 got there, and how noetl/ai-meta#343's first two fix attempts
+    // nearly shipped.
+    let src = production_source(RESULT_STORE_SERVICE);
+
+    let sql_reads = src.matches("object_store::get_result_tier_json").count();
+    let gates = src
+        .matches("crate::services::object_backend::ObjectBackend::Postgres")
+        .count();
+    assert!(
+        gates >= sql_reads,
+        "found {sql_reads} direct SQL tier read(s) in the result-store service \n\
+         but only {gates} Postgres-backend gate(s). Every SQL tier read must sit\n\
+         behind a check that the backend IS Postgres; on a GCS deployment an\n\
+         ungated one returns not-found for a result that exists."
+    );
+    assert!(
+        src.contains("backend.get(&self.pool"),
+        "resolve_canonical no longer fetches through ObjectBackend::get — on a\n\
+         GCS backend that makes every canonical reference resolve to 404."
+    );
+}
+
+#[test]
 fn the_fallback_is_wired_from_the_service_down_to_a_query() {
     // Reachability. This class of bug is "implemented but unreachable", and the
     // three previous fixes for it were all reachable-looking code that nothing
