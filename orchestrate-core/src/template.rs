@@ -332,7 +332,10 @@ impl TemplateRenderer {
                     } else {
                         self.render(k, context)?
                     };
-                    result.insert(rendered_key, self.render_value_deferring_keychain(v, context)?);
+                    result.insert(
+                        rendered_key,
+                        self.render_value_deferring_keychain(v, context)?,
+                    );
                 }
                 Ok(serde_json::Value::Object(result))
             }
@@ -433,6 +436,45 @@ fn contains_template_syntax(s: &str) -> bool {
 /// walk and treats the reference as resolvable up to that point — the worker
 /// resolves the remainder identically.  A present-but-null value counts as
 /// resolved (null is a legitimate build-time value, not a missing one).
+/// Is `v` a **summary stub** rather than the value it stands for? — noetl/server#445.
+///
+/// ⚠⚠ When an upstream step's result goes over the context budget the server
+/// summarises it: large strings collapse to `{"_len": N}`, arrays keep only their
+/// first element, over-budget/over-depth subtrees become `{"_truncated": …}` /
+/// `{"_count": …}` / `{"_keys": …}`. A locator (`_ref` / `_store` / `_uri`) means
+/// the real payload lives in the result tier and is not here at all.
+///
+/// Such a path *resolves* — that is the trap. `{{ fetch.data.filler }}` finds
+/// `{"_len": 1500000}` and renders it, so the consuming step received a stub,
+/// reported success, and the execution completed with wrong data. Measured in
+/// prod-shaped kind runs: 25/25 executions, and a scalar from the SAME object
+/// (`{{ fetch.data.n }}` → 1500000) resolved correctly, which is what makes it
+/// look like real data.
+///
+/// The value is present; it is just not the value the template asked for.
+fn is_summary_stub(v: &serde_json::Value) -> bool {
+    match v {
+        serde_json::Value::Object(m) => {
+            m.contains_key("_len")
+                || m.contains_key("_truncated")
+                || m.contains_key("_count")
+                || m.contains_key("_keys")
+                || m.contains_key("_ref")
+                || m.contains_key("_store")
+                || m.contains_key("_uri")
+        }
+        _ => false,
+    }
+}
+
+/// Does `path` resolve to a **usable** value in `context`?
+///
+/// ⚠ "Usable" excludes a summary stub (noetl/server#445). A path that lands on a
+/// stub is reported as NOT resolved, so `render_value_deferring_unresolved`
+/// defers the template verbatim and the worker re-renders it after
+/// `resolve_context_references` has hydrated the real payload. That worker-side
+/// resolution already exists and already decides correctly — it was simply too
+/// late, because the server had rendered the stub into the args first.
 fn path_resolves(context: &HashMap<String, serde_json::Value>, path: &str) -> bool {
     let mut segs = path.split('.');
     let root = match segs.next() {
@@ -452,7 +494,8 @@ fn path_resolves(context: &HashMap<String, serde_json::Value>, path: &str) -> bo
             _ => return true,
         }
     }
-    true
+    // ⚠ Landed on a value — but a stub is not the value the template asked for.
+    !is_summary_stub(cur)
 }
 
 /// Convert a JSON HashMap to a minijinja Value.
@@ -1125,7 +1168,9 @@ mod tests {
             "a numeric string stays a number, not a bool"
         );
         for k in ["on", "yes", "tru"] {
-            let got = renderer.render_to_value(&format!("{{{{ {k} }}}}"), &ctx).unwrap();
+            let got = renderer
+                .render_to_value(&format!("{{{{ {k} }}}}"), &ctx)
+                .unwrap();
             assert!(got.is_string(), "{k} must stay a string, got {got:?}");
         }
     }
@@ -1149,5 +1194,104 @@ mod tests {
             serde_json::json!(true)
         );
     }
+}
 
+#[cfg(test)]
+mod summary_stub_deferral {
+    use super::*;
+    use serde_json::json;
+
+    fn ctx(v: serde_json::Value) -> HashMap<String, serde_json::Value> {
+        let mut m = HashMap::new();
+        m.insert("fetch".to_string(), v);
+        m
+    }
+
+    /// The exact context shape captured from a kind run — noetl/server#445.
+    fn observed() -> HashMap<String, serde_json::Value> {
+        ctx(json!({
+            "_ref": "noetl://execution/358608606267969536/result/fetch/358608619119316992",
+            "_store": "db",
+            "_uri": "noetl://default/default/results/358608606267969536/fetch/0/0/1",
+            "data": { "filler": { "_len": 1500000 }, "n": 1500000 }
+        }))
+    }
+
+    /// ⭐ The binding that silently received `{"_len": 1500000}` must now be
+    /// treated as UNRESOLVED, so the server defers it and the worker hydrates.
+    #[test]
+    fn a_path_landing_on_a_stub_is_not_resolved() {
+        let c = observed();
+        assert!(
+            !path_resolves(&c, "fetch.data.filler"),
+            "a path landing on a `_len` stub must count as unresolved — it \
+             resolves, which is the trap: the step gets a placeholder, reports \
+             success, and the execution completes with wrong data"
+        );
+        assert!(
+            !path_resolves(&c, "fetch"),
+            "a reference container (_ref/_store/_uri) is a stub too — the real \
+             payload lives in the result tier, not here"
+        );
+    }
+
+    /// ⚠⚠ And the scalar from the SAME object must STILL resolve. This is the
+    /// half that makes the bug invisible, and over-deferring it would put a
+    /// store round-trip on every step that reads a length or an id.
+    #[test]
+    fn a_real_scalar_beside_the_stub_still_resolves() {
+        let c = observed();
+        assert!(
+            path_resolves(&c, "fetch.data.n"),
+            "a genuine scalar must still resolve — the summary keeps every key \
+             and collapses only bulk, so reading `n` needs no hydration"
+        );
+        assert!(
+            path_resolves(&c, "fetch.data"),
+            "an object with real keys resolves"
+        );
+    }
+
+    /// Ordinary values are untouched — this must not defer the whole world.
+    #[test]
+    fn ordinary_values_are_unaffected() {
+        let c = ctx(json!({"rows": [1, 2, 3], "name": "x", "nested": {"a": {"b": 1}}}));
+        for p in ["fetch.name", "fetch.nested.a.b", "fetch.rows", "fetch"] {
+            assert!(path_resolves(&c, p), "{p} must still resolve");
+        }
+        assert!(
+            !path_resolves(&c, "fetch.missing"),
+            "a genuinely absent key stays unresolved"
+        );
+        assert!(
+            !path_resolves(&c, "absent_root"),
+            "an absent root stays unresolved"
+        );
+    }
+
+    /// Every marker the summariser can emit is recognised.
+    #[test]
+    fn every_summariser_marker_counts_as_a_stub() {
+        for k in [
+            "_len",
+            "_truncated",
+            "_count",
+            "_keys",
+            "_ref",
+            "_store",
+            "_uri",
+        ] {
+            let mut m = serde_json::Map::new();
+            m.insert(k.to_string(), json!(1));
+            assert!(
+                is_summary_stub(&serde_json::Value::Object(m)),
+                "{k} must be recognised as a summariser marker"
+            );
+        }
+        assert!(
+            !is_summary_stub(&json!({"a": 1})),
+            "an ordinary object is not a stub"
+        );
+        assert!(!is_summary_stub(&json!("text")), "a scalar is not a stub");
+    }
 }
