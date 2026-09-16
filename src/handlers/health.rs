@@ -221,3 +221,53 @@ mod tests {
         );
     }
 }
+
+/// `GET /api/health/ready` — readiness that exercises a real read path.
+///
+/// ⚠⚠ This exists because `/api/health` returned **200 for the entire six
+/// minutes** that `/api/catalog/list` was returning HTTP 500 in production
+/// (noetl/server#443: a `NULL`-selected column decoded against a non-`Option`
+/// field). The rollout could not halt itself, because nothing it probed was
+/// broken.
+///
+/// A readiness probe that only asks "is the process up" cannot stop a bad image
+/// from taking traffic. This one performs the **smallest real query on the path
+/// that broke**: one row, bodies off — which is precisely the shape that fails
+/// when a `NULL`-selected column meets a non-`Option` field, because the failure
+/// happens at *decode*, not at connect.
+///
+/// ⚠ Deliberately bounded: `limit = 1` and `include_content = false`, so it is
+/// cheap enough to run every 10s. It must never become a reason the server is
+/// slow.
+///
+/// ⚠ Returns 503 (not 500) on failure so the kubelet reads it as "not ready"
+/// rather than a crash — an unready pod stops receiving traffic and halts the
+/// rollout; a crashing one restarts and retries the same bad image.
+pub async fn readiness(
+    State(state): State<crate::state::AppState>,
+) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, Json<serde_json::Value>)> {
+    use crate::db::queries::catalog::{list_catalog_entries, CatalogListOptions};
+
+    let opts = CatalogListOptions {
+        limit: Some(1),
+        include_content: false,
+        ..Default::default()
+    };
+    match list_catalog_entries(state.pools.cluster(), None, true, &opts).await {
+        Ok((rows, _total)) => Ok(Json(serde_json::json!({
+            "status": "ready",
+            // Reported so a human reading the probe's output can tell "the query
+            // ran and the catalog is empty" from "the query ran and decoded a
+            // row" — only the second exercises the decode this guards.
+            "rows_decoded": rows.len(),
+        }))),
+        Err(e) => Err((
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "status": "not_ready",
+                "reason": "catalog read path failed",
+                "error": e.to_string(),
+            })),
+        )),
+    }
+}
