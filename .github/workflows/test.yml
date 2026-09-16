@@ -45,11 +45,27 @@ jobs:
       # --all-targets, not the default. `cargo build`/`cargo test` alone skip
       # integration tests and `cfg(test)`-only code, so a binary can be broken
       # while the lib compiles clean — that has happened in this repo before.
+      #
+      # ⚠ --workspace, and it is NOT redundant with --all-targets. The two
+      # widen different axes: --all-targets widens TARGET KINDS (lib, bins,
+      # tests, examples) within the selected packages; --workspace widens the
+      # PACKAGE SELECTION. This repo's root Cargo.toml is a real `[package]`
+      # (noetl-server) as well as a `[workspace]`, so the default selection is
+      # that root package ALONE and the `orchestrate-core` member was never
+      # built or tested here. Measured: 1197 tests before, 1360 after.
+      #
+      # The 163 that were never gated are all green — this is not a bug fix,
+      # it is closing a hole before something falls in it. That nearly
+      # happened: server#445's `summary_stub_deferral` tests, the proof for a
+      # fix that is LIVE IN PROD, live in `orchestrate-core` and have never
+      # run in CI. They pass, and they were run by hand at the time, so the
+      # fix is sound — but the gate was not gating them, and "I ran it
+      # locally" is not a gate.
       - name: build (all targets)
-        run: cargo build --all-targets --locked
+        run: cargo build --workspace --all-targets --locked
 
       - name: test
-        run: cargo test --all-targets --locked
+        run: cargo test --workspace --all-targets --locked
 
       - name: clippy (visible, non-gating)
-        run: cargo clippy --all-targets --locked || true
+        run: cargo clippy --workspace --all-targets --locked || true
