@@ -1263,7 +1263,7 @@ pub const RECOVERY_SOURCE_ENV: &str = "NOETL_EHDB_RECOVERY_SOURCE";
 pub const RECOVERY_SOURCES: [&str; 3] = ["spine", "verify", "tier"];
 
 /// The sources a fold can actually be attempted against, pinned as labels.
-pub const RECOVERY_FOLD_SOURCES: [&str; 2] = ["spine", "tier"];
+pub const RECOVERY_FOLD_SOURCES: [&str; 3] = ["spine", "tier", "postgres"];
 
 /// Where a recovery fold resolves an execution's events from (ai-meta#307).
 ///
@@ -1404,9 +1404,79 @@ pub async fn events_for_recovery(
     }
 }
 
-pub async fn materialize_from_wal(execution_id: i64) -> Result<FoldedState, FoldRefusal> {
+/// The recovery ladder with **Postgres as its final rung**: spine → tier → Postgres.
+///
+/// # Why this exists
+///
+/// [`events_for_recovery`] resolves to the tier on 100% of prod calls (the
+/// spine is in-flight-only and refuses for completed executions —
+/// noetl/ai-meta#307). When the tier cannot answer either, it refuses. That is
+/// fail-safe and it is not data loss — the events are in `noetl.event` — but it
+/// meant a tier loss turned a **rebuildable** read model into an unrecoverable
+/// one for want of a wiring step.
+///
+/// Measured 2026-09-16 while auditing whether Postgres is still authoritative
+/// for every event-log read path: it is, and `fold_from_postgres` already
+/// existed. Only this rung was missing.
+///
+/// # ⚠ Why the rung is HERE and not inside [`events_for_recovery`]
+///
+/// That function has two callers with opposite requirements:
+///
+/// * `refold_endpoint` — the Phase 2 comparator, whose ground truth is stated
+///   as *"the spine, or the durable event-log tier when the spine cannot
+///   answer. **Never Postgres**"*. Folding Postgres there would compare
+///   Postgres against the stored record instead of EHDB against it, and **a
+///   tier missing events would become invisible to the comparator** — exactly
+///   the class the ai-meta#332 AC14 guards were written to kill.
+/// * this recovery path, where Postgres is precisely what is wanted.
+///
+/// So the ladder itself is untouched and the rung is added to the caller that
+/// wants it. `the_comparator_ground_truth_never_reads_postgres` pins that.
+///
+/// # Hydration
+///
+/// Uses `events_from_postgres_hydrated`, never the raw read. Under
+/// `NOETL_PERMANENT_LOG_LEAN=true` the persisted row carries a `reference`
+/// where the tier carries inlined content, so folding the raw row digests a
+/// *pointer* against *content* — a false divergence on every execution with an
+/// externalised result (30% of a 40-execution prod sample when this was last
+/// measured).
+pub async fn events_for_recovery_or_postgres(
+    pool: &DbPool,
+    result_store: &crate::services::result_store::ResultStoreService,
+    execution_id: i64,
+) -> Result<(FoldSource, Vec<crate::db::models::Event>), FoldRefusal> {
+    match events_for_recovery(execution_id).await {
+        Ok(v) => Ok(v),
+        Err(ehdb_refusal) => {
+            match events_from_postgres_hydrated(pool, result_store, execution_id).await {
+                Ok(events) => {
+                    crate::metrics::record_ehdb_recovery_fold("postgres", "folded");
+                    Ok((FoldSource::Postgres, events))
+                }
+                // Report the EHDB refusal, not the Postgres one. The ladder's
+                // verdict is about why RECOVERY could not proceed, and the
+                // reason an operator needs is the first thing that failed —
+                // a Postgres refusal here is almost always `no_events`, which
+                // would describe an execution that does not exist rather than
+                // a tier that could not be read.
+                Err(pg_refusal) => {
+                    crate::metrics::record_ehdb_recovery_fold("postgres", pg_refusal.reason());
+                    Err(ehdb_refusal)
+                }
+            }
+        }
+    }
+}
+
+pub async fn materialize_from_wal(
+    pool: &DbPool,
+    result_store: &crate::services::result_store::ResultStoreService,
+    execution_id: i64,
+) -> Result<FoldedState, FoldRefusal> {
     let (folded, body) = {
-        let (source, events) = events_for_recovery(execution_id).await?;
+        let (source, events) = events_for_recovery_or_postgres(pool, result_store, execution_id).await?;
         fold_with_body(source, events)?
     };
     let base = std::env::var(super::ehdb::WORKER_QUERY_URL_ENV)
@@ -1584,7 +1654,7 @@ pub async fn wal_projection_state(
     // Materialise first so an in-flight execution has a record to verify. A
     // failure here is not fatal: the read below simply finds nothing and the
     // verdict says so.
-    let _ = materialize_from_wal(execution_id).await;
+    let _ = materialize_from_wal(pool, result_store, execution_id).await;
 
     // The independent re-fold — ai-meta#332 AC14.
     //
@@ -2212,7 +2282,10 @@ mod tests {
         assert_eq!(RECOVERY_SOURCES.len(), 3);
         // The fold sources are the two a fold is actually attempted against —
         // `verify` is a mode, never a source, and must not appear here.
-        assert_eq!(RECOVERY_FOLD_SOURCES, ["spine", "tier"]);
+        // `postgres` joined as the ladder's final rung: the tier refusing no
+        // longer ends recovery, because the events are in `noetl.event` and
+        // `fold_from_postgres` already knew how to read them.
+        assert_eq!(RECOVERY_FOLD_SOURCES, ["spine", "tier", "postgres"]);
         assert!(!RECOVERY_FOLD_SOURCES.contains(&"verify"));
     }
 
@@ -2703,6 +2776,109 @@ mod tests {
             !body.contains("events_for_recovery("),
             "the read path's re-fold went back through the recovery ladder, \
              which falls back to the TIER it is verifying"
+        );
+    }
+
+    /// ⭐ The comparator's ground truth must stay EHDB-only.
+    ///
+    /// `refold_endpoint`'s contract is *"the spine, or the durable event-log
+    /// tier when the spine cannot answer. **Never Postgres**"* — because its job
+    /// is to compare EHDB against the stored record. If its ground truth could
+    /// fall back to Postgres, a tier missing events would fold correctly from
+    /// Postgres, agree with the record, and **the gap would become invisible to
+    /// the one comparator that exists to find it.**
+    ///
+    /// ⚠ This guard was added alongside the Postgres recovery rung, because
+    /// that change makes the mistake attractive: the rung sits one call away, in
+    /// `events_for_recovery_or_postgres`, and "the ladder should just do it"
+    /// reads as tidying. It is the ai-meta#332 AC14 class from the other
+    /// direction — there the verification reached the tier it was verifying;
+    /// here the comparator would reach past the store it is comparing.
+    #[test]
+    fn the_comparator_ground_truth_never_reads_postgres() {
+        let src = include_str!("ehdb_projection_fold.rs");
+        let code = src
+            .split_once("\n#[cfg(test)]")
+            .map(|(above, _)| above)
+            .unwrap_or(src);
+
+        // `events_for_recovery` itself — the ladder the comparator folds.
+        let start = code
+            .find("pub async fn events_for_recovery(")
+            .expect("events_for_recovery not found — extraction broke");
+        let body = &code[start..];
+        let end = body.find("\n}\n").map(|i| i + 3).unwrap_or(body.len());
+        let ladder = &body[..end];
+        assert!(
+            ladder.len() > 300,
+            "events_for_recovery slice too small: {}",
+            ladder.len()
+        );
+        for needle in [
+            "events_from_postgres",
+            "fold_from_postgres",
+            "FoldSource::Postgres",
+        ] {
+            assert!(
+                !ladder.contains(needle),
+                "events_for_recovery reads Postgres ({needle}). Its caller \
+                 `refold_endpoint` states its ground truth is EHDB-only; folding \
+                 Postgres there makes a tier gap agree with the stored record \
+                 and disappear. The Postgres rung belongs in \
+                 `events_for_recovery_or_postgres`, which recovery calls and the \
+                 comparator does not."
+            );
+        }
+
+        // And the comparator endpoint must keep calling the ladder, not the rung.
+        let rs = code
+            .find("pub async fn refold_endpoint(")
+            .expect("refold_endpoint not found");
+        let rbody = &code[rs..];
+        let rend = rbody.find("\n}\n").map(|i| i + 3).unwrap_or(rbody.len());
+        let refold = &rbody[..rend];
+        assert!(
+            !refold.contains("events_for_recovery_or_postgres("),
+            "refold_endpoint went through the Postgres rung — its ground truth \
+             must be EHDB-only or it stops being able to see a mirror gap"
+        );
+        assert!(
+            refold.contains("events_for_recovery("),
+            "refold_endpoint no longer folds the recovery ladder, so it reports \
+             on a path the serving code does not take (the ai-meta#307 trap)"
+        );
+    }
+
+    /// The recovery path DOES reach Postgres — the positive control, so the
+    /// guard above is asserting a boundary rather than an absence.
+    #[test]
+    fn the_recovery_path_reaches_postgres_hydrated() {
+        let src = include_str!("ehdb_projection_fold.rs");
+        let code = src
+            .split_once("\n#[cfg(test)]")
+            .map(|(above, _)| above)
+            .unwrap_or(src);
+        let start = code
+            .find("pub async fn events_for_recovery_or_postgres(")
+            .expect("the Postgres rung is gone");
+        let body = &code[start..];
+        let end = body.find("\n}\n").map(|i| i + 3).unwrap_or(body.len());
+        let rung = &body[..end];
+        assert!(
+            rung.contains("events_from_postgres_hydrated("),
+            "the rung must read Postgres HYDRATED. The raw row carries a \
+             `reference` where the tier carries inlined content, so folding it \
+             digests a pointer against content — a false divergence on every \
+             execution with an externalised result"
+        );
+        assert!(
+            !rung.contains("events_from_postgres(pool"),
+            "the rung reads Postgres RAW — see above"
+        );
+        assert!(
+            rung.contains("events_for_recovery("),
+            "the rung must try the EHDB ladder FIRST; Postgres is the fallback, \
+             not the preference"
         );
     }
 
