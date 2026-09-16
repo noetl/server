@@ -157,6 +157,80 @@ pub async fn get_result_tier_json(
     }))
 }
 
+/// Build the `LIKE` pattern [`get_result_tier_json_by_step`] matches on.
+///
+/// Split out so the anchoring can be tested without a database — the two ways
+/// this can be wrong are both silent. Too loose and a legacy ref resolves to
+/// *another step's* result (worse than the 404 it replaces); too tight and the
+/// fallback never fires and the bug it exists for is still live.
+///
+/// * `/results/<step>/` keeps `<step>` a whole path segment, so `map` cannot
+///   match `map_offers`.
+/// * LIKE metacharacters in the step name are escaped, so a step containing
+///   `%` or `_` cannot widen the match.
+/// * Frame/row/attempt stay wildcard: a legacy ref does not carry them.
+fn tier_step_pattern(execution_id: i64, step: &str) -> String {
+    let escaped_step = step
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    format!("%/execution={execution_id}/results/{escaped_step}/%.json")
+}
+
+/// Resolve an over-budget result's JSON-tier object from **only** the
+/// `(execution_id, step)` pair — the coordinates a *legacy* reference carries
+/// (noetl/ai-meta#343 FIX 3, the server-side belt-and-suspenders fallback).
+///
+/// [`get_result_tier_json`] needs the full logical tail
+/// `<step>/<frame>/<row>/<attempt>`, which only a canonical `reference.uri`
+/// supplies. A legacy `noetl://execution/<eid>/result/<name>/<id>` ref carries
+/// `<eid>` and `<name>` and nothing else, so when the `noetl.result_store` row
+/// was never written — which is exactly what
+/// `NOETL_RESULT_STORE_DUAL_WRITE=false` guarantees — that reference is
+/// unresolvable even though the bytes are sitting in the tier. Measured on prod
+/// 2026-09-15: `GET /api/result/resolve` answered 404 in 0.19 s while 214 KB of
+/// hotel results sat in `noetl.object_store`.
+///
+/// Anchoring on `/results/<step>/` keeps `<step>` a whole path segment, so a
+/// step named `map` cannot match `map_offers`. Frame/row/attempt are left
+/// wildcard because the legacy ref simply does not carry them; the newest
+/// object wins, and the caller is told how many candidates matched so an
+/// ambiguous (multi-frame / retried) step is observable rather than silent.
+///
+/// Returns `(row, candidate_count)`; `candidate_count` is capped at 2 — it
+/// answers "was this unambiguous?", not "how many are there".
+pub async fn get_result_tier_json_by_step(
+    pool: &DbPool,
+    execution_id: i64,
+    step: &str,
+) -> AppResult<Option<(ObjectRow, usize)>> {
+    let pattern = tier_step_pattern(execution_id, step);
+    let rows = sqlx::query(
+        r#"
+        SELECT digest, media_type, bytes
+        FROM noetl.object_store
+        WHERE object_key LIKE $1 ESCAPE '\'
+        ORDER BY created_at DESC
+        LIMIT 2
+        "#,
+    )
+    .bind(pattern)
+    .fetch_all(pool)
+    .await?;
+
+    let count = rows.len();
+    Ok(rows.into_iter().next().map(|r| {
+        (
+            ObjectRow {
+                digest: r.get::<String, _>("digest"),
+                media_type: r.get::<String, _>("media_type"),
+                bytes: r.get::<Vec<u8>, _>("bytes"),
+            },
+            count,
+        )
+    }))
+}
+
 /// List object keys under `prefix` (most-recently-written first), capped at
 /// `limit`. Backs the result-tier GC sweep ([noetl/ai-meta#104](https://github.com/noetl/ai-meta/issues/104)
 /// Phase F) for the Postgres backend.
@@ -194,4 +268,77 @@ pub async fn delete(pool: &DbPool, object_key: &str) -> AppResult<bool> {
     .execute(pool)
     .await?;
     Ok(result.rows_affected() > 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// noetl/ai-meta#343 FIX 3. The legacy-ref tier fallback resolves on
+    /// `(execution_id, step)` alone, so its anchoring is the only thing keeping
+    /// it from serving the WRONG result — a failure mode strictly worse than the
+    /// 404 it replaces, because a wrong payload is silent.
+    #[test]
+    fn the_step_pattern_matches_a_whole_segment_and_nothing_wider() {
+        let p = tier_step_pattern(42, "map");
+        assert_eq!(p, "%/execution=42/results/map/%.json");
+
+        // The trailing `/` is what makes `map` a whole segment. A sibling step
+        // whose name merely starts with it must not be reachable by this
+        // pattern — `map_offers` is a real step name in
+        // `travel/playbooks/flights-details`, sitting next to `map` in the same
+        // execution.
+        let key_wrong = "noetl/env=p/execution=42/results/map_offers/0/0/1.json";
+        let key_right = "noetl/env=p/execution=42/results/map/0/0/1.json";
+        assert!(!like_matches(&p, key_wrong), "must not match a sibling step");
+        assert!(like_matches(&p, key_right));
+
+        // Scoped to the execution: the same step name in another execution is a
+        // different result.
+        assert!(!like_matches(&p, "noetl/env=p/execution=43/results/map/0/0/1.json"));
+
+        // Scoped to the JSON tier. Feather is decoded by the worker's
+        // resolve-by-URN path, which owns the arrow decode the control plane
+        // deliberately does not carry.
+        assert!(!like_matches(&p, "noetl/env=p/execution=42/results/map/0/0/1.feather"));
+    }
+
+    #[test]
+    fn like_metacharacters_in_a_step_name_cannot_widen_the_match() {
+        // `_` is LIKE's single-character wildcard. Unescaped, a step named
+        // `map_offers` would match `mapXoffers` — and, worse, a step named
+        // `%` would match every result in the execution.
+        let p = tier_step_pattern(42, "map_offers");
+        assert!(p.contains("map\\_offers"), "`_` must be escaped, got {p}");
+        assert!(!like_matches(&p, "noetl/env=p/execution=42/results/mapXoffers/0/0/1.json"));
+        assert!(like_matches(&p, "noetl/env=p/execution=42/results/map_offers/0/0/1.json"));
+
+        let wild = tier_step_pattern(42, "%");
+        assert!(wild.contains("\\%"), "`%` must be escaped, got {wild}");
+        assert!(!like_matches(&wild, "noetl/env=p/execution=42/results/anything/0/0/1.json"));
+    }
+
+    /// A minimal SQL-`LIKE` evaluator for `%`, `_` and `\` escapes — enough to
+    /// check anchoring without a database. Postgres is the authority at runtime;
+    /// this only has to agree about the three metacharacters the pattern uses.
+    fn like_matches(pattern: &str, value: &str) -> bool {
+        let p: Vec<char> = pattern.chars().collect();
+        let v: Vec<char> = value.chars().collect();
+        fn go(p: &[char], v: &[char]) -> bool {
+            match p.first() {
+                None => v.is_empty(),
+                Some('%') => (0..=v.len()).any(|i| go(&p[1..], &v[i..])),
+                Some('_') => !v.is_empty() && go(&p[1..], &v[1..]),
+                Some('\\') => match (p.get(1), v.first()) {
+                    (Some(lit), Some(c)) if lit == c => go(&p[2..], &v[1..]),
+                    _ => false,
+                },
+                Some(lit) => match v.first() {
+                    Some(c) if c == lit => go(&p[1..], &v[1..]),
+                    _ => false,
+                },
+            }
+        }
+        go(&p, &v)
+    }
 }

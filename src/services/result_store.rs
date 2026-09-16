@@ -346,6 +346,47 @@ impl ResultStoreService {
         Ok(row.map(|r| r.data))
     }
 
+    /// Resolve a **legacy** result reference from the #104 object tier when the
+    /// `noetl.result_store` row does not exist (noetl/ai-meta#343 FIX 3).
+    ///
+    /// The legacy store is only written while `NOETL_RESULT_STORE_DUAL_WRITE` is
+    /// on. Once it is retired, every reference minted as a legacy ref — by an
+    /// older execution, or by a worker pool that did not get
+    /// `NOETL_RESULT_MINT_AUTHORITATIVE` — resolves to nothing, even though the
+    /// bytes are in the tier under a canonical key. That is not a cache miss:
+    /// the consumer silently receives a bare reference instead of its data.
+    /// Measured on prod 2026-09-15 as a 0.19 s 404 while 214 KB sat in the tier;
+    /// downstream, `hotel-cards` returned 0 hotels.
+    ///
+    /// So on a legacy MISS, fall back to the tier keyed on `(execution_id,
+    /// name)` — the only coordinates a legacy ref carries. The JSON tier holds
+    /// the scrubbed `result.context`, byte-identical to what the legacy row
+    /// held, so the resolve contract is unchanged.
+    ///
+    /// Returns `(data, candidates)` so the caller can warn when a step tiered
+    /// more than one object (multi-frame or retried) and the newest was chosen.
+    /// Returns `None` when the tier has nothing either — a real 404.
+    pub async fn resolve_legacy_from_tier(
+        &self,
+        noetl_ref: &NoetlRef,
+    ) -> AppResult<Option<(serde_json::Value, usize)>> {
+        let found = crate::db::queries::object_store::get_result_tier_json_by_step(
+            &self.pool,
+            noetl_ref.execution_id,
+            &noetl_ref.name,
+        )
+        .await?;
+        let Some((obj, candidates)) = found else {
+            return Ok(None);
+        };
+        let value: serde_json::Value = serde_json::from_slice(&obj.bytes).map_err(|e| {
+            AppError::Internal(format!(
+                "result_store.resolve_legacy_from_tier: decode JSON tier: {e}"
+            ))
+        })?;
+        Ok(Some((value, candidates)))
+    }
+
     /// Resolve a **canonical** result reference
     /// (`noetl://<tenant>/<project>/results/<eid>/<step>/<frame>/<row>/<attempt>`)
     /// from the #104 object tier (noetl/ai-meta#104 Phase C read path).
