@@ -1239,6 +1239,42 @@ pub fn record_result_store_dual_write_skipped() {
     result_store_dual_write_skipped_total().inc();
 }
 
+/// `noetl_result_store_tier_fallback_total{outcome}` — legacy result references
+/// resolved (or not) from the #104 object tier after the `noetl.result_store`
+/// row was missing (noetl/ai-meta#343 FIX 3). `outcome` is `served` (the tier
+/// had the bytes — a reference that would otherwise have read as not-found),
+/// `miss` (neither tier nor store had it — a genuine 404) or `error` (the
+/// fallback query itself failed and was swallowed).
+///
+/// `served` climbing is the measure of how much of the platform's result
+/// delivery currently depends on this fallback. It should be non-zero while
+/// legacy refs are still in flight and fall to zero once every producer emits
+/// the canonical `_uri` — at which point the legacy mint can be retired.
+pub fn result_store_tier_fallback_total() -> &'static IntCounterVec {
+    static M: OnceLock<IntCounterVec> = OnceLock::new();
+    M.get_or_init(|| {
+        let counter = IntCounterVec::new(
+            Opts::new(
+                "noetl_result_store_tier_fallback_total",
+                "Legacy result refs resolved from the #104 tier after a result_store miss (noetl/ai-meta#343).",
+            ),
+            &["outcome"],
+        )
+        .expect("static counter spec must be valid");
+        registry()
+            .register(Box::new(counter.clone()))
+            .expect("counter registration must succeed");
+        counter
+    })
+}
+
+/// Record one legacy-ref tier-fallback attempt.
+pub fn record_result_store_tier_fallback(outcome: &str) {
+    result_store_tier_fallback_total()
+        .with_label_values(&[outcome])
+        .inc();
+}
+
 /// `noetl_state_build_event_scans_total` — incremented once each time the drive
 /// path enters the **event-scan** state-construction block (the block that issues
 /// `WHERE execution_id = $1 …` scans of `noetl.event`: the consistency `COUNT`,

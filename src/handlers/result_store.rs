@@ -193,6 +193,13 @@ pub async fn resolve_ref(
     };
 
     let (execution_id, name, result) = match &parsed {
+        // noetl/ai-meta#343 FIX 3 — the legacy-store-miss fallback to the #104
+        // tier lives in `ResultStoreService::resolve`, not here. The store has
+        // six read sites and only one of them is this endpoint; the path that
+        // actually feeds a parent step's rendered input is
+        // `services::execution` / `hydrate_result_references`, which call the
+        // service directly. A fallback wired into this handler alone left the
+        // production symptom intact (measured in kind, 2026-09-16).
         ResultRef::Legacy(l) => (
             l.execution_id,
             l.name.clone(),

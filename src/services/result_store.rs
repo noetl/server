@@ -230,6 +230,15 @@ pub struct ResultStoreService {
     snowflake: Arc<SnowflakeGenerator>,
 }
 
+/// The object backend, built once. `ObjectBackend::from_env` logs its selection
+/// on construction, so building it per call would both spam that line and
+/// rebuild an HTTP client on a path that runs per result read.
+fn object_backend() -> &'static crate::services::object_backend::ObjectBackend {
+    static B: std::sync::OnceLock<crate::services::object_backend::ObjectBackend> =
+        std::sync::OnceLock::new();
+    B.get_or_init(crate::services::object_backend::ObjectBackend::from_env)
+}
+
 impl ResultStoreService {
     pub fn new(pool: DbPool, snowflake: Arc<SnowflakeGenerator>) -> Self {
         Self { pool, snowflake }
@@ -334,7 +343,18 @@ impl ResultStoreService {
     /// tools layer (`result_fetch`) expects the response body IS the
     /// data, not a wrapper.
     ///
-    /// Returns `None` when no matching row exists (caller maps to 404).
+    /// Reads `noetl.result_store` first and, on a miss, the #104 object tier
+    /// (noetl/ai-meta#343 FIX 3). The fallback lives HERE, in the service,
+    /// rather than in one handler, because the store has six read sites — the
+    /// resolve endpoint, four in `handlers::events` (including
+    /// `hydrate_result_references`, which is what turns an over-budget child
+    /// result into the parent's rendered input) and the execution status view.
+    /// Measured in kind on 2026-09-16: fixing only the HTTP handler left the
+    /// parent bind returning 0 items, because the path that actually feeds it
+    /// is `services::execution`, which calls this method directly and never
+    /// goes through the endpoint.
+    ///
+    /// Returns `None` only when neither tier has it (caller maps to 404).
     pub async fn resolve(&self, noetl_ref: &NoetlRef) -> AppResult<Option<serde_json::Value>> {
         let row = queries::get_by_ref(
             &self.pool,
@@ -343,7 +363,216 @@ impl ResultStoreService {
             noetl_ref.result_id,
         )
         .await?;
+        if let Some(r) = row {
+            return Ok(Some(r.data));
+        }
+        match self.resolve_legacy_from_tier(noetl_ref).await {
+            Ok(Some((data, candidates))) => {
+                if candidates > 1 {
+                    tracing::warn!(
+                        execution_id = noetl_ref.execution_id,
+                        name = %noetl_ref.name,
+                        "result_store.resolve: legacy ref matched more than one tier object \
+                         for this step; served the newest",
+                    );
+                }
+                tracing::info!(
+                    execution_id = noetl_ref.execution_id,
+                    name = %noetl_ref.name,
+                    "result_store.resolve: legacy store miss served from the #104 tier",
+                );
+                crate::metrics::record_result_store_tier_fallback("served");
+                Ok(Some(data))
+            }
+            Ok(None) => {
+                crate::metrics::record_result_store_tier_fallback("miss");
+                Ok(None)
+            }
+            // The fallback is additive. Its own failure must degrade to
+            // not-found — the answer the caller got before it existed — never
+            // turn a 404 into a 500 or fail an event read.
+            Err(e) => {
+                tracing::warn!(
+                    execution_id = noetl_ref.execution_id,
+                    name = %noetl_ref.name,
+                    error = %e,
+                    "result_store.resolve: tier fallback failed; answering not-found",
+                );
+                crate::metrics::record_result_store_tier_fallback("error");
+                Ok(None)
+            }
+        }
+    }
+
+    /// Read `noetl.result_store` ONLY — no tier fallback.
+    ///
+    /// For callers that need to know whether the legacy ROW exists, rather than
+    /// whether the result is retrievable. Nothing on the read path wants this
+    /// today; it exists so a future caller can ask that question without
+    /// re-opening the fallback.
+    pub async fn resolve_store_only(
+        &self,
+        noetl_ref: &NoetlRef,
+    ) -> AppResult<Option<serde_json::Value>> {
+        let row = queries::get_by_ref(
+            &self.pool,
+            noetl_ref.execution_id,
+            &noetl_ref.name,
+            noetl_ref.result_id,
+        )
+        .await?;
         Ok(row.map(|r| r.data))
+    }
+
+    /// The set of §7 object-key prefixes a legacy ref's result could live under.
+    ///
+    /// The physical key is
+    /// `noetl/env=…/region=…/cell=…/shard=…/tenant=…/project=…/date=…/execution=<eid>/results/<step>/<frame>/<row>/<attempt>.<ext>`.
+    /// A legacy ref carries only `<eid>` and `<step>` — but everything to the
+    /// left of `execution=` is derivable here: env/region/cell and the shard
+    /// space come from the same `NOETL_RESULT_CELL*` env the materializer
+    /// writes with, the shard itself is `shard_key(tenant, project, eid)` (it
+    /// does NOT depend on step/frame/row/attempt), and the date partition comes
+    /// from the execution-id snowflake rather than the wall clock.
+    ///
+    /// Neighbouring dates are included because the date is the one segment
+    /// derived rather than configured. Getting it wrong by a day would make the
+    /// fallback silently never fire, which is the failure mode this whole issue
+    /// is about; two extra list calls on a miss is a cheap insurance premium.
+    fn tier_step_prefixes(execution_id: i64, step: &str) -> Vec<String> {
+        let reg = crate::services::cell_registry::CellRegistry::from_env(object_backend());
+        tier_step_prefixes_in(&reg, execution_id, step)
+    }
+}
+
+/// The prefix derivation itself, taking the registry explicitly.
+///
+/// Split out from the env-reading wrapper so it is testable against REAL
+/// object keys without touching process env — see the tests below, which pin it
+/// against five keys read from the prod GCS bucket and four from kind.
+fn tier_step_prefixes_in(
+    reg: &crate::services::cell_registry::CellRegistry,
+    execution_id: i64,
+    step: &str,
+) -> Vec<String> {
+    {
+        use chrono::{Duration, TimeZone, Utc};
+
+        let cell = reg
+            .cells
+            .iter()
+            .find(|c| c.cell == reg.default_cell)
+            .or_else(|| reg.cells.first());
+        let Some(cell) = cell else {
+            return Vec::new();
+        };
+        // Tenant/project are the locator defaults: a legacy ref predates the
+        // canonical naming and carries neither.
+        let shard = noetl_locator::shard_key(
+            "default",
+            "default",
+            Some(&execution_id.to_string()),
+            reg.shard_count,
+        );
+        let mint_ms = ((execution_id as u64) >> 22) + crate::snowflake::NOETL_EPOCH_MS;
+        let base = Utc
+            .timestamp_millis_opt(mint_ms as i64)
+            .single()
+            .unwrap_or_else(Utc::now);
+
+        [0i64, -1, 1]
+            .iter()
+            .map(|d| (base + Duration::days(*d)).format("%Y-%m-%d").to_string())
+            .map(|date| {
+                format!(
+                    "noetl/env={}/region={}/cell={}/shard=s{:04}/tenant=default/project=default/\
+                     date={}/execution={}/results/{}/",
+                    cell.env, cell.region, cell.cell, shard, date, execution_id, step
+                )
+            })
+            .collect()
+    }
+}
+
+impl ResultStoreService {
+    /// Resolve a **legacy** result reference from the #104 object tier when the
+    /// `noetl.result_store` row does not exist (noetl/ai-meta#343 FIX 3).
+    ///
+    /// The legacy store is only written while `NOETL_RESULT_STORE_DUAL_WRITE` is
+    /// on. Once it is retired, every reference minted as a legacy ref — by an
+    /// older execution, or by a worker pool that did not get
+    /// `NOETL_RESULT_MINT_AUTHORITATIVE` — resolves to nothing, even though the
+    /// bytes are in the tier under a canonical key. That is not a cache miss:
+    /// the consumer silently receives a bare reference instead of its data.
+    /// Measured on prod 2026-09-15 as a 0.19 s 404 while 214,805 bytes sat in
+    /// the tier; downstream, `hotel-cards` returned 0 hotels.
+    ///
+    /// ⚠ This goes through [`ObjectBackend`], NOT a query against
+    /// `noetl.object_store`. The first version of this method used raw SQL and
+    /// would have found **nothing on prod**: `NOETL_OBJECT_STORE_BACKEND=gcs`
+    /// there (bucket `shastaratech-noetl-prod-results`, and the server's own
+    /// `noetl_object_store_ops_total{backend="gcs"}` shows 606 puts / 142 gets),
+    /// so that table holds none of the results this is meant to find. It passed
+    /// in kind only because kind runs the Postgres backend — the exact
+    /// "validated one environment short of the real one" mistake that produced
+    /// the three prior failed fixes for this bug.
+    ///
+    /// Scoped to the JSON tier: it holds the scrubbed `result.context`,
+    /// byte-identical to what the legacy row held, so the resolve contract is
+    /// unchanged. Tabular results tier as Arrow Feather and are decoded by the
+    /// worker's `resolve_by_urn`, which owns an arrow dependency the control
+    /// plane deliberately does not carry.
+    ///
+    /// Returns `(data, candidates)` so the caller can warn when a step tiered
+    /// more than one object (multi-frame or retried) and the newest was chosen.
+    /// Returns `None` when the tier has nothing either — a real 404.
+    pub async fn resolve_legacy_from_tier(
+        &self,
+        noetl_ref: &NoetlRef,
+    ) -> AppResult<Option<(serde_json::Value, usize)>> {
+        let backend = object_backend();
+        for prefix in Self::tier_step_prefixes(noetl_ref.execution_id, &noetl_ref.name) {
+            // 8 is generous: a step tiers one object per (frame, row, attempt).
+            let keys = backend.list(&self.pool, &prefix, 8).await?;
+            let json: Vec<&String> = keys.iter().filter(|k| k.ends_with(".json")).collect();
+            let Some(key) = json.last() else {
+                continue;
+            };
+            let Some(obj) = backend.get(&self.pool, key).await? else {
+                continue;
+            };
+            let value: serde_json::Value = serde_json::from_slice(&obj.bytes).map_err(|e| {
+                AppError::Internal(format!(
+                    "result_store.resolve_legacy_from_tier: decode JSON tier: {e}"
+                ))
+            })?;
+            return Ok(Some((value, json.len())));
+        }
+
+        // Postgres-backend fallback: match on the placement-independent key
+        // SUFFIX. This needs no cell/date derivation at all, so it still finds
+        // the object when the derived prefix above is wrong — worth keeping as
+        // the belt to the prefix walk's braces, and it is what the anchoring
+        // tests cover. Meaningless for GCS (no suffix search), hence
+        // backend-gated rather than unconditional.
+        if matches!(backend, crate::services::object_backend::ObjectBackend::Postgres) {
+            let found = crate::db::queries::object_store::get_result_tier_json_by_step(
+                &self.pool,
+                noetl_ref.execution_id,
+                &noetl_ref.name,
+            )
+            .await?;
+            if let Some((obj, candidates)) = found {
+                let value: serde_json::Value =
+                    serde_json::from_slice(&obj.bytes).map_err(|e| {
+                        AppError::Internal(format!(
+                            "result_store.resolve_legacy_from_tier: decode JSON tier: {e}"
+                        ))
+                    })?;
+                return Ok(Some((value, candidates)));
+            }
+        }
+        Ok(None)
     }
 
     /// Resolve a **canonical** result reference
@@ -402,6 +631,119 @@ impl ResultStoreService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- §7 key derivation for the legacy tier fallback (noetl/ai-meta#343) ---
+
+    fn registry(env: &str, region: &str, cell: &str, shard_count: u32) -> crate::services::cell_registry::CellRegistry {
+        crate::services::cell_registry::CellRegistry {
+            shard_count,
+            default_cell: cell.to_string(),
+            cells: vec![crate::services::cell_registry::CellEntry {
+                cell: cell.to_string(),
+                env: env.to_string(),
+                region: region.to_string(),
+                provider: "gcs".to_string(),
+                bucket: String::new(),
+                endpoint: String::new(),
+            }],
+        }
+    }
+
+    /// ⚠ PINNED AGAINST REAL OBJECT KEYS, read from the production GCS bucket
+    /// `shastaratech-noetl-prod-results` on 2026-09-16.
+    ///
+    /// A legacy ref carries only `(execution_id, step)`; everything to the left
+    /// of `execution=` has to be *derived*, and the whole fallback silently
+    /// never fires if that derivation is off by one segment. Derivation is
+    /// exactly the kind of thing that looks right and is wrong, so these are the
+    /// real keys rather than keys this test made up.
+    ///
+    /// The two derived segments are the ones to watch:
+    ///   * `shard` is `shard_key(tenant, project, execution_id) % shard_count` —
+    ///     note it does NOT depend on step/frame/row/attempt, which is what
+    ///     makes a step-level prefix possible at all;
+    ///   * `date` comes from the execution-id snowflake, not the wall clock, so
+    ///     a result read back weeks later still resolves.
+    #[test]
+    fn the_step_prefix_matches_real_production_object_keys() {
+        let reg = registry("prod", "usc1", "usc1-a", 256);
+        for (eid, step, want) in [
+            (358337687603650560i64, "hotelbeds_dispatch",
+             "noetl/env=prod/region=usc1/cell=usc1-a/shard=s0004/tenant=default/project=default/date=2026-09-15/execution=358337687603650560/results/hotelbeds_dispatch/"),
+            (358387240549752832, "hotelbeds_dispatch",
+             "noetl/env=prod/region=usc1/cell=usc1-a/shard=s0004/tenant=default/project=default/date=2026-09-15/execution=358387240549752832/results/hotelbeds_dispatch/"),
+            (351442299651104768, "firestore_dispatch",
+             "noetl/env=prod/region=usc1/cell=usc1-a/shard=s0004/tenant=default/project=default/date=2026-08-27/execution=351442299651104768/results/firestore_dispatch/"),
+            (358157628485935104, "duffel_dispatch",
+             "noetl/env=prod/region=usc1/cell=usc1-a/shard=s0007/tenant=default/project=default/date=2026-09-15/execution=358157628485935104/results/duffel_dispatch/"),
+            (351442533462581248, "firestore_dispatch",
+             "noetl/env=prod/region=usc1/cell=usc1-a/shard=s0007/tenant=default/project=default/date=2026-08-27/execution=351442533462581248/results/firestore_dispatch/"),
+        ] {
+            let got = tier_step_prefixes_in(&reg, eid, step);
+            assert_eq!(
+                got.first().map(String::as_str),
+                Some(want),
+                "derived prefix does not match the real production key for \
+                 execution {eid} step {step}.\nA wrong prefix makes the tier \
+                 fallback list an empty prefix and report not-found — the exact \
+                 silent failure it exists to remove."
+            );
+        }
+    }
+
+    /// The same derivation against keys read from the kind cluster's Postgres
+    /// object store, which runs a different cell seed (`dev`/`local`/`local-0`).
+    /// Both environments have to work off one formula.
+    #[test]
+    fn the_step_prefix_matches_real_kind_object_keys() {
+        let reg = registry("dev", "local", "local-0", 256);
+        for (eid, step, want) in [
+            (358488951972958208i64, "emit",
+             "noetl/env=dev/region=local/cell=local-0/shard=s0184/tenant=default/project=default/date=2026-09-16/execution=358488951972958208/results/emit/"),
+            (358494482770956288, "emit",
+             "noetl/env=dev/region=local/cell=local-0/shard=s0066/tenant=default/project=default/date=2026-09-16/execution=358494482770956288/results/emit/"),
+            (358494179833155584, "fetch",
+             "noetl/env=dev/region=local/cell=local-0/shard=s0207/tenant=default/project=default/date=2026-09-16/execution=358494179833155584/results/fetch/"),
+            (358494181552820224, "emit",
+             "noetl/env=dev/region=local/cell=local-0/shard=s0090/tenant=default/project=default/date=2026-09-16/execution=358494181552820224/results/emit/"),
+        ] {
+            assert_eq!(
+                tier_step_prefixes_in(&reg, eid, step).first().map(String::as_str),
+                Some(want),
+                "derived prefix does not match the real kind key for execution {eid} step {step}"
+            );
+        }
+    }
+
+    /// Neighbouring dates are probed because the date is the one segment that is
+    /// derived rather than configured. An off-by-one there would make the
+    /// fallback never fire, which is indistinguishable from the bug.
+    #[test]
+    fn the_prefix_walk_covers_the_neighbouring_date_partitions() {
+        let reg = registry("prod", "usc1", "usc1-a", 256);
+        let got = tier_step_prefixes_in(&reg, 358337687603650560, "hotelbeds_dispatch");
+        assert_eq!(got.len(), 3, "expected the snowflake date plus one either side");
+        assert!(got[0].contains("date=2026-09-15"), "the snowflake date must be tried FIRST");
+        assert!(got[1].contains("date=2026-09-14"));
+        assert!(got[2].contains("date=2026-09-16"));
+    }
+
+    /// A shard space of a different size must move the shard segment — proof the
+    /// value is derived from the registry rather than baked in.
+    #[test]
+    fn the_shard_segment_follows_the_registrys_shard_count() {
+        let eid = 358337687603650560;
+        let a = tier_step_prefixes_in(&registry("prod", "usc1", "usc1-a", 256), eid, "s");
+        let b = tier_step_prefixes_in(&registry("prod", "usc1", "usc1-a", 512), eid, "s");
+        assert!(a[0].contains("shard=s0004"), "got {}", a[0]);
+        assert!(b[0].contains("shard=s0260"), "got {}", b[0]);
+
+        // And the cell seed moves env/region/cell — kind and prod share one
+        // formula and differ only in this configured part.
+        let k = tier_step_prefixes_in(&registry("dev", "local", "local-0", 256), eid, "s");
+        assert!(k[0].starts_with("noetl/env=dev/region=local/cell=local-0/shard=s0004/"), "got {}", k[0]);
+    }
+
 
     // --- mint_ref_only (dual-write retirement, #104 OQ5) ---
 
