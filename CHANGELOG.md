@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.112.0](https://github.com/noetl/server/compare/v3.111.1...v3.112.0) (2026-09-16)
+
+### Features
+
+* **health:** readiness that exercises the catalog read path ([6268745](https://github.com/noetl/server/commit/62687456c491c2f05358fc694dd66c90ae774cfd)), closes [noetl/server#443](https://github.com/noetl/server/issues/443)
+
 ## [3.111.1](https://github.com/noetl/server/compare/v3.111.0...v3.111.1) (2026-09-16)
 
 ### Bug Fixes
