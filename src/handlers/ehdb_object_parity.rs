@@ -433,3 +433,153 @@ mod tests {
         assert_eq!(r.superseded, 1);
     }
 }
+
+// ---------------------------------------------------------------------------
+// The endpoint
+// ---------------------------------------------------------------------------
+
+/// `GET /api/ehdb/object-parity/{tier}` — run the comparison for real.
+///
+/// Shadow side: the tier service, through the same worker relay
+/// [`raw_tier_query`][super::ehdb::raw_tier_query] uses — no new data access,
+/// the same read with the JSON parsed instead of forwarded.
+/// Authoritative side: [`ObjectBackend`], so it serves GCS and Postgres alike.
+/// Reading the authoritative store with SQL would be blind on production, which
+/// is noetl/server#438 and was nearly shipped twice.
+///
+/// ⚠ **`unmirrored` is only meaningful when the scope covers the authoritative
+/// store.** Without a `prefix` this compares exactly the keys the shadow names,
+/// so `unmirrored` is 0 by construction and would be a reassuring number about
+/// nothing. The response says which scope ran; the number is only published
+/// when it was computed against a listing.
+pub async fn object_parity(
+    axum::extract::State(deps): axum::extract::State<ObjectParityDeps>,
+    axum::extract::Path(tier): axum::extract::Path<String>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl axum::response::IntoResponse {
+    use axum::http::StatusCode;
+    use axum::Json;
+
+    let tier_label: &'static str = match tier.trim().to_ascii_lowercase().as_str() {
+        "object" => "object",
+        "kv" => "kv",
+        other => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "action": "ehdb.object_parity",
+                    "error": format!("unsupported tier {other:?}"),
+                    "supported": ["object", "kv"],
+                })),
+            );
+        }
+    };
+    let limit: usize = params
+        .get("limit")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(500)
+        .clamp(1, 5_000);
+
+    let shadow = match super::ehdb::fetch_shadow_records(&deps.relay, tier_label, limit).await {
+        Ok(v) => v,
+        // A failed fetch must NOT read as an empty shadow: every key would
+        // score `missing_object` and a refusal would be published as a finding
+        // (noetl/ai-meta#263).
+        Err(reason) => {
+            crate::metrics::record_ehdb_crossstore_parity(tier_label, "shadow_unreadable");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "action": "ehdb.object_parity",
+                    "tier": tier_label,
+                    "outcome": "shadow_unreadable",
+                    "error": reason,
+                })),
+            );
+        }
+    };
+
+    // Authoritative side. With a prefix we list, so `unmirrored` means
+    // something; without one we fetch exactly the keys the shadow names.
+    let prefix = params.get("prefix").map(String::as_str);
+    let mut keys: Vec<String> = match prefix {
+        Some(p) => match deps.backend.list(&deps.pool, p, limit).await {
+            Ok(k) => k,
+            Err(e) => {
+                crate::metrics::record_ehdb_crossstore_parity(tier_label, "authoritative_unreadable");
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({
+                        "action": "ehdb.object_parity",
+                        "tier": tier_label,
+                        "outcome": "authoritative_unreadable",
+                        "error": e.to_string(),
+                    })),
+                );
+            }
+        },
+        None => Vec::new(),
+    };
+    for r in &shadow {
+        if !keys.iter().any(|k| k == &r.key) {
+            keys.push(r.key.clone());
+        }
+    }
+
+    let mut authoritative = Vec::with_capacity(keys.len());
+    for key in &keys {
+        match deps.backend.get(&deps.pool, key).await {
+            Ok(Some(row)) => authoritative.push(AuthoritativeObject {
+                key: key.clone(),
+                digest: row.digest,
+                byte_len: row.bytes.len(),
+            }),
+            // Absent is a real state — the comparator reports it as
+            // `missing_object` for a key the shadow claims.
+            Ok(None) => {}
+            Err(e) => {
+                crate::metrics::record_ehdb_crossstore_parity(tier_label, "authoritative_unreadable");
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({
+                        "action": "ehdb.object_parity",
+                        "tier": tier_label,
+                        "outcome": "authoritative_unreadable",
+                        "key": key,
+                        "error": e.to_string(),
+                    })),
+                );
+            }
+        }
+    }
+
+    let report = compare_object_tier(tier_label, &authoritative, &shadow);
+    crate::metrics::record_ehdb_crossstore_parity(tier_label, report.outcome());
+
+    let mut body = serde_json::to_value(&report).unwrap_or(serde_json::Value::Null);
+    if let Some(o) = body.as_object_mut() {
+        o.insert(
+            "scope".to_string(),
+            serde_json::json!(match prefix {
+                Some(p) => format!("authoritative listing under {p:?} plus every key the shadow names"),
+                None => "exactly the keys the shadow names".to_string(),
+            }),
+        );
+        if prefix.is_none() {
+            // Do not publish a 0 that only means "we never looked".
+            o.remove("unmirrored");
+        }
+        o.insert("action".to_string(), serde_json::json!("ehdb.object_parity"));
+        o.insert("outcome".to_string(), serde_json::json!(report.outcome()));
+        o.insert("shadow_records".to_string(), serde_json::json!(shadow.len()));
+    }
+    (StatusCode::OK, Json(body))
+}
+
+/// Dependencies for [`object_parity`].
+#[derive(Clone)]
+pub struct ObjectParityDeps {
+    pub pool: crate::db::DbPool,
+    pub backend: crate::services::object_backend::ObjectBackend,
+    pub relay: super::ehdb::TierRelayState,
+}
