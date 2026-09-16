@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.112.1](https://github.com/noetl/server/compare/v3.112.0...v3.112.1) (2026-09-16)
+
+### Bug Fixes
+
+* **orchestrate:** expire the in-flight guard instead of stranding forever ([a0bf6f8](https://github.com/noetl/server/commit/a0bf6f86de29d98d7e19f526d63f41308b14e4ed)), closes [noetl/server#447](https://github.com/noetl/server/issues/447) [#448](https://github.com/noetl/server/issues/448)
+
 ## [3.112.0](https://github.com/noetl/server/compare/v3.111.1...v3.112.0) (2026-09-16)
 
 ### Features
