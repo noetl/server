@@ -72,6 +72,9 @@ fn build_router(
     let mut health_routes = Router::new()
         .route("/health", get(handlers::health_check))
         .route("/api/health", get(handlers::api_health))
+        // noetl/server#443 — readiness must exercise a real read path, not just
+        // liveness. `/api/health` stayed 200 while `/api/catalog/list` 500'd.
+        .route("/api/health/ready", get(handlers::health::readiness))
         .route("/api/pool/status", get(handlers::health::pool_status));
     // Prometheus metrics endpoint — gated by AppConfig.disable_metrics
     // per agents/rules/observability.md.  Default-on; ingress / netpol
