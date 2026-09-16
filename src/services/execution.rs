@@ -426,6 +426,54 @@ impl ExecutionService {
             fetch_cap.saturating_mul(10).min(2_000)
         };
 
+        // Stage 0 — resolve a `path` filter to catalog ids BEFORE the candidate
+        // window (noetl/server#435).
+        //
+        // ⚠ THE FALSE EMPTY. The path filter used to run in stage 4, in Rust,
+        // over the already-truncated candidate set — so it meant "of the N most
+        // recent executions, those whose path matches" rather than "the N most
+        // recent executions whose path matches". On prod the same filter over
+        // the same data returned 0 rows at `limit=5` and 1 row at `limit=20`,
+        // because the matching execution was the 6th most recent overall.
+        //
+        // The failure direction is what makes it serious: a caller gets `[]`
+        // and cannot tell "this playbook never ran" from "its runs are outside
+        // the window". No error, no truncation flag, and identical across
+        // retries.
+        //
+        // `status` already anticipated this and over-fetches; `path` got no such
+        // widening. Over-fetching would only make the window bigger, so instead
+        // the filter moves INTO stage 1: resolve the path to its catalog ids
+        // here (one query on the cluster pool, which is where `noetl.catalog`
+        // lives — the join #62 deliberately moved out of the per-shard stage),
+        // then let the candidate window select among matching executions only.
+        //
+        // `None` means no path filter. `Some(vec![])` means the path matched no
+        // catalog entry at all, which is a true empty and short-circuits.
+        let path_catalog_ids: Option<Vec<i64>> = match filter.path.as_deref() {
+            None => None,
+            Some(pattern) => {
+                let needle = format!("%{}%", pattern.to_lowercase());
+                let rows: Vec<(i64,)> = sqlx::query_as(
+                    r#"
+                    SELECT catalog_id
+                    FROM noetl.catalog
+                    WHERE lower(path) LIKE $1
+                    "#,
+                )
+                .bind(&needle)
+                .fetch_all(self.pools.cluster())
+                .await?;
+                Some(rows.into_iter().map(|(id,)| id).collect())
+            }
+        };
+        if matches!(path_catalog_ids.as_deref(), Some([])) {
+            // No catalog entry matches, so no execution can. Returning early is
+            // not just an optimisation: `catalog_id = ANY('{}')` is false for
+            // every row, so the query would do the work to reach the same answer.
+            return Ok(Vec::new());
+        }
+
         // Stage 1 — per-shard execution_stats aggregation.  The
         // per-shard query is the original CTE minus the catalog
         // JOIN + path filter (those move to the post-merge
@@ -437,6 +485,7 @@ impl ExecutionService {
             .for_each_shard(|_idx, pool| {
                 let catalog_id = filter.catalog_id;
                 let status = filter.status.clone();
+                let path_ids = path_catalog_ids.clone();
                 async move {
                     // noetl/ai-meta#62: candidate-first.  The old query
                     // GROUP BY'd the entire `noetl.event` table (O(all events)
@@ -460,6 +509,9 @@ impl ExecutionService {
                             FROM noetl.event
                             WHERE event_type IN ('playbook.initialized', 'playbook_started', 'playbook.started')
                               AND ($1::BIGINT IS NULL OR catalog_id = $1)
+                              -- noetl/server#435: the path filter, as catalog
+                              -- ids, applied BEFORE the candidate window.
+                              AND ($6::BIGINT[] IS NULL OR catalog_id = ANY($6))
                             GROUP BY execution_id, catalog_id
                             ORDER BY started_at DESC
                             LIMIT $4
@@ -523,6 +575,7 @@ impl ExecutionService {
                     .bind(fetch_cap)
                     .bind(candidate_cap)
                     .bind(crate::db::queries::event::status_from_steps_enabled())
+                    .bind(path_ids)
                     .fetch_all(&pool)
                     .await
                 }
