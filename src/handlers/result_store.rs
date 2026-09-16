@@ -193,59 +193,18 @@ pub async fn resolve_ref(
     };
 
     let (execution_id, name, result) = match &parsed {
-        ResultRef::Legacy(l) => {
-            // noetl/ai-meta#343 FIX 3 — tier fallback on a legacy-store MISS.
-            //
-            // `noetl.result_store` is only written while
-            // `NOETL_RESULT_STORE_DUAL_WRITE` is on. With it retired, a legacy
-            // ref — minted by an older execution, or by a worker pool that did
-            // not get `NOETL_RESULT_MINT_AUTHORITATIVE` — has no row to find,
-            // and the 404 is indistinguishable from "no such result" even
-            // though the bytes are in the #104 tier under a canonical key. The
-            // consumer then silently binds a bare reference instead of its
-            // data. So before answering not-found, look in the tier.
-            let mut resolved = deps.service.resolve(l).await;
-            if matches!(resolved, Ok(None)) {
-                match deps.service.resolve_legacy_from_tier(l).await {
-                    Ok(Some((data, candidates))) => {
-                        if candidates > 1 {
-                            tracing::warn!(
-                                execution_id = l.execution_id,
-                                name = %l.name,
-                                "result_store.resolve: legacy ref matched more than one \
-                                 tier object for this step; served the newest",
-                            );
-                        }
-                        tracing::info!(
-                            execution_id = l.execution_id,
-                            name = %l.name,
-                            noetl_ref = %params.r#ref,
-                            "result_store.resolve: legacy store miss served from the #104 tier",
-                        );
-                        crate::metrics::record_result_store_resolve(
-                            t0.elapsed().as_secs_f64(),
-                            "ok_tier_fallback",
-                        );
-                        return Ok((StatusCode::OK, Json(data)).into_response());
-                    }
-                    // Tier has nothing either — a genuine not-found; fall
-                    // through to the shared 404 below.
-                    Ok(None) => {}
-                    // The fallback is belt-and-suspenders: never let its own
-                    // failure turn a plain 404 into a 500.
-                    Err(e) => {
-                        tracing::warn!(
-                            execution_id = l.execution_id,
-                            name = %l.name,
-                            error = %e,
-                            "result_store.resolve: tier fallback failed; answering not-found",
-                        );
-                        resolved = Ok(None);
-                    }
-                }
-            }
-            (l.execution_id, l.name.clone(), resolved)
-        }
+        // noetl/ai-meta#343 FIX 3 — the legacy-store-miss fallback to the #104
+        // tier lives in `ResultStoreService::resolve`, not here. The store has
+        // six read sites and only one of them is this endpoint; the path that
+        // actually feeds a parent step's rendered input is
+        // `services::execution` / `hydrate_result_references`, which call the
+        // service directly. A fallback wired into this handler alone left the
+        // production symptom intact (measured in kind, 2026-09-16).
+        ResultRef::Legacy(l) => (
+            l.execution_id,
+            l.name.clone(),
+            deps.service.resolve(l).await,
+        ),
         ResultRef::Canonical(loc) => {
             // Best-effort coords for the log/metric fields; resolution itself
             // re-parses inside `resolve_canonical`.

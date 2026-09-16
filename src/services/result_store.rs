@@ -334,8 +334,77 @@ impl ResultStoreService {
     /// tools layer (`result_fetch`) expects the response body IS the
     /// data, not a wrapper.
     ///
-    /// Returns `None` when no matching row exists (caller maps to 404).
+    /// Reads `noetl.result_store` first and, on a miss, the #104 object tier
+    /// (noetl/ai-meta#343 FIX 3). The fallback lives HERE, in the service,
+    /// rather than in one handler, because the store has six read sites — the
+    /// resolve endpoint, four in `handlers::events` (including
+    /// `hydrate_result_references`, which is what turns an over-budget child
+    /// result into the parent's rendered input) and the execution status view.
+    /// Measured in kind on 2026-09-16: fixing only the HTTP handler left the
+    /// parent bind returning 0 items, because the path that actually feeds it
+    /// is `services::execution`, which calls this method directly and never
+    /// goes through the endpoint.
+    ///
+    /// Returns `None` only when neither tier has it (caller maps to 404).
     pub async fn resolve(&self, noetl_ref: &NoetlRef) -> AppResult<Option<serde_json::Value>> {
+        let row = queries::get_by_ref(
+            &self.pool,
+            noetl_ref.execution_id,
+            &noetl_ref.name,
+            noetl_ref.result_id,
+        )
+        .await?;
+        if let Some(r) = row {
+            return Ok(Some(r.data));
+        }
+        match self.resolve_legacy_from_tier(noetl_ref).await {
+            Ok(Some((data, candidates))) => {
+                if candidates > 1 {
+                    tracing::warn!(
+                        execution_id = noetl_ref.execution_id,
+                        name = %noetl_ref.name,
+                        "result_store.resolve: legacy ref matched more than one tier object \
+                         for this step; served the newest",
+                    );
+                }
+                tracing::info!(
+                    execution_id = noetl_ref.execution_id,
+                    name = %noetl_ref.name,
+                    "result_store.resolve: legacy store miss served from the #104 tier",
+                );
+                crate::metrics::record_result_store_tier_fallback("served");
+                Ok(Some(data))
+            }
+            Ok(None) => {
+                crate::metrics::record_result_store_tier_fallback("miss");
+                Ok(None)
+            }
+            // The fallback is additive. Its own failure must degrade to
+            // not-found — the answer the caller got before it existed — never
+            // turn a 404 into a 500 or fail an event read.
+            Err(e) => {
+                tracing::warn!(
+                    execution_id = noetl_ref.execution_id,
+                    name = %noetl_ref.name,
+                    error = %e,
+                    "result_store.resolve: tier fallback failed; answering not-found",
+                );
+                crate::metrics::record_result_store_tier_fallback("error");
+                Ok(None)
+            }
+        }
+    }
+
+    /// Read `noetl.result_store` ONLY — no tier fallback.
+    ///
+    /// For callers that need to know whether the legacy ROW exists, rather than
+    /// whether the result is retrievable. Nothing on the read path wants this
+    /// today; it exists so a future caller can ask that question without
+    /// re-opening the fallback.
+    pub async fn resolve_store_only(
+        &self,
+        noetl_ref: &NoetlRef,
+    ) -> AppResult<Option<serde_json::Value>> {
         let row = queries::get_by_ref(
             &self.pool,
             noetl_ref.execution_id,

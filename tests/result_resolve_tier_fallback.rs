@@ -38,6 +38,8 @@
 const RESULT_STORE_HANDLER: &str = include_str!("../src/handlers/result_store.rs");
 const RESULT_STORE_SERVICE: &str = include_str!("../src/services/result_store.rs");
 const OBJECT_STORE_QUERIES: &str = include_str!("../src/db/queries/object_store.rs");
+const EVENTS_HANDLER: &str = include_str!("../src/handlers/events.rs");
+const EXECUTION_SERVICE: &str = include_str!("../src/services/execution.rs");
 
 /// Source with comments stripped and the test module removed.
 ///
@@ -54,73 +56,109 @@ fn production_source(src: &str) -> String {
 }
 
 #[test]
-fn the_legacy_arm_consults_the_tier_before_answering_not_found() {
-    let src = production_source(RESULT_STORE_HANDLER);
+fn the_store_read_falls_back_to_the_tier_before_reporting_not_found() {
+    let src = production_source(RESULT_STORE_SERVICE);
 
-    let legacy_arm_start = src
-        .find("ResultRef::Legacy(l)")
-        .expect("resolve_ref no longer has a Legacy arm");
-    let canonical_arm_start = src[legacy_arm_start..]
-        .find("ResultRef::Canonical(")
-        .map(|i| legacy_arm_start + i)
-        .expect("resolve_ref no longer has a Canonical arm");
-    let legacy_arm = &src[legacy_arm_start..canonical_arm_start];
+    let body_start = src
+        .find("pub async fn resolve(&self, noetl_ref: &NoetlRef)")
+        .expect("ResultStoreService::resolve no longer exists");
+    let body_end = src[body_start..]
+        .find("pub async fn resolve_store_only")
+        .map(|i| body_start + i)
+        .expect("resolve_store_only no longer follows resolve");
+    let resolve = &src[body_start..body_end];
 
     assert!(
-        legacy_arm.contains("resolve_legacy_from_tier"),
-        "the legacy arm of resolve_ref no longer falls back to the #104 tier.\n\
+        resolve.contains("resolve_legacy_from_tier"),
+        "ResultStoreService::resolve no longer falls back to the #104 tier.\n\
          With NOETL_RESULT_STORE_DUAL_WRITE=false the legacy row is never\n\
-         written, so every legacy ref 404s while its bytes sit in the tier —\n\
-         and the worker turns that 404 into a silently empty step result.\n\
+         written, so every legacy ref reads as not-found while its bytes sit in\n\
+         the tier — and the consumer silently receives a bare reference.\n\
          Prod 2026-09-15: hotel-cards returned 0 hotels for two days."
     );
     assert!(
-        legacy_arm.contains("deps.service.resolve(l)"),
-        "the legacy arm must still try noetl.result_store FIRST — the fallback\n\
-         is belt-and-suspenders, not a replacement. Rows written before the\n\
-         dual-write was retired are still authoritative for their refs."
+        resolve.contains("queries::get_by_ref"),
+        "resolve must still read noetl.result_store FIRST — the fallback is\n\
+         belt-and-suspenders, not a replacement. Rows written before the\n\
+         dual-write was retired remain authoritative for their refs."
     );
 
-    // Order matters and is the whole point: consulting the tier *after*
-    // returning 404 is the same as not consulting it.
-    let store_read = legacy_arm.find("deps.service.resolve(l)").unwrap();
-    let tier_read = legacy_arm.find("resolve_legacy_from_tier").unwrap();
+    // Order is the whole point: consulting the tier after returning is the same
+    // as not consulting it.
+    let store_read = resolve.find("queries::get_by_ref").unwrap();
+    let tier_read = resolve.find("resolve_legacy_from_tier").unwrap();
     assert!(
         store_read < tier_read,
-        "the tier fallback runs before the legacy store read; it must run only\n\
-         on a MISS, so a stored row is never shadowed by a tier object."
+        "the tier fallback runs before the store read; it must run only on a\n\
+         MISS, so a stored row is never shadowed by a tier object."
     );
 }
 
 #[test]
-fn the_fallback_cannot_turn_a_missing_result_into_a_server_error() {
+fn the_fallback_cannot_turn_a_missing_result_into_an_error() {
     // The fallback is additive. If its own query fails — the object table is
-    // absent on an older deployment, say — the endpoint must still answer the
-    // 404 it answered before, not a 500. A belt-and-suspenders path that can
-    // fail the request is worse than no path at all.
-    let src = production_source(RESULT_STORE_HANDLER);
-    let legacy_arm_start = src.find("ResultRef::Legacy(l)").unwrap();
-    let legacy_arm = &src[legacy_arm_start..];
-    let err_arm = legacy_arm
+    // absent on an older deployment, say — every caller must still get the
+    // not-found it got before, not an error. Two of the six read sites are on
+    // the event-read path, where propagating an error would fail a request that
+    // used to succeed with a bare reference.
+    let src = production_source(RESULT_STORE_SERVICE);
+    let body_start = src
+        .find("pub async fn resolve(&self, noetl_ref: &NoetlRef)")
+        .unwrap();
+    let body_end = src[body_start..]
+        .find("pub async fn resolve_store_only")
+        .map(|i| body_start + i)
+        .unwrap();
+    let resolve = &src[body_start..body_end];
+    let err_arm_at = resolve
         .find("Err(e) =>")
-        .map(|i| &legacy_arm[i..i + 400])
-        .expect("the tier fallback no longer handles its own error case");
+        .expect("resolve no longer handles the tier fallback's own error case");
+    let err_arm = &resolve[err_arm_at..];
     assert!(
-        err_arm.contains("Ok(None)") || err_arm.contains("warn"),
+        err_arm.contains("Ok(None)"),
         "a failing tier fallback must degrade to not-found, not propagate.\n\
-         Found:\n{err_arm}"
+         Found:\n{}",
+        &err_arm[..err_arm.len().min(400)]
     );
 }
 
 #[test]
-fn the_fallback_is_wired_from_the_handler_down_to_a_query() {
+fn every_result_store_read_site_goes_through_the_fallback() {
+    // THE LESSON FROM THE FIRST ATTEMPT AT THIS FIX. It wired the fallback into
+    // `handlers::result_store::resolve_ref` only. That handler is ONE of six
+    // read sites, and it is not the one that feeds a parent step: an
+    // over-budget child result reaches the parent through
+    // `services::execution`'s status view and `hydrate_result_references`,
+    // both of which call the service directly. Measured in kind on 2026-09-16 —
+    // the endpoint logged "legacy store miss served from the #104 tier" four
+    // times while the parent step still received 0 items.
+    //
+    // So the guard is not "the handler calls the fallback" but "no read site
+    // bypasses it".
+    for (label, src) in [
+        ("handlers/result_store.rs", RESULT_STORE_HANDLER),
+        ("handlers/events.rs", EVENTS_HANDLER),
+        ("services/execution.rs", EXECUTION_SERVICE),
+    ] {
+        let prod = production_source(src);
+        assert!(
+            !prod.contains("resolve_store_only"),
+            "{label} calls `resolve_store_only`, which deliberately skips the\n\
+             #104 tier fallback. A read path that wants the RESULT (not the\n\
+             legacy row's existence) must call `resolve`."
+        );
+    }
+}
+
+#[test]
+fn the_fallback_is_wired_from_the_service_down_to_a_query() {
     // Reachability. This class of bug is "implemented but unreachable", and the
     // three previous fixes for it were all reachable-looking code that nothing
     // called on the path that mattered.
     let service = production_source(RESULT_STORE_SERVICE);
     assert!(
         service.contains("pub async fn resolve_legacy_from_tier"),
-        "the service method the handler calls does not exist."
+        "the tier-fallback service method does not exist."
     );
     assert!(
         service.contains("get_result_tier_json_by_step"),
