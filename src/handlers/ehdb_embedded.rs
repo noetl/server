@@ -35,8 +35,9 @@ use ehdb_l0::substrate::{DurableSubstrate, LocalFsSubstrate};
 pub const EMBEDDED_ENV: &str = "NOETL_EHDB_EMBEDDED";
 /// Where the embedded engine keeps its local root.
 pub const EMBEDDED_DIR_ENV: &str = "NOETL_EHDB_EMBEDDED_DIR";
-/// Default local root. Under `/data` so it lands on a mounted volume when one
-/// exists and fails loudly at open when it does not.
+/// Default local root. Under `/data`, which is where the durable volume is
+/// mounted; [`durable_root_usable`] refuses the open when nothing is mounted
+/// there, so the shadow stays off rather than writing to ephemeral storage.
 pub const DEFAULT_EMBEDDED_DIR: &str = "/data/ehdb-embedded";
 
 /// Is the embedded shadow armed?
@@ -54,6 +55,56 @@ pub fn embedded_dir() -> String {
     std::env::var(EMBEDDED_DIR_ENV).unwrap_or_else(|_| DEFAULT_EMBEDDED_DIR.to_string())
 }
 
+/// Is `root` somewhere a durable volume actually lives?
+///
+/// The decision, separated from the filesystem so every combination is
+/// testable — real mount points cannot be created in a unit test.
+///
+/// * an existing root is accepted: something provisioned it, and that is the
+///   steady state on a pod whose volume has been mounted since first boot;
+/// * otherwise the PARENT must be a mount point, because that is the directory
+///   `create_dir_all` would create the root inside.
+///
+/// ⚠ Deliberately permissive about an existing root rather than demanding the
+/// root itself be a mount point: the volume is mounted at `/data`, and the
+/// engine's root is `/data/ehdb-embedded` one level inside it.
+fn root_is_durable(root_exists: bool, parent_exists: bool, parent_is_mount_point: bool) -> bool {
+    root_exists || (parent_exists && parent_is_mount_point)
+}
+
+/// Is `path` a mount point?
+///
+/// True when its device id differs from its parent's — the standard way to ask,
+/// and the same test `mountpoint(1)` makes.
+#[cfg(unix)]
+fn is_mount_point(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Some(parent) = path.parent() else {
+        // `/` has no parent and is always a mount point.
+        return true;
+    };
+    match (std::fs::metadata(path), std::fs::metadata(parent)) {
+        (Ok(a), Ok(b)) => a.dev() != b.dev(),
+        _ => false,
+    }
+}
+
+/// Non-unix has no `st_dev` to compare, so only a pre-existing root is accepted.
+#[cfg(not(unix))]
+fn is_mount_point(_path: &std::path::Path) -> bool {
+    false
+}
+
+/// Filesystem-facing wrapper around [`root_is_durable`].
+fn durable_root_usable(root: &std::path::Path) -> bool {
+    let parent = root.parent();
+    root_is_durable(
+        root.exists(),
+        parent.is_some_and(|p| p.exists()),
+        parent.is_some_and(is_mount_point),
+    )
+}
+
 /// Open the embedded engine, or `None` when the flag is off.
 ///
 /// ⚠ Returns `None` rather than erroring when disabled, and logs-and-returns
@@ -65,6 +116,29 @@ pub fn open_embedded() -> Option<Arc<std::sync::Mutex<L0Engine<D1EventLog>>>> {
         return None;
     }
     let dir = embedded_dir();
+    // noetl/server#419 — refuse a root that is not backed by a mounted volume.
+    //
+    // ⚠ Without this, the shadow opens SUCCESSFULLY on a pod with no volume:
+    // `LocalFsSubstrate::new` calls `fs::create_dir_all`, which happily creates
+    // the path on the container's ephemeral writable layer. Nothing fails, and
+    // the shadow quietly accumulates against the pod's `ephemeral-storage`
+    // limit until the kubelet evicts it — a serving outage caused by a shadow,
+    // which is precisely what this module's design forbids:
+    //
+    //   "A shadow that could take the server down on a storage problem would be
+    //    a liability rather than evidence."
+    //
+    // The scale is not hypothetical. Prod's mounted root holds 357 MB after 7
+    // days (~51 MB/day); against the 1Gi ephemeral limit an unmounted pod would
+    // reach eviction in roughly three weeks — slow enough to look healthy in
+    // any short test, fast enough to matter.
+    if !durable_root_usable(std::path::Path::new(&dir)) {
+        tracing::error!(target: "noetl_server::ehdb_embedded", dir = %dir,
+            "embedded root is not on a mounted volume; shadow stays off rather \
+             than writing to ephemeral storage");
+        crate::metrics::record_embedded_shadow("open_failed");
+        return None;
+    }
     let substrate: Arc<dyn DurableSubstrate> =
         match LocalFsSubstrate::new(format!("{dir}/substrate")) {
             Ok(s) => Arc::new(s),
@@ -439,6 +513,108 @@ mod tests {
         assert_ne!(verdict(0, 0, false), ShadowVerdict::Agreed);
         // And zero-vs-zero WITH a comparison is genuinely agreement.
         assert_eq!(verdict(0, 0, true), ShadowVerdict::Agreed);
+    }
+
+    /// ⭐ noetl/server#419. The truth table the doc comment used to assert
+    /// without implementing.
+    #[test]
+    fn a_root_is_durable_only_when_something_is_actually_mounted() {
+        // root exists: something provisioned it — the steady state on a pod
+        // whose volume has been mounted since first boot.
+        assert!(root_is_durable(true, true, true));
+        assert!(root_is_durable(true, true, false));
+        assert!(root_is_durable(true, false, false));
+
+        // root absent: create_dir_all would make it inside the parent, so the
+        // parent has to be the mount point.
+        assert!(
+            root_is_durable(false, true, true),
+            "fresh pod, volume mounted"
+        );
+
+        // ⚠ The defect. `/data` exists as an ordinary directory on the image or
+        // gets created on the container layer, nothing is mounted, and
+        // create_dir_all succeeds on EPHEMERAL storage.
+        assert!(
+            !root_is_durable(false, true, false),
+            "an unmounted parent must refuse: this is the case where the open \
+             SUCCEEDS today and the shadow accrues against the pod's \
+             ephemeral-storage limit until the kubelet evicts it"
+        );
+        assert!(
+            !root_is_durable(false, false, false),
+            "nothing there at all"
+        );
+        assert!(
+            !root_is_durable(false, false, true),
+            "a mount flag on a parent that does not exist is incoherent; refuse"
+        );
+    }
+
+    /// The filesystem wrapper agrees with the table on real paths.
+    ///
+    /// This is the test the issue asks for: a substrate root under a directory
+    /// that does not exist. There was none, which is why the comment and the
+    /// code diverged unnoticed.
+    #[test]
+    fn a_root_under_a_missing_parent_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // An existing root is fine.
+        assert!(durable_root_usable(tmp.path()));
+
+        // A root whose parent does not exist is not — `create_dir_all` would
+        // cheerfully build the whole chain on whatever filesystem is there.
+        let orphan = tmp.path().join("no-such-mount").join("ehdb-embedded");
+        assert!(
+            !durable_root_usable(&orphan),
+            "a root under a missing parent must be refused"
+        );
+
+        // A root whose parent exists but is an ordinary directory — the prod
+        // shape when the volume is simply absent.
+        let unmounted = tmp.path().join("ehdb-embedded");
+        assert!(
+            !durable_root_usable(&unmounted),
+            "an ordinary directory is not a mount point, so a root inside it \
+             would land on ephemeral storage"
+        );
+    }
+
+    /// ⭐ The guard must actually gate the open, and must not create anything on
+    /// the way to refusing.
+    #[test]
+    fn an_unmounted_root_keeps_the_shadow_off_and_writes_nothing() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("not-a-mount").join("ehdb-embedded");
+
+        std::env::set_var(EMBEDDED_DIR_ENV, root.to_str().unwrap());
+        std::env::set_var(EMBEDDED_ENV, "true");
+
+        assert!(
+            open_embedded().is_none(),
+            "an unmounted root must keep the shadow off"
+        );
+        assert!(
+            !root.exists(),
+            "refusing must not CREATE the path — silently creating it on the \
+             container's writable layer is the entire defect (noetl/server#419)"
+        );
+
+        // Positive control: the same flag-on path DOES open on a root that
+        // exists, so the None above is the guard's doing and not a broken
+        // fixture — the same trap `nothing_opens_when_the_flag_is_off`
+        // documents.
+        let good = tempfile::tempdir().unwrap();
+        std::env::set_var(EMBEDDED_DIR_ENV, good.path().to_str().unwrap());
+        assert!(
+            open_embedded().is_some(),
+            "a usable root must still open, or this test proves nothing"
+        );
+
+        std::env::remove_var(EMBEDDED_ENV);
+        std::env::remove_var(EMBEDDED_DIR_ENV);
     }
 
     /// ⚠⚠ Default OFF. This is what makes the deploy inert on arrival; a flag
