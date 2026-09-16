@@ -3,12 +3,41 @@
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 
 use crate::db::models::{
-    CatalogDeleteRequest, CatalogDeleteResponse, CatalogEntries, CatalogEntry, CatalogEntryRequest,
+    CatalogDeleteRequest, CatalogDeleteResponse, CatalogEntries, CatalogEntriesRequest, CatalogEntry,
+    CatalogEntryRequest,
     CatalogEntryResponse, CatalogRegisterRequest, CatalogRegisterResponse, DeletedCatalogEntry,
 };
 use crate::db::queries::catalog as queries;
 use crate::db::DbPool;
 use crate::error::{AppError, AppResult};
+
+/// Validate a listing request into query options — noetl/server#436.
+///
+/// Mirrors `services::execution::resolve_paging`'s validation posture (reject
+/// negatives with a message naming the offender) but deliberately NOT its
+/// default page size. See `CatalogEntries::total`: entry sizes here are uneven
+/// enough that a row cap does not bound the response, while a default page
+/// would silently truncate callers that legitimately list the whole catalog.
+pub fn resolve_catalog_paging(
+    request: &CatalogEntriesRequest,
+) -> Result<queries::CatalogListOptions, String> {
+    if let Some(l) = request.limit {
+        if l < 0 {
+            return Err(format!("limit must be >= 0 (got {l})"));
+        }
+    }
+    if let Some(o) = request.offset {
+        if o < 0 {
+            return Err(format!("offset must be >= 0 (got {o})"));
+        }
+    }
+    Ok(queries::CatalogListOptions {
+        latest_only: request.latest_only,
+        include_content: request.include_content,
+        limit: request.limit,
+        offset: request.offset.unwrap_or(0),
+    })
+}
 
 /// Service for catalog operations.
 #[derive(Clone)]
@@ -336,18 +365,33 @@ impl CatalogService {
         })
     }
 
-    pub async fn list(
-        &self,
-        resource_type: Option<&str>,
-        include_archived: bool,
-    ) -> AppResult<CatalogEntries> {
-        let entries =
-            queries::list_catalog_entries(&self.pool, resource_type, include_archived).await?;
+    pub async fn list(&self, request: &CatalogEntriesRequest) -> AppResult<CatalogEntries> {
+        let opts = resolve_catalog_paging(request).map_err(AppError::Validation)?;
+
+        let (entries, total) = queries::list_catalog_entries(
+            &self.pool,
+            request.resource_type.as_deref(),
+            request.include_archived,
+            &opts,
+        )
+        .await?;
 
         let responses: Vec<CatalogEntryResponse> = entries.into_iter().map(|e| e.into()).collect();
 
-        Ok(CatalogEntries { entries: responses })
+        // `truncated` is derived from what was actually served, not from
+        // whether a limit was passed: a `limit` larger than the catalog did not
+        // truncate anything, and saying it did would send callers paging
+        // through a second page that does not exist.
+        let truncated = (responses.len() as i64) < total;
+
+        Ok(CatalogEntries {
+            entries: responses,
+            total,
+            truncated,
+        })
     }
+
+    
 
     /// Get a specific catalog resource.
     pub async fn get_resource(&self, request: CatalogEntryRequest) -> AppResult<CatalogEntry> {
@@ -1334,5 +1378,67 @@ spec:
             "kind: Subscription\nspec:\n  source: kafka\n  mode: pull\n  dispatch: { playbook: domain/x }\n",
         );
         assert!(validate_subscription_spec(&v).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod catalog_paging {
+    use super::*;
+
+    fn req() -> CatalogEntriesRequest {
+        CatalogEntriesRequest::default()
+    }
+
+    /// ⭐ noetl/server#436. The defaults must preserve the historical result
+    /// SET while dropping the historical result SIZE.
+    #[test]
+    fn the_defaults_keep_every_record_and_drop_only_the_bodies() {
+        let o = resolve_catalog_paging(&req()).expect("defaults are valid");
+        assert_eq!(o.limit, None, "no default page — see CatalogEntries::total");
+        assert_eq!(o.offset, 0);
+        assert!(
+            !o.latest_only,
+            "defaulting to latest_only would silently drop every superseded \
+             version — 2539 entries -> 346 on prod — without the caller asking"
+        );
+        assert!(
+            !o.include_content,
+            "bodies are 97.4% of the response and are the actual defect"
+        );
+    }
+
+    /// Negatives are rejected with a message that names the offender, matching
+    /// `services::execution::resolve_paging`.
+    #[test]
+    fn a_negative_window_is_rejected_not_silently_clamped() {
+        let mut r = req();
+        r.limit = Some(-1);
+        let e = resolve_catalog_paging(&r).expect_err("a negative limit is invalid");
+        assert!(e.contains("-1"), "the error must name the value, got: {e}");
+
+        let mut r = req();
+        r.offset = Some(-5);
+        let e = resolve_catalog_paging(&r).expect_err("a negative offset is invalid");
+        assert!(e.contains("-5"), "the error must name the value, got: {e}");
+    }
+
+    /// Explicit values pass through unchanged — there is no cap to apply.
+    #[test]
+    fn an_explicit_window_is_honoured_as_asked() {
+        let mut r = req();
+        r.limit = Some(5000);
+        r.offset = Some(10);
+        r.latest_only = true;
+        r.include_content = true;
+        let o = resolve_catalog_paging(&r).unwrap();
+        assert_eq!(
+            o.limit,
+            Some(5000),
+            "a caller that asks for 5000 gets 5000: capping rows does not bound \
+             this response (the largest single prod entry is 509 KB), and a cap \
+             that pretended otherwise would be false reassurance"
+        );
+        assert_eq!(o.offset, 10);
+        assert!(o.latest_only && o.include_content);
     }
 }

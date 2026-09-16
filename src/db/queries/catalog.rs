@@ -151,12 +151,61 @@ pub async fn get_catalog_latest(pool: &DbPool, path: &str) -> AppResult<Option<C
 /// The default hides them: an archived entry is retired, and a listing that
 /// still showed it would defeat the point. The opt-in exists so an operator can
 /// see what was retired and restore it.
+/// How a catalog listing is shaped — noetl/server#436.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CatalogListOptions {
+    /// Newest version per path only.
+    pub latest_only: bool,
+    /// Fetch the `content` / `layout` bodies.
+    pub include_content: bool,
+    /// Maximum rows; `None` means all.
+    pub limit: Option<i32>,
+    /// Rows to skip.
+    pub offset: i32,
+}
+
+/// The body columns, or typed NULLs in their place.
+///
+/// ⚠ The NULLs are selected instead of the columns, not stripped afterwards, so
+/// the bytes never leave Postgres. Fetching 32 MB into the server and then
+/// discarding it would fix the client's memory and none of the database's,
+/// the socket's, or the server's.
+///
+/// The casts are required: without them Postgres types a bare NULL as `text`,
+/// and `layout` decodes as `jsonb`.
+fn body_columns(include_content: bool) -> &'static str {
+    if include_content {
+        "content, layout"
+    } else {
+        "NULL::text AS content, NULL::jsonb AS layout"
+    }
+}
+
+/// The inner row source, shared by the count and the page so they cannot
+/// disagree about what "matching" means.
+fn matching_rows(kind: Option<&str>, archived: &str, opts: &CatalogListOptions) -> String {
+    let body = body_columns(opts.include_content);
+    let kind_pred = if kind.is_some() { "kind = $1" } else { "1 = 1" };
+    let cols = format!("catalog_id, path, kind, version, {body}, payload, meta, created_at");
+    if opts.latest_only {
+        // DISTINCT ON keeps the first row per path under ITS ordering, so the
+        // version ordering has to live here and the display ordering outside.
+        format!(
+            "SELECT DISTINCT ON (path) {cols} FROM noetl.catalog \
+             WHERE {kind_pred}{archived} ORDER BY path, version DESC"
+        )
+    } else {
+        format!("SELECT {cols} FROM noetl.catalog WHERE {kind_pred}{archived}")
+    }
+}
+
+/// List catalog entries, with the total that matched before paging.
 pub async fn list_catalog_entries(
     pool: &DbPool,
     kind: Option<&str>,
     include_archived: bool,
-) -> AppResult<Vec<CatalogEntry>> {
-    const COLS: &str = "catalog_id AS id, path, kind, version, content, layout, payload, meta, created_at AT TIME ZONE 'UTC' as created_at";
+    opts: &CatalogListOptions,
+) -> AppResult<(Vec<CatalogEntry>, i64)> {
     // Absent column => no predicate at all, regardless of `include_archived`:
     // there is nothing to filter and referencing it would break the query.
     let archived = if include_archived {
@@ -164,24 +213,50 @@ pub async fn list_catalog_entries(
     } else {
         archived_filter()
     };
+
+    // ⚠ The count uses the row source WITHOUT bodies regardless of
+    // `include_content`: counting does not read them, and selecting 32 MB to
+    // discard it would double the cost of asking "how many are there".
+    let count_opts = CatalogListOptions {
+        include_content: false,
+        ..*opts
+    };
+    let count_sql = format!(
+        "SELECT count(*) FROM ({}) t",
+        matching_rows(kind, archived, &count_opts)
+    );
+    let total: (i64,) = if let Some(k) = kind {
+        sqlx::query_as(&count_sql).bind(k).fetch_one(pool).await?
+    } else {
+        sqlx::query_as(&count_sql).fetch_one(pool).await?
+    };
+
+    // `limit` and `offset` are i32 already validated non-negative by
+    // `resolve_catalog_paging`, so they interpolate as integer literals with no
+    // injection surface. They are not bound because the optional `kind` would
+    // otherwise shift the parameter numbering between the two query shapes.
+    let window = match opts.limit {
+        Some(l) => format!(" LIMIT {l} OFFSET {}", opts.offset),
+        None if opts.offset > 0 => format!(" OFFSET {}", opts.offset),
+        None => String::new(),
+    };
+    let sql = format!(
+        "SELECT catalog_id AS id, path, kind, version, content, layout, payload, meta, \
+         created_at AT TIME ZONE 'UTC' as created_at FROM ({}) t ORDER BY created_at DESC{window}",
+        matching_rows(kind, archived, opts)
+    );
     let entries = if let Some(k) = kind {
-        let sql = format!(
-            "SELECT {COLS} FROM noetl.catalog WHERE kind = $1{archived} ORDER BY created_at DESC"
-        );
         sqlx::query_as::<_, CatalogEntry>(&sql)
             .bind(k)
             .fetch_all(pool)
             .await?
     } else {
-        let sql = format!(
-            "SELECT {COLS} FROM noetl.catalog WHERE 1 = 1{archived} ORDER BY created_at DESC"
-        );
         sqlx::query_as::<_, CatalogEntry>(&sql)
             .fetch_all(pool)
             .await?
     };
 
-    Ok(entries)
+    Ok((entries, total.0))
 }
 
 /// Get all versions of a catalog entry by path.
@@ -415,4 +490,99 @@ pub async fn restore_catalog_entries(
         }
     };
     Ok(rows)
+}
+
+#[cfg(test)]
+mod catalog_listing_shape {
+    use super::*;
+
+    /// ⭐ noetl/server#436. The bodies must not be SELECTed when they are not
+    /// wanted — the whole point is that the bytes never leave Postgres.
+    #[test]
+    fn the_bodies_are_replaced_by_typed_nulls_not_fetched_and_dropped() {
+        let without = body_columns(false);
+        assert!(
+            without.contains("NULL::text AS content") && without.contains("NULL::jsonb AS layout"),
+            "content/layout must be selected as typed NULLs, got: {without}"
+        );
+        assert!(
+            !without
+                .split("AS content")
+                .next()
+                .unwrap()
+                .ends_with("content, "),
+            "the real columns must not still be selected"
+        );
+
+        let with = body_columns(true);
+        assert_eq!(
+            with, "content, layout",
+            "asking for bodies must fetch the real columns"
+        );
+
+        // The casts are load-bearing: a bare NULL types as text and `layout`
+        // decodes as jsonb, so an uncast NULL fails at the decode boundary.
+        assert!(
+            without.contains("::text") && without.contains("::jsonb"),
+            "both NULLs must be cast, got: {without}"
+        );
+    }
+
+    /// The count and the page must agree on what "matching" means, or `total`
+    /// describes a different set than `entries` — which would make the honesty
+    /// field itself dishonest.
+    #[test]
+    fn latest_only_and_the_filters_apply_to_both_the_count_and_the_page() {
+        let opts = CatalogListOptions {
+            latest_only: true,
+            include_content: false,
+            limit: Some(10),
+            offset: 0,
+        };
+        let page = matching_rows(Some("Playbook"), " AND archived_at IS NULL", &opts);
+        let count_opts = CatalogListOptions {
+            include_content: false,
+            ..opts
+        };
+        let count = matching_rows(Some("Playbook"), " AND archived_at IS NULL", &count_opts);
+        assert_eq!(
+            page, count,
+            "the count and the page must be built from the same row source"
+        );
+
+        assert!(
+            page.contains("DISTINCT ON (path)"),
+            "latest_only must dedupe by path: {page}"
+        );
+        assert!(
+            page.contains("ORDER BY path, version DESC"),
+            "DISTINCT ON keeps the FIRST row under its own ordering, so the \
+             newest version is only selected if that ordering is version DESC: {page}"
+        );
+        assert!(
+            page.contains("kind = $1"),
+            "the kind filter must reach the row source: {page}"
+        );
+        assert!(
+            page.contains("AND archived_at IS NULL"),
+            "the archived filter must reach the row source: {page}"
+        );
+    }
+
+    /// Without `latest_only` the listing must keep every version — the historical
+    /// shape. A dedupe that leaked into the default would silently drop records.
+    #[test]
+    fn the_default_listing_keeps_every_version() {
+        let opts = CatalogListOptions::default();
+        let sql = matching_rows(None, "", &opts);
+        assert!(
+            !sql.contains("DISTINCT"),
+            "the default listing must not dedupe — that would drop records \
+             without the caller asking: {sql}"
+        );
+        assert!(
+            sql.contains("1 = 1"),
+            "absent kind must leave a valid predicate: {sql}"
+        );
+    }
 }
