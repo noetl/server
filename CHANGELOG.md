@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.110.0](https://github.com/noetl/server/compare/v3.109.5...v3.110.0) (2026-09-16)
+
+### Features
+
+* **ehdb:** a parity comparator for the kv and object shadow tiers ([0ade227](https://github.com/noetl/server/commit/0ade22779886e453c8e5ff28bf795a563cdc4f15)), closes [noetl/ai-meta#348](https://github.com/noetl/ai-meta/issues/348)
+* **ehdb:** add Postgres as the recovery ladder's final rung ([daf2d6f](https://github.com/noetl/server/commit/daf2d6f7edc6e44ecf541f2064d553aaefaff355)), closes [noetl/ai-meta#307](https://github.com/noetl/ai-meta/issues/307)
+* **ehdb:** wire the kv/object parity endpoint, gated ([2bee99b](https://github.com/noetl/server/commit/2bee99b1d1d4eae0ad872822dfce5e9131609e17)), closes [noetl/server#438](https://github.com/noetl/server/issues/438) [noetl/ai-meta#312](https://github.com/noetl/ai-meta/issues/312)
+
+### Bug Fixes
+
+* **catalog:** stop /api/catalog/list shipping every body by default ([5a226cd](https://github.com/noetl/server/commit/5a226cd0746fbf1970dcad0fafb703893675bfc7)), closes [noetl/server#436](https://github.com/noetl/server/issues/436) [noetl/ai-meta#49](https://github.com/noetl/ai-meta/issues/49)
+* **ehdb:** make the embedded root actually fail closed ([b009d66](https://github.com/noetl/server/commit/b009d6639302d92055c8ece989ba857983c41ea9)), closes [noetl/server#419](https://github.com/noetl/server/issues/419)
+* **executions:** apply the path filter before the candidate window, not after ([2d757ce](https://github.com/noetl/server/commit/2d757ce162e2c5f1c5529e18146fcbb59adab15c)), closes [noetl/ai-meta#62](https://github.com/noetl/ai-meta/issues/62) [#62](https://github.com/noetl/server/issues/62) [#37](https://github.com/noetl/server/issues/37) [#80](https://github.com/noetl/server/issues/80)
+
 ## [3.109.5](https://github.com/noetl/server/compare/v3.109.4...v3.109.5) (2026-09-16)
 
 ### Bug Fixes
