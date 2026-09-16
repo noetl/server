@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.112.3](https://github.com/noetl/server/compare/v3.112.2...v3.112.3) (2026-09-16)
+
+### Bug Fixes
+
+* **sanitize:** stop the credential scrub eating sha256 digests and base64 ([255781c](https://github.com/noetl/server/commit/255781c90c90fdd0c199efc290e40d92bf810b75)), closes [noetl/server#446](https://github.com/noetl/server/issues/446)
+
 ## [3.112.2](https://github.com/noetl/server/compare/v3.112.1...v3.112.2) (2026-09-16)
 
 ### Bug Fixes
