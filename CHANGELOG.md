@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.109.4](https://github.com/noetl/server/compare/v3.109.3...v3.109.4) (2026-09-16)
+
+### Bug Fixes
+
+* **ehdb-parity:** stop calling a late mirror arrival an order divergence ([ebaf41e](https://github.com/noetl/server/commit/ebaf41edc718d6fbffc9775547be387fbc4cc206))
+
 ## [3.109.3](https://github.com/noetl/server/compare/v3.109.2...v3.109.3) (2026-09-16)
 
 ### Bug Fixes
