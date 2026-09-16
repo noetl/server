@@ -2797,6 +2797,60 @@ pub(crate) fn reconcile_decision(advanced: bool, noops_before: u32, cap: u32) ->
     (n, cap != 0 && n >= cap)
 }
 
+/// Does the in-flight guard still hold, or has it expired? — noetl/server#447.
+///
+/// ⚠⚠ The guard has exactly one clear path — on apply — and before this it had
+/// **no timeout**. A drive that was dispatched and never applied therefore
+/// stranded its execution *permanently*: the event log looked clean, no error
+/// was raised, and the execution simply never advanced. Reproduced in kind, and
+/// it never recovered.
+///
+/// ⚠ This is a deliberate trade, not a free fix. Expiring the guard admits the
+/// possibility of a **duplicate drive** — the thing the guard exists to prevent.
+/// That is the right trade because the two failures are not comparable: a
+/// duplicate drive issues commands that are idempotent by execution+step id and
+/// costs some wasted work, while a leaked guard is an execution that never
+/// finishes and that nothing reports.
+///
+/// ⚠ A guard with **no timestamp** is treated as EXPIRED. That state should be
+/// unreachable since noetl/server#448 stamps every set site, but if it ever
+/// occurs it is precisely the unbounded case being eliminated: a guard whose age
+/// cannot be known is one that can never be shown to be stale. It is counted
+/// separately so the impossible case is visible rather than silent.
+fn in_flight_guard_holds(cache: &crate::state::ExecOrchState) -> bool {
+    if !cache.orchestrate_in_flight {
+        return false;
+    }
+    match cache.orchestrate_in_flight_since {
+        Some(since) => since.elapsed() < IN_FLIGHT_STALE_AFTER,
+        None => false,
+    }
+}
+
+/// Release an expired guard and record why, so the expiry is never silent.
+fn expire_in_flight_guard(cache: &mut crate::state::ExecOrchState, execution_id: i64) {
+    let age = cache
+        .orchestrate_in_flight_since
+        .map(|t| t.elapsed().as_secs())
+        .unwrap_or(0);
+    let reason = if cache.orchestrate_in_flight_since.is_some() {
+        "expired"
+    } else {
+        "expired_no_timestamp"
+    };
+    crate::metrics::record_orchestrate_drive(reason);
+    warn!(
+        execution_id,
+        age_seconds = age,
+        reason,
+        "orchestrate in-flight guard EXPIRED and was released; the drive it \
+         represented was dispatched and never applied, and without this the \
+         execution would never advance again (noetl/server#447)"
+    );
+    cache.orchestrate_in_flight = false;
+    cache.orchestrate_in_flight_since = None;
+}
+
 /// A guard held longer than this is reported as stale — noetl/server#447.
 ///
 /// Five reconcile intervals. A healthy drive is dispatched and applied within
@@ -2998,6 +3052,9 @@ async fn dispatch_offserver_stateless_drive(
     // triggers / the reconcile poller must not double-issue the drive.
     let cache_slot = state.orch_cache.entry(execution_id);
     let mut cache = cache_slot.lock().await;
+    if cache.orchestrate_in_flight && !in_flight_guard_holds(&cache) {
+        expire_in_flight_guard(&mut cache, execution_id);
+    }
     if cache.orchestrate_in_flight {
         crate::metrics::record_orchestrate_drive("skipped_in_flight");
         // noetl/ai-meta#155: the in-flight drive was computed against the head as
@@ -3584,6 +3641,9 @@ async fn trigger_orchestrator_inner(
         // Serialise drives per execution: if one is already dispatched, don't
         // double-issue (two near-simultaneous triggers / the reconcile poller
         // would otherwise produce two orchestrate commands → duplicate work).
+        if cache.orchestrate_in_flight && !in_flight_guard_holds(&cache) {
+            expire_in_flight_guard(&mut cache, execution_id);
+        }
         if cache.orchestrate_in_flight {
             crate::metrics::record_orchestrate_drive("skipped_in_flight");
             // noetl/ai-meta#155 — see the stateless site above.
@@ -5572,6 +5632,75 @@ mod leaked_guard_visibility {
             IN_FLIGHT_STALE_AFTER >= Duration::from_secs(32),
             "the stale threshold must be several reconcile intervals; a healthy \
              drive spanning one poll must not alert"
+        );
+    }
+
+    /// ⭐ noetl/server#447 — the guard must EXPIRE rather than strand forever.
+    #[test]
+    fn a_stale_guard_no_longer_holds() {
+        use crate::state::ExecOrchState;
+        use std::time::{Duration, Instant};
+
+        // Not set at all — nothing to hold.
+        let c = ExecOrchState::default();
+        assert!(!in_flight_guard_holds(&c), "an unset guard holds nothing");
+
+        // Set moments ago — a healthy in-flight drive. This MUST still hold, or
+        // the guard stops preventing the double-dispatch it exists for.
+        let mut c = ExecOrchState {
+            orchestrate_in_flight: true,
+            orchestrate_in_flight_since: Some(Instant::now()),
+            ..Default::default()
+        };
+        assert!(
+            in_flight_guard_holds(&c),
+            "a fresh guard must hold — expiring it would reintroduce duplicate drives"
+        );
+
+        // ⚠ The leak: held past the threshold, with nothing that would ever
+        // clear it.
+        c.orchestrate_in_flight_since = Some(Instant::now() - IN_FLIGHT_STALE_AFTER);
+        assert!(
+            !in_flight_guard_holds(&c),
+            "a guard held past the stale threshold must NOT hold — it has one \
+             clear path (on apply) and the drive it represents was never applied"
+        );
+
+        // ⚠⚠ Unreachable since #448 stamps every set site, but if it happens it
+        // is the unbounded case itself: an age that cannot be known.
+        c.orchestrate_in_flight_since = None;
+        assert!(
+            !in_flight_guard_holds(&c),
+            "a guard with no timestamp can never be SHOWN stale, so it must not \
+             be allowed to hold indefinitely"
+        );
+
+        // Just under the threshold still holds — the boundary is not fuzzy.
+        c.orchestrate_in_flight_since =
+            Some(Instant::now() - (IN_FLIGHT_STALE_AFTER - Duration::from_secs(5)));
+        assert!(
+            in_flight_guard_holds(&c),
+            "just under the threshold still holds"
+        );
+    }
+
+    /// Releasing an expired guard must clear BOTH fields, or the next dispatch
+    /// inherits a stale timestamp and looks instantly old.
+    #[test]
+    fn expiring_clears_the_flag_and_the_clock() {
+        use crate::state::ExecOrchState;
+        use std::time::Instant;
+
+        let mut c = ExecOrchState {
+            orchestrate_in_flight: true,
+            orchestrate_in_flight_since: Some(Instant::now() - IN_FLIGHT_STALE_AFTER),
+            ..Default::default()
+        };
+        expire_in_flight_guard(&mut c, 1234);
+        assert!(!c.orchestrate_in_flight, "the flag must be released");
+        assert!(
+            c.orchestrate_in_flight_since.is_none(),
+            "the clock must be cleared too, or the NEXT drive is born stale"
         );
     }
 }
