@@ -42,7 +42,16 @@
 //! | presence | the authoritative log has mirror-expected events ⇒ the tier holds records for that execution |
 //! | count | `|mirror-expected authoritative events| == |tier records|` |
 //! | membership | every mirror-expected `event_id` appears in the tier, and every tier record matches *some* authoritative row |
-//! | ordering | the tier's records, read in `global_sequence` order, carry `event_id`s in the same relative order the authoritative log has them |
+//! | ordering | the tier returned its records in ascending `global_sequence` — a tier-READ invariant |
+//!
+//! ⚠ Deliberately **not** an ordering check: that the tier's arrival order
+//! matches the authoritative log's `event_id` order. The mirror is asynchronous
+//! behind a retrying drain, so a retried delivery lands after the events that
+//! overtook it, and every tier reader sorts by `event_id` first
+//! (`ehdb_projection_fold::events_from_tier` sorts and dedups; `replay::rebuild_state`
+//! sorts defensively). Asserting it reported 36.9% divergence on prod with equal
+//! counts and nothing missing — noetl/ai-meta#346. The displacement is counted on
+//! [`CrossStoreReport::arrival_reordered`] instead.
 //! | payload identity | for each shared `event_id`: `event_type`, `node_name`/`step` and `status` agree |
 //!
 //! "Mirror-expected" is load-bearing and is defined on
@@ -561,6 +570,21 @@ pub struct CrossStoreReport {
     pub identified: usize,
     /// Shared `event_id`s whose identifying fields agreed.
     pub matched: usize,
+    /// Tier records that arrived **after** an event with a higher `event_id`
+    /// (noetl/ai-meta#346).
+    ///
+    /// An OBSERVATION, not a divergence. The mirror is asynchronous behind a
+    /// retrying drain, so a retried delivery legitimately lands after the events
+    /// that overtook it, and every tier reader sorts by `event_id` before
+    /// folding. This used to be reported as an `order` divergence and fired on
+    /// 36.9% of prod executions with equal counts and nothing missing.
+    ///
+    /// Kept because the number still means something: a displacement that grows
+    /// says the drain is falling behind or retrying hard. Zero on a mirror that
+    /// is keeping up, and `skip_serializing_if` keeps it off the wire there so a
+    /// clean report is byte-identical to before this existed.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub arrival_reordered: usize,
     /// Events the tier can source a missing `parent_execution_id` for.
     ///
     /// Empty on a healthy execution and kept off the wire there, so a clean
@@ -576,6 +600,11 @@ impl CrossStoreReport {
     fn kinds(&self) -> BTreeSet<&'static str> {
         self.divergences.iter().map(|d| d.kind.as_str()).collect()
     }
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 /// Cap on how many ids one divergence detail enumerates before truncating.
@@ -956,30 +985,50 @@ fn compare_inner(
         });
     }
 
+    // (b) ARRIVAL ORDER IS OBSERVED, NOT ASSERTED — noetl/ai-meta#346.
+    //
+    // This check used to compare the tier's records **in arrival order**
+    // against the authoritative log's `event_id` order and report any
+    // difference as a divergence. It fired on 36.9% of executions on prod
+    // (`match 759 / divergent 443`), every one of them `authoritative=N ehdb=N
+    // kinds={"order"}` — equal counts, nothing missing, nothing extra.
+    //
+    // It was the comparator that was wrong, and three independent lines say so:
+    //
+    //  1. MEASURED. Prod execution 358511090226700288: 174 records, 174 unique
+    //     ids, `global_sequence` strictly ascending — and exactly ONE event
+    //     (`358511170843254784`, at sequence 30101) sitting after four events
+    //     with higher ids. One late arrival, displacing five positions.
+    //  2. BY CONSTRUCTION. The mirror is asynchronous behind a retrying drain
+    //     (`NOETL_EHDB_EVENTLOG_MIRROR_ASYNC=true`, `..._MAX_RETRIES=7`). A
+    //     retried delivery lands after the events that overtook it. Arrival
+    //     order equalling id order is not something this design can promise.
+    //  3. NO READER DEPENDS ON IT. Every consumer of the tier sorts first:
+    //     `ehdb_projection_fold::events_from_tier` sorts AND dedups (its own
+    //     comment names the retrying drain as the reason), the spine read sorts,
+    //     and `replay::rebuild_state` sorts defensively. Empirically, 19,818
+    //     projection refolds over the very window this was firing produced
+    //     **0 digest mismatches**.
+    //
+    // ⚠ `the_postgres_read_orders_events_and_the_fold_depends_on_it` is about
+    // the POSTGRES query's `ORDER BY` — the one read that does not sort
+    // afterwards. It is not a claim about the tier's physical order, and
+    // reading it as one is what made this look like a contradiction.
+    //
+    // So the displacement is **counted and reported, not called a divergence**.
+    // Deleting it outright would lose a real signal: a displacement that grows
+    // means the drain is falling behind or retrying hard, and that is worth
+    // seeing before it becomes lag. Calling it divergence taught operators to
+    // ignore the one comparator that guards a `primary` tier.
     let shared_in_tier_order: Vec<i64> = parsed
         .iter()
         .map(|m| m.event_id)
         .filter(|id| auth_by_id.contains_key(id))
         .collect();
-    // Over the whole authoritative log, not just the expected subset: the
-    // relative order of the tier's records is defined by where those events sit
-    // in the real log, and a server-authored event interleaved between two
-    // mirrored ones does not change their relative order.
-    let shared_in_auth_order: Vec<i64> = authoritative
-        .iter()
-        .map(|e| e.event_id)
-        .filter(|id| mirrored_ids.contains(id))
-        .collect();
-    if shared_in_tier_order != shared_in_auth_order {
-        divergences.push(Divergence {
-            kind: DivergenceKind::Order,
-            detail: format!(
-                "shared events differ in order — tier {} vs authoritative {}",
-                id_list(&shared_in_tier_order),
-                id_list(&shared_in_auth_order)
-            ),
-        });
-    }
+    let arrival_reordered = shared_in_tier_order
+        .windows(2)
+        .filter(|w| w[1] < w[0])
+        .count();
 
     // --- payload identity ----------------------------------------------------
     let mut matched = 0usize;
@@ -1032,6 +1081,7 @@ fn compare_inner(
         pending_tier,
         identified: parsed.len(),
         matched,
+        arrival_reordered,
         holds: divergences.is_empty(),
         parent_backfill_candidates,
         divergences,
@@ -1277,13 +1327,22 @@ pub fn run_controls() -> Vec<ControlResult> {
         ),
         (
             DivergenceKind::Order,
-            // Swap the payloads, not the records: the sequence numbers stay
-            // ascending, so this exercises the relative-order check rather than
-            // the monotonicity check.
+            // Swap the SEQUENCE NUMBERS, so the tier hands back its records out
+            // of `global_sequence` order. That is the one ordering property
+            // still asserted, and it is a tier-READ bug: a reader paging by
+            // sequence would skip or repeat records.
+            //
+            // ⚠ This control used to swap the PAYLOADS instead, leaving the
+            // sequence ascending — i.e. it planted a record that merely ARRIVED
+            // late. That is the benign case noetl/ai-meta#346 was about, and
+            // planting it here is what made the control suite certify a check
+            // that false-alarmed on 36.9% of prod executions. A control that
+            // plants a non-defect proves nothing except that the comparator
+            // reacts.
             Box::new(|m: &mut Vec<MirroredRecord>| {
-                let p0 = m[0].payload.clone();
-                m[0].payload = m[1].payload.clone();
-                m[1].payload = p0;
+                let s0 = m[0].global_sequence;
+                m[0].global_sequence = m[1].global_sequence;
+                m[1].global_sequence = s0;
             }),
         ),
         (
@@ -3048,6 +3107,125 @@ mod tests {
         }];
         let r = compare_cross_store(1, &auth, &mirrored);
         assert!(r.holds, "{:?}", r.divergences);
+    }
+
+    /// ⚠ THE FALSE ALARM. noetl/ai-meta#346.
+    ///
+    /// A record that arrived LATE but carries the right id is not a divergence.
+    /// The mirror is asynchronous behind a retrying drain
+    /// (`..._MIRROR_ASYNC=true`, `..._MAX_RETRIES=7`), so a retried delivery
+    /// lands after the events that overtook it — and every tier reader sorts by
+    /// `event_id` before folding, which is why 19,818 projection refolds over
+    /// the window this was firing produced 0 digest mismatches.
+    ///
+    /// Modelled on prod execution 358511090226700288: 174 records,
+    /// `global_sequence` strictly ascending, 174 unique ids, and exactly one
+    /// event sitting after four with higher ids. It reported
+    /// `authoritative=174 ehdb=174 kinds={"order"}` — equal counts, nothing
+    /// missing, nothing extra, and an operator told to distrust the one
+    /// comparator that guards a `primary`-serving tier.
+    #[test]
+    fn a_record_that_arrived_late_is_observed_not_called_a_divergence() {
+        let (auth, mut mirrored) = control_fixtures();
+        assert!(
+            mirrored.len() >= 3,
+            "fixture must have room to displace one record"
+        );
+
+        // Move the FIRST record to the end, keeping `global_sequence` ascending
+        // — i.e. the event was delivered after the ones that overtook it. The
+        // set, the count and every payload are untouched.
+        let late = mirrored.remove(0);
+        let seqs: Vec<u64> = mirrored.iter().map(|m| m.global_sequence).collect();
+        mirrored.push(MirroredRecord {
+            global_sequence: seqs.last().copied().unwrap_or(0) + 1,
+            payload: late.payload,
+        });
+        for (i, m) in mirrored.iter_mut().enumerate() {
+            m.global_sequence = i as u64 + 1;
+        }
+
+        let r = compare_cross_store(1, &auth, &mirrored);
+        assert!(
+            r.holds,
+            "a late arrival must not be a divergence — got {:?}",
+            r.divergences
+        );
+        assert_eq!(
+            r.arrival_reordered, 1,
+            "the displacement must still be COUNTED; losing it would hide a \
+             drain that is falling behind"
+        );
+    }
+
+    /// The observation must be zero when nothing was displaced — otherwise
+    /// `arrival_reordered` is a constant, not a measurement.
+    #[test]
+    fn an_in_order_mirror_reports_no_displacement() {
+        let (auth, mirrored) = control_fixtures();
+        let r = compare_cross_store(1, &auth, &mirrored);
+        assert!(r.holds, "{:?}", r.divergences);
+        assert_eq!(r.arrival_reordered, 0);
+    }
+
+    /// Dropping the arrival-order ASSERTION must not drop the real ones. A late
+    /// arrival is fine; a late arrival that also lost, duplicated or corrupted a
+    /// record is not, and each still has to be caught on its own terms.
+    #[test]
+    fn a_late_arrival_does_not_mask_a_real_divergence() {
+        let displace = |m: &mut Vec<MirroredRecord>| {
+            let late = m.remove(0);
+            m.push(MirroredRecord {
+                global_sequence: 0,
+                payload: late.payload,
+            });
+            for (i, r) in m.iter_mut().enumerate() {
+                r.global_sequence = i as u64 + 1;
+            }
+        };
+
+        // missing, on top of the displacement
+        let (auth, mut mirrored) = control_fixtures();
+        displace(&mut mirrored);
+        mirrored.remove(1);
+        let r = compare_cross_store(1, &auth, &mirrored);
+        assert!(
+            r.kinds().contains("missing_event"),
+            "a dropped event must still be caught behind a late arrival: {:?}",
+            r.divergences
+        );
+
+        // duplicated, on top of the displacement
+        let (auth, mut mirrored) = control_fixtures();
+        displace(&mut mirrored);
+        let dup = mirrored[1].clone();
+        mirrored.push(MirroredRecord {
+            global_sequence: 99,
+            payload: dup.payload,
+        });
+        let r = compare_cross_store(1, &auth, &mirrored);
+        assert!(
+            !r.holds,
+            "a duplicated record must still be caught behind a late arrival: {:?}",
+            r.divergences
+        );
+
+        // payload corrupted, on top of the displacement
+        let (auth, mut mirrored) = control_fixtures();
+        displace(&mut mirrored);
+        // Target by CONTENT, not by index: `displace` moves records, so index 1
+        // is no longer the record it was before it ran.
+        let victim = mirrored
+            .iter_mut()
+            .find(|m| m.payload.contains("\"step.enter\""))
+            .expect("fixture must contain a step.enter record to corrupt");
+        victim.payload = victim.payload.replace("\"step.enter\"", "\"step.exit\"");
+        let r = compare_cross_store(1, &auth, &mirrored);
+        assert!(
+            r.kinds().contains("payload"),
+            "a corrupted payload must still be caught behind a late arrival: {:?}",
+            r.divergences
+        );
     }
 
     #[test]
