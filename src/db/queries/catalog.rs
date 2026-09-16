@@ -251,7 +251,9 @@ pub async fn list_catalog_entries(
             .fetch_all(pool)
             .await?
     } else {
-        sqlx::query_as::<_, CatalogEntry>(&sql).fetch_all(pool).await?
+        sqlx::query_as::<_, CatalogEntry>(&sql)
+            .fetch_all(pool)
+            .await?
     };
 
     Ok((entries, total.0))
@@ -504,7 +506,11 @@ mod catalog_listing_shape {
             "content/layout must be selected as typed NULLs, got: {without}"
         );
         assert!(
-            !without.split("AS content").next().unwrap().ends_with("content, "),
+            !without
+                .split("AS content")
+                .next()
+                .unwrap()
+                .ends_with("content, "),
             "the real columns must not still be selected"
         );
 
