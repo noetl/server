@@ -359,6 +359,24 @@ fn build_router(
         )
         .with_state(handlers::ehdb::TierRelayState::from_env());
 
+    // KV/object shadow parity (noetl/ai-meta#348 prerequisite 2). Its own state
+    // because it reads BOTH sides — the authoritative store through
+    // `ObjectBackend` (which serves GCS and Postgres alike; reading it with SQL
+    // would be blind on prod, noetl/server#438) and the shadow tier through the
+    // same worker relay the route above uses. Read-only: it compares, it never
+    // writes, and it cannot promote a tier — `kv` and `object` stay out of
+    // `SERVE_WIRED_TIERS` and three tests in noetl/worker fail if that changes.
+    let ehdb_object_parity_routes = Router::new()
+        .route(
+            "/api/ehdb/object-parity/{tier}",
+            get(handlers::ehdb_object_parity::object_parity),
+        )
+        .with_state(handlers::ehdb_object_parity::ObjectParityDeps {
+            pool: db_pool.clone(),
+            backend: object_backend.clone(),
+            relay: handlers::ehdb::TierRelayState::from_env(),
+        });
+
     // Cross-store parity (noetl/ai-meta#258).  Carries `AppState` rather than
     // the relay state because it reads BOTH sides — the authoritative
     // `noetl.event` log through the pools, and the EHDB tier through the same
@@ -832,6 +850,16 @@ fn build_router(
         .merge(executions_routes)
         .merge(ehdb_routes)
         .merge(ehdb_tier_routes)
+        // GATED, and the distinction is the codebase's own: the sibling
+        // comparators report on an execution id the caller already has, while
+        // this one ENUMERATES object keys under a prefix. Keys carry tenant,
+        // project and execution ids, so enumeration is a new capability — small
+        // but real — and noetl/ai-meta#312 is what happens when one of those
+        // ships unauthenticated because nobody argued about it.
+        .merge(ehdb_object_parity_routes.layer(axum::middleware::from_fn_with_state(
+            "internal",
+            noetl_server::auth_gate::gate,
+        )))
         .merge(ehdb_parity_routes)
         .merge(ehdb_equivalence_routes.layer(axum::middleware::from_fn_with_state(
             "internal",

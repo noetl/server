@@ -408,6 +408,74 @@ impl TierRelayState {
 /// All query-string params (`limit`, `after`, `bucket`, `key`, `prefix`,
 /// `collection`, `model_id`, `top_k`, `vector`, `execution`, `execution_id`, …)
 /// are forwarded to the worker unchanged.
+/// Fetch one tier's shadow records through the worker relay, typed.
+///
+/// Shares [`TierRelayState`] with [`raw_tier_query`] so the parity endpoint
+/// makes no new access — the data-access boundary is unchanged, this is the
+/// same read with the JSON parsed instead of forwarded.
+///
+/// `Err` carries an operator-readable reason; the caller reports it rather than
+/// treating an unreachable relay as an empty shadow. A failed fetch read as
+/// "the tier holds nothing" would score every key `missing_object`, which is
+/// the noetl/ai-meta#263 shape: a refusal wearing the costume of a finding.
+pub async fn fetch_shadow_records(
+    relay: &TierRelayState,
+    tier: &str,
+    limit: usize,
+) -> Result<Vec<crate::handlers::ehdb_object_parity::ShadowRecord>, String> {
+    let base = relay
+        .worker_query_base
+        .as_deref()
+        .ok_or_else(|| format!("{WORKER_QUERY_URL_ENV} is not set"))?;
+    let url = format!("{}/ehdb/tiers/{}", base.trim_end_matches('/'), tier);
+    let body: serde_json::Value = relay
+        .http
+        .get(&url)
+        .query(&[("limit", limit.to_string())])
+        .timeout(WORKER_QUERY_TIMEOUT)
+        .send()
+        .await
+        .map_err(|e| format!("relay to {url} failed: {e}"))?
+        .json()
+        .await
+        .map_err(|e| format!("relay response was not JSON: {e}"))?;
+
+    if let Some(err) = body.get("error").and_then(|v| v.as_str()) {
+        return Err(format!("tier read refused: {err}"));
+    }
+
+    let mut out = Vec::new();
+    for rec in body
+        .get("records")
+        .and_then(|v| v.as_array())
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+    {
+        let seq = rec.get("global_sequence").and_then(|v| v.as_u64());
+        let payload = rec.get("payload").and_then(|v| v.as_str());
+        let (Some(global_sequence), Some(payload)) = (seq, payload) else {
+            continue;
+        };
+        let Ok(p) = serde_json::from_str::<serde_json::Value>(payload) else {
+            continue;
+        };
+        let (Some(key), Some(digest), Some(byte_len)) = (
+            p.get("key").and_then(|v| v.as_str()),
+            p.get("digest").and_then(|v| v.as_str()),
+            p.get("byte_len").and_then(|v| v.as_u64()),
+        ) else {
+            continue;
+        };
+        out.push(crate::handlers::ehdb_object_parity::ShadowRecord {
+            global_sequence,
+            key: key.to_string(),
+            digest: digest.to_string(),
+            byte_len: byte_len as usize,
+        });
+    }
+    Ok(out)
+}
+
 pub async fn raw_tier_query(
     State(relay): State<TierRelayState>,
     Path(tier): Path<String>,

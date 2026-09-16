@@ -119,7 +119,7 @@ fn every_privileged_router_is_gated_in_main() {
     let src = include_str!("../src/main.rs");
     // Router groups that expose credentials, keychain material, or the internal
     // control surface. Kept explicit so adding one is a deliberate act.
-    const PRIVILEGED: [&str; 16] = [
+    const PRIVILEGED: [&str; 17] = [
         "credential_routes",
         "sealed_credential_routes",
         "keychain_routes",
@@ -142,6 +142,12 @@ fn every_privileged_router_is_gated_in_main() {
         // noetl/ai-meta#312 — serves /api/internal/registry/*, which its own
         // handler doc already described as service-account-gated. It was not.
         "registry_routes",
+        // noetl/ai-meta#348 prerequisite 2. Same reasoning as
+        // `ehdb_equivalence_routes` above: the sibling comparators report on an
+        // execution id the caller already has, while this one ENUMERATES object
+        // keys under a prefix — and those keys carry tenant, project and
+        // execution ids. Enumeration is a new capability, small but real.
+        "ehdb_object_parity_routes",
     ];
     let mut ungated = Vec::new();
     for name in PRIVILEGED {
