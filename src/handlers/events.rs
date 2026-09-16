@@ -2797,11 +2797,82 @@ pub(crate) fn reconcile_decision(advanced: bool, noops_before: u32, cap: u32) ->
     (n, cap != 0 && n >= cap)
 }
 
+/// A guard held longer than this is reported as stale — noetl/server#447.
+///
+/// Five reconcile intervals. A healthy drive is dispatched and applied within
+/// one worker hop; anything still held after five polls has missed every chance
+/// a working system would have taken. Deliberately generous: this number only
+/// decides when a leak is *reported*, never when the guard is released, so
+/// erring long costs nothing but reporting latency.
+pub(crate) const IN_FLIGHT_STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(40);
+
+/// Classify held-guard ages into `(held, stale, oldest_seconds)`.
+///
+/// Pure, so the arithmetic is testable without a cache or a clock.
+pub(crate) fn classify_in_flight(
+    ages: &[std::time::Duration],
+    stale_after: std::time::Duration,
+) -> (i64, i64, i64) {
+    let held = ages.len() as i64;
+    let stale = ages.iter().filter(|a| **a >= stale_after).count() as i64;
+    let oldest = ages.iter().max().map(|d| d.as_secs() as i64).unwrap_or(0);
+    (held, stale, oldest)
+}
+
+/// Sample how long each cached execution has held the in-flight guard.
+///
+/// ⚠ Observation only: this takes each slot's lock briefly and reads two fields.
+/// It never clears a guard, never dispatches, and never skips — releasing a
+/// stale guard would be a semantics change (noetl/server#447 options 1 and 2)
+/// and is not done here.
+async fn sample_in_flight_ages(state: &AppState) -> Vec<(i64, std::time::Duration)> {
+    let now = std::time::Instant::now();
+    let mut out = Vec::new();
+    for execution_id in state.orch_cache.active_executions() {
+        let slot = state.orch_cache.entry(execution_id);
+        let cache = slot.lock().await;
+        if cache.orchestrate_in_flight {
+            let age = cache
+                .orchestrate_in_flight_since
+                .map(|t| now.saturating_duration_since(t))
+                .unwrap_or_default();
+            out.push((execution_id, age));
+        }
+    }
+    out
+}
+
 pub fn spawn_orchestrator_reconciler(state: AppState) {
     tokio::spawn(async move {
         const RECONCILE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(8);
         loop {
             tokio::time::sleep(RECONCILE_INTERVAL).await;
+
+            // noetl/server#447 — publish the guard population before driving, so
+            // a leak is visible even while the poller is being skipped for every
+            // stranded execution. Reporting only; nothing below acts on it.
+            let samples = sample_in_flight_ages(&state).await;
+            let ages: Vec<std::time::Duration> = samples.iter().map(|(_, a)| *a).collect();
+            let (held, stale, oldest) = classify_in_flight(&ages, IN_FLIGHT_STALE_AFTER);
+            crate::metrics::record_orchestrate_in_flight(held, stale, oldest);
+            if stale > 0 {
+                let stuck: Vec<i64> = samples
+                    .iter()
+                    .filter(|(_, a)| *a >= IN_FLIGHT_STALE_AFTER)
+                    .map(|(id, _)| *id)
+                    .take(10)
+                    .collect();
+                warn!(
+                    stale,
+                    held,
+                    oldest_seconds = oldest,
+                    executions = ?stuck,
+                    "orchestrate in-flight guard held past the stale threshold; \
+                     these executions cannot advance until it clears and nothing \
+                     clears it but an applied drive (noetl/server#447)"
+                );
+            }
+
             for execution_id in state.orch_cache.active_executions() {
                 // Execution-affinity (RFC noetl/ai-meta#116): only the owner
                 // replica drives an execution.  Under affinity the orch_cache on a
@@ -3025,6 +3096,7 @@ async fn dispatch_offserver_stateless_drive(
     )
     .await?;
     cache.orchestrate_in_flight = true;
+    cache.orchestrate_in_flight_since = Some(std::time::Instant::now());
     crate::metrics::record_orchestrate_drive("dispatched_offserver_stateless");
     debug!(
         execution_id,
@@ -3608,6 +3680,7 @@ async fn trigger_orchestrator_inner(
         )
         .await?;
         cache.orchestrate_in_flight = true;
+        cache.orchestrate_in_flight_since = Some(std::time::Instant::now());
         crate::metrics::record_orchestrate_drive(if offserver {
             "dispatched_offserver"
         } else {
@@ -3978,6 +4051,7 @@ async fn apply_worker_orchestration(
     let cache_slot = state.orch_cache.entry(execution_id);
     let mut cache = cache_slot.lock().await;
     cache.orchestrate_in_flight = false;
+    cache.orchestrate_in_flight_since = None;
 
     // Stateless off-server retry (RFC #115 Phase 4 remainder): a stateless drive
     // whose WAL chain was still incomplete after the worker's bounded retry
@@ -5438,6 +5512,66 @@ mod reconcile_cap_tests {
             body.contains("orch_cache.evict(execution_id)"),
             "giving up must actually evict, or the entry stays in an unbounded map and \
              is re-driven again on the next tick"
+        );
+    }
+}
+
+#[cfg(test)]
+mod leaked_guard_visibility {
+    use super::*;
+    use std::time::Duration;
+
+    /// ⭐ noetl/server#447. A leaked guard must produce a nonzero stale count; a
+    /// healthy one must produce zero.
+    #[test]
+    fn a_leaked_guard_is_counted_and_a_healthy_one_is_not() {
+        // No guards held at all — the quiet case.
+        assert_eq!(
+            classify_in_flight(&[], IN_FLIGHT_STALE_AFTER),
+            (0, 0, 0),
+            "an idle server must read 0/0/0, not absent"
+        );
+
+        // A drive in flight for a moment: held, but NOT stale. This is the case
+        // that must not alert, or the signal is useless on a busy server.
+        let healthy = [Duration::from_secs(1), Duration::from_millis(250)];
+        let (held, stale, oldest) = classify_in_flight(&healthy, IN_FLIGHT_STALE_AFTER);
+        assert_eq!((held, stale), (2, 0), "a transient guard is not a leak");
+        assert_eq!(oldest, 1);
+
+        // ⚠ The leak. Held past the threshold with no prospect of clearing —
+        // the guard has one clear path (on apply) and no timeout.
+        let leaked = [Duration::from_secs(1), Duration::from_secs(900)];
+        let (held, stale, oldest) = classify_in_flight(&leaked, IN_FLIGHT_STALE_AFTER);
+        assert_eq!(held, 2);
+        assert_eq!(stale, 1, "the 900s guard must be counted as leaked");
+        assert_eq!(
+            oldest, 900,
+            "the age must be reported: one stranded execution keeps the COUNT at \
+             1 forever while its AGE grows without bound, so age is the more \
+             robust alert"
+        );
+    }
+
+    /// The boundary is inclusive, so a guard sitting exactly on the threshold is
+    /// reported rather than hovering invisibly one second below it forever.
+    #[test]
+    fn the_stale_boundary_is_inclusive() {
+        let at = [IN_FLIGHT_STALE_AFTER];
+        assert_eq!(classify_in_flight(&at, IN_FLIGHT_STALE_AFTER).1, 1);
+        let just_under = [IN_FLIGHT_STALE_AFTER - Duration::from_millis(1)];
+        assert_eq!(classify_in_flight(&just_under, IN_FLIGHT_STALE_AFTER).1, 0);
+    }
+
+    /// ⚠ The threshold must be comfortably above one reconcile interval, or a
+    /// guard held across a single ordinary poll would be reported as leaked and
+    /// the signal would be noise.
+    #[test]
+    fn the_threshold_is_well_clear_of_one_poll() {
+        assert!(
+            IN_FLIGHT_STALE_AFTER >= Duration::from_secs(32),
+            "the stale threshold must be several reconcile intervals; a healthy \
+             drive spanning one poll must not alert"
         );
     }
 }

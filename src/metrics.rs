@@ -3612,6 +3612,91 @@ pub fn ehdb_mirror_repair_total() -> &'static IntCounterVec {
 ///
 /// ⚠ A *hint* count, not a gap count. The sweep finds gaps by comparison
 /// regardless of this number, so 0 here means "nothing queued for the fast
+/// Executions currently holding the orchestrate in-flight guard — noetl/server#447.
+///
+/// A healthy guard is **transient**: set when a drive is dispatched, cleared
+/// when its completion is applied. A nonzero reading is normal; a reading that
+/// does not return to 0 is a leak.
+pub fn orchestrate_in_flight_executions() -> &'static IntGauge {
+    static M: OnceLock<IntGauge> = OnceLock::new();
+    M.get_or_init(|| {
+        let g = IntGauge::new(
+            "noetl_orchestrate_in_flight_executions",
+            "Executions currently holding the orchestrate in-flight guard \
+             (noetl/server#447). Transient when healthy.",
+        )
+        .expect("static gauge spec must be valid");
+        registry()
+            .register(Box::new(g.clone()))
+            .expect("gauge registration must succeed");
+        g
+    })
+}
+
+/// Executions whose guard has been held long enough that it is almost certainly
+/// leaked — the alertable signal.
+///
+/// ⚠⚠ This is the number that makes noetl/server#447 visible. The guard has one
+/// clear path (on apply) and **no timeout**, so a drive that is never applied
+/// strands its execution permanently: the event log looks clean, no error is
+/// raised, and the execution simply never advances. Before this gauge the only
+/// symptom was an execution that sat forever.
+///
+/// ⚠ Why not `orchestrate_drive_total{dispatched} - {applied}`: that difference
+/// is cumulative and also counts every drive legitimately in flight at the
+/// moment of the scrape, so it is only meaningful at rest and cannot tell a busy
+/// server from a leaking one. This gauge counts guards actually held past the
+/// point a healthy drive would have completed.
+pub fn orchestrate_in_flight_stale_executions() -> &'static IntGauge {
+    static M: OnceLock<IntGauge> = OnceLock::new();
+    M.get_or_init(|| {
+        let g = IntGauge::new(
+            "noetl_orchestrate_in_flight_stale_executions",
+            "Executions holding the orchestrate in-flight guard past the stale \
+             threshold — a leaked guard wedges the execution permanently \
+             (noetl/server#447).",
+        )
+        .expect("static gauge spec must be valid");
+        registry()
+            .register(Box::new(g.clone()))
+            .expect("gauge registration must succeed");
+        g
+    })
+}
+
+/// Age of the oldest held guard, in seconds. 0 when none is held.
+///
+/// Alerting on an age threshold is more robust than on a count: one permanently
+/// stranded execution is a real incident, and its age grows without bound while
+/// the count stays at 1.
+pub fn orchestrate_in_flight_oldest_seconds() -> &'static IntGauge {
+    static M: OnceLock<IntGauge> = OnceLock::new();
+    M.get_or_init(|| {
+        let g = IntGauge::new(
+            "noetl_orchestrate_in_flight_oldest_seconds",
+            "Age in seconds of the oldest held orchestrate in-flight guard; 0 \
+             when none is held (noetl/server#447).",
+        )
+        .expect("static gauge spec must be valid");
+        registry()
+            .register(Box::new(g.clone()))
+            .expect("gauge registration must succeed");
+        g
+    })
+}
+
+/// Publish one sample of the in-flight guard population.
+///
+/// ⚠ Pinned: all three gauges are set on **every** sample, including to 0. An
+/// un-set gauge is absent from `/metrics` rather than zero, and "absent" and
+/// "no leak" would be indistinguishable — the same absent-vs-zero trap the tier
+/// series pin exists for.
+pub fn record_orchestrate_in_flight(held: i64, stale: i64, oldest_seconds: i64) {
+    orchestrate_in_flight_executions().set(held);
+    orchestrate_in_flight_stale_executions().set(stale);
+    orchestrate_in_flight_oldest_seconds().set(oldest_seconds);
+}
+
 /// path", NOT "the tier is complete".
 pub fn ehdb_mirror_repair_pending() -> &'static IntGauge {
     static M: OnceLock<IntGauge> = OnceLock::new();
