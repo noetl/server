@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.111.1](https://github.com/noetl/server/compare/v3.111.0...v3.111.1) (2026-09-16)
+
+### Bug Fixes
+
+* **catalog:** a NULL-selected column must decode as an Option ([fa948f7](https://github.com/noetl/server/commit/fa948f750ee0cab8940e0a648ac59bc2140da718)), closes [noetl/server#443](https://github.com/noetl/server/issues/443) [#436](https://github.com/noetl/server/issues/436)
+
 ## [3.111.0](https://github.com/noetl/server/compare/v3.110.0...v3.111.0) (2026-09-16)
 
 ### Features
