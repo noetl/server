@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.112.2](https://github.com/noetl/server/compare/v3.112.1...v3.112.2) (2026-09-16)
+
+### Bug Fixes
+
+* **template:** defer a binding that resolves to a summary stub ([30ee5cd](https://github.com/noetl/server/commit/30ee5cda44ab1592d29f88f5d1f634b03be3a0ed)), closes [noetl/server#445](https://github.com/noetl/server/issues/445)
+
 ## [3.112.1](https://github.com/noetl/server/compare/v3.112.0...v3.112.1) (2026-09-16)
 
 ### Bug Fixes
