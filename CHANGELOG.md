@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.111.0](https://github.com/noetl/server/compare/v3.110.0...v3.111.0) (2026-09-16)
+
+### Features
+
+* **orchestrate:** surface leaked in-flight guards ([a524e56](https://github.com/noetl/server/commit/a524e564163bf9eb3efe2e063519df0c63cb0560)), closes [noetl/server#447](https://github.com/noetl/server/issues/447)
+
 ## [3.110.0](https://github.com/noetl/server/compare/v3.109.5...v3.110.0) (2026-09-16)
 
 ### Features
