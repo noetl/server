@@ -262,9 +262,7 @@ pub async fn list(
     State(service): State<CatalogService>,
     Json(request): Json<CatalogEntriesRequest>,
 ) -> AppResult<Json<CatalogEntries>> {
-    let entries = service
-        .list(request.resource_type.as_deref(), request.include_archived)
-        .await?;
+    let entries = service.list(&request).await?;
     Ok(Json(entries))
 }
 

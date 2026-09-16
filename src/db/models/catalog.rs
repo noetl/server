@@ -133,6 +133,43 @@ pub struct CatalogEntriesRequest {
     /// needs before restoring something.
     #[serde(default)]
     pub include_archived: bool,
+
+    /// Return only the newest version of each path (noetl/server#436).
+    ///
+    /// Defaults to false, preserving the historical shape. On prod this is
+    /// 2539 entries -> 346: a caller that wants "the current catalog" is
+    /// otherwise paying for every superseded version of every playbook.
+    #[serde(default)]
+    pub latest_only: bool,
+
+    /// Include the heavy body fields `content` and `layout`.
+    ///
+    /// ⚠ Defaults to **false**, which is a change to what this endpoint
+    /// returns. Measured against prod, those two fields are **97.4%** of the
+    /// response — `content` 55.9%, `layout` 41.5% — against 1.2% for the
+    /// identity fields most callers actually list by.
+    ///
+    /// `payload` and `meta` are always included: together they are 1.0%, and
+    /// the GUI's playbook search reads `payload.metadata.{name,description}`.
+    /// Dropping them to save 1% would break a live caller to no purpose.
+    ///
+    /// The keys are still emitted, as `null` — the pydantic `CatalogEntry` wire
+    /// shape has no `exclude_none`, and omitting them surfaced as DIFF lines in
+    /// the noetl/ai-meta#49 parity harness. Fetch a body with
+    /// `POST /api/catalog/resource`, which is the endpoint for it.
+    #[serde(default)]
+    pub include_content: bool,
+
+    /// Maximum entries to return. Absent means all of them.
+    ///
+    /// ⚠ Deliberately NOT defaulted to a bounded page. See
+    /// `CatalogEntries::total` for why a row cap is the wrong instrument here.
+    #[serde(default)]
+    pub limit: Option<i32>,
+
+    /// Entries to skip, for paging. Absent means 0.
+    #[serde(default)]
+    pub offset: Option<i32>,
 }
 
 /// Response containing list of catalog entries.
@@ -140,6 +177,28 @@ pub struct CatalogEntriesRequest {
 pub struct CatalogEntries {
     /// List of catalog entries
     pub entries: Vec<CatalogEntryResponse>,
+
+    /// How many entries matched the filters, BEFORE `limit`/`offset`.
+    ///
+    /// ⚠ This is the honesty field. A paged response that just returns rows
+    /// cannot be distinguished by the caller from a complete one, so a client
+    /// that asks for 50 and gets 50 has no way to know it is looking at a
+    /// truncated catalog. `total` says what it did not get.
+    ///
+    /// ⚠ Why there is no default page size or hard cap here, unlike
+    /// `/api/executions`: a row cap does not bound this response. Entry sizes
+    /// are wildly uneven — the largest single prod entry is **509 KB**, so even
+    /// a 100-row page can exceed 50 MB. What actually bounds it is
+    /// `include_content`, which is 97.4% of the bytes and drops **no records**.
+    /// Bounding the default by rows instead would silently truncate the GUI's
+    /// playbook picker, which lists the whole catalog, while still shipping
+    /// megabytes.
+    #[serde(default)]
+    pub total: i64,
+
+    /// True when `limit`/`offset` meant this response is a window onto `total`.
+    #[serde(default)]
+    pub truncated: bool,
 }
 
 /// Catalog entry response.
