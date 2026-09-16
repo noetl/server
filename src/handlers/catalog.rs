@@ -13,8 +13,9 @@ use serde::Deserialize;
 
 use crate::db::models::{
     CatalogDeleteRequest, CatalogDeleteResponse, CatalogEntries, CatalogEntriesRequest,
-    CatalogEntryRequest, CatalogEntryResponse, CatalogRegisterRequest, CatalogRegisterResponse,
-    CatalogRegisterBatchItem, CatalogRegisterBatchRequest, CatalogRegisterBatchResponse,
+    CatalogEntryRequest, CatalogEntryResponse, CatalogRegisterBatchItem,
+    CatalogRegisterBatchRequest, CatalogRegisterBatchResponse, CatalogRegisterRequest,
+    CatalogRegisterResponse,
 };
 use crate::error::{AppError, AppResult};
 use crate::services::ui_schema::{infer_ui_schema, UiSchemaResponse};
@@ -377,9 +378,14 @@ pub async fn ui_schema(
 
     // Parse YAML for metadata. Forgiving — if the parse fails, return
     // empty metadata rather than 500, mirroring Python's behaviour.
-    let metadata = parse_metadata(&entry.content);
+    // `content` is Optional on the row because the LISTING path selects a typed
+    // NULL for it (noetl/server#436). This read fetches the real column, so it is
+    // `Some` here; an absent body degrades to empty metadata, which is the same
+    // forgiving behaviour the comment above describes for a parse failure.
+    let content = entry.content.as_deref().unwrap_or_default();
+    let metadata = parse_metadata(content);
 
-    let fields = infer_ui_schema(&entry.content);
+    let fields = infer_ui_schema(content);
 
     let response = UiSchemaResponse {
         path: entry.path,

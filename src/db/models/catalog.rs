@@ -27,8 +27,23 @@ pub struct CatalogEntry {
     /// data column) and v2.1.4 (executions timestamps).
     pub version: i16,
 
-    /// Raw YAML content
-    pub content: String,
+    /// Raw YAML content.
+    ///
+    /// ⚠⚠ `Option`, because the listing path deliberately selects
+    /// `NULL::text AS content` when bodies are not requested (noetl/server#436).
+    /// This was `String`, and that shipped a **500 on every `/api/catalog/list`
+    /// call in prod**: sqlx refused the row with
+    /// `decoding column "content": unexpected null; try decoding as an Option`.
+    ///
+    /// The tests that were supposed to catch it checked the generated SQL
+    /// *string* and measured raw-SQL byte counts — neither ever decoded a row
+    /// through `query_as::<_, CatalogEntry>`, which is the only place the
+    /// mismatch exists. Same row-type/schema drift the `version: i16` comment
+    /// above records twice already.
+    ///
+    /// Every read that genuinely needs the body still selects the real column,
+    /// so it arrives as `Some`.
+    pub content: Option<String>,
 
     /// Parsed layout/structure (JSON)
     #[sqlx(default)]
@@ -248,7 +263,7 @@ impl From<CatalogEntry> for CatalogEntryResponse {
             path: entry.path,
             kind: entry.kind,
             version: entry.version,
-            content: Some(entry.content),
+            content: entry.content,
             layout: entry.layout,
             payload: entry.payload,
             meta: entry.meta,
