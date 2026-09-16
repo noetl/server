@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [3.109.3](https://github.com/noetl/server/compare/v3.109.2...v3.109.3) (2026-09-16)
+
+### Bug Fixes
+
+* **result:** move the tier fallback into the service so every read site gets it ([9c81654](https://github.com/noetl/server/commit/9c81654cd17bd5dbb10216e91d5997c4d0ca87df)), closes [#104](https://github.com/noetl/server/issues/104) [#104](https://github.com/noetl/server/issues/104) [noetl/ai-meta#343](https://github.com/noetl/ai-meta/issues/343) [adiona/frontend#22](https://github.com/adiona/frontend/issues/22)
+* **result:** read the tier through the object backend, not a Postgres query ([30feba8](https://github.com/noetl/server/commit/30feba8584c1302523ede8c6449d0d243ad1e6b5)), closes [noetl/ai-meta#343](https://github.com/noetl/ai-meta/issues/343) [adiona/frontend#22](https://github.com/adiona/frontend/issues/22)
+* **result:** resolve a legacy ref from the [#104](https://github.com/noetl/server/issues/104) tier when its store row is gone ([2020bd9](https://github.com/noetl/server/commit/2020bd923023e2f213887a9e7a2a86d8128f2d26)), closes [noetl/ai-meta#343](https://github.com/noetl/ai-meta/issues/343) [adiona/frontend#22](https://github.com/adiona/frontend/issues/22)
+
 ## [3.109.2](https://github.com/noetl/server/compare/v3.109.1...v3.109.2) (2026-09-13)
 
 ### Bug Fixes
