@@ -265,7 +265,18 @@ impl CredentialService {
         let Some(entry) = catalog_queries::get_catalog_by_id(&self.pool, catalog_id).await? else {
             return Ok(None);
         };
-        let playbook: Playbook = match serde_yaml::from_str(&entry.content) {
+        // ⚠ Distinguished from a parse failure on purpose: "the catalog row has
+        // no body" and "the body did not parse" are different faults, and
+        // collapsing them would hide the first behind the second's message.
+        let Some(content) = entry.content.as_deref() else {
+            tracing::warn!(
+                execution_id,
+                catalog_id,
+                "keychain resolve: catalog row carries no content"
+            );
+            return Ok(None);
+        };
+        let playbook: Playbook = match serde_yaml::from_str(content) {
             Ok(pb) => pb,
             Err(e) => {
                 tracing::warn!(execution_id, error = %e, "keychain resolve: playbook parse failed");
