@@ -198,6 +198,16 @@ pub struct ExecOrchState {
     /// orchestrate commands → double-issue the same next commands.  In-memory
     /// only; a server restart re-derives the drive from the event log.
     pub orchestrate_in_flight: bool,
+    /// When [`Self::orchestrate_in_flight`] was set (noetl/server#447).
+    ///
+    /// ⚠ Observation only — nothing reads this to decide anything. The guard is
+    /// cleared on apply and nowhere else, so a drive that is never applied holds
+    /// it forever; this timestamp is what lets the reconcile poller *report*
+    /// that, without changing when the guard is released.
+    ///
+    /// Clearing the guard on age would be a semantics change (it trades a silent
+    /// hang for possible duplicate work) and is deliberately NOT done here.
+    pub orchestrate_in_flight_since: Option<std::time::Instant>,
     /// A trigger arrived while `orchestrate_in_flight` was set and was dropped
     /// (noetl/ai-meta#155).
     ///
