@@ -201,10 +201,55 @@ pub async fn events_from_postgres_hydrated(
     execution_id: i64,
 ) -> Result<Vec<crate::db::models::Event>, FoldRefusal> {
     let mut events = events_from_postgres(pool, execution_id).await?;
-    // `keep_refs = false`: drop the reference envelope once resolved, so the
-    // result reads like an inline one — which is the tier's shape.
-    super::events::hydrate_result_references(&mut events, result_store, false).await;
+    // ⚠⚠ The policy must be the WRITER'S, not a constant.
+    //
+    // This used to pass a hardcoded `false` — "drop the reference envelope once
+    // resolved, so the result reads like an inline one, which is the tier's
+    // shape." That premise is false whenever `refs_in_state` is on, and it is on
+    // by DEFAULT (`AppConfig::refs_in_state`, `#[serde(default = "default_true")]`).
+    //
+    // `advance_snapshot` folds with `keep_refs = config.refs_in_state`, so under
+    // the default the snapshot it digests carries `{reference, extracted}` plus
+    // the `_ref`/`_store`/`_uri` accessors. Hydrating to inline here built the
+    // opposite representation of the same events, so the two digests could not
+    // agree on any result over `NOETL_PERMANENT_LOG_INLINE_MAX_BYTES` (512 B).
+    //
+    // Measured in kind 2026-09-17, both projector flags on: `muno/probe/big-parent`
+    // moved `projection_refold_total{verdict="digest_mismatch"}` by **+7 on one
+    // execution**, while 5 × `test/simple_loop` — whose results are all under the
+    // floor, so it produces no reference envelope at all — moved it by **0**. The
+    // `diff_paths` were the literal fingerprint of this boolean: `_ref`/`_uri`/
+    // `reference` on one side, `count`/`hotels`/`meta`/`status` on the other.
+    //
+    // ⚠ The hardcoded `false` was itself a fix — for the mirror-image asymmetry,
+    // where this leg did not hydrate at all and reported 12 of 40 prod executions
+    // divergent on nothing but the reference/context pair. It overshot: the
+    // correct policy was never "always resolve", it was "whatever the writer did".
+    super::events::hydrate_result_references(&mut events, result_store, refs_in_state_enabled())
+        .await;
     Ok(events)
+}
+
+/// Envy maps this onto [`crate::config::app::AppConfig::refs_in_state`].
+pub const REFS_IN_STATE_ENV: &str = "NOETL_REFS_IN_STATE";
+
+/// The reference policy as a **pure function of the raw value**.
+///
+/// Split from the env read on purpose: `cargo test` does **not** serialise
+/// tests, so a test that drove `NOETL_REFS_IN_STATE` through `set_var` would
+/// race every other test in the binary. This form is testable with no globals.
+///
+/// ⚠ The default is **true** and that is the load-bearing half — prod leaves the
+/// variable unset, so an `unwrap_or(false)` here would silently reinstate the
+/// exact bug this replaced while every test that sets the value still passed.
+pub(crate) fn refs_in_state_from_raw(raw: Option<&str>) -> bool {
+    raw.and_then(|v| v.trim().parse::<bool>().ok()).unwrap_or(true)
+}
+
+/// The reference policy the snapshot writer used, so the verification fold
+/// builds the shape it is comparing against.
+pub fn refs_in_state_enabled() -> bool {
+    refs_in_state_from_raw(std::env::var(REFS_IN_STATE_ENV).ok().as_deref())
 }
 
 /// [`fold_from_postgres`] over the hydrated event set.
@@ -2595,9 +2640,69 @@ mod tests {
     /// `..._hydrated` that forgot to hydrate would satisfy every one of them
     /// while restoring the exact false-divergence class this fix removes.
     ///
-    /// `keep_refs = false` is load-bearing: keeping the reference envelope
-    /// leaves the pointer beside the content, which still digests differently
-    /// from the tier's inlined-only shape.
+    /// ⚠⚠ This guard used to assert `result_store, false` — it PINNED THE BUG.
+    ///
+    /// Its stated reason ("keeping the reference envelope leaves the pointer
+    /// beside the content, which still digests differently from the tier's
+    /// inlined-only shape") assumed the tier's shape is inlined. It is not, when
+    /// `refs_in_state` is on — and that is the DEFAULT. So the constant this
+    /// guard protected was the thing producing `DigestMismatch` on every result
+    /// over the 512-byte floor, and the guard would have failed any correct fix.
+    ///
+    /// What is actually load-bearing is that the policy is the WRITER'S, read at
+    /// the call, never a literal on either side.
+    /// The reference policy, as a pure function — no env, so no race.
+    ///
+    /// ⚠ The unset case is the one that matters. Prod does not set
+    /// `NOETL_REFS_IN_STATE`; it relies on `AppConfig::refs_in_state`'s
+    /// `default_true`. A verifier that defaulted the other way would rebuild the
+    /// exact asymmetry while looking configurable.
+    #[test]
+    fn refs_in_state_defaults_true_and_only_false_disables_it() {
+        // POSITIVE CONTROL: the value prod actually runs on.
+        assert!(
+            refs_in_state_from_raw(None),
+            "unset must mean true — it is what prod runs, and false here is the bug"
+        );
+        // NEGATIVE CONTROL: the function can return false, so the assert above
+        // is not passing because nothing can.
+        assert!(!refs_in_state_from_raw(Some("false")));
+        assert!(!refs_in_state_from_raw(Some("  false  ")));
+        assert!(refs_in_state_from_raw(Some("true")));
+        // Unparseable falls back to the default rather than to `false`: a typo
+        // must not silently switch the verifier's representation.
+        assert!(refs_in_state_from_raw(Some("")));
+        assert!(refs_in_state_from_raw(Some("0")));
+        assert!(refs_in_state_from_raw(Some("yes")));
+    }
+
+    /// The writer and the verifier must read the SAME default.
+    ///
+    /// This is the agreement the whole fix rests on, and it spans two files, so
+    /// nothing but a check like this holds them together: `AppConfig` declares
+    /// `#[serde(default = "default_true")]` on `refs_in_state`, and
+    /// `refs_in_state_from_raw` must default to the same value. If someone flips
+    /// either one, the digests part company again and every test above still
+    /// passes.
+    #[test]
+    fn the_verifier_default_matches_the_config_default() {
+        let cfg = include_str!("../config/app.rs");
+        let decl = cfg
+            .find("pub refs_in_state: bool")
+            .expect("refs_in_state no longer declared in AppConfig — extraction broke");
+        let window = &cfg[decl.saturating_sub(400)..decl];
+        assert!(
+            window.contains("default = \"default_true\""),
+            "AppConfig::refs_in_state no longer defaults true; the verifier's \
+             default must move with it or the two sides digest different shapes"
+        );
+        assert_eq!(
+            refs_in_state_from_raw(None),
+            true,
+            "the verifier's default drifted from the config's"
+        );
+    }
+
     #[test]
     fn the_hydrated_reader_hydrates_and_drops_the_reference_envelope() {
         let src = include_str!("ehdb_projection_fold.rs");
@@ -2622,10 +2727,15 @@ mod tests {
              leg would digest a reference against inlined content again"
         );
         assert!(
-            body.contains("result_store, false"),
-            "the hydrator must be called with keep_refs = false; keeping the \
-             envelope leaves the pointer beside the content and still diverges \
-             from the tier's inlined shape"
+            body.contains("refs_in_state_enabled()"),
+            "the hydrator must be called with the WRITER'S policy; a literal \
+             here builds a different representation of the same events and \
+             guarantees DigestMismatch on every externalised result"
+        );
+        assert!(
+            !body.contains("result_store, false") && !body.contains("result_store, true"),
+            "keep_refs is hardcoded again — that is the defect this replaced, \
+             in whichever direction the constant points"
         );
     }
 
