@@ -684,6 +684,20 @@ fn fold(
 ) -> Result<FoldedState, FoldRefusal> {
     use noetl_orchestrate_core::state::{canonical_state_digest, WorkflowState};
     normalise_event_precision(&mut events);
+    // ⚠ Both fold entry points must normalise the SAME WAY.
+    //
+    // `fold_with_body` called `normalise_null_json` and this did not, so the
+    // record `materialize_from_wal` writes (built with `fold_with_body`) and
+    // the verification `bounded_fold_at`/`fold_from_postgres_hydrated` compares
+    // it against could disagree on any execution carrying a jsonb `'null'`
+    // context — the residual ai-meta#307 `context` diff, reintroduced by the
+    // split rather than by either function being wrong on its own.
+    //
+    // Latent rather than observed in the 2026-09-19 kind run (the probe emits
+    // no jsonb-null context), and fixed anyway: a normalisation that applies on
+    // one fold path and not the other is the same defect class as the rung
+    // asymmetry above, and it would present identically.
+    normalise_null_json(&mut events);
     let version = events.iter().map(|e| e.event_id).max().unwrap_or(0);
     let applied_count = events.len();
     let core: Vec<noetl_orchestrate_core::event::Event> = events.iter().map(Into::into).collect();
@@ -1493,7 +1507,42 @@ pub async fn events_for_recovery_or_postgres(
     execution_id: i64,
 ) -> Result<(FoldSource, Vec<crate::db::models::Event>), FoldRefusal> {
     match events_for_recovery(execution_id).await {
-        Ok(v) => Ok(v),
+        // ⚠⚠ THE SPINE RUNG MUST HYDRATE TOO — this is the residual
+        // `digest_mismatch` after noetl/server d1bb0820.
+        //
+        // The two rungs of this ladder were building DIFFERENT REPRESENTATIONS
+        // of the same events: the Postgres rung goes through
+        // `events_from_postgres_hydrated`, and the spine rung returned whatever
+        // the tier held, raw. `materialize_from_wal` folds and DIGESTS whichever
+        // one answered, so the record it wrote carried one of two shapes
+        // depending on a rung choice the digest cannot express.
+        //
+        // Measured in kind 2026-09-19 on 3 × `muno/probe/big-parent`
+        // (+7 `digest_mismatch`): the tier held TWO records at the SAME version
+        // and SAME applied_count with different digests, separated only by their
+        // `mirror_source` —
+        //
+        //   seq=14301 ac=12 mirror_source=server     digest=2bf8078b…  (hydrated)
+        //   seq=14302 ac=12 mirror_source=wal_spine  digest=8c740d82…  (raw)
+        //
+        // and the body diff was exactly the reference envelope: `_store` plus
+        // the whole `extracted` block present on the `server` record and absent
+        // on the `wal_spine` one. Whichever record won the `(version, sequence)`
+        // race decided whether the serve path saw `match` or `digest_mismatch`,
+        // which is why the count was intermittent rather than total.
+        //
+        // The policy is the WRITER'S, read at the call — the same rule
+        // d1bb0820 established for the verifier, applied to the leg it missed.
+        // A literal in either direction rebuilds the asymmetry.
+        Ok((source, mut events)) => {
+            super::events::hydrate_result_references(
+                &mut events,
+                result_store,
+                refs_in_state_enabled(),
+            )
+            .await;
+            Ok((source, events))
+        }
         Err(ehdb_refusal) => {
             match events_from_postgres_hydrated(pool, result_store, execution_id).await {
                 Ok(events) => {
@@ -4342,5 +4391,367 @@ mod differing_fields_tests {
             cases.len(),
             wrong.join("\n  ")
         );
+    }
+
+    // ======================================================================
+    // DIAGNOSTIC HARNESS (temporary — ai-meta write-side session 2026-09-19).
+    //
+    // Reproduces the SERVE PATH's comparison offline, against real captured
+    // data, so the residual `digest_mismatch` can be root-caused without an
+    // image build per hypothesis.
+    //
+    // It runs the verifier leg EXACTLY as `wal_projection_state` does —
+    // `events_from_postgres` shape -> `hydrate_result_references(keep_refs)` ->
+    // `fold(FoldSource::Postgres, ..)` — and diffs the resulting state against
+    // the body the writer actually stored in the tier.
+    //
+    // ⚠ Deliberately NOT the `/projection-fold/diff` endpoint: that folds tier
+    // EVENTS rather than the stored SNAPSHOT, applies `normalise_null_json`
+    // which the serve path's `fold` does not, and is not on the serve path at
+    // all. Instrumenting it would be the "instrument that cannot see the fix"
+    // trap a second time.
+    //
+    // No-op unless both env vars are set, so it cannot affect the suite.
+    // ======================================================================
+    fn flatten_json(v: &serde_json::Value, path: String, out: &mut std::collections::BTreeMap<String, String>) {
+        match v {
+            serde_json::Value::Object(m) => {
+                for (k, vv) in m {
+                    flatten_json(vv, format!("{path}/{k}"), out);
+                }
+            }
+            serde_json::Value::Array(a) => {
+                for (i, vv) in a.iter().enumerate() {
+                    flatten_json(vv, format!("{path}/{i}"), out);
+                }
+            }
+            other => {
+                let s = other.to_string();
+                out.insert(path, if s.len() > 120 { format!("{}…<{}B>", &s[..120], s.len()) } else { s });
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn harness_serve_path_digest_diff() {
+        let (Ok(ev_path), Ok(body_path)) = (
+            std::env::var("HARNESS_EVENTS"),
+            std::env::var("HARNESS_BODY"),
+        ) else {
+            return; // not a harness run
+        };
+        let keep_refs = std::env::var("HARNESS_KEEP_REFS")
+            .ok()
+            .and_then(|v| v.parse::<bool>().ok())
+            .unwrap_or(true);
+
+        let raw = std::fs::read_to_string(&ev_path).expect("events json");
+        let mut events: Vec<crate::db::models::Event> =
+            serde_json::from_str(&raw).expect("events deserialize");
+        let stored_body: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&body_path).expect("body json"))
+                .expect("body deserialize");
+        let stored_digest = std::env::var("HARNESS_DIGEST").unwrap_or_default();
+
+        // --- the verifier leg, as the serve path runs it ---------------------
+        // The keep_refs branch of `hydrate_result_references` never touches the
+        // store (it `continue`s first), so a lazily-connected pool is never
+        // dialled. That is asserted by the run completing at all.
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://harness:harness@127.0.0.1:1/harness")
+            .expect("lazy pool");
+        let store = crate::services::result_store::ResultStoreService::new(
+            pool,
+            std::sync::Arc::new(crate::snowflake::SnowflakeGenerator::new(1).expect("gen")),
+        );
+        super::super::events::hydrate_result_references(&mut events, &store, keep_refs).await;
+
+        let folded = fold(FoldSource::Postgres, events.clone()).expect("fold");
+        // Rebuild the body the same way `fold` builds the state it digests.
+        let mut normalised = events.clone();
+        normalise_event_precision(&mut normalised);
+        let core: Vec<noetl_orchestrate_core::event::Event> =
+            normalised.iter().map(Into::into).collect();
+        let st = noetl_orchestrate_core::state::WorkflowState::from_events(&core).expect("state");
+        let verifier_body = serde_json::to_value(&st).unwrap();
+
+        // BOUNDED MODE: verify EVERY stored tier record at its own version,
+        // which is what `grant_for_behind` -> `bounded_fold_at` does on the
+        // serve path. The FINAL record agreeing says nothing about the
+        // intermediate ones, and the serve path reads whichever record exists
+        // at the moment of the read.
+        if let Ok(rec_path) = std::env::var("HARNESS_RECORDS") {
+            let recs: Vec<serde_json::Value> =
+                serde_json::from_str(&std::fs::read_to_string(&rec_path).expect("records json"))
+                    .expect("records deserialize");
+            println!("=== BOUNDED HARNESS: {} stored record(s) ===", recs.len());
+            let mut disagree = 0usize;
+            for r in &recs {
+                let v = r.get("version").and_then(|x| x.as_i64()).unwrap();
+                let d = r.get("digest").and_then(|x| x.as_str()).unwrap();
+                let ac = r.get("applied_count").and_then(|x| x.as_i64()).unwrap_or(-1);
+                let bounded = bounded_fold_at(events.clone(), v);
+                let agree = bounded_fold_agrees(&bounded, v, d);
+                let (bv, bd, bc) = match &bounded {
+                    Ok(b) => (b.version, b.digest.clone(), b.applied_count as i64),
+                    Err(e) => (-1, format!("REFUSED {e:?}"), -1),
+                };
+                if !agree { disagree += 1; }
+                println!(
+                    "  {} v={v} stored_ac={ac} bounded_v={bv} bounded_ac={bc}\n      stored  ={d}\n      bounded ={bd}",
+                    if agree { "AGREE " } else { "DIVERGE" }
+                );
+            }
+            println!("=== BOUNDED RESULT: {}/{} diverge ===", disagree, recs.len());
+        }
+
+        println!("=== HARNESS (keep_refs={keep_refs}) ===");
+        println!("verifier version = {}", folded.version);
+        println!("verifier digest  = {}", folded.digest);
+        println!("stored   digest  = {stored_digest}");
+        println!("digests agree    = {}", folded.digest == stored_digest);
+
+        let mut a = std::collections::BTreeMap::new();
+        let mut b = std::collections::BTreeMap::new();
+        flatten_json(&stored_body, String::new(), &mut a);
+        flatten_json(&verifier_body, String::new(), &mut b);
+
+        let mut only_stored = vec![];
+        let mut only_verifier = vec![];
+        let mut differing = vec![];
+        for (k, v) in &a {
+            match b.get(k) {
+                None => only_stored.push(k.clone()),
+                Some(v2) if v2 != v => differing.push((k.clone(), v.clone(), v2.clone())),
+                _ => {}
+            }
+        }
+        for k in b.keys() {
+            if !a.contains_key(k) {
+                only_verifier.push(k.clone());
+            }
+        }
+        println!("leaves: stored={} verifier={}", a.len(), b.len());
+        println!("--- ONLY IN STORED ({}) ---", only_stored.len());
+        for k in only_stored.iter().take(40) { println!("   {k}"); }
+        println!("--- ONLY IN VERIFIER ({}) ---", only_verifier.len());
+        for k in only_verifier.iter().take(40) { println!("   {k}"); }
+        println!("--- DIFFERING VALUES ({}) ---", differing.len());
+        for (k, v1, v2) in differing.iter().take(40) {
+            println!("   {k}\n      stored  = {v1}\n      verifier= {v2}");
+        }
+    }
+
+    // ======================================================================
+    // Guards for the spine-rung hydration fix (ai-meta write-side 2026-09-19).
+    // ======================================================================
+
+    /// Strip `//` comments so a guard counts CODE, not prose about code.
+    ///
+    /// ⚠ Without this the guards below can be **satisfied by a comment** — and,
+    /// worse, satisfied by DELETING a comment while removing the real call. A
+    /// guard that can be silenced by editing prose is not a guard. (Same trap
+    /// the ai-meta#263 INSERT-counter hit.)
+    fn code_only(src: &str) -> String {
+        src.lines()
+            .map(|l| match l.find("//") {
+                Some(i) => &l[..i],
+                None => l,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Slice one function's body out of the file, failing loudly on a slice
+    /// that is implausibly small — three separate checks in this codebase have
+    /// "passed" against an empty region.
+    fn fn_body<'a>(code: &'a str, sig: &str) -> &'a str {
+        let start = code
+            .find(sig)
+            .unwrap_or_else(|| panic!("{sig} not found — extraction broke"));
+        let body = &code[start..];
+        let end = body.find("\n}\n").map(|i| i + 3).unwrap_or(body.len());
+        let slice = &body[..end];
+        assert!(
+            slice.len() > 120,
+            "slice for {sig} is {} bytes — extraction broke, and a guard over an \
+             empty region passes by measuring nothing",
+            slice.len()
+        );
+        slice
+    }
+
+    /// An event carrying the over-budget reference envelope the probe emits.
+    fn event_with_reference(event_id: i64) -> crate::db::models::Event {
+        let result = serde_json::json!({
+            "status": "COMPLETED",
+            "context": { "result": {
+                "status": "success",
+                "context": { "data": {
+                    "_ref": "noetl://execution/1/result/fetch/2",
+                    "_uri": "noetl://default/default/results/1/fetch/0/0/1"
+                }},
+                "reference": {
+                    "ref": "noetl://execution/1/result/fetch/2",
+                    "uri": "noetl://default/default/results/1/fetch/0/0/1",
+                    "kind": "result_ref",
+                    "scope": "execution",
+                    "store": "db",
+                    "extracted": { "data": { "count": 400 }, "status": "success" }
+                }
+            }}
+        });
+        crate::db::models::Event {
+            id: event_id,
+            execution_id: 1,
+            catalog_id: 1,
+            event_id,
+            parent_event_id: None,
+            parent_execution_id: None,
+            event_type: "call.done".to_string(),
+            node_id: Some("n1".to_string()),
+            node_name: Some("fetch".to_string()),
+            node_type: Some("task".to_string()),
+            status: "COMPLETED".to_string(),
+            context: None,
+            meta: None,
+            result: Some(result),
+            worker_id: Some("w1".to_string()),
+            attempt: None,
+            created_at: chrono::DateTime::parse_from_rfc3339("2026-09-19T21:02:55.411986Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+        }
+    }
+
+    async fn hydrated(mut events: Vec<crate::db::models::Event>, keep_refs: bool)
+        -> Vec<crate::db::models::Event>
+    {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://g:g@127.0.0.1:1/g")
+            .expect("lazy pool");
+        let store = crate::services::result_store::ResultStoreService::new(
+            pool,
+            std::sync::Arc::new(crate::snowflake::SnowflakeGenerator::new(1).expect("gen")),
+        );
+        super::super::events::hydrate_result_references(&mut events, &store, keep_refs).await;
+        events
+    }
+
+    /// POSITIVE CONTROL for the whole fix: hydration CHANGES the digest.
+    ///
+    /// Without this, "both rungs hydrate" is a claim about a transform that
+    /// might be a no-op — and every assertion resting on it would pass against
+    /// a fold that could not tell the two representations apart. This is the
+    /// check that makes the rung guard mean something.
+    #[tokio::test]
+    async fn hydration_is_load_bearing_for_the_digest() {
+        let raw = vec![event_with_reference(10)];
+        let hyd = hydrated(raw.clone(), true).await;
+
+        // The transform must actually have done something.
+        assert_ne!(
+            serde_json::to_string(&raw[0].result).unwrap(),
+            serde_json::to_string(&hyd[0].result).unwrap(),
+            "hydration left the event unchanged — the fixture cannot exhibit the defect"
+        );
+        // …and specifically the fingerprint the kind run measured.
+        let h = serde_json::to_string(&hyd[0].result).unwrap();
+        assert!(h.contains("_store"), "hydration must surface `_store`: {h}");
+        assert!(h.contains("\"count\":400"), "hydration must surface `extracted`: {h}");
+        assert!(
+            !serde_json::to_string(&raw[0].result).unwrap().contains("_store"),
+            "the RAW event must not already carry `_store`, or the diff proves nothing"
+        );
+
+        let d_raw = fold(FoldSource::WalSpine, raw).expect("fold raw").digest;
+        let d_hyd = fold(FoldSource::Postgres, hyd).expect("fold hydrated").digest;
+        assert_ne!(
+            d_raw, d_hyd,
+            "folding raw and hydrated events produced the SAME digest — the two \
+             representations are indistinguishable to the fold, so the rung \
+             asymmetry this fix removes could never have been observed, and the \
+             kind measurement (+7 digest_mismatch) contradicts that"
+        );
+    }
+
+    /// Hydrating twice must equal hydrating once.
+    ///
+    /// The fix adds a hydration call to a rung; if the transform were not
+    /// idempotent, any path that hydrated before reaching it would be corrupted
+    /// by the addition rather than fixed by it.
+    #[tokio::test]
+    async fn hydration_is_idempotent() {
+        let once = hydrated(vec![event_with_reference(10)], true).await;
+        let twice = hydrated(once.clone(), true).await;
+        assert_eq!(
+            serde_json::to_string(&once[0].result).unwrap(),
+            serde_json::to_string(&twice[0].result).unwrap(),
+            "hydration is not idempotent — adding a call to the spine rung would \
+             then corrupt any already-hydrated set instead of aligning it"
+        );
+        assert_eq!(
+            fold(FoldSource::Postgres, once).expect("f1").digest,
+            fold(FoldSource::Postgres, twice).expect("f2").digest
+        );
+    }
+
+    /// BOTH rungs of the recovery ladder must hydrate.
+    ///
+    /// The Postgres rung always did (`events_from_postgres_hydrated`); the spine
+    /// rung did not, and `materialize_from_wal` digests whichever one answered.
+    /// Counted in CODE so a comment cannot satisfy it.
+    #[test]
+    fn both_recovery_ladder_rungs_hydrate() {
+        let code = code_only(include_str!("ehdb_projection_fold.rs"));
+        let body = fn_body(&code, "pub async fn events_for_recovery_or_postgres(");
+        assert!(
+            body.contains("hydrate_result_references("),
+            "the SPINE rung of the recovery ladder does not hydrate. It returns \
+             tier events raw while the Postgres rung returns hydrated ones, so \
+             `materialize_from_wal` writes one of two different representations \
+             of the same events depending on which rung answered — measured in \
+             kind as two tier records at the same version and applied_count with \
+             different digests, differing by `_store` and the `extracted` block."
+        );
+        assert!(
+            body.contains("events_from_postgres_hydrated("),
+            "the Postgres rung must still hydrate — if this call went away the \
+             guard above could be satisfied while the rungs disagreed the other way"
+        );
+        // The policy must be read, never a literal — the d1bb0820 rule.
+        assert!(
+            body.contains("refs_in_state_enabled()"),
+            "the spine rung must hydrate with the WRITER'S policy, not a literal"
+        );
+        assert!(
+            !body.contains("result_store, true)") && !body.contains("result_store, false)"),
+            "a hardcoded keep_refs on either rung rebuilds the d1bb0820 asymmetry"
+        );
+    }
+
+    /// The two fold entry points must apply the SAME normalisations.
+    ///
+    /// `fold_with_body` builds the record `materialize_from_wal` stores;
+    /// `fold` builds the state the serve path verifies it against. A
+    /// normalisation on one and not the other is a digest disagreement with no
+    /// defect in either function.
+    #[test]
+    fn both_fold_entry_points_normalise_identically() {
+        let code = code_only(include_str!("ehdb_projection_fold.rs"));
+        let plain = fn_body(&code, "fn fold(\n    source: FoldSource,");
+        let withbody = fn_body(&code, "fn fold_with_body(");
+        for normaliser in ["normalise_event_precision(", "normalise_null_json("] {
+            assert!(
+                plain.contains(normaliser),
+                "`fold` does not apply {normaliser} but `fold_with_body` does — the \
+                 stored record and the state it is verified against would be \
+                 normalised differently"
+            );
+            assert!(
+                withbody.contains(normaliser),
+                "`fold_with_body` does not apply {normaliser} but `fold` does"
+            );
+        }
     }
 }
