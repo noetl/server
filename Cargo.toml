@@ -103,8 +103,8 @@ gcp_auth = "0.12"
 # open engines against one on-disk layout.  A tag is a decision someone made;
 # a rev is wherever a branch happened to be.  ehdb-l0's FORMAT_VERSION gate is
 # the belt to this braces: it refuses a layout it cannot read.
-ehdb-feed = { git = "https://github.com/noetl/ehdb", tag = "v0.2.0" }
-ehdb-l0 = { git = "https://github.com/noetl/ehdb", tag = "v0.2.0" }
+ehdb-feed = { git = "https://github.com/noetl/ehdb", tag = "v0.3.0" }
+ehdb-l0 = { git = "https://github.com/noetl/ehdb", tag = "v0.3.0" }
 # Value type for the JetStream KV puts in `src/coherence.rs` (multi-replica
 # watermark/descriptor coherence, RFC #115 program-scale).  Matches the version
 # async-nats already pulls in transitively.

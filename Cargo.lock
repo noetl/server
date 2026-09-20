@@ -530,7 +530,7 @@ checksum = "1aaf95b3e5c8f23aa320147307562d361db0ae0d51242340f558153b4eb2439b"
 [[package]]
 name = "ehdb-core"
 version = "0.1.0"
-source = "git+https://github.com/noetl/ehdb?tag=v0.2.0#24e63b8d88adbd0bbc1c95448380193a495b473e"
+source = "git+https://github.com/noetl/ehdb?tag=v0.3.0#7fe5b69c454a8405c4026f254bb1af20d938d6f3"
 dependencies = [
  "arrow-schema",
  "serde",
@@ -539,7 +539,7 @@ dependencies = [
 [[package]]
 name = "ehdb-feed"
 version = "0.1.0"
-source = "git+https://github.com/noetl/ehdb?tag=v0.2.0#24e63b8d88adbd0bbc1c95448380193a495b473e"
+source = "git+https://github.com/noetl/ehdb?tag=v0.3.0#7fe5b69c454a8405c4026f254bb1af20d938d6f3"
 dependencies = [
  "ehdb-core",
  "ehdb-l0",
@@ -553,7 +553,7 @@ dependencies = [
 [[package]]
 name = "ehdb-l0"
 version = "0.1.0"
-source = "git+https://github.com/noetl/ehdb?tag=v0.2.0#24e63b8d88adbd0bbc1c95448380193a495b473e"
+source = "git+https://github.com/noetl/ehdb?tag=v0.3.0#7fe5b69c454a8405c4026f254bb1af20d938d6f3"
 dependencies = [
  "ehdb-core",
  "serde",
