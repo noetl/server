@@ -2994,9 +2994,50 @@ pub fn spawn_orchestrator_reconciler(state: AppState) {
                 // BUDGET that triggers it still lived inside.
                 let (noops, give_up) = {
                     let before = state.drive_tombstones.noops(execution_id);
-                    let (n, give_up) = reconcile_decision(advanced, before, cap);
-                    state.drive_tombstones.set_noops(execution_id, n);
-                    (n, give_up)
+
+                    // noetl/ai-meta chain-advance: when NOETL_CHAIN_ADVANCE is
+                    // on and a chain source can supply this execution's chain,
+                    // the decision comes from FOLLOWING the chain rather than
+                    // from a boolean derived from a command count.
+                    //
+                    // ⭐ The behavioural difference that matters: a
+                    // `BlockedAtGap` leaves the budget UNCHANGED. It is not a
+                    // no-op to be retried, it is a wait on a named key — so it
+                    // spends no budget and can never reach the cap.
+                    //
+                    // With the flag off, or with no chain source configured,
+                    // this is `None` and the existing path runs untouched.
+                    let chain_action = state.chain_source.as_deref().and_then(|src| {
+                        crate::chain_advance::poller_action(src, execution_id, before)
+                    });
+
+                    match chain_action {
+                        Some(action) => {
+                            if let Some(ref key) = action.waiting_on {
+                                info!(
+                                    execution_id,
+                                    missing_event_id = %key,
+                                    decision = action.decision,
+                                    "chain-advance: execution is BLOCKED AT A NAMED KEY, not                                      re-driven — the budget is untouched and no cap applies"
+                                );
+                            }
+                            if action.terminal {
+                                info!(
+                                    execution_id,
+                                    decision = action.decision,
+                                    "chain-advance: execution is terminal; stop polling"
+                                );
+                                state.orch_cache.evict(execution_id);
+                            }
+                            state.drive_tombstones.set_noops(execution_id, action.noops);
+                            (action.noops, action.give_up)
+                        }
+                        None => {
+                            let (n, give_up) = reconcile_decision(advanced, before, cap);
+                            state.drive_tombstones.set_noops(execution_id, n);
+                            (n, give_up)
+                        }
+                    }
                 };
                 if give_up {
                     warn!(

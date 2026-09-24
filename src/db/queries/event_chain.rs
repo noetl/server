@@ -76,3 +76,91 @@ async fn try_ddl(pool: &DbPool, sql: &str, what: &str) {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// The chain read — the source for chain-following advance.
+// ---------------------------------------------------------------------------
+
+/// One `noetl.event` row as the chain decision needs it.
+///
+/// ⚠⚠ **Every nullable column is `Option`, and that is the whole lesson of
+/// server#443.** That change selected `NULL::text AS content` into a `String`
+/// field: sqlx refuses that row **only against a real database**, so it passed
+/// unit tests AND a throwaway-Postgres proof that ran raw SQL, and then
+/// returned HTTP 500 on every `/api/catalog/list` call in production.
+/// *A test that renders SQL is not a test that decodes it.*
+///
+/// `prev_event_id` is NULL at a chain root and `parent_execution_id` is NULL at
+/// a tree root — both are genuinely nullable, so both are `Option<i64>`, and
+/// `tests/chain_source_pg.rs` decodes them against a live PostgreSQL.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ChainRow {
+    pub event_id: i64,
+    pub execution_id: i64,
+    pub prev_event_id: Option<i64>,
+    pub parent_execution_id: Option<i64>,
+    pub event_type: String,
+}
+
+/// Event types that end an execution.
+///
+/// Kept here beside the read so the classification travels with the query, and
+/// exposed so a test can assert the set rather than re-listing it.
+pub const TERMINAL_EVENT_TYPES: &[&str] = &[
+    "execution.completed",
+    "execution.failed",
+    "execution.cancelled",
+    "playbook.completed",
+    "playbook.failed",
+];
+
+pub fn is_terminal_event_type(event_type: &str) -> bool {
+    TERMINAL_EVENT_TYPES.contains(&event_type)
+}
+
+/// Read one execution's chain rows, ascending by `event_id`.
+///
+/// Bounded by `limit` so a pathological execution cannot pull an unbounded
+/// result set onto the poller path.
+///
+/// ⚠ This is a `WHERE execution_id` read of `noetl.event` — the very scan class
+/// the redesign exists to retire. It is here as the **transitional** source: it
+/// buys the correct *semantics* (finished, runnable and missing-link become
+/// distinguishable, which is what removes the re-drive loop) without yet buying
+/// the *performance*. The performance arrives when this is repointed at the
+/// execution-partitioned chain store. Do not mistake one for the other.
+pub async fn read_chain(pool: &DbPool, execution_id: i64, limit: i64) -> AppResult<Vec<ChainRow>> {
+    let rows: Vec<ChainRow> = sqlx::query_as::<_, ChainRow>(
+        "SELECT event_id, execution_id, prev_event_id, parent_execution_id, event_type \
+         FROM noetl.event WHERE execution_id = $1 ORDER BY event_id LIMIT $2",
+    )
+    .bind(execution_id)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+/// Build the advance-decision view from chain rows.
+///
+/// `exec_seq` is the row's ordinal within the execution — the chain decision
+/// only needs a monotone position to pick a head, and `event_id` ordering
+/// already provides one.
+pub fn rows_to_chain_view(
+    execution_id: i64,
+    rows: Vec<ChainRow>,
+) -> crate::chain_advance::ChainView {
+    let events = rows
+        .into_iter()
+        .enumerate()
+        .map(|(i, r)| crate::chain_advance::ChainEventView {
+            exec_seq: (i + 1) as u64,
+            event_id: r.event_id.to_string(),
+            prev_event_id: r.prev_event_id.map(|v| v.to_string()),
+            execution_id: r.execution_id.to_string(),
+            parent_execution_id: r.parent_execution_id.map(|v| v.to_string()),
+            terminal: is_terminal_event_type(&r.event_type),
+        })
+        .collect();
+    crate::chain_advance::ChainView::new(execution_id.to_string(), events)
+}

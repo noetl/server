@@ -47,6 +47,7 @@
 
 pub mod auth_gate;
 pub mod affinity;
+pub mod chain_advance;
 pub mod coherence;
 pub mod command_bus;
 pub mod config;

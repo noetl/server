@@ -100,6 +100,14 @@ pub struct AppState {
     pub orch_cache: Arc<OrchStateCache>,
     /// Executions that must not be re-driven (noetl/ai-meta#315).
     pub drive_tombstones: Arc<DriveTombstones>,
+    /// Chain source for chain-following advance (`NOETL_CHAIN_ADVANCE`).
+    ///
+    /// ⚠ `None` by default and in every current construction path, so the
+    /// reconcile poller runs exactly as it does today. It becomes `Some` only
+    /// when a source is wired — deliberately a separate change, because the
+    /// obvious source reads `noetl.event` and new SQL needs decode-testing
+    /// against a real database (server#443).
+    pub chain_source: Option<Arc<dyn crate::chain_advance::ChainSource>>,
 
     /// Per-execution chain head for the one-level event chain (RFC #115 Phase
     /// 2, noetl/ai-meta#115 §4).  The event-write chokepoint reads + advances it
@@ -1096,6 +1104,8 @@ impl AppState {
             start_time: std::time::Instant::now(),
             orch_cache: Arc::new(OrchStateCache::default()),
             drive_tombstones: Arc::new(DriveTombstones::default()),
+            // Default OFF: the poller runs today's path until a source is wired.
+            chain_source: None,
             chain_heads: Arc::new(ChainHeads::with_coherence(coherence.clone())),
             chain_tails: Arc::new(ChainTails::default()),
             exec_descriptors: Arc::new(ExecDescriptors::with_coherence(coherence)),
