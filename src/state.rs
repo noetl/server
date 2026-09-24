@@ -98,6 +98,8 @@ pub struct AppState {
     /// server).  The per-execution lock inside also serialises a single
     /// execution's concurrent completion triggers.
     pub orch_cache: Arc<OrchStateCache>,
+    /// Executions that must not be re-driven (noetl/ai-meta#315).
+    pub drive_tombstones: Arc<DriveTombstones>,
 
     /// Per-execution chain head for the one-level event chain (RFC #115 Phase
     /// 2, noetl/ai-meta#115 §4).  The event-write chokepoint reads + advances it
@@ -683,6 +685,107 @@ impl FinalizedGuard {
     }
 }
 
+/// Why an execution must not be re-driven.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TombstoneReason {
+    /// A terminal event was written for it.
+    Terminal,
+    /// The reconcile poller hit `NOETL_RECONCILE_MAX_NOOPS` without progress.
+    GaveUp,
+}
+
+/// Execution ids that must not be re-driven, and why — **state that outlives
+/// the thing it describes**.
+///
+/// ⚠⚠ This exists because noetl/ai-meta#315 had two defects of exactly one
+/// shape: the fact was stored inside the structure that gets evicted, so
+/// evicting destroyed the fact.
+///
+/// 1. **Terminality.** `ExecDescriptor.terminal` was the only terminal guard,
+///    and the terminal event **evicted the descriptor**. A later cold slot
+///    re-seeded it with `terminal: false`, because a re-seed cannot know. The
+///    flag was destroyed by the very event that set it, so the guard could
+///    never fire again. Measured in prod: `stateless_terminal_skip` at **7
+///    cumulative, delta +0** over 23 minutes, while executions carrying a
+///    non-null `completed_at` were re-driven ~30x/hour.
+///
+/// 2. **The give-up budget.** `consecutive_reconcile_noops` lived in the
+///    orch_cache slot, and give-up **evicted that slot**. The next
+///    `orch_cache.entry` recreated it at zero, so give-up was a *sawtooth, not a
+///    halt*: 225 polls x 8s ≈ 30 min, one give-up, budget back to zero, forever.
+///    Measured in prod: **0.17 give-ups/min against 15.9 retries/min**, and 32
+///    of 43 executions still being re-driven **14 hours** later.
+///
+/// Bounded on purpose. The eviction those defects performed was not pointless —
+/// it was there to stop `orch_cache` growing without limit (#315's own title).
+/// A tombstone is one `i64` and one enum, so a large cap is cheap, and FIFO
+/// eviction keeps it bounded regardless.
+///
+/// ⚠ The self-heal the give-up comment promised is **preserved and made
+/// deliberate**: a drive carrying a real `trigger_event_id` clears the
+/// tombstone, so a later real event resumes the execution. A poller tick (which
+/// passes `i64::MAX`) does not.
+pub struct DriveTombstones {
+    inner: std::sync::Mutex<(
+        std::collections::HashMap<i64, TombstoneReason>,
+        std::collections::VecDeque<i64>,
+    )>,
+    cap: usize,
+}
+
+impl Default for DriveTombstones {
+    fn default() -> Self {
+        Self::with_capacity(50_000)
+    }
+}
+
+impl DriveTombstones {
+    pub fn with_capacity(cap: usize) -> Self {
+        Self {
+            inner: std::sync::Mutex::new((
+                std::collections::HashMap::new(),
+                std::collections::VecDeque::new(),
+            )),
+            cap: cap.max(1),
+        }
+    }
+
+    /// Record that this execution must not be re-driven.
+    pub fn mark(&self, execution_id: i64, reason: TombstoneReason) {
+        let mut g = self.inner.lock().unwrap();
+        if g.0.insert(execution_id, reason).is_none() {
+            g.1.push_back(execution_id);
+            while g.1.len() > self.cap {
+                if let Some(old) = g.1.pop_front() {
+                    g.0.remove(&old);
+                }
+            }
+        }
+    }
+
+    pub fn get(&self, execution_id: i64) -> Option<TombstoneReason> {
+        self.inner.lock().unwrap().0.get(&execution_id).copied()
+    }
+
+    /// Deliberate self-heal: a real event resumes the execution.
+    pub fn clear(&self, execution_id: i64) -> bool {
+        let mut g = self.inner.lock().unwrap();
+        if g.0.remove(&execution_id).is_some() {
+            g.1.retain(|id| *id != execution_id);
+            return true;
+        }
+        false
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner.lock().unwrap().0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
 /// Per-execution orchestrator state cache.  The outer `std::Mutex` guards a
 /// short get-or-insert; the inner per-execution `tokio::Mutex` is held across
 /// the orchestrator's DB round-trips so a single execution's triggers serialise
@@ -932,6 +1035,7 @@ impl AppState {
             affinity,
             start_time: std::time::Instant::now(),
             orch_cache: Arc::new(OrchStateCache::default()),
+            drive_tombstones: Arc::new(DriveTombstones::default()),
             chain_heads: Arc::new(ChainHeads::with_coherence(coherence.clone())),
             chain_tails: Arc::new(ChainTails::default()),
             exec_descriptors: Arc::new(ExecDescriptors::with_coherence(coherence)),
