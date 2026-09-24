@@ -5621,6 +5621,83 @@ mod reconcile_cap_tests {
         );
     }
 
+    /// ⚠⚠ The THIRD place this same defect hid, and the one that shipped.
+    ///
+    /// `dispatch_offserver_stateless_drive` calls `clear()` for every real event
+    /// — as the `else if` CONDITION, so it runs whether or not a tombstone
+    /// exists — and `clear()` used to drop the budget along with the tombstone.
+    /// A single event anywhere in a 225-poll window therefore reset the count to
+    /// zero.
+    ///
+    /// Measured in prod 2026-09-24, 34 minutes after noetl/ai-meta#462 shipped:
+    /// `retrigger_recorded` ran at 79.6/min across ~101 in-flight executions —
+    /// one real event per execution every ~76s — against a budget needing 1800s
+    /// of quiet. `reconcile_giveup` stayed 0 and `offserver_retry` held 24.7/min,
+    /// its pre-deploy rate. The cap could not be reached by construction.
+    ///
+    /// A real event is NOT progress. Progress is an applied drive, which zeroes
+    /// the budget through `reconcile_decision(advanced = true)`. An execution
+    /// that keeps receiving events and still never advances is the exact
+    /// population the cap exists to bound.
+    #[test]
+    fn decay_survives_a_real_event_that_does_not_advance() {
+        const CAP: u32 = 225;
+        // Prod cadence: a real event roughly every 9-10 polls of the 8s loop.
+        const REAL_EVENT_EVERY: u32 = 10;
+        const ID: i64 = 7;
+        let tombs = DriveTombstones::default();
+
+        let mut rounds = 0u32;
+        let mut real_events = 0u32;
+        while tombs.get(ID).is_none() {
+            rounds += 1;
+            assert!(
+                rounds <= CAP * 4,
+                "after {rounds} polls ({real_events} real events) the execution is \
+                 STILL being driven — a real event that did not advance it refilled \
+                 the budget, which is exactly what shipped in noetl/ai-meta#462"
+            );
+            // A real event arrives and does NOT advance the execution.
+            if rounds % REAL_EVENT_EVERY == 0 {
+                tombs.clear(ID);
+                real_events += 1;
+            }
+            let before = tombs.noops(ID);
+            let (n, give_up) = reconcile_decision(false, before, CAP);
+            tombs.set_noops(ID, n);
+            if give_up {
+                tombs.mark(ID, TombstoneReason::GaveUp);
+            }
+        }
+        assert_eq!(
+            rounds, CAP,
+            "the cap must still be reached in exactly {CAP} polls despite \
+             {real_events} intervening real events"
+        );
+        assert!(real_events > 0, "the test must actually have delivered events");
+    }
+
+    /// ⭐ POSITIVE CONTROL for the change above: `clear()` must still perform the
+    /// self-heal it exists for — dropping the TOMBSTONE — even though it no
+    /// longer drops the budget. Without this, "preserve the budget" could be
+    /// satisfied by making `clear()` do nothing at all.
+    #[test]
+    fn clear_still_drops_the_tombstone_while_preserving_the_budget() {
+        let tombs = DriveTombstones::default();
+        tombs.set_noops(11, 100);
+        tombs.mark(11, TombstoneReason::GaveUp);
+        assert!(tombs.get(11).is_some());
+        // mark() frees the budget; the execution then resumes on a real event.
+        tombs.set_noops(11, 100);
+        assert!(tombs.clear(11), "a real event must still clear the tombstone");
+        assert!(tombs.get(11).is_none(), "self-heal must survive this change");
+        assert_eq!(
+            tombs.noops(11),
+            100,
+            "but the no-progress budget must NOT be refilled by that event"
+        );
+    }
+
     /// ⭐ POSITIVE CONTROL. Without it the test above would pass on a tombstone
     /// that swallowed everything, including executions that are making progress.
     #[test]

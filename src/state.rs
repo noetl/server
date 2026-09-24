@@ -769,8 +769,23 @@ impl DriveTombstones {
     }
 
     /// Deliberate self-heal: a real event resumes the execution.
+    ///
+    /// ⚠⚠ This drops the TOMBSTONE and deliberately leaves the BUDGET alone.
+    /// It used to remove the budget too, and that made the cap unreachable for
+    /// exactly the population it exists to bound — the third place this same
+    /// defect hid. `dispatch_offserver_stateless_drive` calls this for EVERY
+    /// real event, as the `else if` condition, so a single event anywhere in a
+    /// 225-poll window reset the count to zero. Measured in prod 2026-09-24,
+    /// 34 minutes after shipping noetl/ai-meta#462: `retrigger_recorded` ran at
+    /// 79.6/min across ~101 in-flight executions — one real event per
+    /// execution every ~76s against a budget needing 1800s of quiet. giveup
+    /// stayed 0 and offserver_retry held 24.7/min, its pre-deploy rate.
+    ///
+    /// A real event is not progress. Progress is an APPLIED drive, and that
+    /// already zeroes the budget via `reconcile_decision(advanced = true)`.
+    /// An execution that keeps receiving events and still never advances is
+    /// precisely what the cap is for.
     pub fn clear(&self, execution_id: i64) -> bool {
-        self.budgets.lock().unwrap().remove(&execution_id);
         let mut g = self.inner.lock().unwrap();
         if g.0.remove(&execution_id).is_some() {
             g.1.retain(|id| *id != execution_id);
