@@ -264,3 +264,120 @@ pub fn legacy_would_advance(view: &ChainView, spine_buildable: bool) -> bool {
         None => false,
     }
 }
+
+// ---------------------------------------------------------------------------
+// Wiring: what the reconcile poller does with a decision.
+// ---------------------------------------------------------------------------
+
+/// Where the poller gets an execution's chain.
+///
+/// ⚠ Injectable on purpose. The obvious implementation reads `noetl.event`,
+/// which means new SQL — and new SQL is exactly where this codebase has been
+/// bitten: server#443 selected `NULL::text AS content` into a `String` field,
+/// passed unit tests **and** a throwaway-Postgres proof that ran raw SQL, and
+/// then returned HTTP 500 on every `/api/catalog/list` call in production.
+/// *A test that renders SQL is not a test that decodes it.*
+///
+/// So the source is a seam: this increment wires the **decision and the budget
+/// semantics**, which are pure logic and fully testable, and leaves the
+/// Postgres-backed source to its own change where it can be decode-tested
+/// against a real database.
+pub trait ChainSource: Send + Sync {
+    /// The execution's chain, or `None` when this source cannot supply one.
+    fn chain_for(&self, execution_id: i64) -> Option<ChainView>;
+    fn source_name(&self) -> &'static str;
+}
+
+/// What the poller should do, derived from an [`AdvanceDecision`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PollerAction {
+    /// The no-op budget after this tick.
+    pub noops: u32,
+    /// Whether to give up and evict.
+    pub give_up: bool,
+    /// Whether to stop polling because the execution is finished.
+    pub terminal: bool,
+    /// The key this execution is waiting for, when blocked.
+    pub waiting_on: Option<String>,
+    /// Stable label for the decision that produced this.
+    pub decision: &'static str,
+}
+
+/// **The replacement for `reconcile_decision` when the flag is on.**
+///
+/// ⭐ The single most important line in this module is that
+/// [`AdvanceDecision::BlockedAtGap`] **leaves the budget unchanged**.
+///
+/// Today a blocked execution is indistinguishable from a no-op, so it burns
+/// budget every tick and is eventually given up on — or, when something resets
+/// the budget, re-driven forever. Here it is neither: it is *waiting on a named
+/// key*. There is nothing to retry blindly, so there is no budget to spend and
+/// no cap to reach.
+///
+/// `Advance` **resets** the budget, because progress is progress. `Terminal`
+/// stops polling. `Forked` does not retry — a fork is an alarm, and re-driving
+/// it would append to a chain that already has two heads.
+pub fn apply_chain_decision(decision: &AdvanceDecision, noops_before: u32) -> PollerAction {
+    let label = decision.label();
+    match decision {
+        AdvanceDecision::Advance { .. } => PollerAction {
+            noops: 0,
+            give_up: false,
+            terminal: false,
+            waiting_on: None,
+            decision: label,
+        },
+        AdvanceDecision::Terminal { .. } => PollerAction {
+            noops: 0,
+            give_up: false,
+            terminal: true,
+            waiting_on: None,
+            decision: label,
+        },
+        AdvanceDecision::BlockedAtGap {
+            missing_event_id, ..
+        } => PollerAction {
+            // ⭐ UNCHANGED. Not incremented: this is not a no-op, it is a wait.
+            noops: noops_before,
+            give_up: false,
+            terminal: false,
+            waiting_on: Some(missing_event_id.clone()),
+            decision: label,
+        },
+        AdvanceDecision::Empty => PollerAction {
+            noops: noops_before,
+            give_up: false,
+            terminal: false,
+            waiting_on: None,
+            decision: label,
+        },
+        AdvanceDecision::Forked { .. } => PollerAction {
+            noops: noops_before,
+            give_up: false,
+            terminal: false,
+            waiting_on: None,
+            decision: label,
+        },
+    }
+}
+
+/// Consult the chain source and decide, when the flag is on.
+///
+/// Returns `None` when chain-following cannot be used for this tick — the flag
+/// is off, or the source has no chain for this execution. The caller then runs
+/// today's path unchanged.
+///
+/// ⚠ A `None` here is **not** silent: the caller logs which of the two it was.
+/// A flag that appears taken while changing nothing is the defect shape this
+/// program keeps finding.
+pub fn poller_action(
+    source: &dyn ChainSource,
+    execution_id: i64,
+    noops_before: u32,
+) -> Option<PollerAction> {
+    if !chain_advance_enabled() {
+        return None;
+    }
+    let view = source.chain_for(execution_id)?;
+    Some(apply_chain_decision(&decide(&view), noops_before))
+}

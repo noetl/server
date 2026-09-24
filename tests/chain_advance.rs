@@ -13,6 +13,29 @@ use noetl_server::chain_advance::{
     ChainView, CHAIN_ADVANCE_ENV,
 };
 
+/// ⚠ **Env-var tests must serialise.** `cargo test` runs tests in a thread pool
+/// and does NOT serialise them — a SAFETY note elsewhere in this program once
+/// claimed it did, and the tests raced. Every test below that mutates
+/// `NOETL_CHAIN_ADVANCE` takes this lock, and restores the previous value.
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Run `f` with `NOETL_CHAIN_ADVANCE` set to `value` (or removed), serialised,
+/// restoring whatever was there before.
+fn with_flag<T>(value: Option<&str>, f: impl FnOnce() -> T) -> T {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let prev = std::env::var(CHAIN_ADVANCE_ENV).ok();
+    match value {
+        Some(v) => unsafe { std::env::set_var(CHAIN_ADVANCE_ENV, v) },
+        None => unsafe { std::env::remove_var(CHAIN_ADVANCE_ENV) },
+    }
+    let out = f();
+    match prev {
+        Some(v) => unsafe { std::env::set_var(CHAIN_ADVANCE_ENV, v) },
+        None => unsafe { std::env::remove_var(CHAIN_ADVANCE_ENV) },
+    }
+    out
+}
+
 fn ev(seq: u64, id: &str, prev: Option<&str>, terminal: bool) -> ChainEventView {
     ChainEventView {
         exec_seq: seq,
@@ -47,22 +70,18 @@ fn seven_event_chain() -> ChainView {
 
 #[test]
 fn the_flag_is_off_by_default_and_fails_safe() {
-    let prev = std::env::var(CHAIN_ADVANCE_ENV).ok();
-    unsafe { std::env::remove_var(CHAIN_ADVANCE_ENV) };
-    assert!(!chain_advance_enabled(), "default MUST be off");
+    with_flag(None, || {
+        assert!(!chain_advance_enabled(), "default MUST be off");
+    });
     for junk in ["", " ", "off", "no", "0", "enabled", "chain"] {
-        unsafe { std::env::set_var(CHAIN_ADVANCE_ENV, junk) };
-        assert!(
-            !chain_advance_enabled(),
-            "{junk:?} must not move the execution-advance path"
-        );
+        with_flag(Some(junk), || {
+            assert!(
+                !chain_advance_enabled(),
+                "{junk:?} must not move the execution-advance path"
+            );
+        });
     }
-    unsafe { std::env::set_var(CHAIN_ADVANCE_ENV, "true") };
-    assert!(chain_advance_enabled());
-    match prev {
-        Some(v) => unsafe { std::env::set_var(CHAIN_ADVANCE_ENV, v) },
-        None => unsafe { std::env::remove_var(CHAIN_ADVANCE_ENV) },
-    }
+    with_flag(Some("true"), || assert!(chain_advance_enabled()));
 }
 
 // ---------------------------------------------------------------------------
@@ -324,4 +343,177 @@ fn a_prod_sized_chain_decides_in_one_pass() {
         took < std::time::Duration::from_millis(500),
         "a 5,000-event chain took {took:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The poller wiring: what a decision does to the no-op budget.
+// ---------------------------------------------------------------------------
+
+use noetl_server::chain_advance::{apply_chain_decision, poller_action, ChainSource, PollerAction};
+
+/// A test source. ⚠ Deliberately a double rather than the Postgres-backed
+/// source: the real one needs new SQL, and new SQL needs decode-testing against
+/// a live database (server#443 — a select that passed unit tests and a
+/// throwaway-Postgres proof and still 500'd on every prod call).
+struct FixedSource(Option<ChainView>);
+
+impl ChainSource for FixedSource {
+    fn chain_for(&self, _execution_id: i64) -> Option<ChainView> {
+        self.0.clone()
+    }
+    fn source_name(&self) -> &'static str {
+        "fixed-test-source"
+    }
+}
+
+/// ⭐⭐ **The assertion that makes the cap deletable.** A blocked execution
+/// leaves the no-op budget UNCHANGED — it is a wait on a named key, not a no-op
+/// to retry. Today the same situation burns budget every tick.
+#[test]
+fn a_blocked_execution_does_not_spend_budget() {
+    let mut blocked = seven_event_chain();
+    blocked.events.retain(|e| e.event_id != "e4-step-completed");
+    let action = apply_chain_decision(&decide(&blocked), 17);
+    assert_eq!(
+        action,
+        PollerAction {
+            noops: 17, // ⭐ unchanged, NOT 18
+            give_up: false,
+            terminal: false,
+            waiting_on: Some("e4-step-completed".to_string()),
+            decision: "blocked_at_gap",
+        },
+        "a blocked execution must not spend budget, and must name what it waits on"
+    );
+}
+
+/// Progress resets the budget.
+#[test]
+fn an_advance_resets_the_budget() {
+    let action = apply_chain_decision(&decide(&seven_event_chain()), 99);
+    assert_eq!(action.noops, 0, "progress resets the budget");
+    assert!(!action.give_up);
+    assert!(!action.terminal);
+    assert_eq!(action.decision, "advance");
+}
+
+/// A terminal execution stops polling and is not a no-op.
+#[test]
+fn a_terminal_execution_stops_polling_without_spending_budget() {
+    let mut v = seven_event_chain();
+    v.events
+        .push(ev(8, "e8-done", Some("e7-step-completed"), true));
+    let action = apply_chain_decision(&decide(&v), 42);
+    assert!(action.terminal, "must stop polling");
+    assert!(!action.give_up, "finishing is not giving up");
+    assert_eq!(action.noops, 0);
+}
+
+/// ⭐ **No decision ever gives up.** That is the property that lets the cap and
+/// its 18.7-hour arithmetic be deleted outright rather than tuned.
+#[test]
+fn no_chain_decision_ever_gives_up() {
+    let complete = seven_event_chain();
+    let mut blocked = seven_event_chain();
+    blocked.events.retain(|e| e.event_id != "e4-step-completed");
+    let mut terminal = seven_event_chain();
+    terminal
+        .events
+        .push(ev(8, "e8-done", Some("e7-step-completed"), true));
+    let empty = ChainView::new("e", vec![]);
+    let forked = ChainView::new(
+        "e",
+        vec![
+            ev(1, "e1", None, false),
+            ev(2, "a", Some("e1"), false),
+            ev(3, "b", Some("e1"), false),
+        ],
+    );
+
+    for (name, v) in [
+        ("complete", complete),
+        ("blocked", blocked),
+        ("terminal", terminal),
+        ("empty", empty),
+        ("forked", forked),
+    ] {
+        // Start at the cap itself: even there, nothing gives up.
+        let action = apply_chain_decision(&decide(&v), 225);
+        assert!(
+            !action.give_up,
+            "{name}: chain-following must never give up — there is nothing to \
+             retry blindly, so there is nothing to bound"
+        );
+    }
+}
+
+/// ⚠ A blocked execution at the cap still does not give up, and still does not
+/// climb. This is the exact state that produced 53 permanently re-driven
+/// executions.
+#[test]
+fn a_blocked_execution_at_the_cap_neither_gives_up_nor_climbs() {
+    let mut blocked = seven_event_chain();
+    blocked.events.retain(|e| e.event_id != "e4-step-completed");
+    let d = decide(&blocked);
+    for before in [0u32, 1, 224, 225, 10_000] {
+        let a = apply_chain_decision(&d, before);
+        assert_eq!(a.noops, before, "budget moved from {before}");
+        assert!(!a.give_up, "gave up at {before}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The flag gate on the wiring.
+// ---------------------------------------------------------------------------
+
+/// With the flag OFF, `poller_action` returns `None` — the caller runs today's
+/// path. This is the additive guarantee.
+#[test]
+fn with_the_flag_off_the_poller_falls_through_to_todays_path() {
+    with_flag(None, || {
+        let src = FixedSource(Some(seven_event_chain()));
+        assert!(
+            poller_action(&src, 1, 5).is_none(),
+            "flag off MUST fall through, even with a working source"
+        );
+    });
+}
+
+/// With the flag ON and a source, the chain decision is used.
+#[test]
+fn with_the_flag_on_and_a_source_the_chain_decision_is_used() {
+    with_flag(Some("true"), || {
+        let mut blocked = seven_event_chain();
+        blocked.events.retain(|e| e.event_id != "e4-step-completed");
+        let src = FixedSource(Some(blocked));
+        let action = poller_action(&src, 1, 7).expect("the chain path must engage");
+        assert_eq!(action.decision, "blocked_at_gap");
+        assert_eq!(action.noops, 7, "budget untouched");
+        assert_eq!(action.waiting_on.as_deref(), Some("e4-step-completed"));
+
+        // ⚠ And with the flag on but NO chain available, it falls through rather
+        // than inventing a decision from nothing.
+        let empty_src = FixedSource(None);
+        assert!(
+            poller_action(&empty_src, 1, 7).is_none(),
+            "no chain available must fall through, not fabricate a decision"
+        );
+    });
+}
+
+/// ⚠ **Positive control for the two flag tests.** If `poller_action` returned
+/// `None` unconditionally, both "falls through" assertions would pass and the
+/// wiring would be inert while looking wired — the defect shape this program
+/// keeps finding.
+#[test]
+fn poller_action_is_capable_of_returning_some() {
+    with_flag(Some("1"), || {
+        let src = FixedSource(Some(seven_event_chain()));
+        let got = poller_action(&src, 1, 0);
+        assert!(
+            got.is_some(),
+            "poller_action must be capable of engaging, or the flag-off tests are vacuous"
+        );
+        assert_eq!(got.unwrap().decision, "advance");
+    });
 }
