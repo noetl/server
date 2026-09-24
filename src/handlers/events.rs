@@ -2998,6 +2998,15 @@ pub fn spawn_orchestrator_reconciler(state: AppState) {
                          real event resumes it (noetl/ai-meta#315)"
                     );
                     crate::metrics::record_reconcile_giveup("max_noops");
+                    // ⚠⚠ Record the give-up BEFORE evicting. `consecutive_reconcile_noops`
+                    // lives IN the slot being evicted, so without this the next
+                    // `orch_cache.entry` recreates it at zero and the budget
+                    // restarts — a sawtooth, not a halt. That is why prod showed
+                    // 0.17 give-ups/min against 15.9 retries/min, and why 32 of 43
+                    // executions were still being re-driven 14 hours later.
+                    state
+                        .drive_tombstones
+                        .mark(execution_id, crate::state::TombstoneReason::GaveUp);
                     state.orch_cache.evict(execution_id);
                 }
             }
@@ -3032,9 +3041,41 @@ async fn dispatch_offserver_stateless_drive(
     trigger_event_id: i64,
     desc: &crate::state::ExecDescriptor,
 ) -> AppResult<i32> {
+    // ⚠⚠ Tombstone guard (noetl/ai-meta#315) — checked BEFORE the descriptor,
+    // because the descriptor is exactly what eviction destroys.
+    //
+    // A poller tick passes `i64::MAX` as the trigger id; a real event passes a
+    // real one. That existing distinction is the self-heal the give-up comment
+    // always promised: a real event clears the tombstone and the execution
+    // resumes, while a poller tick cannot resurrect it.
+    if trigger_event_id == i64::MAX {
+        if let Some(reason) = state.drive_tombstones.get(execution_id) {
+            crate::metrics::record_orchestrate_drive(match reason {
+                crate::state::TombstoneReason::Terminal => "tombstone_terminal_skip",
+                crate::state::TombstoneReason::GaveUp => "tombstone_gaveup_skip",
+            });
+            debug!(
+                execution_id,
+                ?reason,
+                "stateless drive: tombstoned; not re-driving (noetl/ai-meta#315)"
+            );
+            return Ok(0);
+        }
+    } else if state.drive_tombstones.clear(execution_id) {
+        debug!(
+            execution_id,
+            "stateless drive: a real event cleared the tombstone; resuming"
+        );
+    }
+
     // Terminal guard — no event read.  A cancel/finalize/completion already
     // stamped the descriptor; stop re-dispatching and free the in-memory state.
     if desc.terminal {
+        // ⚠ Record it BEFORE evicting, or the eviction below destroys the only
+        // record that this execution is terminal — the original defect.
+        state
+            .drive_tombstones
+            .mark(execution_id, crate::state::TombstoneReason::Terminal);
         state.exec_descriptors.evict(execution_id).await;
         state.orch_cache.evict(execution_id);
         state.chain_heads.evict(execution_id).await;
@@ -5444,6 +5485,122 @@ mod snapshot_gate_tests {
 #[cfg(test)]
 mod reconcile_cap_tests {
     use super::reconcile_decision;
+    use crate::state::{DriveTombstones, TombstoneReason};
+
+    /// ⭐ The property #315 is actually about: a fixed set of stuck executions
+    /// must DECAY TO ZERO under the cap, not oscillate forever.
+    ///
+    /// This models the shipped loop: `reconcile_decision` decides, and on
+    /// give-up the slot is evicted — which is precisely what used to destroy the
+    /// counter. The tombstone is what survives that eviction.
+    ///
+    /// ⚠ Without the tombstone this test does not merely fail, it never
+    /// terminates in the meaningful sense: the set stays at its original size
+    /// for any number of rounds. The bounded round count makes that a loud
+    /// failure rather than a hang.
+    #[test]
+    fn a_stuck_set_decays_to_zero_under_the_cap() {
+        const CAP: u32 = 225;
+        const STUCK: i64 = 43; // the population measured in prod
+        let tombs = DriveTombstones::default();
+        // Per-execution noop budget, destroyed on eviction exactly like the slot.
+        let mut budget: std::collections::HashMap<i64, u32> =
+            (0..STUCK).map(|i| (i, 0u32)).collect();
+
+        let mut drives: std::collections::HashMap<i64, usize> = Default::default();
+        let mut still_driven = STUCK as usize;
+        let mut rounds = 0u32;
+        while still_driven > 0 {
+            rounds += 1;
+            assert!(
+                rounds <= CAP * 4,
+                "after {rounds} polls {still_driven} executions are STILL being \
+                 re-driven — the set is not decaying; this is the sawtooth"
+            );
+            still_driven = 0;
+            for id in 0..STUCK {
+                // The shipped guard: a poller tick never re-drives a tombstoned id.
+                if tombs.get(id).is_some() {
+                    continue;
+                }
+                still_driven += 1;
+                *drives.entry(id).or_insert(0) += 1;
+                let before = *budget.get(&id).unwrap_or(&0);
+                let (n, give_up) = reconcile_decision(false, before, CAP);
+                budget.insert(id, n);
+                if give_up {
+                    tombs.mark(id, TombstoneReason::GaveUp);
+                    budget.remove(&id); // eviction destroys the counter
+                }
+            }
+        }
+        let max_drives = drives.values().copied().max().unwrap_or(0);
+        assert_eq!(
+            tombs.len(),
+            STUCK as usize,
+            "every stuck execution must end tombstoned"
+        );
+        // The bound that matters: NO execution is driven more than the cap.
+        // `rounds` is CAP+1 because the final round is the one that observes
+        // zero still-driven — the 225th drive is what trips the cap.
+        assert_eq!(
+            rounds,
+            CAP + 1,
+            "decay took {rounds} rounds; expected {} drives plus one round to \
+             observe zero",
+            CAP
+        );
+        assert!(
+            max_drives <= CAP as usize,
+            "an execution was driven {max_drives} times against a cap of {CAP} — \
+             the budget is being reset, which is the sawtooth"
+        );
+    }
+
+    /// ⭐ POSITIVE CONTROL. Without it the test above would pass on a tombstone
+    /// that swallowed everything, including executions that are making progress.
+    #[test]
+    fn an_advancing_execution_is_never_tombstoned() {
+        const CAP: u32 = 225;
+        let tombs = DriveTombstones::default();
+        let mut budget = 0u32;
+        for _ in 0..(CAP * 3) {
+            let (n, give_up) = reconcile_decision(true, budget, CAP); // advanced
+            budget = n;
+            assert!(!give_up, "a progressing execution must never hit the cap");
+        }
+        assert!(
+            tombs.is_empty(),
+            "a progressing execution must never be tombstoned"
+        );
+    }
+
+    /// The self-heal the give-up comment promised, made deliberate: a REAL event
+    /// clears the tombstone; a poller tick does not.
+    #[test]
+    fn a_real_event_clears_a_tombstone_and_a_poller_tick_does_not() {
+        let tombs = DriveTombstones::default();
+        tombs.mark(7, TombstoneReason::GaveUp);
+        assert!(tombs.get(7).is_some());
+        assert!(!tombs.clear(9), "clearing an unmarked id must report false");
+        assert!(tombs.get(7).is_some(), "an unrelated clear must not resurrect it");
+        assert!(tombs.clear(7), "a real event must clear it");
+        assert!(tombs.get(7).is_none(), "and it must then be drivable again");
+    }
+
+    /// The bound the original eviction existed to provide is preserved.
+    #[test]
+    fn tombstones_are_bounded_and_evict_oldest_first() {
+        let tombs = DriveTombstones::with_capacity(3);
+        for id in 1..=5 {
+            tombs.mark(id, TombstoneReason::Terminal);
+        }
+        assert_eq!(tombs.len(), 3, "the set must stay bounded");
+        assert!(tombs.get(1).is_none(), "oldest must be evicted first");
+        assert!(tombs.get(5).is_some(), "newest must be retained");
+    }
+
+
     // =======================================================================
     // noetl/ai-meta#315 — the reconcile poller must stop re-driving an
     // execution that cannot advance.
