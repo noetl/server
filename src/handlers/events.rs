@@ -2980,12 +2980,22 @@ pub fn spawn_orchestrator_reconciler(state: AppState) {
                 // Terminating the execution is a different job, owned by
                 // `nonconvergence_sweep`, on a 24h grace and default-off.
                 let cap = state.config.reconcile_max_noops;
-                let entry = state.orch_cache.entry(execution_id);
+                // ⚠⚠ The budget is read from and written to `drive_tombstones`,
+                // NOT the orch_cache slot. It used to live in the slot
+                // (`ExecOrchState::consecutive_reconcile_noops`), and there are
+                // SIX `orch_cache.evict` sites — every one reset it to zero, so
+                // it could never reach the cap and the give-up never fired.
+                //
+                // Measured in prod 2026-09-24, 47 minutes after shipping the
+                // tombstone that hangs off give-up: giveup=0, tombstone=0, and
+                // offserver_retry 473 -> 787 (~21/min, unchanged). The cap was
+                // due at ~05:42 and did not fire. Moving the RECORD of a give-up
+                // out of the slot was necessary but insufficient while the
+                // BUDGET that triggers it still lived inside.
                 let (noops, give_up) = {
-                    let mut g = entry.lock().await;
-                    let (n, give_up) =
-                        reconcile_decision(advanced, g.consecutive_reconcile_noops, cap);
-                    g.consecutive_reconcile_noops = n;
+                    let before = state.drive_tombstones.noops(execution_id);
+                    let (n, give_up) = reconcile_decision(advanced, before, cap);
+                    state.drive_tombstones.set_noops(execution_id, n);
                     (n, give_up)
                 };
                 if give_up {
@@ -5554,6 +5564,60 @@ mod reconcile_cap_tests {
             max_drives <= CAP as usize,
             "an execution was driven {max_drives} times against a cap of {CAP} — \
              the budget is being reset, which is the sawtooth"
+        );
+    }
+
+    /// ⭐⭐ The test that would have caught the half-fix: decay must hold **while
+    /// the orch_cache slot is being evicted**, which is what production does.
+    ///
+    /// The first version of this fix moved only the give-up RECORD out of the
+    /// slot and left the budget inside. Six `orch_cache.evict` sites then reset
+    /// it every time, so the cap never fired. Deployed to prod it changed
+    /// nothing measurable in 47 minutes: `giveup=0`, `tombstone=0`, and
+    /// `offserver_retry` 473 -> 787 (~21/min, unchanged from pre-fix).
+    ///
+    /// This models that: the slot is evicted on EVERY poll. If the budget lives
+    /// in the slot the loop never terminates; the bounded round count turns that
+    /// into a loud failure instead of a hang.
+    #[test]
+    fn decay_survives_orch_cache_eviction_on_every_poll() {
+        const CAP: u32 = 225;
+        const STUCK: i64 = 43;
+        let tombs = DriveTombstones::default();
+
+        let mut still_driven = STUCK as usize;
+        let mut rounds = 0u32;
+        while still_driven > 0 {
+            rounds += 1;
+            assert!(
+                rounds <= CAP * 4,
+                "after {rounds} polls {still_driven} executions are STILL driven — \
+                 the budget is being reset by eviction, which is exactly what the \
+                 half-fix did in production"
+            );
+            still_driven = 0;
+            for id in 0..STUCK {
+                if tombs.get(id).is_some() {
+                    continue;
+                }
+                still_driven += 1;
+                // The budget is read from the eviction-surviving store...
+                let before = tombs.noops(id);
+                let (n, give_up) = reconcile_decision(false, before, CAP);
+                tombs.set_noops(id, n);
+                if give_up {
+                    tombs.mark(id, TombstoneReason::GaveUp);
+                }
+                // ...and the slot is evicted every single poll. This is the line
+                // that kills the half-fix and leaves this one standing.
+            }
+        }
+        assert_eq!(tombs.len(), STUCK as usize, "all must end tombstoned");
+        assert_eq!(rounds, CAP + 1, "decay must still take exactly the cap");
+        assert_eq!(
+            tombs.budget_len(),
+            0,
+            "budgets must be freed once the tombstone is set"
         );
     }
 

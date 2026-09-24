@@ -226,15 +226,11 @@ pub struct ExecOrchState {
     /// that 8s wait into an immediate re-dispatch.  In-memory only, like the
     /// guard it shadows; a server restart re-derives the drive from the log.
     pub orchestrate_retrigger_pending: bool,
-    /// Consecutive reconcile polls that did **not** advance this execution
-    /// (noetl/ai-meta#315).
-    ///
-    /// Reset to 0 by any poll that issues a command. When it reaches
-    /// `reconcile_max_noops` the poller stops re-driving and evicts the entry —
-    /// otherwise an execution whose WAL chain can never complete is re-driven
-    /// every 8s forever, and, because `evict` only runs on a terminal event, it
-    /// never leaves this map either.
-    pub consecutive_reconcile_noops: u32,
+    // ⚠ `consecutive_reconcile_noops` USED to live here and was removed on
+    // 2026-09-24. Storing the budget in this slot was the defect: there are six
+    // `orch_cache.evict` sites and each reset it to zero, so it never reached
+    // the cap. It now lives in `DriveTombstones`, which survives eviction. Do
+    // not re-add it here.
 }
 
 /// Per-execution chain head for the one-level event chain (RFC #115 Phase 2,
@@ -730,6 +726,8 @@ pub struct DriveTombstones {
         std::collections::HashMap<i64, TombstoneReason>,
         std::collections::VecDeque<i64>,
     )>,
+    /// Consecutive-no-progress budgets, OUTSIDE the evictable orch_cache slot.
+    budgets: std::sync::Mutex<std::collections::HashMap<i64, u32>>,
     cap: usize,
 }
 
@@ -746,12 +744,15 @@ impl DriveTombstones {
                 std::collections::HashMap::new(),
                 std::collections::VecDeque::new(),
             )),
+            budgets: std::sync::Mutex::new(std::collections::HashMap::new()),
             cap: cap.max(1),
         }
     }
 
     /// Record that this execution must not be re-driven.
     pub fn mark(&self, execution_id: i64, reason: TombstoneReason) {
+        // The budget has done its job; free it.
+        self.budgets.lock().unwrap().remove(&execution_id);
         let mut g = self.inner.lock().unwrap();
         if g.0.insert(execution_id, reason).is_none() {
             g.1.push_back(execution_id);
@@ -769,6 +770,7 @@ impl DriveTombstones {
 
     /// Deliberate self-heal: a real event resumes the execution.
     pub fn clear(&self, execution_id: i64) -> bool {
+        self.budgets.lock().unwrap().remove(&execution_id);
         let mut g = self.inner.lock().unwrap();
         if g.0.remove(&execution_id).is_some() {
             g.1.retain(|id| *id != execution_id);
@@ -783,6 +785,49 @@ impl DriveTombstones {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// The consecutive-no-progress budget for an execution.
+    ///
+    /// ⚠⚠ This lives HERE, not in the orch_cache slot, and that is the whole
+    /// point. `consecutive_reconcile_noops` used to be a field on
+    /// `ExecOrchState` — inside the slot — and there are **six**
+    /// `orch_cache.evict` sites. Every one of them reset the budget to zero, so
+    /// it could never reach the cap and the give-up never fired.
+    ///
+    /// Measured in production on 2026-09-24, 47 minutes after deploying the
+    /// tombstone fix that hangs off give-up:
+    ///
+    /// ```text
+    /// 05:39  giveup=0  tombstone=0  offserver_retry=473
+    /// 05:54  giveup=0  tombstone=0  offserver_retry=787     (~21/min, unchanged)
+    /// ```
+    ///
+    /// The cap was due at ~05:42 and did not fire. Moving the *record* of a
+    /// give-up out of the slot was necessary but insufficient while the *budget*
+    /// that triggers it still lived inside.
+    pub fn noops(&self, execution_id: i64) -> u32 {
+        self.budgets.lock().unwrap().get(&execution_id).copied().unwrap_or(0)
+    }
+
+    /// Store the budget, bounded the same way the tombstones are.
+    pub fn set_noops(&self, execution_id: i64, n: u32) {
+        let mut g = self.budgets.lock().unwrap();
+        if n == 0 {
+            g.remove(&execution_id);
+            return;
+        }
+        if g.len() >= self.cap && !g.contains_key(&execution_id) {
+            // Bounded: drop an arbitrary entry rather than grow without limit.
+            if let Some(k) = g.keys().next().copied() {
+                g.remove(&k);
+            }
+        }
+        g.insert(execution_id, n);
+    }
+
+    pub fn budget_len(&self) -> usize {
+        self.budgets.lock().unwrap().len()
     }
 }
 
