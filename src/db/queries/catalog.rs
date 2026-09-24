@@ -181,12 +181,69 @@ fn body_columns(include_content: bool) -> &'static str {
     }
 }
 
+/// The `payload` column, or a listing projection of it.
+///
+/// ⚠⚠ noetl/server#436 replaced `content` and `layout` with typed NULLs and left
+/// `payload` selected unconditionally. Once those two were NULL, `payload` became
+/// **98.1% of the response** — measured on prod 2026-09-24, 13.28 MB of a 13.82 MB
+/// listing — and **`workflow` alone is 92.6%** of that. The #436 guard asserted
+/// only content+layout, so the test encoded the same omission as the code.
+///
+/// Every consumer of a LISTED payload reads exactly three things:
+/// `metadata.description` and `metadata.name` (the console's card + search, and
+/// `NoetlPrompt`), and `workflow.length` — the "Tasks" count on the catalog card.
+/// Nothing renders a listed workflow's step bodies; the editor and the test lab
+/// fetch a single entry through `/api/catalog/resource`.
+///
+/// So the listing keeps `metadata` — and every other key — intact and replaces
+/// each workflow STEP with `{}`. The array keeps its length, so
+/// `payload?.workflow?.length` is unchanged for existing clients, and the step
+/// bodies never leave Postgres. Asking for bodies returns the real column.
+///
+/// ⚠ A NULL `payload` stays NULL: `jsonb_typeof(NULL->'workflow')` is NULL, so the
+/// CASE falls through to `ELSE payload`.
+fn payload_column(include_content: bool) -> &'static str {
+    if include_content {
+        "payload"
+    } else {
+        "CASE WHEN jsonb_typeof(payload->'workflow') = 'array' \
+              THEN jsonb_set(payload, '{workflow}', \
+                     coalesce((SELECT jsonb_agg('{}'::jsonb) \
+                               FROM jsonb_array_elements(payload->'workflow')), '[]'::jsonb)) \
+              ELSE payload END AS payload"
+    }
+}
+
 /// The inner row source, shared by the count and the page so they cannot
 /// disagree about what "matching" means.
 fn matching_rows(kind: Option<&str>, archived: &str, opts: &CatalogListOptions) -> String {
+    matching_rows_for(kind, archived, opts, false)
+}
+
+/// `for_count` selects the smallest column list that still defines the same row
+/// set, because counting does not read any of them.
+///
+/// ⚠ This exists because `payload_column` is no longer a bare column
+/// reference: for a listing it carries a sublink over `jsonb_array_elements`.
+/// Leaving that in the count's row source would make "how many are there" pay
+/// for a projection it discards — the same mistake #436's own comment warns
+/// about for the bodies. `path` and `version` are kept because the
+/// `latest_only` branch's `DISTINCT ON (path) … ORDER BY path, version DESC`
+/// needs both in scope.
+fn matching_rows_for(
+    kind: Option<&str>,
+    archived: &str,
+    opts: &CatalogListOptions,
+    for_count: bool,
+) -> String {
     let body = body_columns(opts.include_content);
     let kind_pred = if kind.is_some() { "kind = $1" } else { "1 = 1" };
-    let cols = format!("catalog_id, path, kind, version, {body}, payload, meta, created_at");
+    let payload = payload_column(opts.include_content);
+    let cols = if for_count {
+        "path, version".to_string()
+    } else {
+        format!("catalog_id, path, kind, version, {body}, {payload}, meta, created_at")
+    };
     if opts.latest_only {
         // DISTINCT ON keeps the first row per path under ITS ordering, so the
         // version ordering has to live here and the display ordering outside.
@@ -223,7 +280,7 @@ pub async fn list_catalog_entries(
     };
     let count_sql = format!(
         "SELECT count(*) FROM ({}) t",
-        matching_rows(kind, archived, &count_opts)
+        matching_rows_for(kind, archived, &count_opts, true)
     );
     let total: (i64,) = if let Some(k) = kind {
         sqlx::query_as(&count_sql).bind(k).fetch_one(pool).await?
@@ -496,6 +553,93 @@ pub async fn restore_catalog_entries(
 mod catalog_listing_shape {
     use super::*;
 
+    /// ⭐⭐ THE GENERIC GUARD #436 DID NOT HAVE.
+    ///
+    /// #436 asserted that `content` and `layout` were nulled — the two columns it
+    /// happened to fix — so `payload` stayed selected verbatim and became **98.1%
+    /// of the response**. A guard naming only the columns already fixed cannot
+    /// fail on the next one.
+    ///
+    /// This asserts the PROPERTY instead: no heavy column appears as a bare
+    /// reference in a listing's select list. Add a heavy column to the table and
+    /// this fails until it is nulled or projected.
+    #[test]
+    fn a_listing_selects_no_heavy_column_verbatim() {
+        const HEAVY: [&str; 3] = ["content", "layout", "payload"];
+        let sql = matching_rows(None, "", &CatalogListOptions::default());
+        let select_list = sql
+            .split_once("SELECT")
+            .expect("no SELECT")
+            .1
+            .split_once(" FROM ")
+            .expect("no FROM")
+            .0
+            .to_string();
+        // Strip the DISTINCT ON prefix so its `(path)` is not mistaken for a column.
+        let select_list = select_list
+            .split_once(')')
+            .filter(|(head, _)| head.contains("DISTINCT ON"))
+            .map(|(_, tail)| tail.to_string())
+            .unwrap_or(select_list);
+        for col in HEAVY {
+            let bare = select_list
+                .split(',')
+                .map(str::trim)
+                .any(|f| f == col);
+            assert!(
+                !bare,
+                "a listing selects `{col}` verbatim; it must be a typed NULL or a \
+                 projection, or its bytes leave Postgres for every row. \
+                 select list: {select_list}"
+            );
+        }
+    }
+
+    /// ⭐ The projection must preserve exactly what listing clients read.
+    ///
+    /// The console's catalog card shows `payload.workflow.length` as "Tasks", so
+    /// the array has to keep its length while losing its step bodies. It also
+    /// reads `payload.metadata.description` / `.name`, so `metadata` must survive
+    /// untouched — which is why this projects the workflow key rather than
+    /// nulling the whole payload.
+    #[test]
+    fn the_listing_payload_keeps_workflow_length_and_metadata() {
+        let listing = payload_column(false);
+        assert!(
+            listing.contains("jsonb_set(payload, '{workflow}'")
+                && listing.contains("jsonb_agg('{}'::jsonb)")
+                && listing.contains("jsonb_array_elements(payload->'workflow')"),
+            "the listing must replace each workflow STEP with an empty object, \
+             preserving the array length: {listing}"
+        );
+        assert!(
+            !listing.contains("NULL::jsonb AS payload"),
+            "nulling the whole payload would break the catalog page's description, \
+             name and Tasks count: {listing}"
+        );
+        assert_eq!(
+            payload_column(true),
+            "payload",
+            "asking for bodies must fetch the real column"
+        );
+    }
+
+    /// ⚠ Counting must not pay for a projection it discards — the same mistake
+    /// #436's own comment warns about for the bodies.
+    #[test]
+    fn the_count_row_source_carries_no_payload_projection() {
+        let opts = CatalogListOptions::default();
+        let counting = matching_rows_for(None, "", &opts, true);
+        assert!(
+            !counting.contains("jsonb_array_elements"),
+            "the count must not evaluate the payload projection: {counting}"
+        );
+        assert!(
+            counting.contains("path") && counting.contains("version"),
+            "the count still needs path+version for the latest_only DISTINCT ON: {counting}"
+        );
+    }
+
     /// ⭐ noetl/server#436. The bodies must not be SELECTed when they are not
     /// wanted — the whole point is that the bytes never leave Postgres.
     #[test]
@@ -586,3 +730,4 @@ mod catalog_listing_shape {
         );
     }
 }
+
