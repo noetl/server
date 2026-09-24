@@ -2992,6 +2992,22 @@ pub fn spawn_orchestrator_reconciler(state: AppState) {
                 // due at ~05:42 and did not fire. Moving the RECORD of a give-up
                 // out of the slot was necessary but insufficient while the
                 // BUDGET that triggers it still lived inside.
+                // ⚠ The chain read is awaited HERE, outside the decision
+                // block. `block_on` inside it would park a runtime worker on
+                // I/O for every execution on every tick.
+                let chain_action = match state.chain_source.as_ref() {
+                    Some(src) => {
+                        let before = state.drive_tombstones.noops(execution_id);
+                        crate::chain_advance::poller_action(
+                            src.as_ref(),
+                            execution_id,
+                            before,
+                        )
+                        .await
+                    }
+                    None => None,
+                };
+
                 let (noops, give_up) = {
                     let before = state.drive_tombstones.noops(execution_id);
 
@@ -3007,10 +3023,6 @@ pub fn spawn_orchestrator_reconciler(state: AppState) {
                     //
                     // With the flag off, or with no chain source configured,
                     // this is `None` and the existing path runs untouched.
-                    let chain_action = state.chain_source.as_deref().and_then(|src| {
-                        crate::chain_advance::poller_action(src, execution_id, before)
-                    });
-
                     match chain_action {
                         Some(action) => {
                             if let Some(ref key) = action.waiting_on {

@@ -250,3 +250,195 @@ fn terminal_event_types_are_enumerated() {
     assert!(!is_terminal_event_type("command.issued"));
     assert_eq!(TERMINAL_EVENT_TYPES.len(), 5);
 }
+
+// ---------------------------------------------------------------------------
+// The config gate: TWO independent switches, both default off.
+// ---------------------------------------------------------------------------
+
+use noetl_server::chain_advance::CHAIN_ADVANCE_ENV;
+use noetl_server::db::queries::event_chain::{chain_source_from_env, CHAIN_SOURCE_ENV};
+
+/// Serialised: these mutate two process-wide env vars.
+static GATE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+async fn with_gates<T, Fut: std::future::Future<Output = T>>(
+    advance: Option<&str>,
+    source: Option<&str>,
+    f: impl FnOnce() -> Fut,
+) -> T {
+    let _g = GATE_LOCK.lock().await;
+    let (pa, ps) = (
+        std::env::var(CHAIN_ADVANCE_ENV).ok(),
+        std::env::var(CHAIN_SOURCE_ENV).ok(),
+    );
+    for (k, v) in [(CHAIN_ADVANCE_ENV, advance), (CHAIN_SOURCE_ENV, source)] {
+        match v {
+            Some(x) => unsafe { std::env::set_var(k, x) },
+            None => unsafe { std::env::remove_var(k) },
+        }
+    }
+    let out = f().await;
+    for (k, v) in [(CHAIN_ADVANCE_ENV, pa), (CHAIN_SOURCE_ENV, ps)] {
+        match v {
+            Some(x) => unsafe { std::env::set_var(k, x) },
+            None => unsafe { std::env::remove_var(k) },
+        }
+    }
+    out
+}
+
+/// ⭐⭐ **The safety property, stated as a test.** Both gates must be on before
+/// a chain source exists. Any other combination leaves the poller on today's
+/// path — which is what makes merging and deploying this inert.
+#[tokio::test]
+async fn a_source_is_built_only_when_BOTH_gates_are_on() {
+    let Some(p) = pool().await else {
+        eprintln!("SKIP: NOETL_TEST_PG_URL unset");
+        return;
+    };
+
+    // The full truth table.
+    for (advance, source, expect_some) in [
+        (None, None, false),                      // today
+        (Some("true"), None, false),              // advance on, no source
+        (None, Some("postgres"), false),          // source named, advance off
+        (Some("false"), Some("postgres"), false), // explicitly off
+        (Some("true"), Some("postgres"), true),   // ⭐ the only combination
+    ] {
+        let got = with_gates(advance, source, || async {
+            chain_source_from_env(&p).is_some()
+        })
+        .await;
+        assert_eq!(
+            got, expect_some,
+            "advance={advance:?} source={source:?} should yield some={expect_some}"
+        );
+    }
+}
+
+/// ⚠ A typo in the source name must not enable it.
+#[tokio::test]
+async fn an_unrecognised_source_resolves_to_none() {
+    let Some(p) = pool().await else {
+        return;
+    };
+    for junk in ["", " ", "postgress", "pgsql", "sql", "true", "1", "ehdb"] {
+        let got = with_gates(Some("true"), Some(junk), || async {
+            chain_source_from_env(&p).is_some()
+        })
+        .await;
+        assert!(!got, "source {junk:?} must not build a chain source");
+    }
+    // ⚠ Control: the accepted spellings DO build one, or the test above is
+    // satisfied by a function that always returns None.
+    for ok in ["postgres", "pg", "  POSTGRES  "] {
+        let got = with_gates(Some("true"), Some(ok), || async {
+            chain_source_from_env(&p).is_some()
+        })
+        .await;
+        assert!(got, "source {ok:?} must build a chain source");
+    }
+}
+
+/// ⭐ End to end through the trait: with both gates on, the source reads the
+/// truncated fixture from Postgres and the poller action is BlockedAtGap with
+/// the budget untouched.
+#[tokio::test]
+async fn both_gates_on_yields_blocked_at_gap_with_the_budget_untouched() {
+    let Some(p) = pool().await else {
+        eprintln!("SKIP: NOETL_TEST_PG_URL unset");
+        return;
+    };
+    let action = with_gates(Some("true"), Some("postgres"), || async {
+        let src = chain_source_from_env(&p).expect("both gates on");
+        assert_eq!(src.source_name(), "postgres");
+        noetl_server::chain_advance::poller_action(src.as_ref(), 1002, 23).await
+    })
+    .await
+    .expect("the chain path must engage");
+
+    assert_eq!(action.decision, "blocked_at_gap");
+    assert_eq!(action.waiting_on.as_deref(), Some("14"));
+    assert_eq!(action.noops, 23, "the budget must be UNTOUCHED, not 24");
+    assert!(!action.give_up);
+}
+
+/// And the complete fixture advances, resetting the budget.
+#[tokio::test]
+async fn both_gates_on_yields_advance_on_a_complete_chain() {
+    let Some(p) = pool().await else {
+        return;
+    };
+    let action = with_gates(Some("true"), Some("postgres"), || async {
+        let src = chain_source_from_env(&p).unwrap();
+        noetl_server::chain_advance::poller_action(src.as_ref(), 1001, 99).await
+    })
+    .await
+    .expect("engaged");
+    assert_eq!(action.decision, "advance");
+    assert_eq!(action.noops, 0, "progress resets the budget");
+}
+
+/// ⚠⚠ **A read FAILURE must fall through, not read as an empty chain.**
+///
+/// Added because a mutant that returned `Some(empty_view)` on a read error
+/// SURVIVED the battery: nothing exercised the failure path. The distinction is
+/// not cosmetic — an empty view makes `decide()` return `Empty`, which is a
+/// DECISION MADE ON BAD DATA. `None` falls through to the reconcile path for
+/// that tick, which costs one tick of old behaviour and asserts nothing false.
+///
+/// Uses a real database that genuinely lacks the table, so the failure is a
+/// real sqlx error rather than a stubbed one.
+#[tokio::test]
+async fn a_read_failure_falls_through_rather_than_reporting_an_empty_chain() {
+    let Some(base) = pg_url() else {
+        eprintln!("SKIP: NOETL_TEST_PG_URL unset");
+        return;
+    };
+    // Same server, a database with no `noetl` schema at all.
+    let broken_url = base
+        .rsplit_once('/')
+        .map(|(h, _)| format!("{h}/noetl_noschema"));
+    let Some(broken_url) = broken_url else {
+        panic!("could not derive the no-schema URL from {base}");
+    };
+    let Ok(broken) = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(std::time::Duration::from_secs(10))
+        .connect(&broken_url)
+        .await
+    else {
+        panic!("the no-schema database must exist for this test to mean anything");
+    };
+
+    // Control: the read genuinely fails there.
+    assert!(
+        read_chain(&broken, 1001, 10).await.is_err(),
+        "the fixture for this test is wrong — the read must actually FAIL"
+    );
+
+    use noetl_server::chain_advance::ChainSource;
+    let src = noetl_server::db::queries::event_chain::PgChainSource::new(broken, 10);
+    assert!(
+        src.chain_for(1001).await.is_none(),
+        "a failed read must yield None (fall through), never Some(empty) — an \
+         empty view would make decide() return Empty, a decision on bad data"
+    );
+}
+
+/// ⚠ Control for the test above: the *working* pool does yield `Some`. Without
+/// it, "returns None on failure" is satisfied by a source that always returns
+/// None.
+#[tokio::test]
+async fn a_working_source_does_yield_some() {
+    let Some(p) = pool().await else {
+        return;
+    };
+    use noetl_server::chain_advance::ChainSource;
+    let src = noetl_server::db::queries::event_chain::PgChainSource::new(p, 100);
+    let view = src
+        .chain_for(1001)
+        .await
+        .expect("a healthy read must yield Some");
+    assert_eq!(view.events.len(), 7);
+}

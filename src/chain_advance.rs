@@ -282,9 +282,15 @@ pub fn legacy_would_advance(view: &ChainView, spine_buildable: bool) -> bool {
 /// semantics**, which are pure logic and fully testable, and leaves the
 /// Postgres-backed source to its own change where it can be decode-tested
 /// against a real database.
+#[async_trait::async_trait]
 pub trait ChainSource: Send + Sync {
     /// The execution's chain, or `None` when this source cannot supply one.
-    fn chain_for(&self, execution_id: i64) -> Option<ChainView>;
+    ///
+    /// ⚠ Async because the real source reads a database. The alternative —
+    /// `block_on` inside the poller — would park a runtime worker on I/O for
+    /// every execution on every tick, which on a loop already measured at
+    /// ~299 s/tick is precisely the wrong direction.
+    async fn chain_for(&self, execution_id: i64) -> Option<ChainView>;
     fn source_name(&self) -> &'static str;
 }
 
@@ -370,7 +376,7 @@ pub fn apply_chain_decision(decision: &AdvanceDecision, noops_before: u32) -> Po
 /// ⚠ A `None` here is **not** silent: the caller logs which of the two it was.
 /// A flag that appears taken while changing nothing is the defect shape this
 /// program keeps finding.
-pub fn poller_action(
+pub async fn poller_action(
     source: &dyn ChainSource,
     execution_id: i64,
     noops_before: u32,
@@ -378,6 +384,6 @@ pub fn poller_action(
     if !chain_advance_enabled() {
         return None;
     }
-    let view = source.chain_for(execution_id)?;
+    let view = source.chain_for(execution_id).await?;
     Some(apply_chain_decision(&decide(&view), noops_before))
 }
