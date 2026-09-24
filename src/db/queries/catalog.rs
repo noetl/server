@@ -195,10 +195,19 @@ fn body_columns(include_content: bool) -> &'static str {
 /// Nothing renders a listed workflow's step bodies; the editor and the test lab
 /// fetch a single entry through `/api/catalog/resource`.
 ///
-/// So the listing keeps `metadata` — and every other key — intact and replaces
-/// each workflow STEP with `{}`. The array keeps its length, so
-/// `payload?.workflow?.length` is unchanged for existing clients, and the step
-/// bodies never leave Postgres. Asking for bodies returns the real column.
+/// So the listing BUILDS a reduced object rather than editing the stored one:
+/// `metadata` verbatim, plus a workflow array of empty objects. The array keeps
+/// its length, so `payload?.workflow?.length` — the console's "Tasks" count — is
+/// unchanged for existing clients, while the step bodies and every other key
+/// (`workload`, `keychain`, `workbook`, …) stay in Postgres.
+///
+/// ⭐ Building the object also drops `anthropic_secret_path` / `openai_secret_path`
+/// from listings, which a catalog page has no reason to carry.
+///
+/// Asking for bodies returns the real column, and the detail path
+/// (`get_catalog_by_id` / `get_catalog_by_path_version`) is untouched — it still
+/// selects `content, layout, payload, meta`, so the editor and any consumer that
+/// needs a real body fetches one entry through `/api/catalog/resource`.
 ///
 /// ⚠ A NULL `payload` stays NULL: `jsonb_typeof(NULL->'workflow')` is NULL, so the
 /// CASE falls through to `ELSE payload`.
@@ -206,11 +215,12 @@ fn payload_column(include_content: bool) -> &'static str {
     if include_content {
         "payload"
     } else {
-        "CASE WHEN jsonb_typeof(payload->'workflow') = 'array' \
-              THEN jsonb_set(payload, '{workflow}', \
-                     coalesce((SELECT jsonb_agg('{}'::jsonb) \
-                               FROM jsonb_array_elements(payload->'workflow')), '[]'::jsonb)) \
-              ELSE payload END AS payload"
+        "CASE WHEN payload IS NULL THEN NULL ELSE jsonb_strip_nulls(jsonb_build_object( \
+              'metadata', payload->'metadata', \
+              'workflow', CASE WHEN jsonb_typeof(payload->'workflow') = 'array' \
+                               THEN coalesce((SELECT jsonb_agg('{}'::jsonb) \
+                                    FROM jsonb_array_elements(payload->'workflow')), '[]'::jsonb) \
+                               ELSE NULL END)) END AS payload"
     }
 }
 
@@ -606,12 +616,20 @@ mod catalog_listing_shape {
     fn the_listing_payload_keeps_workflow_length_and_metadata() {
         let listing = payload_column(false);
         assert!(
-            listing.contains("jsonb_set(payload, '{workflow}'")
+            listing.contains("jsonb_build_object")
+                && listing.contains("'metadata', payload->'metadata'")
                 && listing.contains("jsonb_agg('{}'::jsonb)")
                 && listing.contains("jsonb_array_elements(payload->'workflow')"),
-            "the listing must replace each workflow STEP with an empty object, \
-             preserving the array length: {listing}"
+            "the listing must BUILD {{metadata, workflow-stub}}, preserving the \
+             array length: {listing}"
         );
+        // The body keys must not be carried by a listing at all.
+        for heavy in ["'workload'", "'keychain'", "'workbook'"] {
+            assert!(
+                !listing.contains(heavy),
+                "a listing must not carry {heavy}: {listing}"
+            );
+        }
         assert!(
             !listing.contains("NULL::jsonb AS payload"),
             "nulling the whole payload would break the catalog page's description, \
@@ -730,4 +748,5 @@ mod catalog_listing_shape {
         );
     }
 }
+
 
