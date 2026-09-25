@@ -164,3 +164,80 @@ pub fn rows_to_chain_view(
         .collect();
     crate::chain_advance::ChainView::new(execution_id.to_string(), events)
 }
+
+/// **The Postgres-backed [`ChainSource`](crate::chain_advance::ChainSource).**
+///
+/// Constructed only when `NOETL_CHAIN_ADVANCE` is on **and**
+/// `NOETL_CHAIN_SOURCE=postgres` — see
+/// [`chain_source_from_env`](crate::db::queries::event_chain::chain_source_from_env).
+/// Both default off, so this is never built unless an operator asks for it
+/// twice.
+pub struct PgChainSource {
+    pool: DbPool,
+    /// Upper bound on rows per execution, so one pathological execution cannot
+    /// pull an unbounded result set onto the poller path.
+    limit: i64,
+}
+
+/// Default per-execution row cap.
+pub const DEFAULT_CHAIN_READ_LIMIT: i64 = 10_000;
+
+impl PgChainSource {
+    pub fn new(pool: DbPool, limit: i64) -> Self {
+        Self { pool, limit }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::chain_advance::ChainSource for PgChainSource {
+    /// ⚠ A read FAILURE returns `None`, which makes the poller fall through to
+    /// today's path — deliberately, and it is the conservative direction: a
+    /// database hiccup must not be mistaken for "this execution has no chain",
+    /// which `decide` would read as `Empty`. Falling through costs a tick of
+    /// the old behaviour; misreading it would change a decision on bad data.
+    async fn chain_for(&self, execution_id: i64) -> Option<crate::chain_advance::ChainView> {
+        match read_chain(&self.pool, execution_id, self.limit).await {
+            Ok(rows) => Some(rows_to_chain_view(execution_id, rows)),
+            Err(e) => {
+                tracing::warn!(
+                    execution_id,
+                    error = %e,
+                    "chain-advance: chain read failed; falling through to the reconcile \
+                     path for this tick rather than treating the execution as empty"
+                );
+                None
+            }
+        }
+    }
+
+    fn source_name(&self) -> &'static str {
+        "postgres"
+    }
+}
+
+/// Env var selecting the chain source. **Default `off`.**
+pub const CHAIN_SOURCE_ENV: &str = "NOETL_CHAIN_SOURCE";
+
+/// Build the chain source from configuration.
+///
+/// ⭐ **Two independent gates, both default-off.** `NOETL_CHAIN_ADVANCE` decides
+/// whether chain-following is wanted at all; `NOETL_CHAIN_SOURCE` decides where
+/// the chain comes from. Either one unset leaves the poller on today's path.
+///
+/// ⚠ Unrecognised values resolve to `off`, matching the fail-safe precedent
+/// throughout this codebase: a typo must never move the execution-advance path.
+pub fn chain_source_from_env(
+    pool: &DbPool,
+) -> Option<std::sync::Arc<dyn crate::chain_advance::ChainSource>> {
+    if !crate::chain_advance::chain_advance_enabled() {
+        return None;
+    }
+    let raw = std::env::var(CHAIN_SOURCE_ENV).unwrap_or_default();
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "postgres" | "pg" => Some(std::sync::Arc::new(PgChainSource::new(
+            pool.clone(),
+            DEFAULT_CHAIN_READ_LIMIT,
+        ))),
+        _ => None,
+    }
+}

@@ -1090,6 +1090,9 @@ impl AppState {
             None
         };
 
+        // Built before the struct literal takes `db`.
+        let chain_source = crate::db::queries::event_chain::chain_source_from_env(&db);
+
         Self {
             db,
             pools,
@@ -1104,8 +1107,11 @@ impl AppState {
             start_time: std::time::Instant::now(),
             orch_cache: Arc::new(OrchStateCache::default()),
             drive_tombstones: Arc::new(DriveTombstones::default()),
-            // Default OFF: the poller runs today's path until a source is wired.
-            chain_source: None,
+            // ⭐ Two independent gates, both default-off: NOETL_CHAIN_ADVANCE
+            // (is chain-following wanted) and NOETL_CHAIN_SOURCE (where the
+            // chain comes from). Either unset leaves this None and the poller
+            // on today's path.
+            chain_source,
             chain_heads: Arc::new(ChainHeads::with_coherence(coherence.clone())),
             chain_tails: Arc::new(ChainTails::default()),
             exec_descriptors: Arc::new(ExecDescriptors::with_coherence(coherence)),

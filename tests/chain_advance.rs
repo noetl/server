@@ -17,18 +17,39 @@ use noetl_server::chain_advance::{
 /// and does NOT serialise them — a SAFETY note elsewhere in this program once
 /// claimed it did, and the tests raced. Every test below that mutates
 /// `NOETL_CHAIN_ADVANCE` takes this lock, and restores the previous value.
-static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// ⚠ A `tokio::sync::Mutex`, not `std::sync` — the guard is held across an
+/// `.await` in the async flag tests, and a `std` guard is not `Send`.
+static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Run `f` with `NOETL_CHAIN_ADVANCE` set to `value` (or removed), serialised,
 /// restoring whatever was there before.
-fn with_flag<T>(value: Option<&str>, f: impl FnOnce() -> T) -> T {
-    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+async fn with_flag<T>(value: Option<&str>, f: impl FnOnce() -> T) -> T {
+    let _guard = ENV_LOCK.lock().await;
     let prev = std::env::var(CHAIN_ADVANCE_ENV).ok();
     match value {
         Some(v) => unsafe { std::env::set_var(CHAIN_ADVANCE_ENV, v) },
         None => unsafe { std::env::remove_var(CHAIN_ADVANCE_ENV) },
     }
     let out = f();
+    match prev {
+        Some(v) => unsafe { std::env::set_var(CHAIN_ADVANCE_ENV, v) },
+        None => unsafe { std::env::remove_var(CHAIN_ADVANCE_ENV) },
+    }
+    out
+}
+
+/// The same, for a body that must `.await` (anything calling `poller_action`).
+async fn with_flag_async<T, Fut: std::future::Future<Output = T>>(
+    value: Option<&str>,
+    f: impl FnOnce() -> Fut,
+) -> T {
+    let _guard = ENV_LOCK.lock().await;
+    let prev = std::env::var(CHAIN_ADVANCE_ENV).ok();
+    match value {
+        Some(v) => unsafe { std::env::set_var(CHAIN_ADVANCE_ENV, v) },
+        None => unsafe { std::env::remove_var(CHAIN_ADVANCE_ENV) },
+    }
+    let out = f().await;
     match prev {
         Some(v) => unsafe { std::env::set_var(CHAIN_ADVANCE_ENV, v) },
         None => unsafe { std::env::remove_var(CHAIN_ADVANCE_ENV) },
@@ -68,20 +89,22 @@ fn seven_event_chain() -> ChainView {
 // The flag. Default off = today's path, untouched.
 // ---------------------------------------------------------------------------
 
-#[test]
-fn the_flag_is_off_by_default_and_fails_safe() {
+#[tokio::test]
+async fn the_flag_is_off_by_default_and_fails_safe() {
     with_flag(None, || {
         assert!(!chain_advance_enabled(), "default MUST be off");
-    });
+    })
+    .await;
     for junk in ["", " ", "off", "no", "0", "enabled", "chain"] {
         with_flag(Some(junk), || {
             assert!(
                 !chain_advance_enabled(),
                 "{junk:?} must not move the execution-advance path"
             );
-        });
+        })
+        .await;
     }
-    with_flag(Some("true"), || assert!(chain_advance_enabled()));
+    with_flag(Some("true"), || assert!(chain_advance_enabled())).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -357,8 +380,9 @@ use noetl_server::chain_advance::{apply_chain_decision, poller_action, ChainSour
 /// throwaway-Postgres proof and still 500'd on every prod call).
 struct FixedSource(Option<ChainView>);
 
+#[async_trait::async_trait]
 impl ChainSource for FixedSource {
-    fn chain_for(&self, _execution_id: i64) -> Option<ChainView> {
+    async fn chain_for(&self, _execution_id: i64) -> Option<ChainView> {
         self.0.clone()
     }
     fn source_name(&self) -> &'static str {
@@ -468,25 +492,28 @@ fn a_blocked_execution_at_the_cap_neither_gives_up_nor_climbs() {
 
 /// With the flag OFF, `poller_action` returns `None` — the caller runs today's
 /// path. This is the additive guarantee.
-#[test]
-fn with_the_flag_off_the_poller_falls_through_to_todays_path() {
-    with_flag(None, || {
+#[tokio::test]
+async fn with_the_flag_off_the_poller_falls_through_to_todays_path() {
+    with_flag_async(None, || async {
         let src = FixedSource(Some(seven_event_chain()));
         assert!(
-            poller_action(&src, 1, 5).is_none(),
+            poller_action(&src, 1, 5).await.is_none(),
             "flag off MUST fall through, even with a working source"
         );
-    });
+    })
+    .await;
 }
 
 /// With the flag ON and a source, the chain decision is used.
-#[test]
-fn with_the_flag_on_and_a_source_the_chain_decision_is_used() {
-    with_flag(Some("true"), || {
+#[tokio::test]
+async fn with_the_flag_on_and_a_source_the_chain_decision_is_used() {
+    with_flag_async(Some("true"), || async {
         let mut blocked = seven_event_chain();
         blocked.events.retain(|e| e.event_id != "e4-step-completed");
         let src = FixedSource(Some(blocked));
-        let action = poller_action(&src, 1, 7).expect("the chain path must engage");
+        let action = poller_action(&src, 1, 7)
+            .await
+            .expect("the chain path must engage");
         assert_eq!(action.decision, "blocked_at_gap");
         assert_eq!(action.noops, 7, "budget untouched");
         assert_eq!(action.waiting_on.as_deref(), Some("e4-step-completed"));
@@ -495,7 +522,7 @@ fn with_the_flag_on_and_a_source_the_chain_decision_is_used() {
         // than inventing a decision from nothing.
         let empty_src = FixedSource(None);
         assert!(
-            poller_action(&empty_src, 1, 7).is_none(),
+            poller_action(&empty_src, 1, 7).await.is_none(),
             "no chain available must fall through, not fabricate a decision"
         );
     });
@@ -505,15 +532,16 @@ fn with_the_flag_on_and_a_source_the_chain_decision_is_used() {
 /// `None` unconditionally, both "falls through" assertions would pass and the
 /// wiring would be inert while looking wired — the defect shape this program
 /// keeps finding.
-#[test]
-fn poller_action_is_capable_of_returning_some() {
-    with_flag(Some("1"), || {
+#[tokio::test]
+async fn poller_action_is_capable_of_returning_some() {
+    with_flag_async(Some("1"), || async {
         let src = FixedSource(Some(seven_event_chain()));
-        let got = poller_action(&src, 1, 0);
+        let got = poller_action(&src, 1, 0).await;
         assert!(
             got.is_some(),
             "poller_action must be capable of engaging, or the flag-off tests are vacuous"
         );
         assert_eq!(got.unwrap().decision, "advance");
-    });
+    })
+    .await;
 }
