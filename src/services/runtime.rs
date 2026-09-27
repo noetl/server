@@ -56,6 +56,38 @@ pub struct Runtime {
     pub heartbeat: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Is this registration LIVE — i.e. did it heartbeat within
+    /// `NOETL_ORPHAN_WORKER_TTL_SECS`?
+    ///
+    /// Derived, never stored.  `status` is the worker's own last self-report and
+    /// keeps saying `"ready"` for as long as the row survives, so a crashed pod
+    /// reads as a ready worker until the hourly cleanup removes it — up to ~2h.
+    /// Every liveness CONSUMER already asks the right question
+    /// (`orphan_sweep.rs`, `nonconvergence_sweep.rs`: `heartbeat >= NOW() -
+    /// INTERVAL '1 second' * orphan_worker_ttl_secs`); only the REPORT did not,
+    /// which is how a pool of 5 live and 3 dead registrations gets read as an
+    /// under-provisioned pool with broken cleanup.  Answering it here with the
+    /// same TTL the sweeps use means the report and dispatch can never disagree.
+    #[serde(default)]
+    pub live: bool,
+    /// Seconds since this registration last heartbeat — the number that makes a
+    /// stale row obvious without the reader doing clock arithmetic.
+    #[serde(default)]
+    pub heartbeat_age_seconds: i64,
+}
+
+/// Is a registration live, and how old is its heartbeat?
+///
+/// The single definition of the question, so the reported liveness cannot drift
+/// from the liveness the sweeps enforce.  Pure, so it is testable without a
+/// database or a clock.
+pub fn runtime_liveness(
+    heartbeat: DateTime<Utc>,
+    now: DateTime<Utc>,
+    ttl_secs: i64,
+) -> (bool, i64) {
+    let age = (now - heartbeat).num_seconds();
+    (age <= ttl_secs, age)
 }
 
 /// Request to register a runtime.
@@ -111,6 +143,9 @@ pub struct RuntimeFilter {
 pub struct RuntimeService {
     db: DbPool,
     snowflake: std::sync::Arc<crate::snowflake::SnowflakeGenerator>,
+    /// The liveness TTL the sweeps use (`NOETL_ORPHAN_WORKER_TTL_SECS`), so a
+    /// reported `live` can never disagree with the sweeps' verdict.
+    liveness_ttl_secs: i64,
 }
 
 impl RuntimeService {
@@ -123,8 +158,13 @@ impl RuntimeService {
     pub fn new(
         db: DbPool,
         snowflake: std::sync::Arc<crate::snowflake::SnowflakeGenerator>,
+        liveness_ttl_secs: u64,
     ) -> Self {
-        Self { db, snowflake }
+        Self {
+            db,
+            snowflake,
+            liveness_ttl_secs: liveness_ttl_secs as i64,
+        }
     }
 
     /// Register a new runtime (worker pool, server, or broker).
@@ -352,20 +392,26 @@ impl RuntimeService {
                 heartbeat,
                 created_at,
                 updated_at,
-            )) => Ok(Runtime {
-                runtime_id,
-                name,
-                kind,
-                uri,
-                status,
-                labels,
-                capabilities,
-                capacity,
-                runtime,
-                heartbeat,
-                created_at,
-                updated_at,
-            }),
+            )) => {
+                let (live, heartbeat_age_seconds) =
+                    runtime_liveness(heartbeat, Utc::now(), self.liveness_ttl_secs);
+                Ok(Runtime {
+                    runtime_id,
+                    name,
+                    kind,
+                    uri,
+                    status,
+                    labels,
+                    capabilities,
+                    capacity,
+                    runtime,
+                    heartbeat,
+                    created_at,
+                    updated_at,
+                    live,
+                    heartbeat_age_seconds,
+                })
+            }
             None => Err(AppError::NotFound(format!(
                 "Runtime not found: {}",
                 runtime_id
@@ -407,6 +453,9 @@ impl RuntimeService {
         .fetch_all(&self.db)
         .await?;
 
+        // One clock read for the whole response: two rows with identical
+        // heartbeats must never be reported with different liveness.
+        let now = Utc::now();
         Ok(rows
             .into_iter()
             .map(
@@ -424,6 +473,8 @@ impl RuntimeService {
                     created_at,
                     updated_at,
                 )| {
+                    let (live, heartbeat_age_seconds) =
+                        runtime_liveness(heartbeat, now, self.liveness_ttl_secs);
                     Runtime {
                         runtime_id,
                         name,
@@ -437,6 +488,8 @@ impl RuntimeService {
                         heartbeat,
                         created_at,
                         updated_at,
+                        live,
+                        heartbeat_age_seconds,
                     }
                 },
             )
@@ -505,6 +558,65 @@ mod tests {
         assert!("invalid".parse::<RuntimeKind>().is_err());
     }
 
+    /// The prod reading that sent a year of investigation at the wrong thing.
+    ///
+    /// On 2026-09-27 `/api/worker/pools` returned 11 rows, 3 of them with
+    /// heartbeats 72 minutes old and every one of them `status: "ready"` —
+    /// because `status` is the worker's own last self-report and a dead pod
+    /// never files a correction.  Read as a pool census that is "2 live, 7
+    /// stale", it looks like both under-provisioning AND broken cleanup, and it
+    /// points at the claim loop.  It is neither: claim latency was ~190ms p50
+    /// throughout, and every liveness CONSUMER already filtered on heartbeat
+    /// freshness.  Only the report was silent about it.
+    #[test]
+    fn a_stale_registration_reports_itself_as_not_live() {
+        let now = Utc::now();
+        let ttl = 90; // NOETL_ORPHAN_WORKER_TTL_SECS default: 6 missed 15s beats
+
+        // The three real rows, at their real ages.
+        for age in [4324, 4325, 4333] {
+            let (live, reported_age) =
+                runtime_liveness(now - chrono::Duration::seconds(age), now, ttl);
+            assert!(!live, "a {age}s-old heartbeat must not report as live");
+            assert_eq!(reported_age, age, "the age must be reported, not hidden");
+        }
+
+        // And the five that genuinely were live, at their real ages.
+        for age in [0, 1, 2, 4, 11, 14] {
+            let (live, _) = runtime_liveness(now - chrono::Duration::seconds(age), now, ttl);
+            assert!(live, "a {age}s-old heartbeat is a working worker");
+        }
+    }
+
+    /// The boundary is inclusive, and one beat past the TTL is dead.
+    ///
+    /// The positive control matters here: without the `live` assertion,
+    /// `runtime_liveness` could return `false` unconditionally and satisfy the
+    /// test above while reporting the whole fleet dead.
+    #[test]
+    fn the_liveness_boundary_is_exactly_the_ttl() {
+        let now = Utc::now();
+        assert_eq!(
+            runtime_liveness(now - chrono::Duration::seconds(90), now, 90),
+            (true, 90),
+            "exactly at the TTL is still live — the same comparison the sweeps make"
+        );
+        assert_eq!(
+            runtime_liveness(now - chrono::Duration::seconds(91), now, 90),
+            (false, 91),
+            "one second past the TTL is dead"
+        );
+    }
+
+    /// A clock skew that puts a heartbeat in the future must not read as dead.
+    #[test]
+    fn a_future_heartbeat_is_live() {
+        let now = Utc::now();
+        let (live, age) = runtime_liveness(now + chrono::Duration::seconds(5), now, 90);
+        assert!(live, "a slightly-ahead worker clock is not a dead worker");
+        assert!(age <= 0, "a future heartbeat has a non-positive age, got {age}");
+    }
+
     #[test]
     fn test_runtime_kind_as_str() {
         assert_eq!(RuntimeKind::WorkerPool.as_str(), "worker_pool");
@@ -527,6 +639,8 @@ mod tests {
             heartbeat: Utc::now(),
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            live: true,
+            heartbeat_age_seconds: 0,
         };
 
         let json = serde_json::to_string(&runtime).unwrap();
