@@ -11,7 +11,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::error::{AppError, AppResult};
 use crate::sanitize::sanitize_sensitive_data;
@@ -4579,6 +4579,25 @@ fn take_owed_redrive(enabled: bool, pending: &mut bool) -> bool {
     enabled && std::mem::take(pending)
 }
 
+/// Which `catalog_id` may a terminal `playbook.failed` event be written with,
+/// given the one the caller passed and the one resolvable from the queue?
+///
+/// `None` means REFUSE TO EMIT. The one hard postcondition is that this never
+/// returns `Some(0)`: `noetl.event.catalog_id` is
+/// `NOT NULL REFERENCES noetl.catalog(catalog_id)` with no `catalog_id = 0`
+/// row, so a zero is an event Postgres will reject for ever while it parks the
+/// materializer's ordered drain for the whole cluster (see
+/// [`emit_playbook_failed`]).
+///
+/// Pure so the postcondition is testable without a database or an `AppState`.
+fn terminal_catalog_id(passed: i64, resolved: Option<i64>) -> Option<i64> {
+    match (passed, resolved) {
+        (0, Some(id)) if id != 0 => Some(id),
+        (0, _) => None,
+        (id, _) => Some(id),
+    }
+}
+
 /// Emit a terminal `playbook.failed` event for an execution that hit a
 /// deterministic, non-retryable orchestrator error during evaluate.
 ///
@@ -4596,6 +4615,46 @@ async fn emit_playbook_failed(
     trigger_event_id: i64,
     error: &str,
 ) -> AppResult<()> {
+    // `noetl.event.catalog_id` is `NOT NULL REFERENCES noetl.catalog(catalog_id)`
+    // and there is no `catalog_id = 0` row, so a zero here writes an event that
+    // can NEVER be inserted.  Under the publish-only gate that event still
+    // reaches the `noetl_events` WAL, where the FK rejection makes the whole
+    // batch un-ackable and it redelivers for ever — one such event parks the
+    // ordered drain and every other execution's `command.completed` queues
+    // behind it.
+    //
+    // Measured on prod 2026-09-27: five `playbook.failed` events emitted here
+    // with `catalog_id = 0` on 2026-09-24 were still looping three days later —
+    // 120,545 materializer project errors, 271s of projection lag, a 22s
+    // playbook taking 290s, 1,283 executions abandoned.  The drive's own
+    // fallback (`.filter(|c| *c != 0).unwrap_or(0)`) was the producer.
+    //
+    // So: resolve the real id from the command/event queue first, and if it is
+    // still unknown, refuse to emit.  Losing one execution's terminal event is
+    // strictly better than poisoning the event stream for the whole cluster —
+    // and an execution with no `noetl.command` and no `noetl.event` row has
+    // nothing for that event to terminate.
+    let resolved = if catalog_id == 0 {
+        get_catalog_id(state, execution_id, "playbook_failed").await?
+    } else {
+        None
+    };
+    let catalog_id = match terminal_catalog_id(catalog_id, resolved) {
+        Some(id) => id,
+        None => {
+            crate::metrics::record_orchestrate_drive("playbook_failed_no_catalog");
+            error!(
+                execution_id,
+                trigger_event_id,
+                drive_error = error,
+                "cannot emit playbook.failed: catalog_id is 0 and unresolvable from \
+                 noetl.command / noetl.event.  Refusing to write an event that violates \
+                 event_catalog_id_fkey — such an event is un-insertable and parks the \
+                 materializer's ordered drain for the whole cluster."
+            );
+            return Ok(());
+        }
+    };
     let event_id = state.snowflake.generate()?;
     // CQRS write-path chokepoint (#103 2d-3).
     let ev = crate::handlers::event_write::EventRow::new(
@@ -5543,6 +5602,59 @@ mod owed_redrive_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod terminal_catalog_id_tests {
+    use super::terminal_catalog_id;
+
+    /// The postcondition that matters: **never `Some(0)`**.
+    ///
+    /// `noetl.event.catalog_id` is `NOT NULL REFERENCES noetl.catalog(catalog_id)`
+    /// and no `catalog_id = 0` row exists, so a zero is an event Postgres will
+    /// reject on every redelivery — for ever — while it holds the head of the
+    /// materializer's ordered drain.  On prod (2026-09-27) five such
+    /// `playbook.failed` events from 2026-09-24 were still looping three days
+    /// later: 120,545 project errors, 271s of projection lag, a 22s playbook
+    /// taking 290s, 1,283 executions abandoned by the reconcile poller.
+    ///
+    /// Exhaustive over the interesting shapes of both inputs, so no combination
+    /// can sneak a zero through.
+    #[test]
+    fn a_zero_catalog_id_is_never_emitted() {
+        for passed in [0i64, 1, 717_028_015_384_821_801, -1] {
+            for resolved in [None, Some(0i64), Some(1), Some(717_028_015_384_821_801)] {
+                assert_ne!(
+                    terminal_catalog_id(passed, resolved),
+                    Some(0),
+                    "passed={passed} resolved={resolved:?} would emit an event that \
+                     violates event_catalog_id_fkey and parks the drain for the cluster"
+                );
+            }
+        }
+    }
+
+    /// The positive control: without it, `fn terminal_catalog_id(_,_) -> None`
+    /// passes the postcondition above while silently swallowing every terminal
+    /// event — an execution stuck at RUNNING for ever, which is the
+    /// noetl/ai-meta#123 regression this function must not reintroduce.
+    #[test]
+    fn a_known_catalog_id_is_always_emitted() {
+        assert_eq!(terminal_catalog_id(42, None), Some(42));
+        assert_eq!(terminal_catalog_id(42, Some(0)), Some(42));
+        // A caller that passed nothing but whose execution IS resolvable still
+        // gets its terminal event — the drive's cold-descriptor case.
+        assert_eq!(terminal_catalog_id(0, Some(99)), Some(99));
+    }
+
+    /// Refusal is reserved for the one case where there is no usable id at all.
+    #[test]
+    fn refusal_is_only_for_a_genuinely_unknown_catalog() {
+        assert_eq!(terminal_catalog_id(0, None), None);
+        assert_eq!(terminal_catalog_id(0, Some(0)), None);
+    }
+}
+
+#[cfg(test)]
 mod snapshot_gate_tests {
     use super::snapshot_gate_outcome;
 

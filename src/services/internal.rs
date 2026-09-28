@@ -24,6 +24,120 @@ use sqlx::Row;
 // Scheduled cleanup (noetl/ai-meta#96)
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Dead-letter: the landing spot for events `noetl.event` will never accept.
+// ---------------------------------------------------------------------------
+
+/// One event to park, with the rejection that sent it here.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DeadLetterEvent {
+    pub execution_id: i64,
+    pub event_id: i64,
+    #[serde(default)]
+    pub catalog_id: Option<i64>,
+    #[serde(default)]
+    pub event_type: Option<String>,
+    #[serde(default)]
+    pub node_name: Option<String>,
+    /// The verbatim rejection (`events/project HTTP 500: …`).
+    pub reason: String,
+    /// The complete stream payload, byte-for-byte, so the event stays replayable.
+    pub payload: JsonValue,
+    #[serde(default)]
+    pub parked_by: Option<String>,
+}
+
+/// What the sink confirmed about one park attempt.
+#[derive(Debug, Clone, Serialize)]
+pub struct DeadLetterOutcome {
+    pub execution_id: i64,
+    pub event_id: i64,
+    /// True only when a row for this `(execution_id, event_id)` is **committed and
+    /// read back**.  The caller may ack the stream message only for these.
+    pub durable: bool,
+}
+
+/// Park events in `noetl.event_dead_letter` and CONFIRM each row is durable.
+///
+/// The confirmation is not decoration.  Acking a poison stream message removes it
+/// from the durable log, so the row here is the only remaining copy: the caller
+/// must not ack until this says `durable: true`.  We therefore
+///
+/// 1. INSERT inside one transaction, `ON CONFLICT DO UPDATE` so a redelivery that
+///    races an ack re-lands the same row rather than erroring,
+/// 2. COMMIT, and
+/// 3. SELECT the rows back **after** the commit, on the same pool, and report
+///    `durable` per event from what actually came back.
+///
+/// Step 3 is what makes this a confirmation rather than an assumption: a
+/// `rows_affected` count from step 1 says the statement ran, not that the
+/// transaction committed. Anything that fails leaves `durable: false`, which the
+/// caller must treat as "do not ack".
+pub async fn dead_letter_events(
+    pool: &DbPool,
+    events: &[DeadLetterEvent],
+) -> AppResult<Vec<DeadLetterOutcome>> {
+    if events.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut tx = pool.begin().await?;
+    for e in events {
+        sqlx::query(
+            r#"
+            INSERT INTO noetl.event_dead_letter
+                (execution_id, event_id, catalog_id, event_type, node_name,
+                 reason, payload, parked_by)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            ON CONFLICT (execution_id, event_id) DO UPDATE
+               SET reason     = EXCLUDED.reason,
+                   payload    = EXCLUDED.payload,
+                   parked_by  = EXCLUDED.parked_by,
+                   parked_at  = now()
+            "#,
+        )
+        .bind(e.execution_id)
+        .bind(e.event_id)
+        .bind(e.catalog_id)
+        .bind(e.event_type.as_deref())
+        .bind(e.node_name.as_deref())
+        .bind(&e.reason)
+        .bind(&e.payload)
+        .bind(e.parked_by.as_deref())
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+
+    // Read back AFTER the commit.  This, not the insert's row count, is the
+    // durability evidence the caller's ack depends on.
+    let ids: Vec<i64> = events.iter().map(|e| e.event_id).collect();
+    let execs: Vec<i64> = events.iter().map(|e| e.execution_id).collect();
+    let found: Vec<(i64, i64)> = sqlx::query_as(
+        r#"
+        SELECT execution_id, event_id
+          FROM noetl.event_dead_letter
+         WHERE (execution_id, event_id) IN (
+                   SELECT * FROM UNNEST($1::BIGINT[], $2::BIGINT[])
+               )
+        "#,
+    )
+    .bind(&execs)
+    .bind(&ids)
+    .fetch_all(pool)
+    .await?;
+
+    let found: std::collections::HashSet<(i64, i64)> = found.into_iter().collect();
+    Ok(events
+        .iter()
+        .map(|e| DeadLetterOutcome {
+            execution_id: e.execution_id,
+            event_id: e.event_id,
+            durable: found.contains(&(e.execution_id, e.event_id)),
+        })
+        .collect())
+}
+
 /// Retention policy for one cleanup run.  All windows are inclusive of "older
 /// than"; a `0` / `None` window means **skip that table** so an empty body is
 /// a safe no-op and the event log is never purged unless explicitly asked.
