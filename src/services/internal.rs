@@ -163,8 +163,25 @@ pub struct CleanupPolicy {
 fn default_command_days() -> i64 {
     7
 }
+/// How long a dead `worker_pool` registration survives before it is deleted.
+///
+/// Was 60, which is ~240x the worker heartbeat interval (15s) and 40x the
+/// liveness TTL (`NOETL_ORPHAN_WORKER_TTL_SECS`, 90s).  Because the cleanup
+/// playbook runs hourly, a crashed pod's row could linger for up to ~2h: on
+/// 2026-09-27 prod carried three registrations whose heartbeats were 72 minutes
+/// old, all still reporting `status: "ready"`.
+///
+/// This never gated dispatch — every liveness consumer (`orphan_sweep`,
+/// `nonconvergence_sweep`) filters on heartbeat freshness, not row presence —
+/// but it made the pool census unreadable, and an unreadable census is how a
+/// healthy claim path (~190ms p50) gets diagnosed as an under-provisioned pool.
+///
+/// 5 minutes is 20 missed heartbeats and >3x the liveness TTL, so a row is
+/// unambiguously dead by every measure long before it is removed and deletion
+/// can never flip a liveness verdict.  Kept well clear of the liveness TTL
+/// deliberately — see `cleanup_ttl_cannot_cross_the_liveness_ttl`.
 fn default_runtime_minutes() -> i64 {
-    60
+    5
 }
 
 impl Default for CleanupPolicy {
@@ -842,6 +859,40 @@ mod tests {
     use super::CleanupPolicy;
     use super::EventEnvelope;
 
+    /// The two TTLs must not cross.
+    ///
+    /// `NOETL_ORPHAN_WORKER_TTL_SECS` (90s) decides whether a worker is LIVE;
+    /// `runtime_stale_minutes` decides when its row is DELETED.  If the delete
+    /// window ever fell to or below the liveness window, a row could be removed
+    /// while the sweeps still considered that worker alive — and an absent row
+    /// reads as dead, so the same worker would be live and dead in the same tick
+    /// depending on which query won.  Keep a wide margin between them.
+    #[test]
+    fn cleanup_ttl_cannot_cross_the_liveness_ttl() {
+        let liveness_ttl_secs = crate::config::AppConfig::default().orphan_worker_ttl_secs as i64;
+        let delete_after_secs = CleanupPolicy::default().runtime_stale_minutes * 60;
+        assert!(
+            delete_after_secs >= liveness_ttl_secs * 3,
+            "a row must be dead by a wide margin before it is deleted: \
+             delete_after={delete_after_secs}s vs liveness_ttl={liveness_ttl_secs}s"
+        );
+    }
+
+    /// The tightened default is still generous in heartbeats.
+    ///
+    /// The positive control for the test above, which a delete window of a year
+    /// would also satisfy: 5 minutes is 20 missed 15s beats — dead beyond doubt —
+    /// and short enough that the pool census is readable within one cleanup run
+    /// instead of lingering for ~2h as it did on 2026-09-27.
+    #[test]
+    fn a_dead_registration_is_reaped_promptly() {
+        let minutes = CleanupPolicy::default().runtime_stale_minutes;
+        assert!(
+            (2..=10).contains(&minutes),
+            "runtime_stale_minutes={minutes} — must be minutes, not the old hour"
+        );
+    }
+
     // noetl/ai-meta#106: an EventEnvelope whose `timestamp` is timezone-less
     // (Postgres `to_jsonb` of `timestamp without time zone` — what the tailer
     // publishes) must deserialize, assuming UTC, instead of failing with the
@@ -909,12 +960,15 @@ mod tests {
         // log (source of truth) unless explicitly asked.
         let p: CleanupPolicy = serde_json::from_str("{}").unwrap();
         assert_eq!(p.command_retention_days, 7);
-        assert_eq!(p.runtime_stale_minutes, 60);
+        // 5, not the original 60: an hour-long delete window plus an hourly
+        // cleanup run left dead registrations visible for up to ~2h.  See
+        // `default_runtime_minutes` and `cleanup_ttl_cannot_cross_the_liveness_ttl`.
+        assert_eq!(p.runtime_stale_minutes, 5);
         assert_eq!(p.event_retention_days, 0, "event log must be opt-in");
         // The `Default` impl agrees with the serde defaults.
         let d = CleanupPolicy::default();
         assert_eq!(d.command_retention_days, 7);
-        assert_eq!(d.runtime_stale_minutes, 60);
+        assert_eq!(d.runtime_stale_minutes, 5);
         assert_eq!(d.event_retention_days, 0);
     }
 
@@ -949,7 +1003,7 @@ mod tests {
         assert_eq!(p.event_retention_days, 365);
         // Other fields still fall back to safe defaults.
         assert_eq!(p.command_retention_days, 7);
-        assert_eq!(p.runtime_stale_minutes, 60);
+        assert_eq!(p.runtime_stale_minutes, 5);
     }
 
     /// Verify the exponential-backoff math matches the Python side's

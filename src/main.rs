@@ -1334,7 +1334,13 @@ async fn main() -> anyhow::Result<()> {
     // (noetl/ai-meta#103 2d-3) — honouring NOETL_EVENT_INGEST_PUBLISH_ONLY.
     let execution_service =
         ExecutionService::new(state.pools.clone(), state.snowflake.clone(), state.clone());
-    let runtime_service = RuntimeService::new(db_pool.clone(), state.snowflake.clone());
+    // Same TTL the orphan / nonconvergence sweeps enforce, so the pool report
+    // and dispatch can never disagree about which workers are alive.
+    let runtime_service = RuntimeService::new(
+        db_pool.clone(),
+        state.snowflake.clone(),
+        state.config.orphan_worker_ttl_secs,
+    );
 
     // Phase D R5 Round 1 (noetl/ai-meta#49 → noetl/server#148).
     // Replay engine — per-execution event reconstruction; uses
