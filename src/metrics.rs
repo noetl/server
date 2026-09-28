@@ -132,7 +132,14 @@ pub fn orchestrate_drive_total() -> &'static IntCounterVec {
         let counter = IntCounterVec::new(
             Opts::new(
                 "noetl_orchestrate_drive_total",
-                "Worker-driven orchestrate drive events, by stage.",
+                "Worker-driven orchestrate drive events, by stage. \
+                 ⚠ `retrigger_recorded` vs `retrigger_dispatched` is NOT a loss rate: \
+                 the owed-re-drive flag is a single bool per execution, so N dropped \
+                 triggers coalesce into ONE re-drive that recomputes against the current \
+                 head and covers them all (see `take_owed_redrive`). \
+                 `offserver_retry` is the one to watch — it exceeding `applied_stateless` \
+                 means the off-server drive cannot read the WAL, which on 2026-09-27 was \
+                 a poison batch parking the materializer\'s ordered drain.",
             ),
             &["stage"],
         )

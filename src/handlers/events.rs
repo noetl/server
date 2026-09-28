@@ -11,7 +11,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::error::{AppError, AppResult};
 use crate::sanitize::sanitize_sensitive_data;
@@ -4528,8 +4528,10 @@ async fn apply_worker_orchestration(
     // re-drive loses the guard race again it re-records the flag and the next
     // clear picks it up, which terminates because each drive that wins the race
     // advances the head.
-    let owed = state.config.orch_retrigger_on_clear
-        && std::mem::take(&mut cache.orchestrate_retrigger_pending);
+    let owed = take_owed_redrive(
+        state.config.orch_retrigger_on_clear,
+        &mut cache.orchestrate_retrigger_pending,
+    );
     drop(cache);
     if owed {
         crate::metrics::record_orchestrate_drive("retrigger_dispatched");
@@ -4553,6 +4555,49 @@ async fn apply_worker_orchestration(
     Ok(commands_generated)
 }
 
+/// Claim the owed re-drive, if one is owed and the feature is on.
+///
+/// **This deliberately COALESCES.** `orchestrate_retrigger_pending` is a single
+/// bool per execution, so N triggers dropped while one drive held the in-flight
+/// guard produce ONE re-drive when it clears. That is correct — the re-drive
+/// recomputes against the current head, so it covers every dropped trigger at
+/// once — and it is why `noetl_orchestrate_drive_total{stage="retrigger_recorded"}`
+/// is far larger than `{stage="retrigger_dispatched"}` (40,490 vs 2,974 on prod
+/// 2026-09-27).
+///
+/// ⚠ **That ratio is NOT a lost-wakeup rate, and must not be "fixed".** A dropped
+/// trigger is covered three ways: this coalesced re-drive, the 8s reconcile
+/// poller (`spawn_orchestrator_reconciler`) which re-drives every cached
+/// non-terminal execution regardless of this flag, and the in-flight guard's own
+/// `IN_FLIGHT_STALE_AFTER` expiry. Reading the ratio as 92.6% loss and forcing an
+/// unconditional immediate re-drive would spin: on the `__offserver_retry__` path
+/// the precondition (the WAL has caught up) has not changed, so the re-drive
+/// fails again instantly. That path's cost is one 8s poller tick, by design.
+///
+/// Pure so the coalescing is pinned by a test instead of re-derived from metrics.
+fn take_owed_redrive(enabled: bool, pending: &mut bool) -> bool {
+    enabled && std::mem::take(pending)
+}
+
+/// Which `catalog_id` may a terminal `playbook.failed` event be written with,
+/// given the one the caller passed and the one resolvable from the queue?
+///
+/// `None` means REFUSE TO EMIT. The one hard postcondition is that this never
+/// returns `Some(0)`: `noetl.event.catalog_id` is
+/// `NOT NULL REFERENCES noetl.catalog(catalog_id)` with no `catalog_id = 0`
+/// row, so a zero is an event Postgres will reject for ever while it parks the
+/// materializer's ordered drain for the whole cluster (see
+/// [`emit_playbook_failed`]).
+///
+/// Pure so the postcondition is testable without a database or an `AppState`.
+fn terminal_catalog_id(passed: i64, resolved: Option<i64>) -> Option<i64> {
+    match (passed, resolved) {
+        (0, Some(id)) if id != 0 => Some(id),
+        (0, _) => None,
+        (id, _) => Some(id),
+    }
+}
+
 /// Emit a terminal `playbook.failed` event for an execution that hit a
 /// deterministic, non-retryable orchestrator error during evaluate.
 ///
@@ -4570,6 +4615,46 @@ async fn emit_playbook_failed(
     trigger_event_id: i64,
     error: &str,
 ) -> AppResult<()> {
+    // `noetl.event.catalog_id` is `NOT NULL REFERENCES noetl.catalog(catalog_id)`
+    // and there is no `catalog_id = 0` row, so a zero here writes an event that
+    // can NEVER be inserted.  Under the publish-only gate that event still
+    // reaches the `noetl_events` WAL, where the FK rejection makes the whole
+    // batch un-ackable and it redelivers for ever — one such event parks the
+    // ordered drain and every other execution's `command.completed` queues
+    // behind it.
+    //
+    // Measured on prod 2026-09-27: five `playbook.failed` events emitted here
+    // with `catalog_id = 0` on 2026-09-24 were still looping three days later —
+    // 120,545 materializer project errors, 271s of projection lag, a 22s
+    // playbook taking 290s, 1,283 executions abandoned.  The drive's own
+    // fallback (`.filter(|c| *c != 0).unwrap_or(0)`) was the producer.
+    //
+    // So: resolve the real id from the command/event queue first, and if it is
+    // still unknown, refuse to emit.  Losing one execution's terminal event is
+    // strictly better than poisoning the event stream for the whole cluster —
+    // and an execution with no `noetl.command` and no `noetl.event` row has
+    // nothing for that event to terminate.
+    let resolved = if catalog_id == 0 {
+        get_catalog_id(state, execution_id, "playbook_failed").await?
+    } else {
+        None
+    };
+    let catalog_id = match terminal_catalog_id(catalog_id, resolved) {
+        Some(id) => id,
+        None => {
+            crate::metrics::record_orchestrate_drive("playbook_failed_no_catalog");
+            error!(
+                execution_id,
+                trigger_event_id,
+                drive_error = error,
+                "cannot emit playbook.failed: catalog_id is 0 and unresolvable from \
+                 noetl.command / noetl.event.  Refusing to write an event that violates \
+                 event_catalog_id_fkey — such an event is un-insertable and parks the \
+                 materializer's ordered drain for the whole cluster."
+            );
+            return Ok(());
+        }
+    };
     let event_id = state.snowflake.generate()?;
     // CQRS write-path chokepoint (#103 2d-3).
     let ev = crate::handlers::event_write::EventRow::new(
@@ -5463,6 +5548,109 @@ pub(crate) fn snapshot_gate_outcome(
         Some("skipped_no_state")
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod owed_redrive_tests {
+    use super::take_owed_redrive;
+
+    /// The coalescing is the CONTRACT, not a bug.
+    ///
+    /// Many dropped triggers become one re-drive, because the re-drive recomputes
+    /// against the current head and so covers all of them. This is why
+    /// `retrigger_recorded` (40,490 on prod) dwarfs `retrigger_dispatched`
+    /// (2,974) — a ratio that reads like a 92.6% lost-wakeup rate and is not one.
+    /// Pinned here so nobody "fixes" it into an immediate-re-drive spin.
+    #[test]
+    fn many_dropped_triggers_coalesce_into_one_redrive() {
+        let mut pending = false;
+        for _ in 0..40 {
+            pending = true; // 40 triggers dropped while a drive held the guard
+        }
+        assert!(
+            take_owed_redrive(true, &mut pending),
+            "an owed re-drive must be claimed when the guard clears"
+        );
+        assert!(
+            !take_owed_redrive(true, &mut pending),
+            "and claimed ONCE — the flag is taken, not read, so one clear cannot \
+             dispatch twice"
+        );
+    }
+
+    /// Nothing owed, nothing dispatched — the common case, and the positive
+    /// control: without it, `fn take_owed_redrive(..) -> true` would satisfy the
+    /// test above while re-driving on every single guard clear.
+    #[test]
+    fn nothing_is_claimed_when_nothing_was_dropped() {
+        let mut pending = false;
+        assert!(!take_owed_redrive(true, &mut pending));
+    }
+
+    /// The feature gate wins, and must not consume the flag — flipping
+    /// `NOETL_ORCH_RETRIGGER_ON_CLEAR` off is a revert, and a revert that silently
+    /// ate pending state would not be one.
+    #[test]
+    fn the_gate_short_circuits_without_consuming() {
+        let mut pending = true;
+        assert!(!take_owed_redrive(false, &mut pending));
+        assert!(
+            pending,
+            "a disabled gate must leave the flag alone, so re-enabling resumes \
+             correctly instead of having lost a wakeup"
+        );
+    }
+}
+
+#[cfg(test)]
+mod terminal_catalog_id_tests {
+    use super::terminal_catalog_id;
+
+    /// The postcondition that matters: **never `Some(0)`**.
+    ///
+    /// `noetl.event.catalog_id` is `NOT NULL REFERENCES noetl.catalog(catalog_id)`
+    /// and no `catalog_id = 0` row exists, so a zero is an event Postgres will
+    /// reject on every redelivery — for ever — while it holds the head of the
+    /// materializer's ordered drain.  On prod (2026-09-27) five such
+    /// `playbook.failed` events from 2026-09-24 were still looping three days
+    /// later: 120,545 project errors, 271s of projection lag, a 22s playbook
+    /// taking 290s, 1,283 executions abandoned by the reconcile poller.
+    ///
+    /// Exhaustive over the interesting shapes of both inputs, so no combination
+    /// can sneak a zero through.
+    #[test]
+    fn a_zero_catalog_id_is_never_emitted() {
+        for passed in [0i64, 1, 717_028_015_384_821_801, -1] {
+            for resolved in [None, Some(0i64), Some(1), Some(717_028_015_384_821_801)] {
+                assert_ne!(
+                    terminal_catalog_id(passed, resolved),
+                    Some(0),
+                    "passed={passed} resolved={resolved:?} would emit an event that \
+                     violates event_catalog_id_fkey and parks the drain for the cluster"
+                );
+            }
+        }
+    }
+
+    /// The positive control: without it, `fn terminal_catalog_id(_,_) -> None`
+    /// passes the postcondition above while silently swallowing every terminal
+    /// event — an execution stuck at RUNNING for ever, which is the
+    /// noetl/ai-meta#123 regression this function must not reintroduce.
+    #[test]
+    fn a_known_catalog_id_is_always_emitted() {
+        assert_eq!(terminal_catalog_id(42, None), Some(42));
+        assert_eq!(terminal_catalog_id(42, Some(0)), Some(42));
+        // A caller that passed nothing but whose execution IS resolvable still
+        // gets its terminal event — the drive's cold-descriptor case.
+        assert_eq!(terminal_catalog_id(0, Some(99)), Some(99));
+    }
+
+    /// Refusal is reserved for the one case where there is no usable id at all.
+    #[test]
+    fn refusal_is_only_for_a_genuinely_unknown_catalog() {
+        assert_eq!(terminal_catalog_id(0, None), None);
+        assert_eq!(terminal_catalog_id(0, Some(0)), None);
     }
 }
 

@@ -6,6 +6,7 @@ pub mod catalog;
 pub mod credential;
 pub mod event;
 pub mod event_chain;
+pub mod event_dead_letter;
 pub mod keychain;
 pub mod object_store;
 pub mod plugin_module;

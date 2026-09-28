@@ -246,6 +246,13 @@ fn build_router(
             "/api/internal/events/project",
             post(handlers::internal::events_project),
         )
+        // The landing spot for events `noetl.event` will never accept.  Same
+        // internal-token gate as its sibling: this writes durable rows, and a
+        // caller's ack decision depends on its answer.
+        .route(
+            "/api/internal/events/dead-letter",
+            post(handlers::internal::events_dead_letter),
+        )
         .with_state(state.clone());
 
     // Keychain routes
@@ -1303,6 +1310,11 @@ async fn main() -> anyhow::Result<()> {
     // the schema this expects is db/ddl/postgres/schema_ddl.sql in this repo
     // (still provisioned from noetl/noetl's copy until ops repoints).
     noetl_server::db::queries::event_chain::ensure_columns(&db_pool).await?;
+    // Provision the dead-letter landing spot the same way: idempotent, and a
+    // permission failure is logged rather than fatal.  Without the table the
+    // materializer refuses to ack poison, so the drain stays blocked instead of
+    // dropping an event — safe, but it needs to be visible in the log.
+    noetl_server::db::queries::event_dead_letter::ensure_table(&db_pool).await?;
     // kind: Subscription (noetl/ai-meta#90 Phase 2) — seed the `subscription`
     // resource kind so a catalog register doesn't trip the
     // `noetl.catalog.kind -> noetl.resource(name)` FK.  Idempotent.
