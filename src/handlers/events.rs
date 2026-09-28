@@ -4528,8 +4528,10 @@ async fn apply_worker_orchestration(
     // re-drive loses the guard race again it re-records the flag and the next
     // clear picks it up, which terminates because each drive that wins the race
     // advances the head.
-    let owed = state.config.orch_retrigger_on_clear
-        && std::mem::take(&mut cache.orchestrate_retrigger_pending);
+    let owed = take_owed_redrive(
+        state.config.orch_retrigger_on_clear,
+        &mut cache.orchestrate_retrigger_pending,
+    );
     drop(cache);
     if owed {
         crate::metrics::record_orchestrate_drive("retrigger_dispatched");
@@ -4551,6 +4553,30 @@ async fn apply_worker_orchestration(
         });
     }
     Ok(commands_generated)
+}
+
+/// Claim the owed re-drive, if one is owed and the feature is on.
+///
+/// **This deliberately COALESCES.** `orchestrate_retrigger_pending` is a single
+/// bool per execution, so N triggers dropped while one drive held the in-flight
+/// guard produce ONE re-drive when it clears. That is correct — the re-drive
+/// recomputes against the current head, so it covers every dropped trigger at
+/// once — and it is why `noetl_orchestrate_drive_total{stage="retrigger_recorded"}`
+/// is far larger than `{stage="retrigger_dispatched"}` (40,490 vs 2,974 on prod
+/// 2026-09-27).
+///
+/// ⚠ **That ratio is NOT a lost-wakeup rate, and must not be "fixed".** A dropped
+/// trigger is covered three ways: this coalesced re-drive, the 8s reconcile
+/// poller (`spawn_orchestrator_reconciler`) which re-drives every cached
+/// non-terminal execution regardless of this flag, and the in-flight guard's own
+/// `IN_FLIGHT_STALE_AFTER` expiry. Reading the ratio as 92.6% loss and forcing an
+/// unconditional immediate re-drive would spin: on the `__offserver_retry__` path
+/// the precondition (the WAL has caught up) has not changed, so the re-drive
+/// fails again instantly. That path's cost is one 8s poller tick, by design.
+///
+/// Pure so the coalescing is pinned by a test instead of re-derived from metrics.
+fn take_owed_redrive(enabled: bool, pending: &mut bool) -> bool {
+    enabled && std::mem::take(pending)
 }
 
 /// Which `catalog_id` may a terminal `playbook.failed` event be written with,
@@ -5522,6 +5548,58 @@ pub(crate) fn snapshot_gate_outcome(
         Some("skipped_no_state")
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod owed_redrive_tests {
+    use super::take_owed_redrive;
+
+    /// The coalescing is the CONTRACT, not a bug.
+    ///
+    /// Many dropped triggers become one re-drive, because the re-drive recomputes
+    /// against the current head and so covers all of them. This is why
+    /// `retrigger_recorded` (40,490 on prod) dwarfs `retrigger_dispatched`
+    /// (2,974) — a ratio that reads like a 92.6% lost-wakeup rate and is not one.
+    /// Pinned here so nobody "fixes" it into an immediate-re-drive spin.
+    #[test]
+    fn many_dropped_triggers_coalesce_into_one_redrive() {
+        let mut pending = false;
+        for _ in 0..40 {
+            pending = true; // 40 triggers dropped while a drive held the guard
+        }
+        assert!(
+            take_owed_redrive(true, &mut pending),
+            "an owed re-drive must be claimed when the guard clears"
+        );
+        assert!(
+            !take_owed_redrive(true, &mut pending),
+            "and claimed ONCE — the flag is taken, not read, so one clear cannot \
+             dispatch twice"
+        );
+    }
+
+    /// Nothing owed, nothing dispatched — the common case, and the positive
+    /// control: without it, `fn take_owed_redrive(..) -> true` would satisfy the
+    /// test above while re-driving on every single guard clear.
+    #[test]
+    fn nothing_is_claimed_when_nothing_was_dropped() {
+        let mut pending = false;
+        assert!(!take_owed_redrive(true, &mut pending));
+    }
+
+    /// The feature gate wins, and must not consume the flag — flipping
+    /// `NOETL_ORCH_RETRIGGER_ON_CLEAR` off is a revert, and a revert that silently
+    /// ate pending state would not be one.
+    #[test]
+    fn the_gate_short_circuits_without_consuming() {
+        let mut pending = true;
+        assert!(!take_owed_redrive(false, &mut pending));
+        assert!(
+            pending,
+            "a disabled gate must leave the flag alone, so re-enabling resumes \
+             correctly instead of having lost a wakeup"
+        );
     }
 }
 
