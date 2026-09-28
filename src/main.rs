@@ -246,6 +246,13 @@ fn build_router(
             "/api/internal/events/project",
             post(handlers::internal::events_project),
         )
+        // The landing spot for events `noetl.event` will never accept.  Same
+        // internal-token gate as its sibling: this writes durable rows, and a
+        // caller's ack decision depends on its answer.
+        .route(
+            "/api/internal/events/dead-letter",
+            post(handlers::internal::events_dead_letter),
+        )
         .with_state(state.clone());
 
     // Keychain routes

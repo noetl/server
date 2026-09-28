@@ -1172,9 +1172,24 @@ mod tests {
 
     fn insert_column_and_bind_counts_agree() {
         let src = include_str!("events.rs");
+        // The TABLE is `noetl.event`, so the match must end at a table-name
+        // boundary.  A bare prefix also matches `noetl.event_dead_letter` — a
+        // different table whose shape is deliberately different, because it exists
+        // to accept a row the constrained one rejected — and these guards then
+        // report it as a truncating `noetl.event` writer.  This is precision, not
+        // leniency: every real `noetl.event` INSERT still matches.
         let needle = format!("INSERT INTO noetl.event{}", "");
+        let same_table = |src: &str, i: usize| -> bool {
+            !matches!(
+                src[i + needle.len()..].chars().next(),
+                Some(c) if c == '_' || c.is_alphanumeric()
+            )
+        };
         let mut checked = 0;
         for (i, _) in src.match_indices(&needle) {
+            if !same_table(src, i) {
+                continue; // a different table that merely shares the prefix
+            }
             let rest = &src[i..];
             let open = rest.find('(').expect("column list opens");
             let close = rest.find(')').expect("column list closes");
@@ -1308,7 +1323,19 @@ mod tests {
         // repair, and it is deliberately NOT claimed as live-validated.
         let known_truncating = ["handlers/internal.rs"];
 
+        // The TABLE is `noetl.event`, so the match must end at a table-name
+        // boundary.  A bare prefix also matches `noetl.event_dead_letter` — a
+        // different table whose shape is deliberately different, because it exists
+        // to accept a row the constrained one rejected — and these guards then
+        // report it as a truncating `noetl.event` writer.  This is precision, not
+        // leniency: every real `noetl.event` INSERT still matches.
         let needle = format!("INSERT INTO noetl.event{}", "");
+        let same_table = |src: &str, i: usize| -> bool {
+            !matches!(
+                src[i + needle.len()..].chars().next(),
+                Some(c) if c == '_' || c.is_alphanumeric()
+            )
+        };
         let mut offenders: Vec<String> = Vec::new();
         let mut scanned = 0;
         for (file, src) in [
@@ -1325,6 +1352,12 @@ mod tests {
             ),
         ] {
             for (i, _) in src.match_indices(&needle) {
+                if !same_table(src, i) {
+                    continue; // a different table that merely shares the prefix
+                }
+            if !same_table(src, i) {
+                continue; // a different table that merely shares the prefix
+            }
                 // Strip `--` comments BEFORE locating the parens, not after: a
                 // comment containing a `)` — e.g. "(emit_events publishes rather
                 // than inserting)" — otherwise closes the column list early and the
@@ -1426,7 +1459,19 @@ mod tests {
         );
 
         // Assembled so `include_str!` cannot match this test against itself.
+        // The TABLE is `noetl.event`, so the match must end at a table-name
+        // boundary.  A bare prefix also matches `noetl.event_dead_letter` — a
+        // different table whose shape is deliberately different, because it exists
+        // to accept a row the constrained one rejected — and these guards then
+        // report it as a truncating `noetl.event` writer.  This is precision, not
+        // leniency: every real `noetl.event` INSERT still matches.
         let needle = format!("INSERT INTO noetl.event{}", "");
+        let same_table = |src: &str, i: usize| -> bool {
+            !matches!(
+                src[i + needle.len()..].chars().next(),
+                Some(c) if c == '_' || c.is_alphanumeric()
+            )
+        };
         for (file, src) in [
             ("handlers/events.rs", include_str!("events.rs")),
             ("handlers/event_write.rs", include_str!("event_write.rs")),
@@ -1436,6 +1481,12 @@ mod tests {
             }
             let mut sites = 0;
             for (i, _) in src.match_indices(&needle) {
+                if !same_table(src, i) {
+                    continue; // a different table that merely shares the prefix
+                }
+            if !same_table(src, i) {
+                continue; // a different table that merely shares the prefix
+            }
                 let rest = &src[i..];
                 let open = rest.find('(').expect("column list opens");
                 let close = rest.find(')').expect("column list closes");
