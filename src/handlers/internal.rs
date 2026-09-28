@@ -299,6 +299,65 @@ pub async fn outbox_pending_count(
     Ok(Json(OutboxPendingCountResponse { pending }))
 }
 
+/// Request for `POST /api/internal/events/dead-letter`.
+#[derive(Debug, Deserialize)]
+pub struct EventsDeadLetterRequest {
+    pub events: Vec<svc::DeadLetterEvent>,
+}
+
+/// Response: one outcome per event, in request order.
+#[derive(Debug, Serialize)]
+pub struct EventsDeadLetterResponse {
+    pub outcomes: Vec<svc::DeadLetterOutcome>,
+    /// How many are confirmed durable.  The caller may ack ONLY the durable ones.
+    pub durable: usize,
+}
+
+/// `POST /api/internal/events/dead-letter`
+///
+/// Park events `noetl.event` will never accept, and report per-event whether the
+/// row is **committed and read back**.
+///
+/// This exists because freeing a poisoned drain means acking the offending stream
+/// message, and an ack removes it from the durable log — so this row becomes the
+/// only remaining copy.  The caller must not ack an event this endpoint did not
+/// confirm `durable: true` for.  A partial result is normal and safe: ack the
+/// confirmed ones, leave the rest in flight to redeliver.
+///
+/// Returns 200 even when nothing was confirmed, because "not durable" is a
+/// per-event answer the caller must act on, not a transport failure. A 5xx here
+/// would lose which of a batch DID land.
+#[tracing::instrument(skip(state, _token), fields(batch_size = request.events.len()))]
+pub async fn events_dead_letter(
+    State(state): State<AppState>,
+    _token: RequireInternalApiToken,
+    Json(request): Json<EventsDeadLetterRequest>,
+) -> AppResult<Json<EventsDeadLetterResponse>> {
+    if request.events.is_empty() {
+        return Err(crate::error::AppError::BadRequest(
+            "events must not be empty".to_string(),
+        ));
+    }
+    let outcomes = svc::dead_letter_events(&state.db, &request.events).await?;
+    let durable = outcomes.iter().filter(|o| o.durable).count();
+    if durable == outcomes.len() {
+        info!(
+            parked = durable,
+            "events/dead-letter: all rows committed and read back"
+        );
+    } else {
+        // Loud: the caller is about to NOT ack, so the stream stays blocked and
+        // somebody needs to know why.
+        tracing::error!(
+            requested = outcomes.len(),
+            durable,
+            "events/dead-letter: some rows could NOT be confirmed durable — the \
+             caller must not ack those, so the drain stays blocked until this is fixed"
+        );
+    }
+    Ok(Json(EventsDeadLetterResponse { outcomes, durable }))
+}
+
 /// `POST /api/internal/events/project`
 ///
 /// Batch-INSERT events into `noetl.event`.  Idempotent via
