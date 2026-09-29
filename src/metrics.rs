@@ -3329,6 +3329,54 @@ pub fn init_embedded_read_series() {
     }
 }
 
+/// Counter: chain-store populator outcomes (the repoint's prerequisite).
+///
+/// ⚠ Same registry as every other server metric. A counter registered on a
+/// second registry increments correctly and never appears on `/metrics`
+/// (noetl/ai-meta#389), which reads exactly like a populator that never ran.
+///
+/// ⚠ Labels are a closed set pinned at 0 in [`init_chain_populate_series`].
+/// `opened` is the one series that separates *the populator never ran* from
+/// *it ran and rejected everything* — without it both are silence.
+pub fn chain_populate_total() -> &'static prometheus::IntCounterVec {
+    static M: std::sync::OnceLock<prometheus::IntCounterVec> = std::sync::OnceLock::new();
+    M.get_or_init(|| {
+        let m = prometheus::IntCounterVec::new(
+            prometheus::Opts::new(
+                "noetl_chain_populate_total",
+                "Chain-store populator outcomes (open/populate per batch and per row)",
+            ),
+            &["outcome"],
+        )
+        .expect("valid metric");
+        registry().register(Box::new(m.clone())).ok();
+        m
+    })
+}
+
+/// Every chain-populate label. Batch verdicts plus the lifecycle/row labels the
+/// module records directly.
+pub const CHAIN_POPULATE_OUTCOMES: &[&str] = &[
+    "populated",
+    "partial",
+    "rejected",
+    "skipped",
+    "opened",
+    "open_failed",
+    "append_rejected",
+];
+
+pub fn record_chain_populate(outcome: &str) {
+    chain_populate_total().with_label_values(&[outcome]).inc();
+}
+
+/// Pin every chain-populate label at 0, **unconditionally**.
+pub fn init_chain_populate_series() {
+    for o in CHAIN_POPULATE_OUTCOMES {
+        chain_populate_total().with_label_values(&[o]).inc_by(0);
+    }
+}
+
 pub fn record_embedded_shadow(outcome: &str) {
     embedded_shadow_total().with_label_values(&[outcome]).inc();
 }

@@ -103,8 +103,22 @@ gcp_auth = "0.12"
 # open engines against one on-disk layout.  A tag is a decision someone made;
 # a rev is wherever a branch happened to be.  ehdb-l0's FORMAT_VERSION gate is
 # the belt to this braces: it refuses a layout it cannot read.
-ehdb-feed = { git = "https://github.com/noetl/ehdb", tag = "v0.3.0" }
-ehdb-l0 = { git = "https://github.com/noetl/ehdb", tag = "v0.3.0" }
+#
+# ⚠⚠ THE TWO PINS MOVE TOGETHER. `ehdb-feed` depends on `ehdb-l0`, so pinning
+# them at different tags puts TWO `ehdb-l0` versions in the graph — `D1EventLog`
+# from one and `Dataset` from the other. Here that surfaced as a compile error
+# (E0277, `command_bus.rs`), which is the lucky outcome: the unlucky one is a
+# pair of tags whose types happen to line up, and then two engine versions open
+# the same on-disk layout. That is the exact corruption vector the paragraph
+# above is about, reached by bumping only one line.
+#
+# v0.4.2 = the execution-partitioned chain store + the populator and its
+# watermark. FORMAT_VERSION is 1 in both v0.3.0 and v0.4.2, so the layout gate
+# does not refuse an existing store. The feed side of the bump carries exactly
+# one behavioural change, ehdb#373 (release a departed connection's in-flight
+# records at once).
+ehdb-feed = { git = "https://github.com/noetl/ehdb", tag = "v0.4.2" }
+ehdb-l0 = { git = "https://github.com/noetl/ehdb", tag = "v0.4.2" }
 # Value type for the JetStream KV puts in `src/coherence.rs` (multi-replica
 # watermark/descriptor coherence, RFC #115 program-scale).  Matches the version
 # async-nats already pulls in transitively.

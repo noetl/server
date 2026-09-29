@@ -96,7 +96,7 @@ fn is_mount_point(_path: &std::path::Path) -> bool {
 }
 
 /// Filesystem-facing wrapper around [`root_is_durable`].
-fn durable_root_usable(root: &std::path::Path) -> bool {
+pub(crate) fn durable_root_usable(root: &std::path::Path) -> bool {
     let parent = root.parent();
     root_is_durable(
         root.exists(),
@@ -380,7 +380,10 @@ pub fn compare_reads(
 /// `Some(vec![])`, which means the engine IS open and holds nothing for it.
 pub fn read_embedded(execution_id: &str) -> Option<Vec<ComparableEvent>> {
     let engine = engine()?;
-    let mut guard = match engine.lock() {
+    // ⚠ Not `mut`: as of ehdb v0.4.2 `read_execution_after` takes `&self`. The
+    // lock is still taken, because the engine is shared, but the read no longer
+    // needs exclusive access.
+    let guard = match engine.lock() {
         Ok(g) => g,
         Err(poisoned) => poisoned.into_inner(),
     };

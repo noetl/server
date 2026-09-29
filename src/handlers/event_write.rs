@@ -498,6 +498,22 @@ pub async fn emit_events(state: &AppState, pool: &DbPool, rows: &[EventRow]) -> 
     // silently-degraded shadow stays visible.
     crate::handlers::ehdb_embedded::shadow_append(rows);
 
+    // ⭐ The chain-store populator, same placement and the same three reasons:
+    // one chokepoint, both sides of the gate, and it cannot fail a real write.
+    //
+    // ⚠ It must stay BELOW the `prev_event_id` stamping above. The chain store
+    // enforces I1 (each event links to the partition's head), so a row that
+    // reached here unstamped would be rejected as `NotHead` on everything past
+    // an execution's root — the populator would run, report, and store almost
+    // nothing.
+    //
+    // ⚠ A high `rejected` count right after arming is EXPECTED, not a fault:
+    // every already-running execution's next event carries a `prev` the empty
+    // store has never seen. What matters is that it falls as the in-flight set
+    // turns over — and that an unpopulated execution reads as *cannot answer*
+    // rather than *no events* while it does.
+    crate::handlers::chain_populate::populate_batch(rows);
+
     // All rows in a batch share the same execution + catalog, so one decision
     // covers the batch.
     let __t = std::time::Instant::now();
@@ -879,6 +895,121 @@ mod tests {
              unnoticed for a full window — an unreachable shadow reports \
              `agreed=0, diverged=0, append_failed=0`, which is byte-identical to \
              a healthy shadow on a quiet system (noetl/ai-meta#332)."
+        );
+    }
+
+    /// ⚠⚠ THE wiring for the chain populator, gated at the source.
+    ///
+    /// Same argument as the shadow above, and the same trap: calling
+    /// `populate_batch` directly from a unit test asserts it is *callable*, not
+    /// that anything on the write path invokes it. noetl/ai-meta#326 is what
+    /// that costs — a mechanism that exists, is documented, and never runs.
+    #[test]
+    fn populate_batch_is_called_from_the_emit_chokepoint() {
+        let body = emit_events_body();
+        assert!(
+            body.contains("chain_populate::populate_batch("),
+            "emit_events does not call populate_batch. The chain store is then              never written, and — this is the part that makes it dangerous              rather than merely useless — repointing the advance path at an              unpopulated store makes `decide()` read `Empty` on running              executions."
+        );
+    }
+
+    /// The populator has exactly one call site, and it is not the materializer.
+    ///
+    /// Two call sites would double-append (the chain store's write-once `ev/`
+    /// key makes the second a rejection, so the symptom is a `rejected` counter
+    /// nobody can explain rather than duplicate data). A call site in
+    /// `services::internal::project_events` is the specific mistake that left
+    /// the embedded shadow unreachable for a full window: prod's scheduled
+    /// traffic is system executions, which `should_publish` excludes, so the
+    /// materializer never sees them.
+    #[test]
+    fn the_populator_has_exactly_one_call_site() {
+        let event_write = code_only(
+            include_str!("event_write.rs")
+                .split("#[cfg(test)]")
+                .next()
+                .unwrap(),
+        );
+        let internal = code_only(
+            include_str!("../services/internal.rs")
+                .split("#[cfg(test)]")
+                .next()
+                .unwrap(),
+        );
+        assert!(
+            event_write.contains("pub async fn emit_events"),
+            "non-test slice of event_write.rs lost emit_events — extraction broke"
+        );
+        assert_eq!(
+            event_write
+                .matches("chain_populate::populate_batch(")
+                .count(),
+            1,
+            "expected exactly one populate_batch call site in event_write.rs's \
+             non-test code"
+        );
+        assert_eq!(
+            internal.matches("chain_populate::populate_batch(").count(),
+            0,
+            "services::internal::project_events calls populate_batch. That is the \
+             materializer, which never sees system executions — the populator \
+             would then be armed and unreachable on exactly the traffic prod \
+             runs."
+        );
+    }
+
+    /// The populate call must sit BEFORE the publish/insert fork.
+    #[test]
+    fn populate_batch_precedes_the_publish_insert_fork() {
+        let body = emit_events_body();
+        let call = body
+            .find("chain_populate::populate_batch(")
+            .expect("populate_batch call missing — see the previous test");
+        let fork = body
+            .find("should_publish(state")
+            .expect("publish/insert fork not found — extraction broke");
+        assert!(
+            call < fork,
+            "populate_batch is called AFTER the publish/insert decision, so it              covers only one branch of the gate — and the gate-off branch is the              one prod does not exercise."
+        );
+    }
+
+    /// ⭐ The populate call must sit AFTER the `prev_event_id` stamping.
+    ///
+    /// The chain store enforces I1. An unstamped row is rejected as `NotHead` on
+    /// everything past an execution's root, so a populator wired above the
+    /// stamping would run, emit metrics, and store almost nothing — a shadow
+    /// that looks armed and holds one event per execution.
+    #[test]
+    fn populate_batch_follows_the_prev_event_id_stamping() {
+        let body = emit_events_body();
+        let call = body
+            .find("chain_populate::populate_batch(")
+            .expect("populate_batch call missing");
+        let stamp = body
+            .find("chain_heads.link_batch(")
+            .expect("the prev_event_id stamping was not found — re-anchor this                      guard rather than deleting it; the ordering it protects is                      still real");
+        assert!(
+            stamp < call,
+            "populate_batch runs BEFORE prev_event_id is stamped, so every row              past an execution's root reaches the chain store with no chain              edge and is rejected as NotHead."
+        );
+    }
+
+    /// The populator must not be able to fail the authoritative write.
+    #[test]
+    fn the_populator_cannot_fail_the_serving_path() {
+        let body = emit_events_body();
+        let at = body
+            .find("chain_populate::populate_batch(")
+            .expect("populate_batch call missing");
+        let stmt = &body[at..body[at..].find('\n').map(|i| at + i).unwrap_or(body.len())];
+        assert!(
+            !stmt.contains('?'),
+            "the populate_batch call propagates with `?`: {stmt:?}. A shadow              that can fail a real write is a liability, not evidence."
+        );
+        assert!(
+            stmt.trim_end().ends_with(");"),
+            "expected a bare statement call, found {stmt:?} — if its result is              now consumed, re-check that no failure can reach the caller."
         );
     }
 
