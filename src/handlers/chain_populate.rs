@@ -121,6 +121,30 @@ fn open_chain() -> Option<std::sync::Mutex<ChainRig>> {
     }
 }
 
+/// Drive `populate_from_log` directly against the process store.
+///
+/// ⚠ Exposed for the divergence POSITIVE CONTROL only. The burst test proves that
+/// concurrent reads no longer produce false divergence; without a way to plant a
+/// genuine CONTENT conflict, that test would also pass on a build where
+/// divergence detection had simply been switched off (noetl/ai-meta#360).
+///
+/// It does not bypass anything the normal path enforces — it is the same
+/// `populate_from_log` on the same store, just with a caller-supplied log.
+pub fn populate_from_log_for_test(
+    execution_id: i64,
+    events: &[ehdb_l0::chain_populator::LogEvent],
+) -> Option<ehdb_l0::chain_populator::FromLog> {
+    let rig = rig()?;
+    let guard = match rig.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    guard
+        .populator()
+        .populate_from_log(&execution_id.to_string(), events)
+        .ok()
+}
+
 /// Read an execution's authority, for the verify endpoint and for tests.
 ///
 /// `None` when the populator is off — *"nothing can be said"*, which is not the
@@ -164,22 +188,25 @@ impl LogSourcedChainSource {
     pub fn new(pool: crate::db::DbPool, limit: i64) -> Self {
         Self { pool, limit }
     }
-}
 
-#[async_trait::async_trait]
-impl crate::chain_advance::ChainSource for LogSourcedChainSource {
-    async fn chain_for(&self, execution_id: i64) -> Option<crate::chain_advance::ChainView> {
+    /// One authoritative read: the log's events plus their terminal flags.
+    ///
+    /// `None` is "cannot answer" and has already recorded WHY — a failed read or a
+    /// truncated page. Never an empty view for either, because an empty view says
+    /// "this execution has no events" and a running execution would read as
+    /// finished.
+    async fn read_log(
+        &self,
+        execution_id: i64,
+    ) -> Option<(Vec<ehdb_l0::chain_populator::LogEvent>, Vec<bool>)> {
         let rows =
             match crate::db::queries::event_chain::read_chain(&self.pool, execution_id, self.limit)
                 .await
             {
                 Ok(r) => r,
-                // ⚠ `None`, never an empty view. A failed read is "cannot answer"; an
-                // empty view would say "this execution has no events", and the caller
-                // would treat a running execution as finished.
                 Err(e) => {
                     tracing::warn!(target: "noetl_server::chain_populate", execution_id, error = %e,
-                    "authoritative chain read failed; falling through");
+                        "authoritative chain read failed; falling through");
                     crate::metrics::record_chain_populate("log_read_failed");
                     return None;
                 }
@@ -211,15 +238,115 @@ impl crate::chain_advance::ChainSource for LogSourcedChainSource {
             })
             .collect();
 
+        Some((events, terminal))
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::chain_advance::ChainSource for LogSourcedChainSource {
+    async fn chain_for(&self, execution_id: i64) -> Option<crate::chain_advance::ChainView> {
+        let (events, terminal) = self.read_log(execution_id).await?;
+
         let rig = rig()?;
-        let guard = match rig.lock() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        let populator = guard.populator();
         let key = execution_id.to_string();
 
-        match populator.populate_from_log(&key, &events) {
+        // ⚠⚠⚠ THE STALE-vs-FOREIGN-WRITER DISCRIMINATION, and why it needs a
+        // SECOND read (noetl/ai-meta#360, guarding noetl/ai-meta#358).
+        //
+        // "The store holds more than my snapshot, and the prefix agrees" has TWO
+        // causes that a single snapshot CANNOT tell apart:
+        //
+        //   (a) benign staleness — a concurrent reader applied a FRESHER snapshot
+        //       between our read and our lock. The extra events are real log events
+        //       we simply had not read yet.
+        //   (b) a FOREIGN WRITER — a second populator put events in the store that
+        //       are not in the log at all. This is exactly noetl/ai-meta#358, the
+        //       13.3% divergence, and it must NOT be absorbed.
+        //
+        // I originally classified this as benign on the reasoning that
+        // `populate_from_log` is the sole writer — which is true only while no
+        // second writer exists, i.e. it assumes away case (b). The #358 regression
+        // test caught that immediately, which is the test doing its job.
+        //
+        // The discriminator is whether the log CATCHES UP: re-read it, and if it
+        // now contains at least what the store holds, it was (a). If the log still
+        // ends short while the store runs ahead, the extra events are not in the
+        // authoritative log and it is (b) — escalate to a divergence and refuse.
+        //
+        // The re-read costs one query on a path that is already doing one, and only
+        // on an outcome that should be rare.
+        // ⚠⚠ POPULATE AND THE GUARDED READ MUST BE ONE LOCK HOLD.
+        //
+        // My first version of this escalation released the lock between them, and
+        // under the concurrent burst that produced 2 `length_disagreement` refusals
+        // in 800: another reader advanced the store after our populate, so the chain
+        // came back LONGER than the `terminal` vector built from our log rows, and
+        // the zip below refused. Safe — it declines rather than answering wrongly —
+        // but it is the same false alarm one step downstream, and on prod it counts
+        // against the comparator.
+        //
+        // Holding one lock across both makes the pair atomic: the chain we read is
+        // exactly the chain we just populated.
+        let attempt = |evs: &[ehdb_l0::chain_populator::LogEvent]| {
+            let guard = match rig.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            let populator = guard.populator();
+            let outcome = populator.populate_from_log(&key, evs);
+            match outcome {
+                Ok(o) => {
+                    // Read under the SAME hold, unless the outcome already decides.
+                    let needs_read = !matches!(
+                        o,
+                        ehdb_l0::chain_populator::FromLog::Diverged { .. }
+                            | ehdb_l0::chain_populator::FromLog::StaleLog { .. }
+                    );
+                    let chain = if needs_read {
+                        Some(populator.chain_if_authoritative(&key))
+                    } else {
+                        None
+                    };
+                    (Ok(o), chain)
+                }
+                Err(e) => (Err(e), None),
+            }
+        };
+
+        let (outcome_or_err, chain_res, terminal) = {
+            let (o, c) = attempt(&events);
+            match o {
+                Ok(ehdb_l0::chain_populator::FromLog::StaleLog {
+                    stored_len,
+                    log_len,
+                }) => {
+                    crate::metrics::record_chain_populate("stale_log");
+                    tracing::debug!(target: "noetl_server::chain_populate", execution_id,
+                        stored_len, log_len,
+                        "log snapshot was behind the store; re-reading to tell \
+                         staleness from a foreign writer");
+
+                    let (fresh_events, fresh_terminal) = self.read_log(execution_id).await?;
+                    if fresh_events.len() < stored_len {
+                        // The log did NOT catch up. The store's extra events are not
+                        // in the authoritative log, so a writer other than this one
+                        // put them there (noetl/ai-meta#358).
+                        tracing::warn!(target: "noetl_server::chain_populate", execution_id,
+                            stored_len, log_len, reread_len = fresh_events.len(),
+                            "chain partition holds events the authoritative log does \
+                             not have after a re-read; treating as DIVERGED (a \
+                             second writer)");
+                        crate::metrics::record_chain_populate("diverged");
+                        return None;
+                    }
+                    let (o2, c2) = attempt(&fresh_events);
+                    (o2, c2, fresh_terminal)
+                }
+                other => (other, c, terminal),
+            }
+        };
+
+        match outcome_or_err {
             Ok(outcome) => {
                 crate::metrics::record_chain_populate(outcome.label());
                 if let ehdb_l0::chain_populator::FromLog::Diverged {
@@ -233,6 +360,15 @@ impl crate::chain_advance::ChainSource for LogSourcedChainSource {
                         "chain partition DIVERGED from the authoritative log");
                     return None;
                 }
+                // ⚠ A StaleLog reaching here is the SECOND attempt after the log
+                // caught up. The store is a superset of a log we have now confirmed,
+                // so it is the fresher answer — but we deliberately did NOT read the
+                // chain under that hold (the outcome was undecided), so fall through
+                // rather than answer from a read we did not take atomically.
+                if matches!(outcome, ehdb_l0::chain_populator::FromLog::StaleLog { .. }) {
+                    crate::metrics::record_chain_populate("stale_log_unresolved");
+                    return None;
+                }
             }
             Err(e) => {
                 tracing::warn!(target: "noetl_server::chain_populate", execution_id, error = %e,
@@ -242,9 +378,20 @@ impl crate::chain_advance::ChainSource for LogSourcedChainSource {
             }
         }
 
-        // Answer from the STORE, through the guarded read, so coverage and the
-        // watermark both have to agree before a decision is made on it.
-        let chain = match populator.chain_if_authoritative(&key) {
+        // Answer from the STORE, through the guarded read taken under the SAME lock
+        // hold as the populate, so coverage and the watermark both have to agree
+        // before a decision is made on it — and the store cannot have moved.
+        // ⚠ No `expect` on a request path. Every decided outcome reads the chain under
+        // the same hold, so `None` here is unreachable today — but an `expect` turns a
+        // future refactor of the match above into a panic in the server, and this
+        // path's whole job is to decline safely.
+        let Some(chain_res) = chain_res else {
+            tracing::warn!(target: "noetl_server::chain_populate", execution_id,
+                "no chain was read under the populate's lock hold; declining");
+            crate::metrics::record_chain_populate("guarded_read_refused");
+            return None;
+        };
+        let chain = match chain_res {
             Ok(Some(c)) => c,
             Ok(None) => {
                 crate::metrics::record_chain_populate("guarded_read_refused");

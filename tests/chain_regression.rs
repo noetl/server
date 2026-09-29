@@ -32,7 +32,7 @@
 
 use std::sync::Arc;
 
-use ehdb_l0::chain_populator::{populator_enabled, Authority, ChainPopulator, FromLog, LogEvent};
+use ehdb_l0::chain_populator::{populator_enabled, ChainPopulator, FromLog, LogEvent};
 use ehdb_l0::chain_store_durable::DurableChainStore;
 use ehdb_l0::substrate::{DurableSubstrate, LocalFsSubstrate};
 
@@ -501,24 +501,37 @@ fn mode6_a_second_prefork_writer_makes_the_log_source_diverge() {
         .populate_from_log(exec, &committed)
         .expect("second populate must not error");
 
+    // ⚠⚠⚠ THE VERDICT MOVED UP A LAYER — read this before "fixing" the assertion.
+    //
+    // This test asserted `Diverged` here, and noetl/ai-meta#360 changed it to
+    // `StaleLog`. That change is NOT the alarm being switched off, but it is close
+    // enough to one that it has to be spelled out.
+    //
+    // From this single snapshot the populator genuinely CANNOT distinguish:
+    //   (a) a foreign writer put t4 in the store (this test — noetl/ai-meta#358), from
+    //   (b) a concurrent reader applied a FRESHER log that already contained t4, and
+    //       our snapshot is simply old (noetl/ai-meta#360).
+    // Both present as "store longer, prefix agrees". Calling it `Diverged`
+    // misreported (b) — 5 false divergences in 79 on prod. Calling it healthy would
+    // absorb (a) — 13.3% real divergence. So it is now reported as UNRESOLVED and
+    // the discrimination happens where a second read is possible:
+    // `LogSourcedChainSource::chain_for` re-reads the log and escalates to
+    // `diverged` when the log does not catch up.
+    //
+    // What must still hold HERE is the safety property, asserted below: an
+    // unresolved partition is NOT SERVABLE. That is the property that kept the prod
+    // canary safe, and it is unchanged.
     match out {
-        FromLog::Diverged {
-            at_position,
-            ref stored,
-            ref log,
-        } => {
-            assert_eq!(
-                at_position, 3,
-                "divergence is at the extra event's position"
-            );
-            assert_eq!(stored, "t4", "the store holds an event the log does not");
-            assert_eq!(log, "", "and the log has nothing at that position");
+        FromLog::StaleLog { stored_len, log_len } => {
+            assert_eq!(stored_len, 4, "the store holds the foreign writer's t4");
+            assert_eq!(log_len, 3, "while the committed log still ends at t3");
         }
+        FromLog::Diverged { .. } => { /* also acceptable: strictly stronger */ }
         other => panic!(
-            "expected Diverged — a second pre-fork writer MUST be detected, not \
-             silently absorbed. Got {other:?}. If this now reports InSync, the \
-             prefix check has stopped comparing and the 13.3% prod divergence \
-             would have gone unnoticed."
+            "expected StaleLog or Diverged — a second pre-fork writer must never be \
+             silently ABSORBED. Got {other:?}. An `InSync`/`extended` here means the \
+             prefix check has stopped comparing and the 13.3% prod divergence would \
+             have gone unnoticed."
         ),
     }
 
@@ -526,9 +539,13 @@ fn mode6_a_second_prefork_writer_makes_the_log_source_diverge() {
     assert_eq!(
         p.chain_if_authoritative(exec).unwrap(),
         None,
-        "a partition whose store disagrees with the committed log must read as \
-         CANNOT ANSWER, so the caller falls through to the authoritative log. \
-         This is what kept the prod canary safe."
+        "⭐ THE LOAD-BEARING ASSERTION. A partition whose store holds events the \
+         committed log does not must read as CANNOT ANSWER, so the caller falls \
+         through to the authoritative log — whether the populator called it \
+         Diverged or StaleLog. This is what kept the prod canary safe, and it is \
+         what makes relocating the verdict to chain_for safe rather than a \
+         weakening. Coverage still covers 3 while the store holds 4, so the \
+         guarded read refuses on its own."
     );
 }
 
