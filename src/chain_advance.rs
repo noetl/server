@@ -51,14 +51,7 @@ pub const CHAIN_ADVANCE_ENV: &str = "NOETL_CHAIN_ADVANCE";
 /// ⚠ Fail-safe: anything unrecognised is `false`. A typo must not move the
 /// execution-advance path.
 pub fn chain_advance_enabled() -> bool {
-    matches!(
-        std::env::var(CHAIN_ADVANCE_ENV)
-            .unwrap_or_default()
-            .trim()
-            .to_ascii_lowercase()
-            .as_str(),
-        "1" | "true" | "yes" | "on"
-    )
+    crate::env_flag::truthy(CHAIN_ADVANCE_ENV)
 }
 
 /// One event as the advance decision needs to see it — the four ids plus

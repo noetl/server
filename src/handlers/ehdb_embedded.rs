@@ -42,12 +42,21 @@ pub const DEFAULT_EMBEDDED_DIR: &str = "/data/ehdb-embedded";
 
 /// Is the embedded shadow armed?
 ///
-/// ⚠ Strict `== "true"`. A flag that accepts `1`, `yes`, `TRUE` and `on` is a
-/// flag whose state nobody can read off a manifest with confidence.
+/// ⚠⚠ Reads through [`crate::env_flag::truthy`] — `1|true|yes|on`, trimmed and
+/// case-insensitive — like every other `NOETL_*` boolean in this binary.
+///
+/// This was byte-exact `== "true"`, justified as *"a flag that accepts `1`, `yes`,
+/// `TRUE` and `on` is a flag whose state nobody can read off a manifest with
+/// confidence."* That argument is right about the accepted set and wrong about the
+/// trimming, and the trimming is what bit: `value: "true "` and `value: "True"`
+/// both read as **OFF**, silently, from a manifest that looks armed. A manifest
+/// that reads armed and is not is worse than a permissive parse, because nothing
+/// reports it.
+///
+/// Prod sets `"true"`, which resolves identically — see
+/// `env_flag::tests::prod_values_resolve_identically`.
 pub fn embedded_enabled() -> bool {
-    std::env::var(EMBEDDED_ENV)
-        .map(|v| v == "true")
-        .unwrap_or(false)
+    crate::env_flag::truthy(EMBEDDED_ENV)
 }
 
 /// The local root for the embedded engine.
@@ -622,22 +631,47 @@ mod tests {
 
     /// ⚠⚠ Default OFF. This is what makes the deploy inert on arrival; a flag
     /// that defaults on turns a shadow into a change.
+    ///
+    /// ⚠⚠ **CONTRACT CHANGE 2026-09-29.** This test was
+    /// `the_flag_defaults_off_and_is_strict` and asserted that `1`, `yes`, `TRUE`
+    /// and `on` must NOT arm, on the argument that *"a flag that accepts many
+    /// spellings is one nobody can read off a manifest"*.
+    ///
+    /// That argument is right about the accepted set and wrong about the
+    /// trimming, and the trimming is what bit: under byte-exact `== "true"`,
+    /// `value: "true "` and `value: "True"` both read as **OFF** from a manifest
+    /// that looks armed, with nothing anywhere reporting it. A manifest that reads
+    /// armed and is not is worse than a permissive parse.
+    ///
+    /// So the flag now uses [`crate::env_flag::truthy`] like every other
+    /// `NOETL_*` boolean in this binary — one parse, 33 flags, no divergence. The
+    /// part of the original intent that WAS load-bearing is kept and still
+    /// asserted below: absent means off, and an unrecognised value means off.
     #[test]
-    fn the_flag_defaults_off_and_is_strict() {
+    fn the_flag_defaults_off_and_parses_like_every_other_flag() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // Not set at all.
         std::env::remove_var(EMBEDDED_ENV);
         assert!(!embedded_enabled(), "absent must mean off");
-        for v in ["", "1", "yes", "TRUE", "on", "false"] {
+
+        // ⭐ The fail-safe half, unchanged: explicit-off and typos stay OFF.
+        for v in ["", " ", "false", "0", "no", "off", "ture", "enabled", "2"] {
             std::env::set_var(EMBEDDED_ENV, v);
             assert!(
                 !embedded_enabled(),
-                "{v:?} must not arm the shadow — a flag that accepts many \
-                 spellings is one nobody can read off a manifest"
+                "{v:?} must not arm the shadow — a typo must never arm a gate"
             );
         }
-        std::env::set_var(EMBEDDED_ENV, "true");
-        assert!(embedded_enabled());
+
+        // ⭐ The changed half: the shared accepted set, trimmed and case-folded.
+        for v in ["true", "true ", " TRUE ", "True", "1", "yes", "on", "ON"] {
+            std::env::set_var(EMBEDDED_ENV, v);
+            assert!(
+                embedded_enabled(),
+                "{v:?} must arm — it is in the shared truthy set. `\"true \"` and \
+                 `\"True\"` in particular are the manifest values that used to read \
+                 as OFF with nothing reporting it."
+            );
+        }
         std::env::remove_var(EMBEDDED_ENV);
     }
 

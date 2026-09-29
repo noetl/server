@@ -45,8 +45,8 @@
 //! }
 //! ```
 
-pub mod auth_gate;
 pub mod affinity;
+pub mod auth_gate;
 pub mod chain_advance;
 pub mod coherence;
 pub mod command_bus;
@@ -54,6 +54,7 @@ pub mod config;
 pub mod crypto;
 pub mod db;
 pub mod engine;
+pub mod env_flag;
 pub mod error;
 pub mod event_bus;
 pub mod handlers;
@@ -79,12 +80,5 @@ pub use result_ext::ResultExt;
 /// at startup and mounts the `/api/internal/registry/*` routes. Off → no schema
 /// change, no routes (the additive default-off contract).
 pub fn registry_enabled() -> bool {
-    matches!(
-        std::env::var("NOETL_REGISTRY_ENABLED")
-            .unwrap_or_default()
-            .trim()
-            .to_ascii_lowercase()
-            .as_str(),
-        "1" | "true" | "yes" | "on"
-    )
+    crate::env_flag::truthy("NOETL_REGISTRY_ENABLED")
 }

@@ -979,14 +979,7 @@ fn resolve_encryption_key(key_env: Option<String>, allow_insecure: bool) -> anyh
 /// policy in `resolve_encryption_key`.
 fn get_encryption_key() -> anyhow::Result<String> {
     let key_env = std::env::var("NOETL_ENCRYPTION_KEY").ok();
-    let allow_insecure = std::env::var("NOETL_ALLOW_INSECURE_DEFAULT_KEY")
-        .map(|v| {
-            matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false);
+    let allow_insecure = noetl_server::env_flag::truthy("NOETL_ALLOW_INSECURE_DEFAULT_KEY");
     resolve_encryption_key(key_env, allow_insecure)
 }
 
@@ -1063,6 +1056,19 @@ async fn main() -> anyhow::Result<()> {
     noetl_server::metrics::init_embedded_shadow_series();
     noetl_server::metrics::init_chain_populate_series();
     noetl_server::metrics::init_chain_head_hydrate_series();
+    noetl_server::metrics::init_feature_arming_series();
+
+    // ⭐⭐ Report multi-gate arming at boot. `Off` is silent; `Partial` is a WARN.
+    //
+    // A partially-armed feature — some gates on, some off — does not run, and is
+    // indistinguishable from an unarmed one in every other signal. That is what
+    // made the chain-store gates hard to reason about (noetl/ai-meta#357): the
+    // resolver correctly refuses the combination, but the refusal left no trace.
+    {
+        let arming = noetl_server::env_flag::chain_store_arming();
+        noetl_server::metrics::record_feature_arming("chain_store", arming.label());
+        noetl_server::env_flag::log_arming("chain_store", &arming);
+    }
     noetl_server::metrics::init_embedded_read_series();
     noetl_server::metrics::init_projection_serve_refusal_series();
     noetl_server::metrics::init_ehdb_eventlog_mirror_series();

@@ -3409,6 +3409,41 @@ pub fn chain_head_hydrate_total() -> &'static prometheus::IntCounterVec {
     })
 }
 
+/// Gauge-like counter: a feature's resolved multi-gate arming at boot.
+///
+/// ⚠ `partial` is the label to alert on. It means some gates are on and some are
+/// off, so the feature does NOT run while the manifest looks configured.
+pub fn feature_arming_total() -> &'static prometheus::IntCounterVec {
+    static M: std::sync::OnceLock<prometheus::IntCounterVec> = std::sync::OnceLock::new();
+    M.get_or_init(|| {
+        let m = prometheus::IntCounterVec::new(
+            prometheus::Opts::new(
+                "noetl_feature_arming_total",
+                "Resolved multi-gate arming per feature, recorded once at boot",
+            ),
+            &["feature", "state"],
+        )
+        .expect("valid metric");
+        registry().register(Box::new(m.clone())).ok();
+        m
+    })
+}
+
+pub fn record_feature_arming(feature: &str, state: &str) {
+    feature_arming_total()
+        .with_label_values(&[feature, state])
+        .inc();
+}
+
+/// Pin every arming state for every known feature at 0, unconditionally.
+pub fn init_feature_arming_series() {
+    for f in ["chain_store"] {
+        for s in crate::env_flag::Arming::ALL_LABELS {
+            feature_arming_total().with_label_values(&[f, s]).inc_by(0);
+        }
+    }
+}
+
 pub fn record_chain_head_hydrate(outcome: &str) {
     chain_head_hydrate_total()
         .with_label_values(&[outcome])

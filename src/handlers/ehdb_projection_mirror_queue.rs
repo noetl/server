@@ -115,14 +115,12 @@ const DEFAULT_DRAIN_MAX: usize = 64;
 pub const FLUSH_TIMEOUT_ENV: &str = "NOETL_EHDB_PROJECTION_MIRROR_FLUSH_TIMEOUT_MS";
 const DEFAULT_FLUSH_TIMEOUT_MS: u64 = 10_000;
 
+/// ⚠ Delegates to [`crate::env_flag::truthy`]. This was a local copy of the same
+/// four-value match, and there were FOUR such copies across server and worker —
+/// identical today, free to drift tomorrow, and the drift is invisible because
+/// each copy looks correct on its own.
 fn env_bool(name: &str) -> bool {
-    matches!(
-        std::env::var(name)
-            .ok()
-            .map(|s| s.trim().to_ascii_lowercase())
-            .as_deref(),
-        Some("1" | "true" | "yes" | "on")
-    )
+    crate::env_flag::truthy(name)
 }
 
 fn env_usize(name: &str, default: usize) -> usize {

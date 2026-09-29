@@ -49,14 +49,7 @@ use crate::services::object_backend::ObjectBackend;
 /// `NOETL_RESULT_TIER_GC` — master switch for the result-tier sweep. Default off
 /// → the GC endpoint returns a no-op report and deletes nothing.
 pub fn gc_enabled() -> bool {
-    matches!(
-        std::env::var("NOETL_RESULT_TIER_GC")
-            .unwrap_or_default()
-            .trim()
-            .to_ascii_lowercase()
-            .as_str(),
-        "1" | "true" | "yes" | "on"
-    )
+    crate::env_flag::truthy("NOETL_RESULT_TIER_GC")
 }
 
 /// Default number of objects a single sweep examines.
@@ -290,14 +283,7 @@ pub fn classify_object(key: &str) -> ObjectClass {
 /// belt-and-suspenders against a late cold-load racing retention on a
 /// never-sealed execution. Sealed shards + result objects are unaffected.
 pub fn state_shard_gc_enabled() -> bool {
-    matches!(
-        std::env::var("NOETL_STATE_SHARD_GC")
-            .unwrap_or_default()
-            .trim()
-            .to_ascii_lowercase()
-            .as_str(),
-        "1" | "true" | "yes" | "on"
-    )
+    crate::env_flag::truthy("NOETL_STATE_SHARD_GC")
 }
 
 /// `NOETL_RESULT_TIER_GC_SINK_GATE` — opt-in write-behind-cache guard
@@ -341,14 +327,7 @@ pub(crate) fn is_unsunk(
 }
 
 pub fn sink_gate_enabled() -> bool {
-    matches!(
-        std::env::var("NOETL_RESULT_TIER_GC_SINK_GATE")
-            .unwrap_or_default()
-            .trim()
-            .to_ascii_lowercase()
-            .as_str(),
-        "1" | "true" | "yes" | "on"
-    )
+    crate::env_flag::truthy("NOETL_RESULT_TIER_GC_SINK_GATE")
 }
 
 /// Default multiplier applied to the grace window for an **open** state shard
