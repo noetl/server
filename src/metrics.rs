@@ -3364,16 +3364,22 @@ pub fn chain_populate_total() -> &'static prometheus::IntCounterVec {
 /// here, so each would have been an absent series — indistinguishable from a build
 /// that predates the metric. `every_recorded_label_is_pinned` now computes the set
 /// from the source so the list cannot fall behind silently again.
+/// Every chain-populate label.
+///
+/// ⚠ The per-event-path verdicts (`populated`, `partial`, `rejected`, `skipped`,
+/// `append_rejected`) were REMOVED with the emit-path call site
+/// (noetl/ai-meta#358): nothing records them any more, and a pinned label nothing
+/// can record reads as a permanent `0`, which is a claim that the thing was
+/// measured and never happened. That is the opposite of what pinning is for.
+///
+/// ⚠⚠ This list was once short by six, found by reading `/metrics` on a running
+/// server rather than the code. `every_recorded_label_is_pinned` now computes the
+/// recorded set from the source and prints the denominator, so it cannot drift in
+/// either direction.
 pub const CHAIN_POPULATE_OUTCOMES: &[&str] = &[
-    // per-batch verdicts (the per-event path)
-    "populated",
-    "partial",
-    "rejected",
-    "skipped",
     // lifecycle
     "opened",
     "open_failed",
-    "append_rejected",
     // the log-sourced path's verdicts (ehdb_l0::chain_populator::FromLog)
     "in_sync",
     "extended",

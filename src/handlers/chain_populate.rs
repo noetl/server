@@ -57,50 +57,6 @@ pub fn populate_dir() -> String {
     std::env::var(POPULATE_DIR_ENV).unwrap_or_else(|_| DEFAULT_POPULATE_DIR.to_string())
 }
 
-/// What one batch's population did, as a metric label.
-///
-/// A closed set, pinned at 0, because **absence is the default** for a labelled
-/// series: an unpinned `populated` that has never fired is indistinguishable
-/// from a binary that predates the metric.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PopulateOutcome {
-    /// Every row in the batch landed.
-    Populated,
-    /// Some rows landed and some did not.
-    Partial,
-    /// No row landed.
-    Rejected,
-    /// Nothing to do.
-    Skipped,
-}
-
-impl PopulateOutcome {
-    pub fn label(&self) -> &'static str {
-        match self {
-            Self::Populated => "populated",
-            Self::Partial => "partial",
-            Self::Rejected => "rejected",
-            Self::Skipped => "skipped",
-        }
-    }
-
-    /// Every label, for pinning.
-    pub const ALL_LABELS: [&'static str; 4] = ["populated", "partial", "rejected", "skipped"];
-
-    /// Classify a batch by how much of it landed.
-    ///
-    /// Separated from the I/O so every combination is testable without a
-    /// filesystem.
-    pub fn classify(landed: usize, total: usize) -> Self {
-        match (landed, total) {
-            (_, 0) => Self::Skipped,
-            (0, _) => Self::Rejected,
-            (l, t) if l == t => Self::Populated,
-            _ => Self::Partial,
-        }
-    }
-}
-
 /// The store plus the substrate it was opened over.
 ///
 /// [`ChainPopulator`] borrows both, so they have to outlive it — hence one rig
@@ -163,68 +119,6 @@ fn open_chain() -> Option<std::sync::Mutex<ChainRig>> {
             None
         }
     }
-}
-
-/// Populate the chain store with the batch that is about to become
-/// authoritative.
-///
-/// Called from [`crate::handlers::event_write::emit_events`] — the one
-/// chokepoint every server-originated event passes through, on both sides of the
-/// CQRS gate. ⚠ It must sit where `shadow_append` sits: **after** the
-/// `prev_event_id` stamping and **before** the publish/insert fork. After the
-/// stamping because the chain store enforces I1 and an unstamped row would be
-/// rejected as `NotHead` on everything past the root; before the fork because
-/// the gate-off branch is the one prod does not exercise, and a second copy
-/// there is the classic place to rot (noetl/ai-meta#332).
-///
-/// ⚠ Never returns an error and never panics on a poisoned lock. A shadow that
-/// can fail a real write is a liability, not evidence.
-pub fn populate_batch(rows: &[crate::handlers::event_write::EventRow]) {
-    let Some(rig) = rig() else {
-        // Flag off, or the open failed and already recorded why.
-        return;
-    };
-    if rows.is_empty() {
-        crate::metrics::record_chain_populate(PopulateOutcome::Skipped.label());
-        return;
-    }
-    let guard = match rig.lock() {
-        Ok(g) => g,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    let populator = guard.populator();
-
-    let mut landed = 0usize;
-    for row in rows {
-        let execution_id = row.execution_id.to_string();
-        let event_id = row.event_id.to_string();
-        let prev = row.prev_event_id.map(|p| p.to_string());
-        let parent_exec = row.parent_execution_id.map(|p| p.to_string());
-        match populator.populate(
-            &execution_id,
-            &event_id,
-            prev.as_deref(),
-            parent_exec.as_deref(),
-            &row.to_stream_json().to_string(),
-        ) {
-            Ok(_) => landed += 1,
-            Err(e) => {
-                // ⚠ `debug`, not `warn`. Arming mid-flight rejects the first
-                // event of every in-flight execution by design (its `prev` is
-                // not in the store), so a `warn` here would emit one line per
-                // in-flight execution on every arm — noise that trains readers
-                // to ignore the one that matters. The counter carries the
-                // signal; `rejected` staying high after the in-flight set has
-                // turned over is the thing to look at.
-                // ⚠ `?e` (Debug), not `%e`: `ChainError` carries no `Display`.
-                tracing::debug!(target: "noetl_server::chain_populate",
-                    execution_id = %execution_id, event_id = %event_id, error = ?e,
-                    "chain populate rejected");
-                crate::metrics::record_chain_populate("append_rejected");
-            }
-        }
-    }
-    crate::metrics::record_chain_populate(PopulateOutcome::classify(landed, rows.len()).label());
 }
 
 /// Read an execution's authority, for the verify endpoint and for tests.
@@ -401,46 +295,8 @@ impl crate::chain_advance::ChainSource for LogSourcedChainSource {
 mod tests {
     use super::*;
 
-    #[test]
-    fn classify_covers_every_split() {
-        assert_eq!(PopulateOutcome::classify(0, 0), PopulateOutcome::Skipped);
-        assert_eq!(PopulateOutcome::classify(3, 3), PopulateOutcome::Populated);
-        assert_eq!(PopulateOutcome::classify(0, 3), PopulateOutcome::Rejected);
-        assert_eq!(PopulateOutcome::classify(1, 3), PopulateOutcome::Partial);
-    }
 
-    /// ⚠ An all-rejected batch must NOT read as `populated`.
-    ///
-    /// This is the shape that made an unreachable shadow invisible for a full
-    /// window: a verdict that cannot distinguish "did nothing" from "did
-    /// everything" reports healthy on a broken path.
-    #[test]
-    fn a_batch_that_landed_nothing_is_not_populated() {
-        assert_ne!(
-            PopulateOutcome::classify(0, 5).label(),
-            PopulateOutcome::Populated.label(),
-            "a batch where every row was rejected reported as populated"
-        );
-        assert_eq!(PopulateOutcome::classify(0, 5).label(), "rejected");
-    }
 
-    #[test]
-    fn every_outcome_label_is_enumerated_for_pinning() {
-        for o in [
-            PopulateOutcome::Populated,
-            PopulateOutcome::Partial,
-            PopulateOutcome::Rejected,
-            PopulateOutcome::Skipped,
-        ] {
-            assert!(
-                PopulateOutcome::ALL_LABELS.contains(&o.label()),
-                "{} is not in ALL_LABELS, so it would be an absent series \
-                 rather than a pinned 0",
-                o.label()
-            );
-        }
-        assert_eq!(PopulateOutcome::ALL_LABELS.len(), 4);
-    }
 
     /// The flag is off by default, so the module is inert on arrival.
     #[test]
