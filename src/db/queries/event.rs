@@ -352,14 +352,7 @@ pub async fn has_errored_step(pool: &DbPool, execution_id: i64) -> AppResult<boo
 /// semantics change, so it must be a deliberate flip and not a side effect of
 /// deploying a new image.
 pub fn status_from_steps_enabled() -> bool {
-    matches!(
-        std::env::var("NOETL_EXECUTION_STATUS_FROM_STEPS")
-            .unwrap_or_default()
-            .trim()
-            .to_ascii_lowercase()
-            .as_str(),
-        "1" | "true" | "yes" | "on"
-    )
+    crate::env_flag::truthy("NOETL_EXECUTION_STATUS_FROM_STEPS")
 }
 
 /// Get execution status based on events.

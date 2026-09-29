@@ -209,14 +209,7 @@ pub const CONTENT_PARITY_ENV: &str = "NOETL_EHDB_CROSSSTORE_PARITY_CONTENT";
 
 /// Whether the content comparison is armed.
 pub fn content_parity_enabled() -> bool {
-    std::env::var(CONTENT_PARITY_ENV)
-        .map(|v| {
-            matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false)
+    crate::env_flag::truthy(CONTENT_PARITY_ENV)
 }
 
 /// The content fields, in the order they are reported.

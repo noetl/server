@@ -426,13 +426,7 @@ pub const SINK_MIRROR_ENV: &str = "NOETL_EHDB_SINK_MIRROR";
 /// verification passed only because the comparator had not sampled those
 /// executions yet (`compared` was 0 at the same moment `extra_event` was 0).
 pub fn sink_mirror_enabled() -> bool {
-    std::env::var(SINK_MIRROR_ENV)
-        .ok()
-        .map(|v| {
-            let v = v.trim().to_ascii_lowercase();
-            v == "1" || v == "true" || v == "on" || v == "enabled"
-        })
-        .unwrap_or(false)
+    crate::env_flag::truthy(SINK_MIRROR_ENV)
 }
 
 /// Mirror a batch of authoritative rows into the event-log tier.
@@ -1355,9 +1349,9 @@ mod tests {
                 if !same_table(src, i) {
                     continue; // a different table that merely shares the prefix
                 }
-            if !same_table(src, i) {
-                continue; // a different table that merely shares the prefix
-            }
+                if !same_table(src, i) {
+                    continue; // a different table that merely shares the prefix
+                }
                 // Strip `--` comments BEFORE locating the parens, not after: a
                 // comment containing a `)` — e.g. "(emit_events publishes rather
                 // than inserting)" — otherwise closes the column list early and the
@@ -1484,9 +1478,9 @@ mod tests {
                 if !same_table(src, i) {
                     continue; // a different table that merely shares the prefix
                 }
-            if !same_table(src, i) {
-                continue; // a different table that merely shares the prefix
-            }
+                if !same_table(src, i) {
+                    continue; // a different table that merely shares the prefix
+                }
                 let rest = &src[i..];
                 let open = rest.find('(').expect("column list opens");
                 let close = rest.find(')').expect("column list closes");
