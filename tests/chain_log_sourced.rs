@@ -404,3 +404,112 @@ async fn with_the_populator_off_the_source_writes_nothing() {
         "a root the populator was never pointed at must stay empty"
     );
 }
+
+// ---------------------------------------------------------------------------
+// ⭐⭐ The repoint itself: the POLLER path, with the source selected by config.
+// ---------------------------------------------------------------------------
+
+/// ⚠ `cargo test` does not serialise tests, and these mutate env.
+static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// ⭐⭐ **The repoint proof.** With all THREE gates on, `chain_source_from_env`
+/// yields the log-sourced store and `poller_action` decides from it.
+///
+/// This is the reachability half. Correctness is proven above by calling the
+/// source directly; this asserts that a server configured the way a repoint would
+/// configure it actually routes the poller's decision through that source — which
+/// is a different question, and the one this program keeps finding answered wrong.
+#[tokio::test]
+async fn the_poller_decides_from_the_chain_store_when_configured_to() {
+    let Some(p) = pool().await else {
+        eprintln!("SKIP: NOETL_TEST_PG_URL unset");
+        return;
+    };
+    let _g = ENV_LOCK.lock().await;
+    arm_store();
+    unsafe {
+        std::env::set_var(noetl_server::chain_advance::CHAIN_ADVANCE_ENV, "true");
+        std::env::set_var(
+            noetl_server::db::queries::event_chain::CHAIN_SOURCE_ENV,
+            "chain",
+        );
+    }
+
+    let src = noetl_server::db::queries::event_chain::chain_source_from_env(&p)
+        .expect("all three gates on must yield a source");
+    assert_eq!(
+        src.source_name(),
+        "log_sourced_chain_store",
+        "the configured source must be the chain store, not the Postgres scan"
+    );
+
+    // 2003 is running with 3 events. The budget must be RESET by an advance, and
+    // the decision must not be Empty.
+    let action = noetl_server::chain_advance::poller_action(src.as_ref(), 2003, 17)
+        .await
+        .expect("the chain path must engage — None means the source could not answer");
+    assert_eq!(action.decision, "advance", "got {action:?}");
+    assert!(!action.give_up);
+    assert_eq!(
+        action.noops, 0,
+        "an advance resets the budget; a stale budget is how the give-up cap \
+         misfires"
+    );
+
+    // 2004 is terminal.
+    let t = noetl_server::chain_advance::poller_action(src.as_ref(), 2004, 5)
+        .await
+        .expect("terminal execution must engage the chain path");
+    assert_eq!(t.decision, "terminal", "got {t:?}");
+
+    // ⚠⚠ And 2001 — the post-restart execution with THREE null-prev rows — must
+    // ALSO advance. Before the fix its partition froze and the guarded read served
+    // a stale prefix; the poller would then have seen a chain that stopped where
+    // the server restarted.
+    let r = noetl_server::chain_advance::poller_action(src.as_ref(), 2001, 9)
+        .await
+        .expect("the post-restart execution must engage the chain path");
+    assert_eq!(
+        r.decision, "advance",
+        "the post-restart execution must advance, got {r:?}"
+    );
+
+    unsafe {
+        std::env::remove_var(noetl_server::db::queries::event_chain::CHAIN_SOURCE_ENV);
+        std::env::remove_var(noetl_server::chain_advance::CHAIN_ADVANCE_ENV);
+    }
+}
+
+/// ⚠⚠ And the third gate, through the real resolver: source=chain with the
+/// populator OFF must yield NO source, not one reading an unpopulated store.
+#[tokio::test]
+async fn the_resolver_refuses_the_chain_store_without_the_populator() {
+    let Some(p) = pool().await else {
+        eprintln!("SKIP: NOETL_TEST_PG_URL unset");
+        return;
+    };
+    let _g = ENV_LOCK.lock().await;
+    unsafe {
+        std::env::set_var(noetl_server::chain_advance::CHAIN_ADVANCE_ENV, "true");
+        std::env::set_var(
+            noetl_server::db::queries::event_chain::CHAIN_SOURCE_ENV,
+            "chain",
+        );
+        std::env::remove_var(ehdb_l0::chain_populator::POPULATOR_ENV);
+    }
+    let got = noetl_server::db::queries::event_chain::chain_source_from_env(&p);
+    let refused = got.is_none();
+    // Restore before asserting, so a failure cannot leak the unset flag into
+    // whichever test runs next.
+    unsafe {
+        std::env::set_var(ehdb_l0::chain_populator::POPULATOR_ENV, "true");
+        std::env::remove_var(noetl_server::db::queries::event_chain::CHAIN_SOURCE_ENV);
+        std::env::remove_var(noetl_server::chain_advance::CHAIN_ADVANCE_ENV);
+    }
+    assert!(
+        refused,
+        "source=chain with the populator OFF returned a source. It would read an \
+         UNPOPULATED store, and decide() would report Empty on running \
+         executions — the exact cliff noetl/ai-meta#357 records."
+    );
+}

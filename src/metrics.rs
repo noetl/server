@@ -3356,14 +3356,35 @@ pub fn chain_populate_total() -> &'static prometheus::IntCounterVec {
 
 /// Every chain-populate label. Batch verdicts plus the lifecycle/row labels the
 /// module records directly.
+/// Every chain-populate label.
+///
+/// ⚠⚠ This list was short by SIX, and the gap was found by reading `/metrics` on
+/// a running server rather than by reading the code: the log-sourced path records
+/// `in_sync`, `extended`, `diverged` and four refusal reasons that were absent from
+/// here, so each would have been an absent series — indistinguishable from a build
+/// that predates the metric. `every_recorded_label_is_pinned` now computes the set
+/// from the source so the list cannot fall behind silently again.
 pub const CHAIN_POPULATE_OUTCOMES: &[&str] = &[
+    // per-batch verdicts (the per-event path)
     "populated",
     "partial",
     "rejected",
     "skipped",
+    // lifecycle
     "opened",
     "open_failed",
     "append_rejected",
+    // the log-sourced path's verdicts (ehdb_l0::chain_populator::FromLog)
+    "in_sync",
+    "extended",
+    "diverged",
+    // and its refusal reasons — each one a distinct "cannot answer"
+    "log_read_failed",
+    "log_truncated",
+    "populate_failed",
+    "guarded_read_refused",
+    "guarded_read_failed",
+    "length_disagreement",
 ];
 
 /// Counter: chain-head hydration outcomes.

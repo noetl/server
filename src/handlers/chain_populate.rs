@@ -462,3 +462,70 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod label_denominator_tests {
+    /// ⚠⚠ **Print the denominator.** Every label this module actually records must
+    /// be in the pinned set, and the set is checked against the SOURCE rather than
+    /// against a hand-written list — because the hand-written list was already
+    /// short by six, and a missing label is an absent series that reads exactly
+    /// like a build predating the metric.
+    ///
+    /// Found by reading `/metrics` on a running server, not by reading the code.
+    #[test]
+    fn every_recorded_label_is_pinned() {
+        let src = include_str!("chain_populate.rs");
+        let non_test = src.split("#[cfg(test)]").next().unwrap();
+        assert!(
+            non_test.len() > 4000,
+            "extracted {} bytes — implausibly small; a guard measuring nothing \
+             passes",
+            non_test.len()
+        );
+
+        // Literal `record_chain_populate("x")` call sites.
+        let mut found: Vec<String> = Vec::new();
+        let needle = "record_chain_populate(\"";
+        let mut at = 0usize;
+        while let Some(i) = non_test[at..].find(needle) {
+            let start = at + i + needle.len();
+            let end = non_test[start..]
+                .find('"')
+                .map(|j| start + j)
+                .expect("unterminated label literal");
+            found.push(non_test[start..end].to_string());
+            at = end;
+        }
+        assert!(
+            found.len() >= 9,
+            "found only {} literal label call sites — the extraction is probably \
+             wrong, and a short denominator reports a false clean: {found:?}",
+            found.len()
+        );
+
+        for l in &found {
+            assert!(
+                crate::metrics::CHAIN_POPULATE_OUTCOMES.contains(&l.as_str()),
+                "label {l:?} is recorded but NOT pinned, so it is an absent series \
+                 until it first fires — which reads identically to a binary that \
+                 has no such metric.\nrecorded={found:?}\npinned={:?}",
+                crate::metrics::CHAIN_POPULATE_OUTCOMES
+            );
+        }
+
+        // And the labels reached indirectly, through `FromLog::label()`.
+        for l in ehdb_l0::chain_populator::FromLog::ALL_LABELS {
+            assert!(
+                crate::metrics::CHAIN_POPULATE_OUTCOMES.contains(&l),
+                "FromLog label {l:?} is recorded via outcome.label() but not pinned"
+            );
+        }
+
+        eprintln!(
+            "denominator: {} literal labels + {} FromLog labels, {} pinned",
+            found.len(),
+            ehdb_l0::chain_populator::FromLog::ALL_LABELS.len(),
+            crate::metrics::CHAIN_POPULATE_OUTCOMES.len()
+        );
+    }
+}
