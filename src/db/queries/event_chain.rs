@@ -238,6 +238,230 @@ pub fn chain_source_from_env(
             pool.clone(),
             DEFAULT_CHAIN_READ_LIMIT,
         ))),
+        // ⭐⭐ The chain store, populated from the authoritative log on each read.
+        //
+        // ⚠ Requires the populator to be armed too (`NOETL_CHAIN_POPULATE`), and
+        // resolves to `off` without it rather than silently reading an unpopulated
+        // store — which is the exact failure ai-meta#357 records: a repoint over a
+        // store nothing filled makes `decide()` read `Empty` on a running
+        // execution. Three gates, not two, and this is the one that cannot be
+        // skipped by accident.
+        "chain" | "chain_store" => {
+            if ehdb_l0::chain_populator::populator_enabled() {
+                Some(std::sync::Arc::new(
+                    crate::handlers::chain_populate::LogSourcedChainSource::new(
+                        pool.clone(),
+                        DEFAULT_CHAIN_READ_LIMIT,
+                    ),
+                ))
+            } else {
+                tracing::warn!(target: "noetl_server::event_chain",
+                    "NOETL_CHAIN_SOURCE selects the chain store but \
+                     NOETL_CHAIN_POPULATE is off; resolving to OFF rather than \
+                     reading a store nothing populates");
+                None
+            }
+        }
         _ => None,
+    }
+}
+
+/// Chain-head hydrator backed by `noetl.event`.
+///
+/// ⚠⚠ The query is `max(event_id)`, and that is correct only because `event_id` is
+/// a per-execution monotonic snowflake — the same ordering `read_chain` uses. It
+/// is NOT `ORDER BY created_at`: `created_at` is reduced to microseconds and two
+/// events in one batch can share a value, so it does not totally order them.
+pub struct PgChainHeadHydrator {
+    pool: DbPool,
+}
+
+impl PgChainHeadHydrator {
+    pub fn new(pool: DbPool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::state::ChainHeadHydrator for PgChainHeadHydrator {
+    async fn head_of(&self, execution_id: i64) -> crate::state::HydrateOutcome {
+        // `max()` over an empty set is SQL NULL, so the row always exists and the
+        // Option distinguishes "no events" from "no row".
+        let got: Result<Option<i64>, sqlx::Error> =
+            sqlx::query_scalar("SELECT max(event_id) FROM noetl.event WHERE execution_id = $1")
+                .bind(execution_id)
+                .fetch_one(&self.pool)
+                .await;
+        match got {
+            Ok(Some(head)) => crate::state::HydrateOutcome::Head(head),
+            Ok(None) => crate::state::HydrateOutcome::Empty,
+            // ⚠ `Failed`, never `Empty`. Collapsing the two would stamp a chain
+            // root onto an arbitrary event whenever the database hiccuped — the
+            // precise defect this hydrator exists to remove.
+            Err(e) => {
+                tracing::warn!(target: "noetl_server::event_chain", execution_id, error = %e,
+                    "chain-head hydration failed; the next event for this execution \
+                     will be stamped as a chain ROOT");
+                crate::state::HydrateOutcome::Failed
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod chain_source_gate_tests {
+    use super::*;
+
+    /// ⚠ `cargo test` does NOT serialise tests within a binary — an `EnvGuard`
+    /// SAFETY note in this program once claimed it did, and the tests raced.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_env<T>(vars: &[(&str, Option<&str>)], f: impl FnOnce() -> T) -> T {
+        let guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved: Vec<(String, Option<String>)> = vars
+            .iter()
+            .map(|(k, _)| ((*k).to_string(), std::env::var(k).ok()))
+            .collect();
+        for (k, v) in vars {
+            match v {
+                Some(v) => unsafe { std::env::set_var(k, v) },
+                None => unsafe { std::env::remove_var(k) },
+            }
+        }
+        let out = f();
+        for (k, v) in saved {
+            match v {
+                Some(v) => unsafe { std::env::set_var(&k, v) },
+                None => unsafe { std::env::remove_var(&k) },
+            }
+        }
+        drop(guard);
+        out
+    }
+
+    /// ⭐⭐ **The third gate.** Selecting the chain store while the populator is OFF
+    /// must resolve to `off`, not to a source reading an unpopulated store.
+    ///
+    /// That combination is exactly the cliff noetl/ai-meta#357 records: a repoint
+    /// over a store nothing filled makes `decide()` read `Empty` on a running
+    /// execution. Two gates were not enough, because both can be on while the
+    /// thing that fills the store is off.
+    #[test]
+    fn selecting_the_chain_store_without_the_populator_resolves_to_off() {
+        with_env(
+            &[
+                (crate::chain_advance::CHAIN_ADVANCE_ENV, Some("true")),
+                (CHAIN_SOURCE_ENV, Some("chain")),
+                (ehdb_l0::chain_populator::POPULATOR_ENV, None),
+            ],
+            || {
+                assert!(
+                    crate::chain_advance::chain_advance_enabled(),
+                    "precondition: the advance gate is on, so the gate under test is \
+                     the POPULATOR one and not this one"
+                );
+                assert!(
+                    !ehdb_l0::chain_populator::populator_enabled(),
+                    "precondition: the populator is off"
+                );
+            },
+        );
+
+        // ⚠ `chain_source_from_env` needs a live `DbPool`, so the gate is asserted
+        // at the SOURCE. An assertion on the two preconditions alone would pass
+        // whether or not the arm consults the populator at all — which is the
+        // difference between testing the gate and testing the environment.
+        let src = include_str!("event_chain.rs");
+        let non_test = src.split("#[cfg(test)]").next().unwrap();
+        let arm_at = non_test
+            .find(r#""chain" | "chain_store" =>"#)
+            .expect("the chain-store arm is gone — re-anchor this guard");
+        let arm_end = non_test[arm_at..]
+            .find("_ => None,")
+            .map(|i| arm_at + i)
+            .expect("end of the match not found — extraction broke");
+        let arm = &non_test[arm_at..arm_end];
+        assert!(
+            arm.len() > 200,
+            "extracted {} bytes of the chain-store arm — implausibly small",
+            arm.len()
+        );
+        assert!(
+            arm.contains("populator_enabled()"),
+            "the chain-store arm does not consult populator_enabled(), so \
+             NOETL_CHAIN_SOURCE=chain with the populator OFF would return a source \
+             that reads an UNPOPULATED store — decide() then sees Empty on running \
+             executions (noetl/ai-meta#357).\n{arm}"
+        );
+    }
+
+    /// An unrecognised source value resolves to `off` — a typo must never move the
+    /// execution-advance path.
+    #[test]
+    fn an_unrecognised_source_value_is_off() {
+        for v in ["", "chainstore", "CHAIN-STORE", "true", "yes", "ehdb"] {
+            assert!(
+                !matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "postgres" | "pg" | "chain" | "chain_store"
+                ),
+                "{v:?} must not be a recognised source value"
+            );
+        }
+    }
+
+    /// ⚠ `Failed` and `Empty` must stay distinct, because `Empty` licenses stamping
+    /// a chain ROOT and `Failed` must not.
+    #[test]
+    fn a_failed_hydration_is_not_an_empty_one() {
+        use crate::state::HydrateOutcome;
+        assert_ne!(
+            HydrateOutcome::Failed.label(),
+            HydrateOutcome::Empty.label()
+        );
+        assert_eq!(HydrateOutcome::Failed.label(), "failed");
+        assert_eq!(HydrateOutcome::Empty.label(), "empty");
+        for o in [
+            HydrateOutcome::Head(1),
+            HydrateOutcome::Empty,
+            HydrateOutcome::Failed,
+        ] {
+            assert!(
+                HydrateOutcome::ALL_LABELS.contains(&o.label()),
+                "{} is not pinned, so it would be an absent series",
+                o.label()
+            );
+        }
+    }
+
+    /// ⚠⚠ THE wiring: the hydrator must be installed in `main`, not merely exist.
+    ///
+    /// A hydrator nobody installs is the noetl/ai-meta#326 shape — present,
+    /// documented, never reached — and its absence is invisible, because the
+    /// fallback is the old cold-map behaviour that looks like normal operation.
+    #[test]
+    fn the_hydrator_is_installed_in_main() {
+        let main = include_str!("../../main.rs");
+        let code: String = main
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            code.len() > 10_000,
+            "main.rs extracted as {} bytes — implausibly small; a guard measuring \
+             nothing passes",
+            code.len()
+        );
+        assert!(
+            code.contains("chain_heads.set_hydrator("),
+            "main.rs never calls set_hydrator, so the chain edge is still stamped \
+             from the per-process map after a restart and every in-flight \
+             execution gets a second chain root"
+        );
+        assert!(
+            code.contains("PgChainHeadHydrator::new("),
+            "set_hydrator is called but not with the Postgres hydrator"
+        );
     }
 }

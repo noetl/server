@@ -1062,6 +1062,7 @@ async fn main() -> anyhow::Result<()> {
     // noetl/ai-meta#332 step 5 — pinned so an unrun shadow reads 0, not absent.
     noetl_server::metrics::init_embedded_shadow_series();
     noetl_server::metrics::init_chain_populate_series();
+    noetl_server::metrics::init_chain_head_hydrate_series();
     noetl_server::metrics::init_embedded_read_series();
     noetl_server::metrics::init_projection_serve_refusal_series();
     noetl_server::metrics::init_ehdb_eventlog_mirror_series();
@@ -1142,6 +1143,16 @@ async fn main() -> anyhow::Result<()> {
     // shared with the services below.  Services that need to mint
     // ids take a clone of `state.snowflake` (an `Arc`).
     let state = AppState::new(db_pool.clone(), pools, app_config.clone());
+    // ⭐⭐ Chain-head hydration. Without it the chain edge is stamped from a
+    // per-process, non-durable map, so after a restart the next event for a
+    // still-running execution becomes a second chain ROOT — measured in kind
+    // 2026-09-28 as 534 of 595 executions carrying more than one null-prev root
+    // (noetl/ai-meta#357). Installed unconditionally: a correct chain link is not a
+    // feature to gate, and with no chain store armed it only makes the existing
+    // `prev_event_id` column right.
+    state.chain_heads.set_hydrator(Some(std::sync::Arc::new(
+        noetl_server::db::queries::event_chain::PgChainHeadHydrator::new(db_pool.clone()),
+    )));
 
     // Background reconcile poller (noetl/ai-meta#101 block b): periodically
     // force-advances any cached execution that got stuck on a missed
@@ -1239,6 +1250,7 @@ async fn main() -> anyhow::Result<()> {
     // CREATE TABLE IF NOT EXISTS at startup is the right shape — no
     // out-of-band migration step required for first-boot deployments.
     noetl_server::db::queries::secret_audit::ensure_table(&db_pool).await?;
+
 
     // Result-store MVP (noetl/ai-meta#70) — same idempotent startup-DDL
     // pattern as secret_audit above.  The table is server-owned end-to-end;

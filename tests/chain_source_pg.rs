@@ -83,9 +83,21 @@ async fn the_database_we_reached_is_the_fixture_we_expect() {
                 "the fixture table must exist — if this fails, check WHICH cluster the \
                      port-forward actually reached",
             );
+    // ⚠ The UNION of two fixtures in one database. 1001-1003 are this suite's
+    // (1002 carries the deliberate hole at event 14); 2001-2004 belong to
+    // `chain_log_sourced.rs` and are renumbered apart because the two suites want
+    // incompatible shapes for the same id.
     assert_eq!(
         counts,
-        vec![(1001, 7), (1002, 6), (1003, 3)],
+        vec![
+            (1001, 7),
+            (1002, 6),
+            (1003, 3),
+            (2001, 7),
+            (2002, 6),
+            (2003, 3),
+            (2004, 3)
+        ],
         "not the expected fixture: got {counts:?}"
     );
 }
