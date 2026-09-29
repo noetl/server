@@ -3384,6 +3384,18 @@ pub const CHAIN_POPULATE_OUTCOMES: &[&str] = &[
     "in_sync",
     "extended",
     "diverged",
+    // ⚠ A snapshot BEHIND the store — benign, and the partition stays servable
+    // (noetl/ai-meta#360). It must be pinned like any other: an unpinned label is
+    // an absent series until it first fires, which reads identically to a binary
+    // that has no such outcome. This one in particular needs to be VISIBLE,
+    // because its whole point is that it used to be miscounted as `diverged`.
+    "stale_log",
+    // ⚠ A StaleLog on the SECOND attempt: the log caught up, but the outcome was
+    // undecided so no chain was read under that lock hold. Falling through is
+    // correct — answering from a read taken outside the hold is what produced
+    // `length_disagreement` under load. Pinned so "this never happens" is
+    // distinguishable from "nothing records it" (noetl/ai-meta#360).
+    "stale_log_unresolved",
     // and its refusal reasons — each one a distinct "cannot answer"
     "log_read_failed",
     "log_truncated",

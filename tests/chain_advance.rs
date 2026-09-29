@@ -525,7 +525,16 @@ async fn with_the_flag_on_and_a_source_the_chain_decision_is_used() {
             poller_action(&empty_src, 1, 7).await.is_none(),
             "no chain available must fall through, not fabricate a decision"
         );
-    });
+    })
+    // ⚠⚠ THIS `.await` WAS MISSING, and its absence made the single most
+    // load-bearing test in this file inert: the async block was constructed and
+    // dropped, so "with the flag on, the chain decision IS used" — the whole
+    // reachability claim — asserted nothing. rustc says so
+    // (`unused implementer of Future that must be used`); the warning was in
+    // every build and went unread. noetl/ai-meta#360.
+    //
+    // Every sibling in this file ends `}).await;`. This one ended `});`.
+    .await;
 }
 
 /// ⚠ **Positive control for the two flag tests.** If `poller_action` returned
@@ -544,4 +553,51 @@ async fn poller_action_is_capable_of_returning_some() {
         assert_eq!(got.unwrap().decision, "advance");
     })
     .await;
+}
+
+/// ⚠⚠ Guard on this file: every `with_flag_async` block must be AWAITED.
+///
+/// `with_the_flag_on_and_a_source_the_chain_decision_is_used` ended `});` instead
+/// of `}).await;` and was therefore INERT — an async block built and dropped. It
+/// was the one test asserting the chain decision is actually used, i.e. the entire
+/// reachability claim, and it asserted nothing. rustc emitted `unused implementer
+/// of Future that must be used` on every build and nobody read it
+/// (noetl/ai-meta#360).
+///
+/// An `#[allow]`-free build would make this guard redundant. Until then, a test
+/// that reads its own source is the cheap version, and unlike the warning it
+/// FAILS rather than scrolls past.
+#[test]
+fn every_with_flag_async_block_is_awaited() {
+    let src = include_str!("chain_advance.rs");
+
+    // ⚠ Exclude this guard's own body, or the literals below match themselves.
+    let anchor = "fn every_with_flag_async_block_is_awaited";
+    let body = src.split(anchor).next().expect("anchor must exist");
+    assert!(
+        body.len() > 8000,
+        "extracted {} bytes — implausibly small, and a guard measuring nothing \
+         passes. The anchor probably moved.",
+        body.len()
+    );
+
+    let calls = body.matches("with_flag_async(").count();
+    assert!(
+        calls >= 3,
+        "found only {calls} with_flag_async call sites — too few to be the real \
+         population, so a clean result here would be false"
+    );
+
+    // Each call's block ends at a `})` that must be followed by `.await`, possibly
+    // across a newline and comments. Rather than parse, assert the negative form
+    // that actually bit: a `})` closing one of these, then `;` with no `.await`.
+    let unawaited = body.matches("})\n}").count() + body.matches("});\n}").count();
+
+    eprintln!("denominator: {calls} with_flag_async call sites, {unawaited} closing without .await");
+    assert_eq!(
+        unawaited, 0,
+        "a with_flag_async block closes without `.await`, so its assertions never \
+         run. Look for a block closing with brace-paren-semicolon where the \
+         siblings close with brace-paren-dot-await-semicolon."
+    );
 }
