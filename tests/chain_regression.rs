@@ -455,3 +455,154 @@ fn this_suite_does_not_skip_without_a_database() {
          mode5); found {skips}. Every other test here must always run."
     );
 }
+
+// ===========================================================================
+// MODE 6 — TWO WRITERS on one partition. The mode the canary found and this
+// suite could not see, because every test above exercises ONE writer alone.
+// ===========================================================================
+
+/// ⚠⚠ **The coverage gap, closed.**
+///
+/// Modes 1–5 each drive a single populator. That is structurally blind to the
+/// defect the prod canary found (noetl/ai-meta#358): an emit-path writer appending
+/// **pre-fork** — before the authoritative write commits — alongside
+/// `populate_from_log`, which compares against what the log **has committed**.
+///
+/// The store then legitimately runs AHEAD of the log, the prefix check reports
+/// `Diverged`, and the guarded read refuses. Measured on prod over 22 executions:
+/// `in_sync=13, diverged=2` — 13.3% divergence.
+///
+/// This test reproduces that interference from a temp dir, with no database, by
+/// modelling the two commit points explicitly: the emit writer appends event N
+/// while the log the reader sees still ends at N-1.
+#[test]
+fn mode6_a_second_prefork_writer_makes_the_log_source_diverge() {
+    let r = rig();
+    let p = r.pop();
+    let exec = "two-writers";
+
+    // The log as Postgres has COMMITTED it: 3 events.
+    let committed = log(&["t1", "t2", "t3"]);
+    p.populate_from_log(exec, &committed)
+        .expect("initial populate");
+    assert!(
+        p.chain_if_authoritative(exec).unwrap().is_some(),
+        "precondition: one writer, and the partition is servable"
+    );
+
+    // ⚠ Now a SECOND writer appends pre-fork: event t4 exists in the store before
+    // the authoritative log has it. This is exactly what `populate_batch` did at
+    // the emit chokepoint.
+    p.populate(exec, "t4", Some("t3"), None, "{}")
+        .expect("the pre-fork writer appends");
+
+    // The reader runs again; the log it can see STILL ends at t3.
+    let out = p
+        .populate_from_log(exec, &committed)
+        .expect("second populate must not error");
+
+    match out {
+        FromLog::Diverged {
+            at_position,
+            ref stored,
+            ref log,
+        } => {
+            assert_eq!(
+                at_position, 3,
+                "divergence is at the extra event's position"
+            );
+            assert_eq!(stored, "t4", "the store holds an event the log does not");
+            assert_eq!(log, "", "and the log has nothing at that position");
+        }
+        other => panic!(
+            "expected Diverged — a second pre-fork writer MUST be detected, not \
+             silently absorbed. Got {other:?}. If this now reports InSync, the \
+             prefix check has stopped comparing and the 13.3% prod divergence \
+             would have gone unnoticed."
+        ),
+    }
+
+    // ⭐ And the SAFETY property: a diverged partition is never served.
+    assert_eq!(
+        p.chain_if_authoritative(exec).unwrap(),
+        None,
+        "a partition whose store disagrees with the committed log must read as \
+         CANNOT ANSWER, so the caller falls through to the authoritative log. \
+         This is what kept the prod canary safe."
+    );
+}
+
+/// ⭐⭐ **And with ONE writer, the same sequence is clean.**
+///
+/// The positive half of the RED→GREEN: remove the second writer and the identical
+/// read sequence reports `InSync` and stays servable. Without this, mode 6 would
+/// pass for a build where `populate_from_log` always returned `Diverged`.
+#[test]
+fn mode6_with_a_single_writer_the_comparator_is_clean() {
+    let r = rig();
+    let p = r.pop();
+    let exec = "one-writer";
+
+    let committed = log(&["s1", "s2", "s3"]);
+    assert_eq!(
+        p.populate_from_log(exec, &committed).unwrap(),
+        FromLog::InSync {
+            total: 3,
+            appended: 3
+        }
+    );
+
+    // No second writer. Re-read with the same committed log.
+    assert_eq!(
+        p.populate_from_log(exec, &committed).unwrap(),
+        FromLog::InSync {
+            total: 3,
+            appended: 0
+        },
+        "the sole writer re-reading its own partition must be InSync with nothing \
+         appended — this is the state the fix restores"
+    );
+    // And the log growing is an extension, not a divergence.
+    let grown = log(&["s1", "s2", "s3", "s4"]);
+    assert_eq!(
+        p.populate_from_log(exec, &grown).unwrap(),
+        FromLog::InSync {
+            total: 4,
+            appended: 1
+        }
+    );
+
+    let chain = p.chain_if_authoritative(exec).unwrap().expect("servable");
+    assert_eq!(chain.len(), 4);
+    assert_eq!(
+        chain.iter().filter(|e| e.prev_event_id.is_none()).count(),
+        1,
+        "still exactly one root"
+    );
+}
+
+/// ⚠⚠ **The wiring half.** The server must have NO emit-path call site.
+///
+/// mode 6 proves the *mechanism*; this proves the *fix is wired*. A test that only
+/// demonstrated the mechanism would pass on the very build that shipped the defect.
+#[test]
+fn mode6_the_server_has_no_emit_path_populator_call_site() {
+    let src = include_str!("../src/handlers/event_write.rs");
+    let non_test = src.split("#[cfg(test)]").next().expect("non-test region");
+    assert!(
+        non_test.len() > 5000,
+        "extracted {} bytes — implausibly small; a guard measuring nothing passes",
+        non_test.len()
+    );
+    assert!(
+        non_test.contains("pub async fn emit_events"),
+        "the extraction missed emit_events, so the assertion below would be vacuous"
+    );
+    assert!(
+        !non_test.contains("populate_batch("),
+        "event_write.rs calls populate_batch again — a SECOND writer to the chain \
+         store with a different commit point from populate_from_log. That measured \
+         13.3% divergence on prod (noetl/ai-meta#358). The log-sourced populator \
+         must remain the sole writer."
+    );
+}
