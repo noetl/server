@@ -354,17 +354,39 @@ fn mode5_the_populator_flag_defaults_off() {
     );
 }
 
-/// ⚠⚠ The server's chain source must resolve to OFF unless the populator is
-/// armed too. Two advance gates on with the populator off would point a reader at
-/// a store nothing fills, which makes `decide()` report Empty on a RUNNING
+/// ⚠⚠ The server's chain source must resolve to OFF unless the populator is armed
+/// too. Two advance gates on with the populator off would point a reader at a
+/// store nothing fills, which makes `decide()` report `Empty` on a RUNNING
 /// execution — the cliff this whole program exists to close.
+///
+/// ⚠ Asserted at the SOURCE. `chain_source_from_env` needs a live `DbPool`, so a
+/// runtime assertion here would need a database — which is exactly what this suite
+/// must not need. An assertion on env vars alone would pass whether or not the arm
+/// consults the populator at all, which is the difference between testing the gate
+/// and testing the environment.
 #[test]
-fn mode5_the_chain_store_needs_all_three_gates() {
-    let arming = noetl_server::env_flag::chain_store_arming();
-    // In a clean test environment no gate is set.
+fn mode5_the_chain_store_arm_consults_the_populator_gate() {
+    let src = include_str!("../src/db/queries/event_chain.rs");
+    let non_test = src.split("#[cfg(test)]").next().expect("non-test region");
+    let at = non_test
+        .find(r#""chain" | "chain_store" =>"#)
+        .expect("the chain-store arm is gone — re-anchor this guard, do not delete it");
+    let end = non_test[at..]
+        .find("_ => None,")
+        .map(|i| at + i)
+        .expect("end of the match not found — the extraction broke");
+    let arm = &non_test[at..end];
     assert!(
-        !arming.is_armed(),
-        "a test environment with no gates set must not read as armed, got {arming:?}"
+        arm.len() > 200,
+        "extracted {} bytes of the chain-store arm — implausibly small; a guard \
+         measuring nothing passes",
+        arm.len()
+    );
+    assert!(
+        arm.contains("populator_enabled()"),
+        "the chain-store arm does not consult populator_enabled(), so \
+         NOETL_CHAIN_SOURCE=chain with the populator OFF would hand back a source \
+         that reads an UNPOPULATED store.\n{arm}"
     );
 }
 
