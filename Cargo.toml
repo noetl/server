@@ -112,13 +112,22 @@ gcp_auth = "0.12"
 # the same on-disk layout. That is the exact corruption vector the paragraph
 # above is about, reached by bumping only one line.
 #
-# v0.4.2 = the execution-partitioned chain store + the populator and its
-# watermark. FORMAT_VERSION is 1 in both v0.3.0 and v0.4.2, so the layout gate
-# does not refuse an existing store. The feed side of the bump carries exactly
-# one behavioural change, ehdb#373 (release a departed connection's in-flight
-# records at once).
-ehdb-feed = { git = "https://github.com/noetl/ehdb", tag = "v0.4.2" }
-ehdb-l0 = { git = "https://github.com/noetl/ehdb", tag = "v0.4.2" }
+# v0.4.3 = the chain is reconstructed from the AUTHORITATIVE LOG:
+# `populate_from_log` recomputes the chain edge from log order (the log's own
+# `prev_event_id` is never an input — it is NULL on 643,420 of 645,677 measured
+# rows), plus the COVERAGE record that makes "populated from the beginning"
+# distinguishable from "populated from the middle", plus the guarded read's
+# refusal when the watermark is ahead of the content (ehdb#374 + #375,
+# noetl/ai-meta#357).
+#
+# FORMAT_VERSION is 1 in v0.3.0, v0.4.2 and v0.4.3 alike, so the on-disk layout
+# gate does not refuse an existing store.
+#
+# ⚠ v0.4.1 must not be adopted: its populator could create authority out of a
+# failure. v0.4.2 lacks `populate_from_log` and coverage, so a reader built on it
+# cannot tell a truncated partition from a whole one.
+ehdb-feed = { git = "https://github.com/noetl/ehdb", tag = "v0.4.3" }
+ehdb-l0 = { git = "https://github.com/noetl/ehdb", tag = "v0.4.3" }
 # Value type for the JetStream KV puts in `src/coherence.rs` (multi-replica
 # watermark/descriptor coherence, RFC #115 program-scale).  Matches the version
 # async-nats already pulls in transitively.
