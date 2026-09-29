@@ -257,8 +257,59 @@ pub struct ExecOrchState {
 /// validates.  Restart-spanning repair is a Phase 3 builder concern (it
 /// re-walks from a durable head); nothing reads `prev_event_id` yet, so a chain
 /// restart here is additive metadata, never a regression.
+/// Supplies an execution's chain head from durable storage, for the case the
+/// in-memory map has never seen it.
+///
+/// ⚠⚠ This exists because the map is the ONLY source of the chain edge, and it is
+/// per-process and non-durable. After a restart, the next event for a
+/// still-running execution was therefore stamped `prev_event_id = NULL` — a second
+/// chain ROOT for an execution already hours old. Measured in kind 2026-09-28:
+/// **534 of 595 executions carry more than one null-prev root**, and 643,420 of
+/// 645,677 rows carry no prev at all.
+///
+/// The downstream cost was not cosmetic. A chain store built on those rows roots
+/// each partition wherever the server last restarted, and a reader of it sees a
+/// running execution whose history begins there.
+#[async_trait::async_trait]
+pub trait ChainHeadHydrator: Send + Sync {
+    /// The execution's current head (its greatest `event_id`), or `None` when the
+    /// execution genuinely has no events.
+    ///
+    /// ⚠ Must return `None` ONLY for a genuinely empty execution. A read failure
+    /// has to be distinguishable, because `None` here means "this event is the
+    /// root" and stamping a root onto event 4,000 is the defect this fixes.
+    /// Implementations report failure by returning [`HydrateOutcome::Failed`].
+    async fn head_of(&self, execution_id: i64) -> HydrateOutcome;
+}
+
+/// What a hydration attempt produced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HydrateOutcome {
+    /// The execution has this head.
+    Head(i64),
+    /// The execution genuinely has no events, so the next one IS the root.
+    Empty,
+    /// The lookup failed. ⚠ NOT the same as `Empty`: the caller must not stamp a
+    /// root on the strength of a failed read.
+    Failed,
+}
+
+impl HydrateOutcome {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Head(_) => "head",
+            Self::Empty => "empty",
+            Self::Failed => "failed",
+        }
+    }
+    /// Every label, pinned at 0 so absence never reads as zero.
+    pub const ALL_LABELS: [&'static str; 4] = ["head", "empty", "failed", "cache_hit"];
+}
+
 pub struct ChainHeads {
     map: std::sync::Mutex<std::collections::HashMap<i64, i64>>,
+    /// Durable fallback for a cold map. `None` → today's behaviour exactly.
+    hydrator: std::sync::Mutex<Option<Arc<dyn ChainHeadHydrator>>>,
     /// Multi-replica coherence backend (RFC #115 program-scale).  `local`
     /// (default) → disabled, the `map` is the whole story (today's behavior).
     /// `nats_kv` → the head is CAS-advanced in a shared KV bucket so 2+ replicas
@@ -270,6 +321,7 @@ impl Default for ChainHeads {
     fn default() -> Self {
         Self {
             map: std::sync::Mutex::new(std::collections::HashMap::new()),
+            hydrator: std::sync::Mutex::new(None),
             coherence: Arc::new(crate::coherence::CoherenceKv::default()),
         }
     }
@@ -280,6 +332,7 @@ impl ChainHeads {
     pub fn with_coherence(coherence: Arc<crate::coherence::CoherenceKv>) -> Self {
         Self {
             map: std::sync::Mutex::new(std::collections::HashMap::new()),
+            hydrator: std::sync::Mutex::new(None),
             coherence,
         }
     }
@@ -312,11 +365,62 @@ impl ChainHeads {
             crate::metrics::record_replica_coherence("chain_head", "link_batch", "kv_unavailable");
             // Fall through to the in-process map (degraded mode == local).
         }
+        // ⭐⭐ Double-checked hydration. The map is per-process and non-durable, so a
+        // miss after a restart is not "this execution is new" — it is "this process
+        // has not seen this execution". Stamping `None` there roots the chain at
+        // whatever event happens to be next.
+        //
+        // ⚠ The `std::Mutex` is NEVER held across the `await`: the map is checked,
+        // the lock dropped, the durable head fetched, then the lock retaken and the
+        // map re-checked, because another task may have filled it meanwhile.
+        let cached = { self.map.lock().unwrap().get(&execution_id).copied() };
+        let head = match cached {
+            Some(h) => {
+                crate::metrics::record_chain_head_hydrate("cache_hit");
+                Some(h)
+            }
+            None => {
+                let hydrator = { self.hydrator.lock().unwrap().clone() };
+                match hydrator {
+                    None => None,
+                    Some(h) => match h.head_of(execution_id).await {
+                        HydrateOutcome::Head(id) => {
+                            crate::metrics::record_chain_head_hydrate("head");
+                            Some(id)
+                        }
+                        HydrateOutcome::Empty => {
+                            crate::metrics::record_chain_head_hydrate("empty");
+                            None
+                        }
+                        // ⚠ A failed read must NOT become a root. Falling back to
+                        // `None` here is exactly the bug: it is indistinguishable
+                        // from a genuinely-new execution. The batch still gets
+                        // stamped from the map (which is a miss, so `None`) because
+                        // there is nothing better to do on the write path — but the
+                        // failure is counted, so a store built on these rows is not
+                        // silently trusted.
+                        HydrateOutcome::Failed => {
+                            crate::metrics::record_chain_head_hydrate("failed");
+                            None
+                        }
+                    },
+                }
+            }
+        };
+
         let mut map = self.map.lock().unwrap();
-        let head = map.get(&execution_id).copied();
+        // Re-check: a concurrent batch for this execution may have advanced the
+        // head while the await was in flight. The map wins when it has a value,
+        // because it reflects writes this process has already stamped.
+        let head = map.get(&execution_id).copied().or(head);
         let prevs = Self::prevs_from(head, event_ids);
         map.insert(execution_id, new_head);
         prevs
+    }
+
+    /// Install the durable fallback. `None` leaves today's behaviour untouched.
+    pub fn set_hydrator(&self, hydrator: Option<Arc<dyn ChainHeadHydrator>>) {
+        *self.hydrator.lock().unwrap() = hydrator;
     }
 
     /// Given the head *before* a batch + the batch's ids (in order), the

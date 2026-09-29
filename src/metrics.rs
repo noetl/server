@@ -3366,6 +3366,41 @@ pub const CHAIN_POPULATE_OUTCOMES: &[&str] = &[
     "append_rejected",
 ];
 
+/// Counter: chain-head hydration outcomes.
+///
+/// ⚠ `failed` is the one to alert on. A failed durable read falls back to the
+/// cold-map answer, which stamps `prev_event_id = NULL` — a second chain root on
+/// a running execution. It is the only arm where the write path proceeds on worse
+/// information than it asked for.
+pub fn chain_head_hydrate_total() -> &'static prometheus::IntCounterVec {
+    static M: std::sync::OnceLock<prometheus::IntCounterVec> = std::sync::OnceLock::new();
+    M.get_or_init(|| {
+        let m = prometheus::IntCounterVec::new(
+            prometheus::Opts::new(
+                "noetl_chain_head_hydrate_total",
+                "Chain-head hydration outcomes when the in-memory head map misses",
+            ),
+            &["outcome"],
+        )
+        .expect("valid metric");
+        registry().register(Box::new(m.clone())).ok();
+        m
+    })
+}
+
+pub fn record_chain_head_hydrate(outcome: &str) {
+    chain_head_hydrate_total()
+        .with_label_values(&[outcome])
+        .inc();
+}
+
+/// Pin every hydration label at 0, unconditionally.
+pub fn init_chain_head_hydrate_series() {
+    for o in crate::state::HydrateOutcome::ALL_LABELS {
+        chain_head_hydrate_total().with_label_values(&[o]).inc_by(0);
+    }
+}
+
 pub fn record_chain_populate(outcome: &str) {
     chain_populate_total().with_label_values(&[outcome]).inc();
 }
