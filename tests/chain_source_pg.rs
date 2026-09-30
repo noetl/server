@@ -582,3 +582,76 @@ async fn cleanup(p: &sqlx::PgPool, exec: i64) {
         .await
         .expect("cleanup");
 }
+
+// ---------------------------------------------------------------------------
+// noetl/ai-meta#362 — the one-root invariant sampler.
+// ---------------------------------------------------------------------------
+
+/// The invariant classification, against real rows.
+///
+/// ⚠ The counting query and the endpoint's detail query must agree, because two
+/// independent implementations of "what counts as one root" is how the two parity
+/// oracles ended up disagreeing by construction (noetl/ai-meta#325).
+#[tokio::test]
+async fn a362_invariant_counts_classify_one_multi_and_none() {
+    let Some(p) = pool().await else {
+        eprintln!("SKIP: NOETL_TEST_PG_URL unset");
+        return;
+    };
+    // Three shapes, in a window of their own.
+    let healthy = 5201i64;
+    let forked = 5202i64;
+    seed_linked(&p, healthy, &[(1, None), (2, Some(1)), (3, Some(2))]).await;
+    // Two roots: 1 and 5.
+    seed_linked(&p, forked, &[(1, None), (2, Some(1)), (5, None), (6, Some(5))]).await;
+
+    let got = noetl_server::handlers::chain_populate::root_invariant_counts_for_test(&p, 1)
+        .await
+        .expect("counts");
+
+    // ⭐ Scoped assertions: other tests and the fixture share this database, so
+    // asserting absolute totals would make this fail for unrelated reasons — the
+    // fixture-pollution failure this suite has already produced once.
+    assert!(
+        got.0 >= 1,
+        "the healthy execution must be counted as one_root; got one={} multi={} none={}",
+        got.0,
+        got.1,
+        got.2
+    );
+    assert!(
+        got.1 >= 1,
+        "the forked execution must be counted as multi_root; got one={} multi={} none={}",
+        got.0,
+        got.1,
+        got.2
+    );
+
+    // And the discriminating part: removing the forked execution must DROP multi_root.
+    let before_multi = got.1;
+    cleanup(&p, forked).await;
+    let after = noetl_server::handlers::chain_populate::root_invariant_counts_for_test(&p, 1)
+        .await
+        .expect("counts");
+    assert_eq!(
+        after.1,
+        before_multi - 1,
+        "multi_root must fall by exactly one when the forked execution goes away — \
+         otherwise the count is not attributable to the rows it claims to measure"
+    );
+    cleanup(&p, healthy).await;
+}
+
+/// ⚠ 0 disables the sampler, and that must be an off switch rather than a code
+/// change — but it must also be DISTINGUISHABLE from a sampler that is running and
+/// finding nothing. `sampled_at` is what separates them.
+#[tokio::test]
+async fn a362_sampled_at_starts_at_zero_meaning_never() {
+    noetl_server::metrics::init_chain_root_invariant_series();
+    assert_eq!(
+        noetl_server::metrics::chain_invariant_sampled_at().get(),
+        0,
+        "0 means NEVER sampled. Without this marker, three zeros from a healthy \
+         system and three zeros from a dead sampler are the same reading."
+    );
+}

@@ -618,6 +618,105 @@ pub struct ChainInvariantReport {
     pub worst: Vec<ChainInvariantOffender>,
 }
 
+/// Test seam for [`root_invariant_counts`], which is private because callers should
+/// go through the sampler or the endpoint.
+pub async fn root_invariant_counts_for_test(
+    pool: &crate::db::DbPool,
+    hours: i64,
+) -> Result<(i64, i64, i64), sqlx::Error> {
+    root_invariant_counts(pool, hours).await
+}
+
+/// Compute the one-root invariant and publish it to `/metrics`, forever.
+///
+/// ⚠⚠ THE ENDPOINT ALONE IS NOT A SIGNAL, and that asymmetry is why this exists.
+///
+/// `noetl_chain_root_invariant` is only written when someone calls
+/// `/api/internal/chain/invariant`. Nothing calls it on a schedule, so on a running
+/// cluster the gauge sits pinned at 0 — which is exactly the shape of a healthy
+/// system. A metric that only updates when a human asks is not monitoring; it is a
+/// debugger with a misleading resting state.
+///
+/// Worse, the endpoint is behind the internal-token gate (correctly — it enumerates
+/// execution ids), and the token arrives as a CSI-projected FILE while the image
+/// carries no `curl`. So on prod the endpoint is, in practice, unreachable without
+/// handling a secret. The number I needed for the #362 investigation was therefore
+/// measurable only against a local cluster. This sampler makes it available on the
+/// unauthenticated `/metrics` surface, which is where the rest of the signals live.
+///
+/// Costs one grouped query per interval over a bounded window.
+pub fn spawn_root_invariant_sampler(state: crate::state::AppState) {
+    let secs: u64 = std::env::var("NOETL_CHAIN_INVARIANT_SAMPLE_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(300);
+    // 0 disables it, so the sampler has an off switch that is not a code change.
+    if secs == 0 {
+        tracing::info!(target: "noetl_server::chain_populate",
+            "chain root-invariant sampler DISABLED (NOETL_CHAIN_INVARIANT_SAMPLE_SECS=0)");
+        return;
+    }
+    let hours: i64 = std::env::var("NOETL_CHAIN_INVARIANT_WINDOW_HOURS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(168)
+        .clamp(1, 24 * 400);
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+            match root_invariant_counts(&state.db, hours).await {
+                Ok((one, multi, none)) => {
+                    crate::metrics::set_chain_root_invariant("one_root", one);
+                    crate::metrics::set_chain_root_invariant("multi_root", multi);
+                    crate::metrics::set_chain_root_invariant("no_root", none);
+                    // ⚠ Sampled-at is published too. A gauge with no freshness marker
+                    // reads identically whether it was written a second ago or the
+                    // sampler died an hour ago.
+                    crate::metrics::set_chain_invariant_sampled_at(
+                        chrono::Utc::now().timestamp(),
+                    );
+                    if multi > 0 {
+                        tracing::warn!(target: "noetl_server::chain_populate",
+                            multi_root = multi, one_root = one, window_hours = hours,
+                            "executions with MORE THAN ONE chain root — these cannot be \
+                             served from the chain store (noetl/ai-meta#362)");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(target: "noetl_server::chain_populate", error = %e,
+                        "root-invariant sample failed");
+                    crate::metrics::record_chain_invariant_sample_failed();
+                }
+            }
+        }
+    });
+}
+
+/// The grouped count behind both the sampler and the endpoint, so the two can never
+/// disagree about what the invariant means.
+async fn root_invariant_counts(
+    pool: &crate::db::DbPool,
+    hours: i64,
+) -> Result<(i64, i64, i64), sqlx::Error> {
+    let rows: Vec<(i64, i64)> = sqlx::query_as(
+        "SELECT roots, count(*) FROM (            SELECT execution_id, count(*) FILTER (WHERE prev_event_id IS NULL) AS roots            FROM noetl.event            WHERE created_at > now() - make_interval(hours => $1::int)            GROUP BY execution_id) per          GROUP BY roots",
+    )
+    .bind(hours)
+    .fetch_all(pool)
+    .await?;
+    let mut one = 0i64;
+    let mut multi = 0i64;
+    let mut none = 0i64;
+    for (roots, n) in rows {
+        match roots {
+            1 => one += n,
+            0 => none += n,
+            _ => multi += n,
+        }
+    }
+    Ok((one, multi, none))
+}
+
 /// `GET /api/chain/invariant` — read-only.
 ///
 /// The invariant is: **exactly one NULL-prev event per execution.** That event is
@@ -656,13 +755,31 @@ pub async fn chain_invariant(
 
     let executions = rows.len() as i64;
     let events: i64 = rows.iter().map(|r| r.1).sum();
-    let one_root = rows.iter().filter(|r| r.2 == 1).count() as i64;
-    let multi_root = rows.iter().filter(|r| r.2 > 1).count() as i64;
-    let no_root = rows.iter().filter(|r| r.2 == 0).count() as i64;
+
+    // ⚠ The counts come from the SAME function the sampler uses, not from a second
+    // classification over `rows`. Two independent implementations of "what counts as
+    // one root" is exactly how two parity oracles ended up disagreeing by
+    // construction (noetl/ai-meta#325) — one deserialised five fields and compared
+    // three. The detail list below is this endpoint's own job; the numbers are not.
+    let (one_root, multi_root, no_root) = root_invariant_counts(&state.db, since_hours)
+        .await
+        .map_err(crate::error::AppError::from)?;
+
+    // ⭐ And assert the two views agree on the population. They query the same window
+    // from the same table, so a mismatch means the detail query and the counting
+    // query disagree about the window — a bug that would otherwise surface as a
+    // confusing report rather than an error.
+    let counted = one_root + multi_root + no_root;
+    if counted != executions {
+        tracing::warn!(target: "noetl_server::chain_populate",
+            counted, executions, since_hours,
+            "invariant count and detail query disagree about the population");
+    }
 
     crate::metrics::set_chain_root_invariant("one_root", one_root);
     crate::metrics::set_chain_root_invariant("multi_root", multi_root);
     crate::metrics::set_chain_root_invariant("no_root", no_root);
+    crate::metrics::set_chain_invariant_sampled_at(chrono::Utc::now().timestamp());
 
     let worst = rows
         .iter()
