@@ -3559,6 +3559,43 @@ pub fn init_chain_root_invariant_series() {
     chain_invariant_sample_failed_total().inc_by(0);
 }
 
+/// Materialize outcomes (noetl/ai-meta#363).
+///
+/// ⚠ `parked` exists so a dead-lettered event is VISIBLE rather than merely absent
+/// from `noetl.event`. Absence is what the poison loop looked like for an hour.
+pub fn materialize_outcome_total() -> &'static prometheus::IntCounterVec {
+    static M: std::sync::OnceLock<prometheus::IntCounterVec> = std::sync::OnceLock::new();
+    M.get_or_init(|| {
+        let c = prometheus::IntCounterVec::new(
+            prometheus::Opts::new(
+                "noetl_materialize_outcome_total",
+                "events_materialize outcomes: parked (permanent, dead-lettered) vs \
+                 transient_failure (retried)",
+            ),
+            &["outcome"],
+        )
+        .expect("valid counter vec");
+        registry().register(Box::new(c.clone())).expect("register");
+        c
+    })
+}
+
+pub const MATERIALIZE_OUTCOMES: &[&str] = &["parked", "transient_failure"];
+
+pub fn record_materialize_outcome(outcome: &str, n: u64) {
+    materialize_outcome_total()
+        .with_label_values(&[outcome])
+        .inc_by(n);
+}
+
+/// Pin both at 0 — a labelled family is pruned from `/metrics` until it fires, so an
+/// unpinned `parked` is absent and reads like a build that cannot park.
+pub fn init_materialize_outcome_series() {
+    for o in MATERIALIZE_OUTCOMES {
+        materialize_outcome_total().with_label_values(&[o]).inc_by(0);
+    }
+}
+
 pub fn record_chain_populate(outcome: &str) {
     chain_populate_total().with_label_values(&[outcome]).inc();
 }
