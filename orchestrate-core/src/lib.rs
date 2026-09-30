@@ -15,6 +15,7 @@
 //! noetl/ai-meta#108.  The migration is incremental: the template renderer is
 //! the first slice; `evaluator`, `state`, `commands`, and `orchestrator` follow.
 
+pub mod chain_cert;
 pub mod commands;
 pub mod error;
 pub mod event;
