@@ -224,17 +224,57 @@ impl LogSourcedChainSource {
             return None;
         }
 
-        let terminal: Vec<bool> = rows
-            .iter()
-            .map(|r| crate::db::queries::event_chain::is_terminal_event_type(&r.event_type))
-            .collect();
-
-        let events: Vec<ehdb_l0::chain_populator::LogEvent> = rows
+        let raw: Vec<ehdb_l0::chain_populator::LogEvent> = rows
             .iter()
             .map(|r| ehdb_l0::chain_populator::LogEvent {
                 event_id: r.event_id.to_string(),
                 parent_execution_id: r.parent_execution_id.map(|v| v.to_string()),
                 payload: String::new(),
+                // The link as the LOG records it. This is the whole of
+                // noetl/ai-meta#362: the order comes from here, not from the
+                // `ORDER BY event_id` the read happens to use.
+                prev_event_id: r.prev_event_id.map(|v| v.to_string()),
+            })
+            .collect();
+
+        // ⭐⭐ ORDER BY FOLLOWING THE LINKS. The rows arrived sorted by `event_id`
+        // only because a SQL read has to return them in some order — that order is
+        // NOT the chain, and treating it as one is the defect.
+        //
+        // A snowflake `event_id` is minted BEFORE the insert, so an event can commit
+        // into the MIDDLE of an id-ordered read. Every position after it then shifts,
+        // and the stored chain compares as a content conflict against a partition
+        // that is perfectly correct. Measured on prod: the store held at position 72
+        // what the log holds at 73 — one missing interior row, recurring about once
+        // an hour, which is why a ten-minute ramp read 100% healthy.
+        let order = ehdb_l0::chain_populator::order_by_links(&raw);
+        let idx = match order {
+            ehdb_l0::chain_populator::LinkOrder::Ordered(idx) => idx,
+            // ⚠ Every other variant is REFUSE, and each is recorded under its own
+            // label. They are genuinely different conditions — a forked chain needs a
+            // different response from a truncated read — and collapsing them into one
+            // "cannot answer" is how the last two divergence classes went unexplained.
+            other => {
+                tracing::warn!(target: "noetl_server::chain_populate", execution_id,
+                    outcome = other.label(), detail = ?other,
+                    "the log's links do not form ONE chain for this execution; \
+                     refusing to populate and falling through to Postgres");
+                crate::metrics::record_chain_populate(other.label());
+                return None;
+            }
+        };
+
+        // Reorder BOTH vectors by the link order, so the `terminal` flags stay
+        // aligned with the events they describe. Zipping a link-ordered chain against
+        // an id-ordered flag vector is the kind of silent mis-pairing that produces a
+        // wrong `terminal` on the last event — i.e. an execution that looks finished
+        // when it is not.
+        let events: Vec<ehdb_l0::chain_populator::LogEvent> =
+            idx.iter().map(|&i| raw[i].clone()).collect();
+        let terminal: Vec<bool> = idx
+            .iter()
+            .map(|&i| {
+                crate::db::queries::event_chain::is_terminal_event_type(&rows[i].event_type)
             })
             .collect();
 

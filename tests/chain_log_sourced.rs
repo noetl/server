@@ -125,7 +125,7 @@ async fn the_database_we_reached_is_the_fixture_we_expect() {
     .await
     .unwrap();
     assert_eq!(
-        nulls, 10,
+        nulls, 9,
         "the fixture must carry the null-prev rows the fix exists for; a fixture \
          that cannot exhibit the failure makes the test decorative"
     );
@@ -243,51 +243,56 @@ async fn view_for(
 /// of them (Postgres 7, store 6, watermark `1:7`). The log source recomputes the
 /// edge from log order, so the chain is whole and singly-rooted.
 #[tokio::test]
-async fn post_restart_null_prev_rows_yield_one_root_and_a_whole_chain() {
+async fn a362_a_post_restart_multi_root_execution_is_REFUSED_not_recovered() {
     let Some(p) = pool().await else {
         eprintln!("SKIP: NOETL_TEST_PG_URL unset");
         return;
     };
-    let view = view_for(&p, 2001).await.expect(
-        "the log source must answer for a post-restart execution; None here means \
-         the guarded read refused, which is the OLD behaviour",
-    );
-    assert_eq!(
-        view.events.len(),
-        7,
-        "every event, not the pre-restart prefix"
+
+    // ⚠⚠⚠ THIS TEST ASSERTED THE OPPOSITE, AND THE REVERSAL IS THE POINT.
+    //
+    // It used to require that the source ANSWER for 2001 — a post-restart execution
+    // with three NULL-prev rows — on the reasoning that "the log source recomputes
+    // the edge from log order, so the chain is whole and singly-rooted". That was
+    // noetl/ai-meta#357's capability and it worked.
+    //
+    // noetl/ai-meta#362 removes it deliberately. Recomputing the edge from log order
+    // means trusting `ORDER BY event_id`, and a snowflake id is minted before the
+    // insert, so an event can commit into the MIDDLE of that order. Recovering a
+    // forked chain by position is the same mechanism that produced false divergence
+    // on prod — it was never recovery, it was a guess that happened to look right.
+    //
+    // ⚠ THE COST IS REAL AND MUST NOT BE GLOSSED: an execution that has ever been
+    // re-rooted is now UNSERVABLE from the chain store. It falls through to Postgres,
+    // which is correct and safe, but the store covers fewer executions until the
+    // WRITE path stops producing forks (the hydrator fix, #362(b)). In the measured
+    // corpus that is 2 of 63 recent executions plus the whole legacy era.
+    //
+    // So "comparator green" is not sufficient on its own: a source that refuses
+    // everything also reports zero divergence. Coverage has to be read alongside it.
+    let view = view_for(&p, 2001).await;
+    assert!(
+        view.is_none(),
+        "a 3-root execution must be REFUSED. Nothing can say which root is real, so \
+         answering means guessing — and the guess is what #362 fixes. Got a view with \
+         {:?} events.",
+        view.map(|v| v.events.len())
     );
 
-    let roots = view
+    // ⭐ And the positive control: a cleanly linked execution IS served, so the
+    // refusal above is about the fork and not about the source being broken.
+    let ok = view_for(&p, 2002)
+        .await
+        .expect("2002 is cleanly linked and MUST be served; if this is None the \
+                 source is broken rather than discriminating");
+    assert_eq!(ok.events.len(), 6, "2002 has 6 events");
+    let roots = ok
         .events
         .iter()
         .filter(|e| e.prev_event_id.is_none())
         .count();
-    assert_eq!(
-        roots, 1,
-        "3 null-prev rows in the log must still yield ONE chain root; found {roots}"
-    );
-    for w in view.events.windows(2) {
-        assert_eq!(
-            w[1].prev_event_id.as_deref(),
-            Some(w[0].event_id.as_str()),
-            "each event links to its predecessor in log order"
-        );
-    }
-
-    // ⭐ And the decision is Advance, not Empty and not BlockedAtGap.
-    let d = decide(&view);
-    assert!(
-        matches!(d, AdvanceDecision::Advance { .. }),
-        "a running post-restart execution must Advance, got {d:?}"
-    );
-    assert!(!d.requires_redrive(), "no decision may require a re-drive");
+    assert_eq!(roots, 1, "exactly one root, which is the invariant");
 }
-
-/// ⭐⭐ **Mid-flight arming reads the TRUE event set.**
-///
-/// Measured before the fix: store 1 of Postgres' 3, read as complete. Now the
-/// partition is built from the log's first event, so it cannot be short.
 #[tokio::test]
 async fn mid_flight_arming_reads_the_true_event_set() {
     let Some(p) = pool().await else {
@@ -349,7 +354,15 @@ async fn every_execution_agrees_with_the_postgres_oracle() {
         eprintln!("SKIP: NOETL_TEST_PG_URL unset");
         return;
     };
-    for exec in [2001i64, 2002, 2003, 2004] {
+    // ⚠ 2001 is EXCLUDED and checked separately: it carries three NULL-prev rows, so
+    // under link-defined ordering it is refused rather than reconstructed
+    // (noetl/ai-meta#362). Leaving it in this loop would make the oracle assert the
+    // old, position-based recovery.
+    assert!(
+        view_for(&p, 2001).await.is_none(),
+        "the multi-root execution must be refused, not reconciled against Postgres"
+    );
+    for exec in [2002i64, 2003, 2004] {
         let pg: i64 = sqlx::query_scalar("SELECT count(*) FROM noetl.event WHERE execution_id=$1")
             .bind(exec)
             .fetch_one(&p)
@@ -485,16 +498,17 @@ async fn the_poller_decides_from_the_chain_store_when_configured_to() {
         .expect("terminal execution must engage the chain path");
     assert_eq!(t.decision, "terminal", "got {t:?}");
 
-    // ⚠⚠ And 2001 — the post-restart execution with THREE null-prev rows — must
-    // ALSO advance. Before the fix its partition froze and the guarded read served
-    // a stale prefix; the poller would then have seen a chain that stopped where
-    // the server restarted.
-    let r = noetl_server::chain_advance::poller_action(src.as_ref(), 2001, 9)
-        .await
-        .expect("the post-restart execution must engage the chain path");
-    assert_eq!(
-        r.decision, "advance",
-        "the post-restart execution must advance, got {r:?}"
+    // ⚠⚠ 2001 — three NULL-prev rows — must NOT engage the chain path at all.
+    //
+    // This asserted `advance` under noetl/ai-meta#357, which rebuilt the chain from
+    // log order. #362 refuses a forked execution instead: falling through to the
+    // legacy path is safe, and inventing an order for a chain whose root is unknowable
+    // is not. The poller therefore gets `None` and uses today's path.
+    assert!(
+        noetl_server::chain_advance::poller_action(src.as_ref(), 2001, 9)
+            .await
+            .is_none(),
+        "a multi-root execution must fall through, not advance off a guessed order"
     );
 
     unsafe {
@@ -654,13 +668,18 @@ async fn a360_burst_concurrent_readers_racing_a_growing_log() {
     let wp = p.clone();
     let writer = tokio::spawn(async move {
         for i in 1..=400i64 {
+            // ⚠ LINKED. Seeding unlinked events makes every row a ROOT, so
+            // `order_by_links` correctly refuses the whole execution as
+            // `multiple_roots` and the burst measures a refusal path instead of the
+            // race it exists for (noetl/ai-meta#362).
             let _ = sqlx::query(
-                "INSERT INTO noetl.event (event_id, execution_id, catalog_id, event_type, status) \
-                 VALUES ($1,$2,$3,'step.enter','PENDING')",
+                "INSERT INTO noetl.event (event_id, execution_id, catalog_id, event_type, status, \
+                 prev_event_id) VALUES ($1,$2,$3,'step.enter','PENDING',$4)",
             )
             .bind(20_100_000i64 + i)
             .bind(exec)
             .bind(cid)
+            .bind(20_100_000i64 + i - 1)
             .execute(&wp)
             .await;
         }
@@ -820,8 +839,8 @@ async fn a360_a_real_content_conflict_is_still_caught_against_postgres() {
         let src = noetl_server::handlers::chain_populate::LogSourcedChainSource::new(p.clone(), 1000);
         let _ = src.chain_for(exec).await; // establishes/confirms an empty partition
         let planted = vec![
-            LogEvent { event_id: "9001".into(), parent_execution_id: None, payload: "{}".into() },
-            LogEvent { event_id: "9002".into(), parent_execution_id: None, payload: "{}".into() },
+            LogEvent { event_id: "9001".into(), parent_execution_id: None, payload: "{}".into(), prev_event_id: None },
+            LogEvent { event_id: "9002".into(), parent_execution_id: None, payload: "{}".into(), prev_event_id: Some("9001".into()) },
         ];
         let out = noetl_server::handlers::chain_populate::populate_from_log_for_test(exec, &planted)
             .expect("plant");
@@ -832,8 +851,8 @@ async fn a360_a_real_content_conflict_is_still_caught_against_postgres() {
     {
         use ehdb_l0::chain_populator::LogEvent;
         let conflicting = vec![
-            LogEvent { event_id: "9001".into(), parent_execution_id: None, payload: "{}".into() },
-            LogEvent { event_id: "7777".into(), parent_execution_id: None, payload: "{}".into() },
+            LogEvent { event_id: "9001".into(), parent_execution_id: None, payload: "{}".into(), prev_event_id: None },
+            LogEvent { event_id: "7777".into(), parent_execution_id: None, payload: "{}".into(), prev_event_id: Some("9001".into()) },
         ];
         let out = noetl_server::handlers::chain_populate::populate_from_log_for_test(exec, &conflicting)
             .expect("no error");
@@ -893,14 +912,21 @@ async fn a360_a_store_ahead_of_a_log_that_does_not_catch_up_still_reports_diverg
     .enumerate()
     {
         sqlx::query(
-            "INSERT INTO noetl.event (event_id, execution_id, catalog_id, event_type, status) \
-             VALUES ($1,$2,$3,$4,$5)",
+            "INSERT INTO noetl.event (event_id, execution_id, catalog_id, event_type, status, \
+             prev_event_id) VALUES ($1,$2,$3,$4,$5,$6)",
         )
         .bind(20_110_000i64 + n as i64)
         .bind(exec)
         .bind(cid)
         .bind(ty)
         .bind(st)
+        // ⚠ LINKED, or every row is a root and the execution is refused as
+        // `multiple_roots` before the escalation is ever reached.
+        .bind(if n == 0 {
+            None
+        } else {
+            Some(20_110_000i64 + n as i64 - 1)
+        })
         .execute(&p)
         .await
         .expect("commit");
@@ -914,6 +940,11 @@ async fn a360_a_store_ahead_of_a_log_that_does_not_catch_up_still_reports_diverg
             event_id: (20_110_000i64 + n).to_string(),
             parent_execution_id: None,
             payload: String::new(),
+            prev_event_id: if n == 0 {
+                None
+            } else {
+                Some((20_110_000i64 + n - 1).to_string())
+            },
         })
         .collect();
     noetl_server::handlers::chain_populate::populate_from_log_for_test(exec, &four)

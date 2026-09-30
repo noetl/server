@@ -3396,6 +3396,17 @@ pub const CHAIN_POPULATE_OUTCOMES: &[&str] = &[
     // `length_disagreement` under load. Pinned so "this never happens" is
     // distinguishable from "nothing records it" (noetl/ai-meta#360).
     "stale_log_unresolved",
+    // noetl/ai-meta#362 — the link-traversal refusals. Each is a distinct condition
+    // with a distinct response, so each gets its own label rather than one shared
+    // "cannot answer": a forked chain needs different handling from a truncated read,
+    // and collapsing them is how the previous two divergence classes stayed
+    // unexplained. Sourced from `LinkOrder::ALL_LABELS` minus "ordered", which is the
+    // success path and is already counted as in_sync/extended.
+    "multiple_roots",
+    "no_root",
+    "fork",
+    "dangling_prev",
+    "unreachable",
     // and its refusal reasons — each one a distinct "cannot answer"
     "log_read_failed",
     "log_truncated",
