@@ -98,6 +98,11 @@ INSERT INTO noetl.event (event_id, execution_id, event_type, status, prev_event_
 INSERT INTO noetl.event (event_id, execution_id, event_type, status, prev_event_id, parent_execution_id) VALUES
  (2031,2004,'playbook.initialized','initialized',NULL,2001),
  (2032,2004,'command.issued','PENDING',2031,2001),
- (2033,2004,'execution.completed','COMPLETED',NULL,2001);
+ (2033,2004,'execution.completed','COMPLETED',2032,2001);
+-- ⚠ 2033's prev was NULL, making 2004 a TWO-ROOT execution by accident. Harmless
+-- while the chain was rebuilt from id order; fatal under link-defined ordering
+-- (noetl/ai-meta#362), which refuses a forked execution rather than guessing which
+-- root is real. 2004 exists to test terminal + parent_execution_id, not forking —
+-- 2001 is the deliberate multi-root case.
 
 COMMIT;

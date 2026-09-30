@@ -526,6 +526,15 @@ pub(crate) struct NormalizedEventRow {
     pub result: serde_json::Value,
     pub meta: serde_json::Value,
     pub created_at: chrono::DateTime<chrono::Utc>,
+    /// The chain link, stamped by the CALLER after normalization.
+    ///
+    /// ⚠ Normalization cannot fill this in: `link_batch` advances one head per
+    /// execution and must see the whole batch for an execution at once, so the
+    /// caller groups and stamps. It starts `None` and a caller that forgets writes a
+    /// chain ROOT — which is why `events_materialize` produced one per row until
+    /// noetl/ai-meta#362. The field exists on this struct precisely so that
+    /// forgetting is visible here rather than invisible in a column list.
+    pub prev_event_id: Option<i64>,
 }
 
 /// Normalize an [`EventRequest`] into the `noetl.event` row shape: derive
@@ -610,6 +619,7 @@ pub(crate) async fn normalize_event_to_row(
         result,
         meta,
         created_at,
+        prev_event_id: None,
     })
 }
 

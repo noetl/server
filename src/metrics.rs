@@ -3396,6 +3396,17 @@ pub const CHAIN_POPULATE_OUTCOMES: &[&str] = &[
     // `length_disagreement` under load. Pinned so "this never happens" is
     // distinguishable from "nothing records it" (noetl/ai-meta#360).
     "stale_log_unresolved",
+    // noetl/ai-meta#362 — the link-traversal refusals. Each is a distinct condition
+    // with a distinct response, so each gets its own label rather than one shared
+    // "cannot answer": a forked chain needs different handling from a truncated read,
+    // and collapsing them is how the previous two divergence classes stayed
+    // unexplained. Sourced from `LinkOrder::ALL_LABELS` minus "ordered", which is the
+    // success path and is already counted as in_sync/extended.
+    "multiple_roots",
+    "no_root",
+    "fork",
+    "dangling_prev",
+    "unreachable",
     // and its refusal reasons — each one a distinct "cannot answer"
     "log_read_failed",
     "log_truncated",
@@ -3437,6 +3448,71 @@ pub fn record_chain_head_hydrate(outcome: &str) {
 pub fn init_chain_head_hydrate_series() {
     for o in crate::state::HydrateOutcome::ALL_LABELS {
         chain_head_hydrate_total().with_label_values(&[o]).inc_by(0);
+    }
+}
+
+/// Envelopes projected with no chain link (noetl/ai-meta#362).
+///
+/// ⚠ Not an error on its own: one NULL prev per execution is that execution's
+/// genesis. A rate that exceeds roughly one-per-execution is the re-rooting defect,
+/// attributable to the source that produced the envelope.
+pub fn projected_unlinked_total() -> &'static prometheus::IntCounter {
+    static M: std::sync::OnceLock<prometheus::IntCounter> = std::sync::OnceLock::new();
+    M.get_or_init(|| {
+        let c = prometheus::IntCounter::new(
+            "noetl_projected_unlinked_total",
+            "Envelopes projected into noetl.event with prev_event_id NULL (noetl/ai-meta#362)",
+        )
+        .expect("valid counter");
+        registry()
+            .register(Box::new(c.clone()))
+            .expect("register projected_unlinked_total");
+        c
+    })
+}
+
+pub fn record_projected_unlinked(n: u64) {
+    projected_unlinked_total().inc_by(n);
+}
+
+/// Pin it at 0 so absence never reads as zero — an unlabelled counter is pruned
+/// from `/metrics` until it first fires.
+pub fn init_projected_unlinked_series() {
+    projected_unlinked_total().inc_by(0);
+}
+
+/// The one-root invariant, as a gauge (a SNAPSHOT of a distribution, not a rate).
+pub fn chain_root_invariant() -> &'static prometheus::IntGaugeVec {
+    static M: std::sync::OnceLock<prometheus::IntGaugeVec> = std::sync::OnceLock::new();
+    M.get_or_init(|| {
+        let g = prometheus::IntGaugeVec::new(
+            prometheus::Opts::new(
+                "noetl_chain_root_invariant",
+                "Executions by NULL-prev root count in the measured window: exactly one root is \
+                 healthy (the genesis), more than one is the noetl/ai-meta#362 re-rooting defect",
+            ),
+            &["outcome"],
+        )
+        .expect("valid gauge vec");
+        registry()
+            .register(Box::new(g.clone()))
+            .expect("register chain_root_invariant");
+        g
+    })
+}
+
+pub const CHAIN_ROOT_INVARIANT_OUTCOMES: &[&str] = &["one_root", "multi_root", "no_root"];
+
+pub fn set_chain_root_invariant(outcome: &str, v: i64) {
+    chain_root_invariant().with_label_values(&[outcome]).set(v);
+}
+
+/// Pin all three at 0 unconditionally. ⚠ A labelled family is PRUNED from
+/// `/metrics` until something sets it, so an unpinned `multi_root` is absent —
+/// indistinguishable from a build that cannot report it.
+pub fn init_chain_root_invariant_series() {
+    for o in CHAIN_ROOT_INVARIANT_OUTCOMES {
+        chain_root_invariant().with_label_values(&[o]).set(0);
     }
 }
 

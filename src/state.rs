@@ -292,6 +292,22 @@ pub enum HydrateOutcome {
     /// The lookup failed. ⚠ NOT the same as `Empty`: the caller must not stamp a
     /// root on the strength of a failed read.
     Failed,
+    /// ⚠⚠ MORE THAN ONE TIP — the chain is ALREADY broken before we got here, and
+    /// this is the re-rooting defect showing up at hydration time
+    /// (noetl/ai-meta#362).
+    ///
+    /// We still return a head, and deliberately so. The alternative on ambiguity is
+    /// to stamp `prev = NULL`, which creates *another* root and makes the one thing
+    /// we are trying to protect strictly worse. Linking to an existing event cannot
+    /// increase the root count and reduces the tip count by one, so it is a repair,
+    /// not a guess about correctness.
+    ///
+    /// `chosen` is the highest-id tip: deterministic, and the most likely real head
+    /// since ids are minted in rough time order even though commit order is not.
+    /// It is a SEPARATE variant rather than a plain `Head` so the condition is
+    /// countable — a repair that looks identical to a healthy hydration is a repair
+    /// nobody ever investigates.
+    HeadAmbiguous { chosen: i64, tips: usize },
 }
 
 impl HydrateOutcome {
@@ -300,10 +316,25 @@ impl HydrateOutcome {
             Self::Head(_) => "head",
             Self::Empty => "empty",
             Self::Failed => "failed",
+            Self::HeadAmbiguous { .. } => "head_ambiguous",
         }
     }
     /// Every label, pinned at 0 so absence never reads as zero.
-    pub const ALL_LABELS: [&'static str; 4] = ["head", "empty", "failed", "cache_hit"];
+    pub const ALL_LABELS: [&'static str; 5] =
+        ["head", "empty", "failed", "cache_hit", "head_ambiguous"];
+
+    /// The head to stamp, if this outcome supplies one.
+    ///
+    /// ⚠ `Failed` and `Empty` both yield `None` but mean opposite things, and the
+    /// caller must already have distinguished them before calling this — `Empty`
+    /// means "stamp a root", `Failed` means "do not stamp anything".
+    pub fn head(&self) -> Option<i64> {
+        match self {
+            Self::Head(h) => Some(*h),
+            Self::HeadAmbiguous { chosen, .. } => Some(*chosen),
+            Self::Empty | Self::Failed => None,
+        }
+    }
 }
 
 pub struct ChainHeads {
@@ -402,6 +433,17 @@ impl ChainHeads {
                         HydrateOutcome::Failed => {
                             crate::metrics::record_chain_head_hydrate("failed");
                             None
+                        }
+                        // ⚠⚠ The chain already has more than one tip. Take the
+                        // chosen one: the alternative is `None`, which stamps a
+                        // SECOND ROOT and makes the very invariant we are defending
+                        // worse (noetl/ai-meta#362). Counted under its own label so
+                        // a repair is never mistaken for a healthy hydration.
+                        HydrateOutcome::HeadAmbiguous { chosen, tips } => {
+                            crate::metrics::record_chain_head_hydrate("head_ambiguous");
+                            tracing::warn!(target: "noetl_server::state", execution_id, tips,
+                                chosen, "hydrated a forked chain; linking rather than re-rooting");
+                            Some(chosen)
                         }
                     },
                 }

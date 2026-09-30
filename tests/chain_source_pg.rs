@@ -454,3 +454,131 @@ async fn a_working_source_does_yield_some() {
         .expect("a healthy read must yield Some");
     assert_eq!(view.events.len(), 7);
 }
+
+// ---------------------------------------------------------------------------
+// noetl/ai-meta#362 (b) — the head is the LINK TIP, not max(event_id).
+// ---------------------------------------------------------------------------
+
+/// ⭐⭐ **The discriminating test.** An execution whose link tip is NOT the highest
+/// `event_id`. `SELECT max(event_id)` names the wrong event; the tip query names the
+/// right one.
+///
+/// This is the shape an interior insert produces, and it is why the hydrator had to
+/// move: stamping the next event's `prev` from `max(event_id)` links it to something
+/// that already has a successor, forking the chain in a way that looks perfectly
+/// healthy from the row it wrote.
+#[tokio::test]
+async fn a362_hydrator_returns_the_link_tip_not_the_max_id() {
+    let Some(p) = pool().await else {
+        eprintln!("SKIP: NOETL_TEST_PG_URL unset");
+        return;
+    };
+    let exec = 3101i64;
+    seed_linked(&p, exec, &[(1, None), (9, Some(1)), (4, Some(9))]).await;
+
+    // Fixture sanity: the two definitions MUST disagree here, or the test is vacuous.
+    let max_id: Option<i64> =
+        sqlx::query_scalar("SELECT max(event_id) FROM noetl.event WHERE execution_id = $1")
+            .bind(exec)
+            .fetch_one(&p)
+            .await
+            .expect("max");
+    assert_eq!(
+        max_id,
+        Some(exec * 1000 + 9),
+        "fixture sanity: the highest id must be the MIDDLE link"
+    );
+
+    let h = noetl_server::db::queries::event_chain::PgChainHeadHydrator::new(p.clone());
+    let got = noetl_server::state::ChainHeadHydrator::head_of(&h, exec).await;
+    assert_eq!(
+        got,
+        noetl_server::state::HydrateOutcome::Head(exec * 1000 + 4),
+        "the head is the event NOTHING links to. Got {got:?}; max(event_id) would \
+         have said {max_id:?}, which already has a successor — stamping that as the \
+         next event's prev forks the chain."
+    );
+    cleanup(&p, exec).await;
+}
+
+/// Two tips: the chain is already forked. The hydrator must still return a head —
+/// returning `None` would stamp a SECOND ROOT and make the invariant worse — and it
+/// must say so under its own label.
+#[tokio::test]
+async fn a362_two_tips_report_ambiguous_and_still_link() {
+    let Some(p) = pool().await else {
+        eprintln!("SKIP: NOETL_TEST_PG_URL unset");
+        return;
+    };
+    let exec = 3102i64;
+    // 1 -> 2, and 5 -> 6 : two chains, so two tips (2 and 6).
+    seed_linked(&p, exec, &[(1, None), (2, Some(1)), (5, None), (6, Some(5))]).await;
+
+    let h = noetl_server::db::queries::event_chain::PgChainHeadHydrator::new(p.clone());
+    match noetl_server::state::ChainHeadHydrator::head_of(&h, exec).await {
+        noetl_server::state::HydrateOutcome::HeadAmbiguous { chosen, tips } => {
+            assert_eq!(tips, 2);
+            assert_eq!(
+                chosen,
+                exec * 1000 + 6,
+                "the highest-id tip is chosen deterministically"
+            );
+        }
+        other => panic!(
+            "two tips must report HeadAmbiguous, got {other:?}. A plain Head hides a \
+             forked chain; a None stamps a second root and makes it worse."
+        ),
+    }
+    cleanup(&p, exec).await;
+}
+
+/// An execution with no events at all is `Empty` — the next event IS the root. This
+/// must stay distinguishable from `Failed`, which must never stamp a root.
+#[tokio::test]
+async fn a362_no_events_is_empty_not_a_head() {
+    let Some(p) = pool().await else {
+        eprintln!("SKIP: NOETL_TEST_PG_URL unset");
+        return;
+    };
+    let exec = 3103i64;
+    cleanup(&p, exec).await;
+    let h = noetl_server::db::queries::event_chain::PgChainHeadHydrator::new(p.clone());
+    assert_eq!(
+        noetl_server::state::ChainHeadHydrator::head_of(&h, exec).await,
+        noetl_server::state::HydrateOutcome::Empty
+    );
+}
+
+/// Seed `(suffix, prev_suffix)` pairs as a linked execution. Ids are `exec*1000 + n`
+/// so they are readable in a failure message.
+async fn seed_linked(p: &sqlx::PgPool, exec: i64, links: &[(i64, Option<i64>)]) {
+    cleanup(p, exec).await;
+    let cid: i64 = sqlx::query_scalar("SELECT catalog_id FROM noetl.catalog LIMIT 1")
+        .fetch_one(p)
+        .await
+        .expect("a catalog row must exist");
+    for (n, prev) in links {
+        sqlx::query(
+            "INSERT INTO noetl.event (event_id, execution_id, catalog_id, event_type, status, \
+             prev_event_id) VALUES ($1,$2,$3,'step.enter','PENDING',$4)",
+        )
+        .bind(exec * 1000 + n)
+        .bind(exec)
+        .bind(cid)
+        .bind(prev.map(|v| exec * 1000 + v))
+        .execute(p)
+        .await
+        .expect("seed");
+    }
+}
+
+/// ⚠ Scoped cleanup. The fixture-identity guard counts declared executions, and a
+/// test that leaves rows behind makes a later suite fail for reasons unrelated to
+/// what it tests — which has already happened once in this program.
+async fn cleanup(p: &sqlx::PgPool, exec: i64) {
+    sqlx::query("DELETE FROM noetl.event WHERE execution_id = $1")
+        .bind(exec)
+        .execute(p)
+        .await
+        .expect("cleanup");
+}

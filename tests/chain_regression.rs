@@ -59,15 +59,32 @@ impl Rig {
     }
 }
 
-/// A log slice. ⚠ Carries NO `prev_event_id` — the edge is recomputed from
-/// position, because the column is NULL on 643,420 of 645,677 measured prod-shaped
-/// rows and 534 of 595 executions carry more than one null-prev root.
+/// A LINKED log slice: each event's predecessor is its neighbour to the left, and
+/// the first is the root.
+///
+/// ⚠ This doc comment used to say the opposite — "carries NO `prev_event_id`,
+/// because the column is NULL on 643,420 of 645,677 rows and 534 of 595 executions
+/// carry more than one null-prev root". Both numbers were real and the conclusion
+/// drawn from them was wrong, which is worth leaving on the record.
+///
+/// They were AGGREGATES. A NULL prev is an execution's GENESIS, so one per execution
+/// is correct by design and the aggregate count says nothing about health. Measured
+/// per execution, the 643k NULLs are one dead pre-feature era (533 executions, Apr
+/// 25-27, every event a false root) and the linked era is healthy on 61 of 63
+/// executions. Recomputing the edge from position instead is what noetl/ai-meta#362
+/// had to undo.
 fn log(ids: &[&str]) -> Vec<LogEvent> {
     ids.iter()
-        .map(|id| LogEvent {
+        .enumerate()
+        .map(|(i, id)| LogEvent {
             event_id: (*id).to_string(),
             parent_execution_id: None,
             payload: "{}".to_string(),
+            prev_event_id: if i == 0 {
+                None
+            } else {
+                Some(ids[i - 1].to_string())
+            },
         })
         .collect()
 }

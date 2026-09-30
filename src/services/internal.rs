@@ -668,6 +668,32 @@ pub async fn project_events(
         return Ok((0, 0, Vec::new()));
     }
 
+    // ⚠⚠ COUNT UNLINKED ENVELOPES — deliberately do NOT re-stamp them
+    // (noetl/ai-meta#362).
+    //
+    // This is a REPLICATION path: it re-inserts events that were already written
+    // somewhere else, and `EventEnvelope` carries `prev_event_id`, so a correctly
+    // linked source event stays linked through here. That makes this writer
+    // different in kind from `events_materialize`, which had no column at all and
+    // manufactured a chain root per row.
+    //
+    // So the temptation is to stamp a fresh link when the envelope has none. That
+    // would be wrong: it would make the projection disagree with the source it is
+    // projecting, and the projection is supposed to be a faithful copy. A NULL prev
+    // arriving here for a non-genesis event is the SOURCE's defect.
+    //
+    // What this path owes is therefore attribution, not repair — one NULL prev per
+    // execution is a genesis and correct, more than one is the re-rooting defect,
+    // and this counter is what lets a second root be traced to this writer instead
+    // of guessed at. `/api/chain/invariant` reports the shape; this says who wrote it.
+    let unlinked = events.iter().filter(|e| e.prev_event_id.is_none()).count();
+    if unlinked > 0 {
+        crate::metrics::record_projected_unlinked(unlinked as u64);
+        tracing::debug!(target: "noetl_server::internal", unlinked, total = events.len(),
+            "projecting envelopes with no chain link; one per execution is the \
+             genesis, more than one is noetl/ai-meta#362 re-rooting at the source");
+    }
+
     // Reduce every envelope's timestamp to storage precision BEFORE serialising
     // (noetl/ai-meta#307).
     //

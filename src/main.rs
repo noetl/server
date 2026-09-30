@@ -239,6 +239,22 @@ fn build_router(
             "/api/internal/events/materialize",
             post(handlers::internal::events_materialize),
         )
+        // noetl/ai-meta#362 (d) — the one-root invariant, read-only.
+        //
+        // ⚠ Behind the internal-token gate rather than open, deliberately. It
+        // touches nothing, but it enumerates execution ids, and this codebase has
+        // already shipped two endpoints that returned more than intended without
+        // authentication (noetl/ai-meta#303, #312). Read-only is still a surface.
+        //
+        // ⚠ It lives in THIS router because this one carries `AppState`; the
+        // `internal_routes` group next to it is stated on `Pool<Postgres>`. Two
+        // routers under one `/api/internal/` prefix with different state types is a
+        // trap worth naming — putting it in the wrong one compiles as a confusing
+        // mismatch on every OTHER route in the group.
+        .route(
+            "/api/internal/chain/invariant",
+            get(handlers::chain_populate::chain_invariant),
+        )
         // events/project (the materializer's row-shape writer) carries AppState
         // so it can fire the relocated orchestrator trigger after materializing
         // a batch under NOETL_EVENT_INGEST_PUBLISH_ONLY (#103 phase 2d-3).
@@ -1063,6 +1079,8 @@ async fn main() -> anyhow::Result<()> {
     noetl_server::metrics::init_embedded_shadow_series();
     noetl_server::metrics::init_chain_populate_series();
     noetl_server::metrics::init_chain_head_hydrate_series();
+    noetl_server::metrics::init_projected_unlinked_series();
+    noetl_server::metrics::init_chain_root_invariant_series();
     noetl_server::metrics::init_embedded_read_series();
     noetl_server::metrics::init_projection_serve_refusal_series();
     noetl_server::metrics::init_ehdb_eventlog_mirror_series();

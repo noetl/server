@@ -546,12 +546,39 @@ pub async fn events_materialize(
         rows.push(crate::handlers::events::normalize_event_to_row(&state, req).await?);
     }
 
+    // ⚠⚠⚠ STAMP THE CHAIN LINK. This endpoint wrote 10 columns and
+    // `prev_event_id` was not among them, so every row it materialised landed with
+    // a NULL prev — i.e. as a CHAIN ROOT (noetl/ai-meta#362, the #327
+    // truncating-writer family).
+    //
+    // One NULL prev per execution is correct: that is the genesis. A second one is
+    // the defect, and a writer that stamps NULL unconditionally manufactures one per
+    // row. Under link-defined ordering that does not merely look untidy — it makes
+    // the partition UNBUILDABLE, because nothing can say which root is real.
+    //
+    // Grouped per execution because `link_batch` advances one head per execution and
+    // the order within a group is the order we insert.
+    {
+        use std::collections::BTreeMap;
+        let mut by_exec: BTreeMap<i64, Vec<usize>> = BTreeMap::new();
+        for (i, r) in rows.iter().enumerate() {
+            by_exec.entry(r.execution_id).or_default().push(i);
+        }
+        for (execution_id, idxs) in by_exec {
+            let ids: Vec<i64> = idxs.iter().map(|&i| rows[i].event_id).collect();
+            let prevs = state.chain_heads.link_batch(execution_id, &ids).await;
+            for (&i, prev) in idxs.iter().zip(prevs.into_iter()) {
+                rows[i].prev_event_id = prev;
+            }
+        }
+    }
+
     // Idempotent batch insert.  Single pool (state.db) mirrors `events_project`;
     // sharding would group by `pool_for(execution_id)` — a shared follow-up with
     // that endpoint, out of scope here.
     let mut qb = sqlx::QueryBuilder::new(
         "INSERT INTO noetl.event (event_id, execution_id, catalog_id, event_type, \
-         node_id, node_name, status, result, meta, created_at) ",
+         node_id, node_name, status, result, meta, created_at, prev_event_id) ",
     );
     qb.push_values(rows.iter(), |mut b, r| {
         b.push_bind(r.event_id)
@@ -563,7 +590,8 @@ pub async fn events_materialize(
             .push_bind(&r.status)
             .push_bind(&r.result)
             .push_bind(&r.meta)
-            .push_bind(r.created_at);
+            .push_bind(r.created_at)
+            .push_bind(r.prev_event_id);
     });
     qb.push(" ON CONFLICT DO NOTHING");
     let result = qb.build().execute(&state.db).await?;
