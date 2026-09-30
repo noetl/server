@@ -1221,6 +1221,11 @@ async fn main() -> anyhow::Result<()> {
     );
     handlers::ehdb_parity::spawn_crossstore_parity_sampler(state.clone());
     handlers::ehdb_projection_parity::spawn_projection_parity_sampler(state.clone());
+    // noetl/ai-meta#362 — publish the one-root invariant on /metrics.
+    //
+    // ⚠ Without this the gauge only moves when someone calls the gated endpoint, so
+    // on a running cluster it sits at 0 — indistinguishable from healthy.
+    handlers::chain_populate::spawn_root_invariant_sampler(state.clone());
     // noetl/ai-meta#317 — sample the shared pool so exhaustion is visible.
     // Cheap: two atomic reads off the sqlx handle every 15s, no query.
     {

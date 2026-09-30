@@ -3503,6 +3503,45 @@ pub fn chain_root_invariant() -> &'static prometheus::IntGaugeVec {
 
 pub const CHAIN_ROOT_INVARIANT_OUTCOMES: &[&str] = &["one_root", "multi_root", "no_root"];
 
+/// When the invariant was last sampled (unix seconds).
+///
+/// ⚠ A gauge with no freshness marker reads identically whether it was written a
+/// second ago or the sampler died an hour ago — the "a number with no as-of is not
+/// evidence" rule, applied to our own output.
+pub fn chain_invariant_sampled_at() -> &'static prometheus::IntGauge {
+    static M: std::sync::OnceLock<prometheus::IntGauge> = std::sync::OnceLock::new();
+    M.get_or_init(|| {
+        let g = prometheus::IntGauge::new(
+            "noetl_chain_invariant_sampled_at_seconds",
+            "Unix time of the last successful root-invariant sample; 0 means never sampled",
+        )
+        .expect("valid gauge");
+        registry().register(Box::new(g.clone())).expect("register");
+        g
+    })
+}
+
+pub fn set_chain_invariant_sampled_at(t: i64) {
+    chain_invariant_sampled_at().set(t);
+}
+
+pub fn chain_invariant_sample_failed_total() -> &'static prometheus::IntCounter {
+    static M: std::sync::OnceLock<prometheus::IntCounter> = std::sync::OnceLock::new();
+    M.get_or_init(|| {
+        let c = prometheus::IntCounter::new(
+            "noetl_chain_invariant_sample_failed_total",
+            "Root-invariant samples that errored",
+        )
+        .expect("valid counter");
+        registry().register(Box::new(c.clone())).expect("register");
+        c
+    })
+}
+
+pub fn record_chain_invariant_sample_failed() {
+    chain_invariant_sample_failed_total().inc();
+}
+
 pub fn set_chain_root_invariant(outcome: &str, v: i64) {
     chain_root_invariant().with_label_values(&[outcome]).set(v);
 }
@@ -3514,6 +3553,10 @@ pub fn init_chain_root_invariant_series() {
     for o in CHAIN_ROOT_INVARIANT_OUTCOMES {
         chain_root_invariant().with_label_values(&[o]).set(0);
     }
+    // 0 = never sampled, which is what distinguishes "healthy" from "the sampler
+    // never ran". Both otherwise show three zeros.
+    chain_invariant_sampled_at().set(0);
+    chain_invariant_sample_failed_total().inc_by(0);
 }
 
 pub fn record_chain_populate(outcome: &str) {
