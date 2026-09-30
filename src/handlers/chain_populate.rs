@@ -532,3 +532,122 @@ mod label_denominator_tests {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// noetl/ai-meta#362 (d) — the one-root invariant, as a live signal.
+// ---------------------------------------------------------------------------
+
+/// Query for [`chain_invariant`].
+#[derive(Debug, serde::Deserialize)]
+pub struct ChainInvariantQuery {
+    /// How far back to look. Defaults to 168h (7 days).
+    ///
+    /// ⚠ A WINDOW, not "everything", and that is deliberate. The measured corpus
+    /// contains a dead pre-feature era (Apr 25-27) where nothing stamped a link at
+    /// all — 533 executions, every event a false root, one of them with 70,977 of
+    /// them. Including it reports 10% healthy forever and buries any live
+    /// regression under four-month-old test data. The window keeps the signal about
+    /// the linked era.
+    pub since_hours: Option<i64>,
+    /// Cap on the offenders listed back. Defaults to 20.
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct ChainInvariantOffender {
+    pub execution_id: String,
+    pub events: i64,
+    pub roots: i64,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct ChainInvariantReport {
+    pub since_hours: i64,
+    /// ⭐ The denominator. A finding without it is not evidence — a clean report
+    /// over zero executions reads exactly like a healthy system.
+    pub executions: i64,
+    pub events: i64,
+    /// Exactly one NULL-prev event: the genesis, and the healthy shape.
+    pub one_root: i64,
+    /// ⚠ More than one: the re-rooting defect. A link-defined chain cannot be
+    /// built for these, because nothing can say which root is real.
+    pub multi_root: i64,
+    /// No NULL-prev event at all: the root is outside the window, or a cycle.
+    pub no_root: i64,
+    pub healthy_pct: f64,
+    pub worst: Vec<ChainInvariantOffender>,
+}
+
+/// `GET /api/chain/invariant` — read-only.
+///
+/// The invariant is: **exactly one NULL-prev event per execution.** That event is
+/// the genesis; every other event links to its predecessor. One root is correct by
+/// design, so the aggregate NULL count says nothing — this has to be measured PER
+/// EXECUTION, and getting that wrong is what hid the shape for a whole session.
+///
+/// More than one root is the defect: a lost in-memory head map stamps a mid-flight
+/// execution's next event as a second false root, and under link-defined ordering
+/// the partition then cannot be built at all.
+///
+/// ⚠ Touches nothing. It exists because there was no way to measure this on a
+/// running cluster: `/api/postgres/execute` is disabled, no endpoint exposed
+/// `prev_event_id`, and every number in the investigation had to come from a local
+/// cluster instead of the one that mattered.
+pub async fn chain_invariant(
+    axum::extract::State(state): axum::extract::State<crate::state::AppState>,
+    _token: crate::handlers::internal::RequireInternalApiToken,
+    axum::extract::Query(q): axum::extract::Query<ChainInvariantQuery>,
+) -> crate::error::AppResult<axum::Json<ChainInvariantReport>> {
+    let since_hours = q.since_hours.unwrap_or(168).clamp(1, 24 * 400);
+    let limit = q.limit.unwrap_or(20).clamp(1, 500);
+
+    let rows: Vec<(i64, i64, i64)> = sqlx::query_as(
+        "WITH per AS ( \
+           SELECT execution_id, count(*) AS n, \
+                  count(*) FILTER (WHERE prev_event_id IS NULL) AS roots \
+           FROM noetl.event \
+           WHERE created_at > now() - make_interval(hours => $1::int) \
+           GROUP BY execution_id) \
+         SELECT execution_id, n, roots FROM per ORDER BY roots DESC, n DESC",
+    )
+    .bind(since_hours)
+    .fetch_all(&state.db)
+    .await?;
+
+    let executions = rows.len() as i64;
+    let events: i64 = rows.iter().map(|r| r.1).sum();
+    let one_root = rows.iter().filter(|r| r.2 == 1).count() as i64;
+    let multi_root = rows.iter().filter(|r| r.2 > 1).count() as i64;
+    let no_root = rows.iter().filter(|r| r.2 == 0).count() as i64;
+
+    crate::metrics::set_chain_root_invariant("one_root", one_root);
+    crate::metrics::set_chain_root_invariant("multi_root", multi_root);
+    crate::metrics::set_chain_root_invariant("no_root", no_root);
+
+    let worst = rows
+        .iter()
+        .filter(|r| r.2 != 1)
+        .take(limit as usize)
+        .map(|r| ChainInvariantOffender {
+            // String, because a 64-bit id loses precision in a browser's JSON number.
+            execution_id: r.0.to_string(),
+            events: r.1,
+            roots: r.2,
+        })
+        .collect();
+
+    Ok(axum::Json(ChainInvariantReport {
+        since_hours,
+        executions,
+        events,
+        one_root,
+        multi_root,
+        no_root,
+        healthy_pct: if executions == 0 {
+            0.0
+        } else {
+            (one_root as f64) * 100.0 / (executions as f64)
+        },
+        worst,
+    }))
+}

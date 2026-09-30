@@ -144,10 +144,24 @@ async fn hydration_returns_the_real_head_for_a_running_execution() {
         return;
     };
     let h = noetl_server::db::queries::event_chain::PgChainHeadHydrator::new(p.clone());
+    // ⭐⭐ 2001 is the fixture's POST-RESTART shape: three NULL-prev rows (2001, 2005,
+    // 2006), so three roots and three tips (2004, 2005, 2007). The hydrator must now
+    // SEE that and say so.
+    //
+    // ⚠ This assertion used to read `Head(2007)` with the justification "2001's head
+    // is its greatest event_id". That was true of the old implementation and it was
+    // the bug: `max(event_id)` cannot distinguish a clean chain from a forked one, so
+    // it reported the defect the fixture exists to encode as perfectly healthy
+    // (noetl/ai-meta#362). The CHOSEN head is unchanged, so behaviour is compatible —
+    // what changed is that the fork is now countable.
     assert_eq!(
         h.head_of(2001).await,
-        HydrateOutcome::Head(2007),
-        "2001's head is its greatest event_id"
+        HydrateOutcome::HeadAmbiguous {
+            chosen: 2007,
+            tips: 3
+        },
+        "the post-restart fixture has 3 tips; the hydrator must report the fork AND \
+         still return a head, because stamping NULL here would add a fourth root"
     );
     assert_eq!(h.head_of(2003).await, HydrateOutcome::Head(2023));
     assert_eq!(

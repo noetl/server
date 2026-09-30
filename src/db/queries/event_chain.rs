@@ -285,16 +285,53 @@ impl PgChainHeadHydrator {
 #[async_trait::async_trait]
 impl crate::state::ChainHeadHydrator for PgChainHeadHydrator {
     async fn head_of(&self, execution_id: i64) -> crate::state::HydrateOutcome {
-        // `max()` over an empty set is SQL NULL, so the row always exists and the
-        // Option distinguishes "no events" from "no row".
-        let got: Result<Option<i64>, sqlx::Error> =
-            sqlx::query_scalar("SELECT max(event_id) FROM noetl.event WHERE execution_id = $1")
-                .bind(execution_id)
-                .fetch_one(&self.pool)
-                .await;
+        // ⚠⚠⚠ THE HEAD IS THE LINK TIP — THE EVENT NOTHING LINKS TO.
+        //
+        // This was `SELECT max(event_id)`, and that re-imported the exact assumption
+        // noetl/ai-meta#362 invalidates: `event_id` is a snowflake minted BEFORE the
+        // insert, so commit order is not id order. An event that commits late with a
+        // lower id is the real tail while `max(event_id)` names something else, and
+        // the next event then links to the wrong predecessor — forking the chain in
+        // a way that looks perfectly healthy from the row it wrote.
+        //
+        // Measured on the linked-era corpus: tip and `max(event_id)` agree on 63 of
+        // 65 executions and disagree on exactly the 2 that are already broken. They
+        // will also disagree whenever an interior insert is in flight, which is the
+        // #362 case itself.
+        //
+        // ⚠ Cost: a partition-local anti-join. There is no index on
+        // `prev_event_id`, so this scans the execution's rows — acceptable because
+        // it runs only on a cache MISS and executions hold tens to hundreds of
+        // events. An index on `(execution_id, prev_event_id)` is the move if misses
+        // ever become hot; it is deliberately NOT added here, because an index
+        // added on a guess is a schema change nobody can justify later.
+        let got: Result<Vec<i64>, sqlx::Error> = sqlx::query_scalar(
+            "SELECT e.event_id FROM noetl.event e \
+             WHERE e.execution_id = $1 \
+               AND NOT EXISTS (SELECT 1 FROM noetl.event s \
+                               WHERE s.execution_id = $1 AND s.prev_event_id = e.event_id) \
+             ORDER BY e.event_id DESC",
+        )
+        .bind(execution_id)
+        .fetch_all(&self.pool)
+        .await;
         match got {
-            Ok(Some(head)) => crate::state::HydrateOutcome::Head(head),
-            Ok(None) => crate::state::HydrateOutcome::Empty,
+            // Exactly one tip: the healthy shape.
+            Ok(tips) if tips.len() == 1 => crate::state::HydrateOutcome::Head(tips[0]),
+            // ⚠⚠ More than one tip means the chain is already forked. Return a head
+            // anyway — see `HeadAmbiguous`: stamping NULL here would add another
+            // ROOT, making the invariant we are protecting strictly worse.
+            Ok(tips) if tips.len() > 1 => {
+                tracing::warn!(target: "noetl_server::event_chain", execution_id,
+                    tips = tips.len(), chosen = tips[0],
+                    "chain has MORE THAN ONE tip; linking to the highest-id tip \
+                     rather than stamping a second root");
+                crate::state::HydrateOutcome::HeadAmbiguous {
+                    chosen: tips[0],
+                    tips: tips.len(),
+                }
+            }
+            Ok(_) => crate::state::HydrateOutcome::Empty,
             // ⚠ `Failed`, never `Empty`. Collapsing the two would stamp a chain
             // root onto an arbitrary event whenever the database hiccuped — the
             // precise defect this hydrator exists to remove.
