@@ -543,6 +543,26 @@ mod amortized_tests {
     }
 
     #[test]
+    fn the_chunked_digest_matches_an_independent_implementation() {
+        // Golden vector computed by a separate Python/hashlib implementation, so
+        // the construction is pinned by something that shares no code with it.
+        // The ehdb-side benchmark copy (noetl/server#482) asserts this same
+        // vector, which is what proves the two implementations agree.
+        assert_eq!(CHUNK_EVENTS, 8, "the golden vector below assumes 8");
+        let mut r = ChunkRoller::resume(None);
+        for i in 0..24u32 {
+            r.absorb(format!("ehdb-cert-vector-{i:04}").as_bytes());
+        }
+        let cert = r.certificate(1).expect("3 sealed chunks");
+        assert_eq!(cert.chain_len, 24);
+        assert_eq!(
+            hex::encode(cert.chain_digest),
+            "c7d3e1fff420f51f0458bcf4f3fe5a3cbefe65aa6879d036197352d8b70a1f44",
+            "chunked chain digest must match the independent implementation"
+        );
+    }
+
+    #[test]
     fn the_uncertified_tail_never_exceeds_one_chunk() {
         // The cost of amortizing: a prefix past the last sealed chunk needs a
         // bounded refold. Bounded is the claim; prove the bound.
