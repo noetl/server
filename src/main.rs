@@ -1081,6 +1081,7 @@ async fn main() -> anyhow::Result<()> {
     noetl_server::metrics::init_chain_head_hydrate_series();
     noetl_server::metrics::init_projected_unlinked_series();
     noetl_server::metrics::init_chain_root_invariant_series();
+    noetl_server::metrics::init_materialize_outcome_series();
     noetl_server::metrics::init_embedded_read_series();
     noetl_server::metrics::init_projection_serve_refusal_series();
     noetl_server::metrics::init_ehdb_eventlog_mirror_series();

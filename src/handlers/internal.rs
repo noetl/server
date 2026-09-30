@@ -527,6 +527,42 @@ pub async fn projection_advance(
 /// tailer's `to_jsonb` rows) by **normalizing native shapes**; differs from the
 /// synchronous ingest by **not triggering the orchestrator** — the materializer
 /// only writes the durable log (the orchestrator advances off the stream).
+/// Is this write failure one that will fail identically on every retry?
+///
+/// ⚠ Deliberately a SMALL allow-list, and unclassified means TRANSIENT. Getting this
+/// wrong in the permanent direction parks an event that would have succeeded — which is
+/// worse than a retry loop, because a retry loop is loud and a wrongly-parked event is
+/// silent. So the default is to retry and only these are parked:
+///
+///   23503 foreign_key_violation   — the referenced row does not exist and this
+///                                   insert cannot create it
+///   23502 not_null_violation      — a required column is absent from the row
+///   22P02 invalid_text_representation — the value cannot be parsed into its type
+///   22001 string_data_right_truncation — the value does not fit the column
+///
+/// `23505 unique_violation` is NOT here: the insert already carries
+/// `ON CONFLICT DO NOTHING`, so a duplicate is a normal outcome rather than a failure.
+/// Test seam: classify by SQLSTATE alone, without needing a live `sqlx::Error`.
+///
+/// ⚠ It must share the code list with the real classifier, not restate it — a second
+/// copy of "which codes are permanent" is how two oracles come to disagree.
+pub fn is_permanent_write_failure_for_test(code: &str) -> bool {
+    PERMANENT_SQLSTATES.contains(&code)
+}
+
+/// The one list both the classifier and its test read.
+const PERMANENT_SQLSTATES: &[&str] = &["23503", "23502", "22P02", "22001"];
+
+fn is_permanent_write_failure(e: &sqlx::Error) -> bool {
+    match e {
+        sqlx::Error::Database(db) => db
+            .code()
+            .map(|c| PERMANENT_SQLSTATES.contains(&c.as_ref()))
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
 pub async fn events_materialize(
     State(state): State<AppState>,
     _token: RequireInternalApiToken,
@@ -594,7 +630,59 @@ pub async fn events_materialize(
             .push_bind(r.prev_event_id);
     });
     qb.push(" ON CONFLICT DO NOTHING");
-    let result = qb.build().execute(&state.db).await?;
+
+    // ⚠⚠⚠ A PERMANENT FAILURE MUST BE PARKED, NOT RETRIED FOREVER
+    // (noetl/ai-meta#363).
+    //
+    // `?` here sends a 500 and the caller retries.  For a TRANSIENT fault that is
+    // right.  For a PERMANENT one it is a poison loop: an event whose `catalog_id` has
+    // no `noetl.catalog` row can never be inserted, so the FK fails identically on
+    // every attempt, forever.  Observed in kind still retrying more than an hour after
+    // publication, ~150 log lines deep.
+    //
+    // ⚠ And in publish-only mode this handler is the SOLE writer, so the producer has
+    // already been told `ok` and holds event ids it believes are durable.  A permanent
+    // failure here is invisible exactly where it matters most.
+    let result = match qb.build().execute(&state.db).await {
+        Ok(r) => r,
+        Err(e) if is_permanent_write_failure(&e) => {
+            // Park the whole batch with the reason, then report success-with-parked
+            // rather than an error: returning 500 is what makes the caller retry, and
+            // retrying is the defect.
+            let parked: Vec<crate::services::internal::DeadLetterEvent> = rows
+                .iter()
+                .map(|r| crate::services::internal::DeadLetterEvent {
+                    execution_id: r.execution_id,
+                    event_id: r.event_id,
+                    catalog_id: r.catalog_id,
+                    event_type: Some(r.event_type.clone()),
+                    node_name: Some(r.node_name.clone()),
+                    reason: format!("materialize permanent failure: {e}"),
+                    payload: r.result.clone(),
+                    parked_by: Some("events_materialize".to_string()),
+                })
+                .collect();
+            let n = parked.len() as i64;
+            tracing::error!(target: "noetl_server::internal", error = %e, parked = n,
+                "materialize hit a PERMANENT write failure; parking the batch in \
+                 event_dead_letter instead of retrying it forever (noetl/ai-meta#363)");
+            // ⚠ If parking ITSELF fails, that is transient-or-unknown and must
+            // surface — swallowing it would lose the batch with no record anywhere.
+            crate::services::internal::dead_letter_events(&state.db, &parked).await?;
+            crate::metrics::record_materialize_outcome("parked", n as u64);
+            return Ok(Json(EventsMaterializeResponse {
+                materialized: 0,
+                duplicates: 0,
+            }));
+        }
+        // Transient (or unclassified): surface it so the caller retries. An
+        // unclassified failure retrying is the safe default — the unsafe default is
+        // parking something that would have succeeded.
+        Err(e) => {
+            crate::metrics::record_materialize_outcome("transient_failure", 1);
+            return Err(e.into());
+        }
+    };
     let materialized = result.rows_affected() as i64;
     let duplicates = (total - materialized).max(0);
     crate::metrics::record_events_materialized(materialized as u64);
