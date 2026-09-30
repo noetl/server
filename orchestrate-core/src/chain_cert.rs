@@ -229,6 +229,352 @@ pub fn certification_enabled() -> bool {
     )
 }
 
+// ---------------------------------------------------------------------------
+// Amortized certification (follow-up to noetl/server#480)
+// ---------------------------------------------------------------------------
+// #480 measured the per-event variant at -17% append throughput (512
+// events/fsync). Decomposition showed the per-event cost splits three ways:
+// re-serialisation (1.79us), SHA-256 block processing (1.03us soft / 0.17us
+// with the `asm` feature) and hasher init+finalize (0.22us / 0.04us). Only the
+// LAST of those can be amortized by grouping -- block processing is
+// proportional to bytes and serialisation is per-event regardless.
+//
+// So the amortized path here does two things, in order of how much they buy:
+//   1. `roll_bytes` digests the bytes the WAL ALREADY wrote, removing the
+//      re-serialisation entirely. Sound only if the stored bytes are already
+//      deterministic (normalise at event construction, not at digest time) --
+//      A8 shows the normalisation itself cannot be dropped.
+//   2. A roller keeps ONE hasher open across many events, paying init+finalize
+//      once per chunk instead of once per event.
+//
+// ⚠ HOW YOU CHUNK IS A CORRECTNESS QUESTION, NOT A TUNING KNOB.
+
+/// Digest the bytes the append already produced, instead of re-serialising the
+/// event inside [`roll`]. Equivalent to `roll` when `body == canonical(event)`.
+pub fn roll_bytes(prev: Option<[u8; 32]>, body: &[u8]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(DOMAIN_TAG);
+    if let Some(p) = prev {
+        h.update(p);
+    }
+    h.update(body);
+    h.finalize().into()
+}
+
+/// Events per digest advance for [`ChunkRoller`]. Chosen against the recorded
+/// corpus (chains of ~36-174 events): a chunk larger than a typical chain would
+/// leave short executions with NOTHING sealed and therefore nothing to compare
+/// in O(1), which defeats the purpose.
+pub const CHUNK_EVENTS: u32 = 8;
+
+/// Amortizes hasher init+finalize across a chunk, chunking by **chain
+/// position** (`chain_len % CHUNK_EVENTS`).
+///
+/// Chunking by chain position is what makes the digest reproducible: two
+/// independent producers folding the same events derive the same boundaries
+/// from the same indices, so they derive the same digest. Contrast
+/// [`CommitBatchRoller`].
+pub struct ChunkRoller {
+    hasher: Sha256,
+    len: u32,
+    sealed_len: u32,
+    sealed_digest: Option<[u8; 32]>,
+    open: bool,
+}
+
+impl ChunkRoller {
+    /// Resume from a previously sealed certificate (or `None` at the root).
+    pub fn resume(sealed: Option<ChainCert>) -> Self {
+        let (sealed_len, sealed_digest) = match sealed {
+            Some(c) => (c.chain_len, Some(c.chain_digest)),
+            None => (0, None),
+        };
+        Self {
+            hasher: Sha256::new(),
+            len: sealed_len,
+            sealed_len,
+            sealed_digest,
+            open: false,
+        }
+    }
+
+    /// Absorb one event's stored bytes. Seals a chunk when the chain position
+    /// reaches a multiple of [`CHUNK_EVENTS`].
+    pub fn absorb(&mut self, body: &[u8]) {
+        if !self.open {
+            self.hasher = Sha256::new();
+            self.hasher.update(DOMAIN_TAG);
+            if let Some(p) = self.sealed_digest {
+                self.hasher.update(p);
+            }
+            self.open = true;
+        }
+        self.hasher.update(body);
+        self.len += 1;
+        if self.len.is_multiple_of(CHUNK_EVENTS) {
+            // `finalize_reset` reuses the hasher in place: constructing a fresh
+            // Sha256 and moving the old one out copies ~100 bytes of state per
+            // seal, which on a hardware-SHA host costs more than the
+            // init+finalize the chunking is trying to save.
+            let d: [u8; 32] =
+                sha2::digest::FixedOutputReset::finalize_fixed_reset(&mut self.hasher).into();
+            self.sealed_digest = Some(d);
+            self.sealed_len = self.len;
+            self.open = false;
+        }
+    }
+
+    /// The certificate for the sealed prefix. Events after `sealed_len` are not
+    /// covered -- a reader validating a longer prefix refolds at most
+    /// `CHUNK_EVENTS - 1` events, which is the price of the amortization.
+    pub fn certificate(&self, execution_id: i64) -> Option<ChainCert> {
+        self.sealed_digest.map(|d| ChainCert {
+            execution_id,
+            chain_len: self.sealed_len,
+            chain_digest: d,
+        })
+    }
+
+    /// Events absorbed but not yet covered by a sealed certificate.
+    pub fn uncertified_tail(&self) -> u32 {
+        self.len - self.sealed_len
+    }
+}
+
+/// Rolls up whatever arrived in one commit batch, the shape proposed as the fix
+/// for #480's append tax.
+///
+/// ⚠ **This is unsound and is kept only to host the control that proves it.**
+/// Commit-batch boundaries are a function of arrival timing, load and
+/// `MAX_COMMIT_BATCH`, so `H(TAG || prev || b1 || b2)` and
+/// `H(TAG || H(TAG || prev || b1) || b2)` are different digests for the same
+/// chain. Two replicas that batched differently disagree -- which is exactly
+/// the non-deterministic-serialisation failure A8 guards against, reappearing
+/// one level up. See `rolling_up_by_commit_batch_is_not_reproducible`.
+pub struct CommitBatchRoller {
+    hasher: Sha256,
+    len: u32,
+}
+
+impl CommitBatchRoller {
+    pub fn resume(sealed: Option<ChainCert>) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(DOMAIN_TAG);
+        let len = match sealed {
+            Some(c) => {
+                hasher.update(c.chain_digest);
+                c.chain_len
+            }
+            None => 0,
+        };
+        Self { hasher, len }
+    }
+
+    pub fn absorb(&mut self, body: &[u8]) {
+        self.hasher.update(body);
+        self.len += 1;
+    }
+
+    /// Seal at the commit boundary -- wherever that happens to fall.
+    pub fn seal(self, execution_id: i64) -> ChainCert {
+        ChainCert {
+            execution_id,
+            chain_len: self.len,
+            chain_digest: self.hasher.finalize().into(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod amortized_tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn body(i: usize) -> Vec<u8> {
+        format!("{{\"event\":{i},\"payload\":\"abcdefghijklmnopqrstuvwxyz\"}}").into_bytes()
+    }
+
+    #[test]
+    fn digesting_stored_bytes_matches_the_per_event_roll() {
+        // roll_bytes must be the same function as roll, just without paying for
+        // a second serialisation -- otherwise it is a different chain.
+        let e = crate::event::Event {
+            event_id: 7,
+            execution_id: 1,
+            catalog_id: 9,
+            event_type: "step.enter".into(),
+            node_name: None,
+            status: "success".into(),
+            context: None,
+            result: None,
+            meta: None,
+            timestamp: chrono::Utc.timestamp_opt(1_790_000_000, 0).unwrap(),
+            parent_execution_id: None,
+            attempt: Some(1),
+        };
+        let prev = Some([3u8; 32]);
+        assert_eq!(
+            roll(prev, &e),
+            roll_bytes(prev, &canonical(&e)),
+            "digesting the stored canonical bytes must yield the same chain as              re-serialising inside roll()"
+        );
+    }
+
+    #[test]
+    fn a_chunk_of_one_reduces_to_the_per_event_chain() {
+        // Sanity: with CHUNK_EVENTS == 1 the amortized roller and the per-event
+        // roll are the same chain. Proves the roller is the same function,
+        // grouped -- not a different one.
+        let mut prev: Option<[u8; 32]> = None;
+        for i in 0..5usize {
+            prev = Some(roll_bytes(prev, &body(i)));
+        }
+        // Emulate CHUNK_EVENTS == 1 by sealing after every absorb.
+        let mut sealed: Option<ChainCert> = None;
+        for i in 0..5usize {
+            let mut r = CommitBatchRoller::resume(sealed);
+            r.absorb(&body(i));
+            sealed = Some(r.seal(1));
+        }
+        assert_eq!(
+            prev.unwrap(),
+            sealed.unwrap().chain_digest,
+            "sealing every single event must reproduce the per-event chain"
+        );
+    }
+
+    #[test]
+    fn chunking_by_chain_position_is_reproducible_across_producers() {
+        // THE property the amortization must preserve: two producers that split
+        // the same chain into different COMMIT batches still agree, because the
+        // chunk boundaries come from the chain index, not from arrival timing.
+        let bodies: Vec<Vec<u8>> = (0..CHUNK_EVENTS as usize * 3).map(body).collect();
+
+        // Producer A: everything in one batch.
+        let mut a = ChunkRoller::resume(None);
+        for b in &bodies {
+            a.absorb(b);
+        }
+
+        // Producer B: the same events, chopped into ragged batches (3, then 1,
+        // then the rest) -- a different fsync grouping entirely.
+        let mut bb = ChunkRoller::resume(None);
+        for b in bodies.iter().take(3) {
+            bb.absorb(b);
+        }
+        for b in bodies.iter().skip(3).take(1) {
+            bb.absorb(b);
+        }
+        for b in bodies.iter().skip(4) {
+            bb.absorb(b);
+        }
+
+        assert_eq!(
+            a.certificate(1),
+            bb.certificate(1),
+            "chunking by chain position must be independent of how events were              grouped into commit batches"
+        );
+    }
+
+    #[test]
+    fn rolling_up_by_commit_batch_is_not_reproducible() {
+        // The hazard, asserted so it cannot be reintroduced silently: the
+        // proposed commit-batch rollup gives a DIFFERENT digest for the SAME
+        // chain when the batch boundaries differ. This is why the benchmark's
+        // amortized path chunks by chain position instead.
+        let bodies: Vec<Vec<u8>> = (0..6usize).map(body).collect();
+
+        let mut one = CommitBatchRoller::resume(None);
+        for b in &bodies {
+            one.absorb(b);
+        }
+        let all_in_one = one.seal(1);
+
+        let mut first = CommitBatchRoller::resume(None);
+        for b in bodies.iter().take(2) {
+            first.absorb(b);
+        }
+        let mid = first.seal(1);
+        let mut second = CommitBatchRoller::resume(Some(mid));
+        for b in bodies.iter().skip(2) {
+            second.absorb(b);
+        }
+        let split = second.seal(1);
+
+        assert_eq!(
+            all_in_one.chain_len, split.chain_len,
+            "both cover the same number of events"
+        );
+        assert_ne!(
+            all_in_one.chain_digest, split.chain_digest,
+            "commit-batch rollup is boundary-dependent: this inequality IS the              defect. If it ever becomes an equality the hazard is gone and this              test should be revisited."
+        );
+    }
+
+    #[test]
+    fn a_divergent_early_chunk_changes_every_later_certificate() {
+        // Amortizing must not turn the chain into a set of independent chunk
+        // digests. If chunk N+1 does not absorb chunk N's digest, a chain that
+        // diverged early but converged later would certify as VALID -- the
+        // certificate would be checking the tail only. Tamper with the first
+        // event and require every subsequent certificate to move.
+        let n = CHUNK_EVENTS as usize * 3;
+        let mut clean = ChunkRoller::resume(None);
+        let mut tampered = ChunkRoller::resume(None);
+        let mut clean_certs = Vec::new();
+        let mut tampered_certs = Vec::new();
+        for i in 0..n {
+            clean.absorb(&body(i));
+            tampered.absorb(&if i == 0 { body(999) } else { body(i) });
+            if let (Some(c), Some(t)) = (clean.certificate(1), tampered.certificate(1)) {
+                clean_certs.push(c);
+                tampered_certs.push(t);
+            }
+        }
+        assert!(clean_certs.len() >= 3, "expected at least 3 sealed chunks");
+        for (c, t) in clean_certs.iter().zip(tampered_certs.iter()) {
+            assert_eq!(c.chain_len, t.chain_len);
+            assert_ne!(
+                c.chain_digest, t.chain_digest,
+                "a divergence in chunk 1 must still be visible at chain_len {} —                  chunks must be CHAINED, not independent digests",
+                c.chain_len
+            );
+        }
+    }
+
+    #[test]
+    fn the_uncertified_tail_never_exceeds_one_chunk() {
+        // The cost of amortizing: a prefix past the last sealed chunk needs a
+        // bounded refold. Bounded is the claim; prove the bound.
+        let mut r = ChunkRoller::resume(None);
+        for i in 0..(CHUNK_EVENTS as usize * 4 + 3) {
+            r.absorb(&body(i));
+            assert!(
+                r.uncertified_tail() < CHUNK_EVENTS,
+                "uncertified tail {} must stay under one chunk ({})",
+                r.uncertified_tail(),
+                CHUNK_EVENTS
+            );
+        }
+    }
+
+    #[test]
+    fn a_short_chain_still_seals_at_least_one_chunk() {
+        // If CHUNK_EVENTS were set above typical chain length, short executions
+        // would certify nothing and the whole path would be inert -- the
+        // "exists but never runs" shape. Guard the choice of constant.
+        let mut r = ChunkRoller::resume(None);
+        for i in 0..36usize {
+            r.absorb(&body(i));
+        }
+        assert!(
+            r.certificate(1).is_some(),
+            "a 36-event chain (the corpus mean) must seal at least one chunk;              CHUNK_EVENTS={} is too large if this fails",
+            CHUNK_EVENTS
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
