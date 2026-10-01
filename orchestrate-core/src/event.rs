@@ -127,7 +127,7 @@ mod timestamp_normalisation_tests {
         // only digits that never survived a round trip anyway.
         let ns = Utc.timestamp_opt(1_790_000_000, 123_456_789).unwrap();
         let db_precision = Utc.timestamp_micros(ns.timestamp_micros()).single().unwrap();
-        let serialised = serde_json::to_value(&ev(ns)).unwrap();
+        let serialised = serde_json::to_value(ev(ns)).unwrap();
         let round_tripped: Event = serde_json::from_value(serialised).unwrap();
         assert_eq!(
             round_tripped.timestamp, db_precision,

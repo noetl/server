@@ -111,12 +111,6 @@ pub fn canonical(event: &Event) -> Vec<u8> {
     serde_json::to_vec(&value).unwrap_or_default()
 }
 
-/// Force the timestamp to whole microseconds, by truncation, always.
-///
-/// The choice between rounding and truncating is arbitrary; agreeing on one is
-/// not. Truncation is chosen because it is monotone in the input and cannot
-/// carry a value into the next second.
-
 /// One step of the rolling digest.
 ///
 /// `roll(None, root)` seeds the chain; `roll(Some(prev), e)` extends it. Note
