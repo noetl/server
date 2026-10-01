@@ -1568,7 +1568,10 @@ args: ["echo hi"]
             .config
             .get("command")
             .expect("command propagated to ToolCall config");
-        assert!(call_command.is_array(), "command must stay an array, got {call_command:?}");
+        assert!(
+            call_command.is_array(),
+            "command must stay an array, got {call_command:?}"
+        );
         assert_eq!(call_command, &serde_json::json!(["/bin/sh", "-c"]));
     }
 
@@ -1780,7 +1783,10 @@ mod tool_kind_tests {
         assert!(ToolKind::parse("totally_bogus_kind").is_none());
         // Positive control: the check is capable of accepting something.
         assert_eq!(ToolKind::parse("noop"), Some(ToolKind::Noop));
-        assert_eq!(ToolKind::parse("task_sequence"), Some(ToolKind::TaskSequence));
+        assert_eq!(
+            ToolKind::parse("task_sequence"),
+            Some(ToolKind::TaskSequence)
+        );
     }
 
     /// Case and whitespace are NOT silently accepted — `Agent` is as invalid as
@@ -1797,6 +1803,9 @@ mod tool_kind_tests {
     fn the_valid_set_names_real_kinds() {
         let s = ToolKind::valid_set();
         assert!(s.contains("noop") && s.contains("task_sequence") && s.contains("wasm"));
-        assert!(!s.contains("agent"), "the invalid kinds must not be advertised");
+        assert!(
+            !s.contains("agent"),
+            "the invalid kinds must not be advertised"
+        );
     }
 }

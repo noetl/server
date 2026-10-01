@@ -1300,6 +1300,17 @@ pub async fn claim_command(
         // can take. Measured on prod: the shadow held 12 of 14 events for an
         // hourly `system/scheduled_cleanup`, missing exactly the rows written here.
         crate::handlers::ehdb_embedded::shadow_append(std::slice::from_ref(&ev));
+        // noetl/ai-meta#366 -- the chain certificate rides the SAME bypass. A
+        // roller that misses these rows runs permanently short, `reconcile`
+        // fails the fold skip closed, and the feature disables itself. Observed
+        // AFTER the commit so the chain only covers durable events.
+        crate::services::certified_fold::observe(
+            ev.execution_id,
+            ev.event_id,
+            &ev.event_type,
+            ev.node_name.as_deref(),
+            &ev.status,
+        );
     }
 
     Ok(Json(ClaimResponse {
@@ -1488,6 +1499,16 @@ pub async fn handle_batch_events(
         crate::handlers::ehdb_eventlog_mirror::mirror_rows(&state, &event_rows).await;
         // noetl/ai-meta#332 -- same bypass, same reason as the claim site above.
         crate::handlers::ehdb_embedded::shadow_append(&event_rows);
+        // noetl/ai-meta#366 -- same bypass, same reason as the claim site above.
+        for r in &event_rows {
+            crate::services::certified_fold::observe(
+                r.execution_id,
+                r.event_id,
+                &r.event_type,
+                r.node_name.as_deref(),
+                &r.status,
+            );
+        }
     }
 
     // Trigger orchestrator for any command.completed in the batch,
@@ -3008,12 +3029,8 @@ pub fn spawn_orchestrator_reconciler(state: AppState) {
                 let chain_action = match state.chain_source.as_ref() {
                     Some(src) => {
                         let before = state.drive_tombstones.noops(execution_id);
-                        crate::chain_advance::poller_action(
-                            src.as_ref(),
-                            execution_id,
-                            before,
-                        )
-                        .await
+                        crate::chain_advance::poller_action(src.as_ref(), execution_id, before)
+                            .await
                     }
                     None => None,
                 };
@@ -5925,7 +5942,10 @@ mod reconcile_cap_tests {
             "the cap must still be reached in exactly {CAP} polls despite \
              {real_events} intervening real events"
         );
-        assert!(real_events > 0, "the test must actually have delivered events");
+        assert!(
+            real_events > 0,
+            "the test must actually have delivered events"
+        );
     }
 
     /// ⭐ POSITIVE CONTROL for the change above: `clear()` must still perform the
@@ -5940,8 +5960,14 @@ mod reconcile_cap_tests {
         assert!(tombs.get(11).is_some());
         // mark() frees the budget; the execution then resumes on a real event.
         tombs.set_noops(11, 100);
-        assert!(tombs.clear(11), "a real event must still clear the tombstone");
-        assert!(tombs.get(11).is_none(), "self-heal must survive this change");
+        assert!(
+            tombs.clear(11),
+            "a real event must still clear the tombstone"
+        );
+        assert!(
+            tombs.get(11).is_none(),
+            "self-heal must survive this change"
+        );
         assert_eq!(
             tombs.noops(11),
             100,
@@ -5975,7 +6001,10 @@ mod reconcile_cap_tests {
         tombs.mark(7, TombstoneReason::GaveUp);
         assert!(tombs.get(7).is_some());
         assert!(!tombs.clear(9), "clearing an unmarked id must report false");
-        assert!(tombs.get(7).is_some(), "an unrelated clear must not resurrect it");
+        assert!(
+            tombs.get(7).is_some(),
+            "an unrelated clear must not resurrect it"
+        );
         assert!(tombs.clear(7), "a real event must clear it");
         assert!(tombs.get(7).is_none(), "and it must then be drivable again");
     }
@@ -5991,7 +6020,6 @@ mod reconcile_cap_tests {
         assert!(tombs.get(1).is_none(), "oldest must be evicted first");
         assert!(tombs.get(5).is_some(), "newest must be retained");
     }
-
 
     // =======================================================================
     // noetl/ai-meta#315 — the reconcile poller must stop re-driving an

@@ -5,6 +5,7 @@
 
 pub mod catalog;
 pub mod cell_registry;
+pub mod certified_fold;
 pub mod credential;
 pub mod event;
 pub mod execution;

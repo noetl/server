@@ -69,6 +69,11 @@ pub async fn insert_event(
     .fetch_one(pool)
     .await?;
 
+    // Advance the execution's chain certificate (noetl/ai-meta#366), after the
+    // row is durable. One of several `noetl.event` writers — see
+    // `services::certified_fold` for why every one of them must do this.
+    crate::services::certified_fold::observe(execution_id, event_id, event_type, node_name, status);
+
     Ok(row.0)
 }
 

@@ -18,8 +18,8 @@
 pub mod chain_cert;
 pub mod commands;
 pub mod error;
-pub mod event;
 pub mod evaluator;
+pub mod event;
 pub mod input_binding;
 pub mod orchestrator;
 pub mod playbook;

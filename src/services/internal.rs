@@ -873,6 +873,28 @@ pub async fn project_events(
     // so a second append would double-count it and manufacture a divergence the
     // engine did not cause.
 
+    // noetl/ai-meta#366 — advance each execution's chain certificate over the
+    // rows Postgres ACCEPTED (the `RETURNING` set), not the input batch.
+    //
+    // ⚠ Why this is safe here when the #332 shadow append was not: that hook
+    // sits at `event_write::emit_events`, which an event passes on BOTH sides
+    // of the CQRS gate — so with the gate on it fired there AND again here, via
+    // the materializer. The chain observer is wired at the INSERT instead
+    // (`event_write::insert_rows`, the two `handlers::events` in-tx sites, the
+    // two materializer sites), and an event is INSERTed exactly once by exactly
+    // one of them. Published events are not inserted by `emit_events` at all —
+    // it publishes and returns — so observing here is their first and only
+    // observe, not a second.
+    for r in &inserted {
+        crate::services::certified_fold::observe(
+            r.execution_id,
+            r.event_id,
+            &r.event_type,
+            r.node_name.as_deref(),
+            &r.status,
+        );
+    }
+
     Ok((projected, duplicates, inserted))
 }
 

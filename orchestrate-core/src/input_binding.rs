@@ -234,7 +234,10 @@ tool:
         );
         let full = ctx(&[
             ("generate_data", serde_json::json!({"id": 7})),
-            ("unrelated_big", serde_json::json!({"blob": "x".repeat(10_000)})),
+            (
+                "unrelated_big",
+                serde_json::json!({"blob": "x".repeat(10_000)}),
+            ),
             ("another_step", serde_json::json!({"k": "v"})),
         ]);
         let narrowed = project_context(&step, &full).expect("bounded");
@@ -272,7 +275,10 @@ tool:
 "#,
         );
         let di = analyze(&step);
-        assert!(!di.bounded, "a whole-context spread must force full context");
+        assert!(
+            !di.bounded,
+            "a whole-context spread must force full context"
+        );
         let full = ctx(&[("a", serde_json::json!(1)), ("b", serde_json::json!(2))]);
         assert!(
             project_context(&step, &full).is_none(),

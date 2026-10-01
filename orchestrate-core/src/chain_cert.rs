@@ -50,6 +50,29 @@ pub const DOMAIN_TAG: &[u8] = b"noetl.ehdb.chain-cert.v1";
 /// feature. Guarded by `a_short_chain_still_seals_at_least_one_chunk`.
 pub const CHUNK_EVENTS: u32 = 8;
 
+/// How many consecutive skips an execution may take before a real fold is
+/// forced, to re-run the precondition check.
+///
+/// ⚠ THIS CONSTANT IS WHAT MAKES THE MISS-DETECTOR ABLE TO FIRE AT ALL, and it
+/// exists because the first version of this module could not detect the worst
+/// case it was built for.
+///
+/// `reconcile` only learns the chain's real length from a fold. But a process
+/// that has stopped seeing an execution's events has a roller that stops
+/// advancing — so `decide` reads "nothing changed", skips, and therefore never
+/// folds, and therefore never reconciles. The miss would go undetected forever
+/// while the skip served progressively staler state. Detection required the
+/// very fold the skip was removing.
+///
+/// Forcing a fold every `MAX_CONSECUTIVE_SKIPS` bounds that blind window. At
+/// 16, with the reconciler re-driving roughly every 8s, an undetected miss is
+/// caught within ~2 minutes, and at most 1 fold in 17 is kept — 94% of folds
+/// still eliminated, above the spec's >=90% gate.
+///
+/// Raising it widens the blind window; lowering it costs folds. Do not raise it
+/// without re-deriving both numbers.
+pub const MAX_CONSECUTIVE_SKIPS: u32 = 16;
+
 /// `(chain_len, chain_digest)` for one execution — 36 bytes, 44 with the id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChainCert {
@@ -82,6 +105,13 @@ pub enum FoldDecision {
     /// Same length, different digest — the chains diverged. The dangerous one:
     /// a length-only check would have called this valid.
     RefoldDigestMismatch,
+    /// This execution's roller has not yet been calibrated against a real
+    /// chain length by [`CertifiedFoldCache::reconcile`].
+    RefoldUncalibrated,
+    /// The certificate matches, but this execution has taken
+    /// [`MAX_CONSECUTIVE_SKIPS`] skips in a row — fold anyway so the
+    /// precondition check runs. See that constant for why this is not optional.
+    RefoldRevalidationDue,
     /// This process has been proven to have missed events (see
     /// [`CertifiedFoldCache::reconcile`]), so no roller is trustworthy. Fails
     /// closed for every execution, not only the one that revealed it.
@@ -226,6 +256,22 @@ pub fn fold_skip_enabled() -> bool {
 pub struct CertifiedFoldCache {
     rollers: HashMap<i64, ChunkRoller>,
     cached: HashMap<i64, ChainCert>,
+    /// Events an execution already had before this roller started watching it.
+    ///
+    /// The flag can be turned on mid-flight, and a process restarts, so a roller
+    /// routinely begins partway through a chain. Its digest is still a valid
+    /// CHANGE DETECTOR from that point on, but its length is permanently short
+    /// by however much it missed. Without recording that offset, the first
+    /// `reconcile` would read as "this process missed events", fail closed, and
+    /// the feature would disable itself the moment it was enabled.
+    ///
+    /// Set once per execution, on its first `reconcile`. Every later mismatch is
+    /// then a REAL miss, which is what the guard is for.
+    offsets: HashMap<i64, u32>,
+    /// Consecutive skips per execution, reset by [`Self::record_fold`]. Bounds
+    /// how long a missed event can go undetected — see
+    /// [`MAX_CONSECUTIVE_SKIPS`].
+    skips_since_fold: HashMap<i64, u32>,
 }
 
 impl CertifiedFoldCache {
@@ -239,6 +285,42 @@ impl CertifiedFoldCache {
     /// key twice per event, which measured as a real per-event cost in
     /// noetl/ehdb#379 and showed up first as a non-linear benchmark rather than
     /// as a number.
+    /// Observe one event by the fields the fold keys on.
+    ///
+    /// ⚠ This, not `observe`, is what call sites use. There are at least four
+    /// places that write `noetl.event`, and `handlers::ehdb_eventlog_mirror`
+    /// records that the nominal chokepoint (`event_write::emit_events`) is NOT
+    /// one — two sites in `handlers::events` write the table directly on the
+    /// branch `should_publish` takes when false, which is the ONLY branch a
+    /// system-pool execution can take. That already shipped as a defect
+    /// (noetl/ai-meta#263: `system/*` mirrored 11 of 13 events per run).
+    ///
+    /// So the identity is built HERE from values every site already has, rather
+    /// than each site serialising its own. Four sites each composing their own
+    /// byte string is four chances to compose it differently, and a digest that
+    /// differs by call site is a digest that reports change that did not happen.
+    ///
+    /// Covers event identity AND the fields the fold reacts to, so an in-place
+    /// mutation (not just an append) also moves the digest.
+    pub fn observe_event(
+        &mut self,
+        execution_id: i64,
+        event_id: i64,
+        event_type: &str,
+        node_name: Option<&str>,
+        status: &str,
+    ) {
+        let mut body = Vec::with_capacity(48 + event_type.len() + status.len());
+        body.extend_from_slice(&event_id.to_be_bytes());
+        body.push(0x1f);
+        body.extend_from_slice(event_type.as_bytes());
+        body.push(0x1f);
+        body.extend_from_slice(node_name.unwrap_or("").as_bytes());
+        body.push(0x1f);
+        body.extend_from_slice(status.as_bytes());
+        self.observe(execution_id, &body);
+    }
+
     pub fn observe(&mut self, execution_id: i64, body: &[u8]) {
         OBSERVED.fetch_add(1, Ordering::Relaxed);
         if let Some(r) = self.rollers.get_mut(&execution_id) {
@@ -272,10 +354,33 @@ impl CertifiedFoldCache {
         // Once this process has demonstrably missed an event, its rollers are
         // no longer change detectors for anything. Fail closed, globally, not
         // just for the execution that revealed it.
-        if DIVERGENCES.load(Ordering::Relaxed) > 0 {
-            return FoldDecision::RefoldDivergenceDetected;
-        }
-        let d = decide(self.cached(execution_id), self.current(execution_id));
+        // Every decision below is COUNTED, including the refusals: a ramp needs
+        // skipped/decided to be a true ratio, and "we refused because the
+        // roller was never calibrated" is a refold that should show up as one.
+        let d = if DIVERGENCES.load(Ordering::Relaxed) > 0 {
+            FoldDecision::RefoldDivergenceDetected
+        } else if !self.is_calibrated(execution_id) {
+            // An uncalibrated roller has never been checked against a real
+            // chain length, so its digest covers an unverified prefix. Refold
+            // once to calibrate before any skip is licensed.
+            FoldDecision::RefoldUncalibrated
+        } else {
+            let d = decide(self.cached(execution_id), self.current(execution_id));
+            // A matching certificate is necessary but not sufficient: force a
+            // fold periodically so the miss-detector gets to run.
+            if d.skips_fold()
+                && self
+                    .skips_since_fold
+                    .get(&execution_id)
+                    .copied()
+                    .unwrap_or(0)
+                    >= MAX_CONSECUTIVE_SKIPS
+            {
+                FoldDecision::RefoldRevalidationDue
+            } else {
+                d
+            }
+        };
         DECIDED.fetch_add(1, Ordering::Relaxed);
         if d.skips_fold() {
             SKIPPED.fetch_add(1, Ordering::Relaxed);
@@ -310,12 +415,56 @@ impl CertifiedFoldCache {
     /// Returns `true` when consistent.
     pub fn reconcile(&mut self, execution_id: i64, actual_len: u32) -> bool {
         let seen = self.observed_len(execution_id);
-        if seen == actual_len {
-            return true;
+        match self.offsets.get(&execution_id).copied() {
+            // Already calibrated: `seen + offset` must equal the real length.
+            // Anything else means this process missed an event.
+            Some(offset) => {
+                if seen.saturating_add(offset) == actual_len {
+                    true
+                } else {
+                    DIVERGENCES.fetch_add(1, Ordering::Relaxed);
+                    self.forget(execution_id);
+                    false
+                }
+            }
+            // First sight of this execution: adopt whatever it already had as
+            // the offset. This is a late start, not a miss.
+            None => {
+                let offset = actual_len.saturating_sub(seen);
+                self.offsets.insert(execution_id, offset);
+                // A roller that somehow saw MORE than the chain holds is not a
+                // late start — that is incoherent, so fail closed.
+                if seen > actual_len {
+                    DIVERGENCES.fetch_add(1, Ordering::Relaxed);
+                    self.forget(execution_id);
+                    return false;
+                }
+                true
+            }
         }
-        DIVERGENCES.fetch_add(1, Ordering::Relaxed);
-        self.forget(execution_id);
-        false
+    }
+
+    /// Has this execution's baseline been calibrated by a `reconcile` yet?
+    ///
+    /// Until it has, the roller's length is unanchored, so a skip could be
+    /// licensed by a digest covering a prefix nobody verified. `decide_for`
+    /// refuses to skip before calibration.
+    pub fn is_calibrated(&self, execution_id: i64) -> bool {
+        self.offsets.contains_key(&execution_id)
+    }
+
+    /// Note that a skip was taken, for the revalidation budget. Called by the
+    /// wiring immediately after it acts on a [`FoldDecision::SkipValid`].
+    pub fn note_skip(&mut self, execution_id: i64) {
+        *self.skips_since_fold.entry(execution_id).or_insert(0) += 1;
+    }
+
+    /// Consecutive skips taken since this execution last really folded.
+    pub fn skips_since_fold(&self, execution_id: i64) -> u32 {
+        self.skips_since_fold
+            .get(&execution_id)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Record that a fold was performed, so the next decision can match it.
@@ -323,12 +472,16 @@ impl CertifiedFoldCache {
         if let Some(c) = self.current(execution_id) {
             self.cached.insert(execution_id, c);
         }
+        // A real fold just reconciled, so the blind window restarts.
+        self.skips_since_fold.insert(execution_id, 0);
     }
 
     /// Drop an execution's state (it completed, or the cache slot was evicted).
     pub fn forget(&mut self, execution_id: i64) {
         self.rollers.remove(&execution_id);
         self.cached.remove(&execution_id);
+        self.offsets.remove(&execution_id);
+        self.skips_since_fold.remove(&execution_id);
     }
 
     pub fn tracked(&self) -> usize {
@@ -362,6 +515,14 @@ mod tests {
         }
     }
 
+    /// Observe `n` events AND calibrate, which is the state a real execution is
+    /// in after its first refold. Most tests want this; the ones that care
+    /// about calibration itself call `fill` and `reconcile` separately.
+    fn fill_calibrated(cache: &mut CertifiedFoldCache, exec: i64, n: u32) {
+        fill(cache, exec, n);
+        assert!(cache.reconcile(exec, n), "fixture must calibrate cleanly");
+    }
+
     #[test]
     fn the_digest_matches_an_independent_implementation() {
         // Golden vector from a THIRD implementation (Python/hashlib) sharing no
@@ -390,7 +551,9 @@ mod tests {
             reset_counters();
             let mut c = CertifiedFoldCache::new();
             fill(&mut c, 1, 16);
-            // First decision: nothing cached -> refold, then record it.
+            // Uncalibrated: must refold even though a digest exists.
+            assert_eq!(c.decide_for(1), FoldDecision::RefoldUncalibrated);
+            assert!(c.reconcile(1, 16), "calibrate against the real length");
             assert_eq!(c.decide_for(1), FoldDecision::RefoldNoCachedState);
             c.record_fold(1);
             // Chain unchanged -> the skip must fire.
@@ -401,9 +564,9 @@ mod tests {
             );
             let (observed, decided, skipped, refolded, _div) = counters();
             assert_eq!(observed, 16, "the producer side must have run");
-            assert_eq!(decided, 2, "the reader side must have run");
+            assert_eq!(decided, 3, "the reader side must have run");
             assert_eq!(skipped, 1, "the skip must have FIRED at least once");
-            assert_eq!(refolded, 1);
+            assert_eq!(refolded, 2);
         });
     }
 
@@ -411,7 +574,7 @@ mod tests {
     fn a_chain_that_advanced_must_refold() {
         with_flag_on(|| {
             let mut c = CertifiedFoldCache::new();
-            fill(&mut c, 1, 16);
+            fill_calibrated(&mut c, 1, 16);
             c.record_fold(1);
             fill(&mut c, 1, 8); // now 24
             assert_eq!(
@@ -475,6 +638,7 @@ mod tests {
             let mut c = CertifiedFoldCache::new();
             fill(&mut c, 1, CHUNK_EVENTS - 1);
             assert!(c.current(1).is_none(), "under one chunk seals nothing");
+            assert!(c.reconcile(1, CHUNK_EVENTS - 1));
             c.record_fold(1);
             assert!(
                 !c.decide_for(1).skips_fold(),
@@ -571,7 +735,7 @@ mod tests {
     fn forgetting_an_execution_clears_both_halves() {
         with_flag_on(|| {
             let mut c = CertifiedFoldCache::new();
-            fill(&mut c, 1, 16);
+            fill_calibrated(&mut c, 1, 16);
             c.record_fold(1);
             assert!(c.decide_for(1).skips_fold());
             c.forget(1);
@@ -636,6 +800,7 @@ mod tests {
             for e in &events {
                 c.observe(1, &serde_json::to_vec(e).expect("serialise"));
             }
+            assert!(c.reconcile(1, events.len() as u32), "calibrate");
 
             // The fold the reader would cache.
             let folded = WorkflowState::from_events(&events).expect("fold");
@@ -716,13 +881,15 @@ mod tests {
         with_flag_on(|| {
             reset_counters();
             let mut c = CertifiedFoldCache::new();
-            fill(&mut c, 1, 16);
+            fill_calibrated(&mut c, 1, 16);
             c.record_fold(1);
             assert!(
                 c.decide_for(1).skips_fold(),
                 "sanity: it would have skipped"
             );
 
+            // Now 8 events arrive that this process never saw, and the next
+            // refold reads 24. Already calibrated, so this is a REAL miss.
             assert!(
                 !c.reconcile(1, 24),
                 "a roller 8 events behind the real chain must be reported inconsistent"
@@ -730,7 +897,7 @@ mod tests {
             assert_eq!(divergences(), 1, "the divergence must be COUNTED");
 
             // Fails closed globally, including for an execution that looks fine.
-            fill(&mut c, 2, 16);
+            fill_calibrated(&mut c, 2, 16);
             c.record_fold(2);
             assert_eq!(
                 c.decide_for(2),
@@ -758,6 +925,49 @@ mod tests {
             );
             reset_counters();
         });
+    }
+
+    #[test]
+    fn a_run_of_skips_is_bounded_so_the_detector_can_fire() {
+        // The flaw this closes: `reconcile` only learns the real chain length
+        // from a fold, so a process that stopped seeing events has a roller that
+        // stops advancing, reads "nothing changed", skips forever, and never
+        // folds — so the miss is never detected. Detection needed the very fold
+        // the skip removed. The budget forces one.
+        with_flag_on(|| {
+            let mut c = CertifiedFoldCache::new();
+            fill_calibrated(&mut c, 1, 16);
+            c.record_fold(1);
+            for i in 0..MAX_CONSECUTIVE_SKIPS {
+                assert_eq!(
+                    c.decide_for(1),
+                    FoldDecision::SkipValid,
+                    "skip {i} of the budget must still be allowed"
+                );
+                c.note_skip(1);
+            }
+            assert_eq!(
+                c.decide_for(1),
+                FoldDecision::RefoldRevalidationDue,
+                "past the budget the certificate still matches, but a fold must be                  forced so the precondition check runs"
+            );
+            // A real fold restarts the window.
+            c.record_fold(1);
+            assert_eq!(c.skips_since_fold(1), 0);
+            assert_eq!(c.decide_for(1), FoldDecision::SkipValid);
+        });
+    }
+
+    #[test]
+    fn the_budget_still_eliminates_most_folds() {
+        // The budget costs folds, so pin what it costs: at most 1 fold per
+        // (budget + 1) decisions, which must stay above the spec's >=90% gate.
+        let kept = 1.0 / (MAX_CONSECUTIVE_SKIPS as f64 + 1.0);
+        let eliminated = (1.0 - kept) * 100.0;
+        assert!(
+            eliminated >= 90.0,
+            "MAX_CONSECUTIVE_SKIPS={MAX_CONSECUTIVE_SKIPS} eliminates only              {eliminated:.1}% of folds, below the >=90% gate"
+        );
     }
 
     #[test]
