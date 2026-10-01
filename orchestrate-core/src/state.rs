@@ -2849,7 +2849,10 @@ mod double_apply_tests {
             .get("loop_step")
             .map(|s| s.iterations_dispatched)
             .unwrap_or(-1);
-        assert!(once >= 1, "fixture did not increment at all ({once}) — vacuous");
+        assert!(
+            once >= 1,
+            "fixture did not increment at all ({once}) — vacuous"
+        );
         assert_eq!(
             once, twice,
             "re-applying the SAME command.issued incremented \
@@ -2913,12 +2916,18 @@ mod digest_invariance_tests {
         let mut meta = serde_json::Map::new();
         meta.insert("command_id".to_string(), serde_json::json!(cid));
         Event {
-            event_id: id, execution_id: 1, catalog_id: 2,
-            event_type: t.to_string(), node_name: Some(step.to_string()),
-            status: String::new(), context: None, result: None,
+            event_id: id,
+            execution_id: 1,
+            catalog_id: 2,
+            event_type: t.to_string(),
+            node_name: Some(step.to_string()),
+            status: String::new(),
+            context: None,
+            result: None,
             meta: Some(serde_json::Value::Object(meta)),
             timestamp: DateTime::from_timestamp(0, 0).unwrap(),
-            parent_execution_id: None, attempt: None,
+            parent_execution_id: None,
+            attempt: None,
         }
     }
 
@@ -2965,7 +2974,10 @@ mod digest_invariance_tests {
         let once = WorkflowState::from_events(&base).expect("fold");
         // make it an iterator so iterations_dispatched participates
         let mut doubled: Vec<Event> = Vec::new();
-        for e in &base { doubled.push(e.clone()); doubled.push(e.clone()); }
+        for e in &base {
+            doubled.push(e.clone());
+            doubled.push(e.clone());
+        }
         let twice = WorkflowState::from_events(&doubled).expect("fold");
 
         // Prove the fixture CAN exhibit the condition before trusting either result.
@@ -2980,7 +2992,12 @@ mod digest_invariance_tests {
         let d1 = canonical_state_digest(&once);
         let d2 = canonical_state_digest(&twice);
         // Printed so a failure shows both digests, not just "not equal".
-        println!("digest once={} twice={} equal={}", &d1[..16], &d2[..16], d1 == d2);
+        println!(
+            "digest once={} twice={} equal={}",
+            &d1[..16],
+            &d2[..16],
+            d1 == d2
+        );
         assert_eq!(d1, d2, "duplicated replay changed the canonical digest");
     }
 }

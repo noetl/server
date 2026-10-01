@@ -498,7 +498,6 @@ pub async fn emit_events(state: &AppState, pool: &DbPool, rows: &[EventRow]) -> 
     // silently-degraded shadow stays visible.
     crate::handlers::ehdb_embedded::shadow_append(rows);
 
-
     // All rows in a batch share the same execution + catalog, so one decision
     // covers the batch.
     let __t = std::time::Instant::now();
@@ -594,6 +593,17 @@ async fn insert_rows(pool: &DbPool, rows: &[EventRow]) -> AppResult<()> {
             .push_bind(r.created_at);
     });
     qb.build().execute(pool).await?;
+    // Advance each execution's chain certificate (noetl/ai-meta#366). After the
+    // INSERT succeeds, so the chain only ever covers events that are durable.
+    for r in rows {
+        crate::services::certified_fold::observe(
+            r.execution_id,
+            r.event_id,
+            &r.event_type,
+            r.node_name.as_deref(),
+            &r.status,
+        );
+    }
     Ok(())
 }
 
@@ -939,7 +949,10 @@ mod tests {
         for (name, src) in [
             ("event_write.rs", include_str!("event_write.rs")),
             ("chain_populate.rs", include_str!("chain_populate.rs")),
-            ("../services/internal.rs", include_str!("../services/internal.rs")),
+            (
+                "../services/internal.rs",
+                include_str!("../services/internal.rs"),
+            ),
         ] {
             let non_test = src.split("#[cfg(test)]").next().unwrap_or("");
             // The definition itself is not a call site.

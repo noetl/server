@@ -174,8 +174,14 @@ pub async fn fold_from_postgres(
     pool: &DbPool,
     execution_id: i64,
 ) -> Result<FoldedState, FoldRefusal> {
-    let events = events_from_postgres(pool, execution_id).await?;
-    fold(FoldSource::Postgres, events)
+    // noetl/ai-meta#366 — skip the read+fold entirely when the chain
+    // certificate proves nothing has moved since the last one. Inert unless
+    // `NOETL_CHAIN_CERT` is on; see `services::certified_fold`.
+    crate::services::certified_fold::fold_or_skip(execution_id, || async move {
+        let events = events_from_postgres(pool, execution_id).await?;
+        fold(FoldSource::Postgres, events)
+    })
+    .await
 }
 
 /// As [`events_from_postgres`], but with **result references hydrated** — the
@@ -243,7 +249,8 @@ pub const REFS_IN_STATE_ENV: &str = "NOETL_REFS_IN_STATE";
 /// variable unset, so an `unwrap_or(false)` here would silently reinstate the
 /// exact bug this replaced while every test that sets the value still passed.
 pub(crate) fn refs_in_state_from_raw(raw: Option<&str>) -> bool {
-    raw.and_then(|v| v.trim().parse::<bool>().ok()).unwrap_or(true)
+    raw.and_then(|v| v.trim().parse::<bool>().ok())
+        .unwrap_or(true)
 }
 
 /// The reference policy the snapshot writer used, so the verification fold
@@ -1570,7 +1577,8 @@ pub async fn materialize_from_wal(
     execution_id: i64,
 ) -> Result<FoldedState, FoldRefusal> {
     let (folded, body) = {
-        let (source, events) = events_for_recovery_or_postgres(pool, result_store, execution_id).await?;
+        let (source, events) =
+            events_for_recovery_or_postgres(pool, result_store, execution_id).await?;
         fold_with_body(source, events)?
     };
     let base = std::env::var(super::ehdb::WORKER_QUERY_URL_ENV)
@@ -4413,7 +4421,11 @@ mod differing_fields_tests {
     //
     // No-op unless both env vars are set, so it cannot affect the suite.
     // ======================================================================
-    fn flatten_json(v: &serde_json::Value, path: String, out: &mut std::collections::BTreeMap<String, String>) {
+    fn flatten_json(
+        v: &serde_json::Value,
+        path: String,
+        out: &mut std::collections::BTreeMap<String, String>,
+    ) {
         match v {
             serde_json::Value::Object(m) => {
                 for (k, vv) in m {
@@ -4427,7 +4439,14 @@ mod differing_fields_tests {
             }
             other => {
                 let s = other.to_string();
-                out.insert(path, if s.len() > 120 { format!("{}…<{}B>", &s[..120], s.len()) } else { s });
+                out.insert(
+                    path,
+                    if s.len() > 120 {
+                        format!("{}…<{}B>", &s[..120], s.len())
+                    } else {
+                        s
+                    },
+                );
             }
         }
     }
@@ -4489,20 +4508,29 @@ mod differing_fields_tests {
             for r in &recs {
                 let v = r.get("version").and_then(|x| x.as_i64()).unwrap();
                 let d = r.get("digest").and_then(|x| x.as_str()).unwrap();
-                let ac = r.get("applied_count").and_then(|x| x.as_i64()).unwrap_or(-1);
+                let ac = r
+                    .get("applied_count")
+                    .and_then(|x| x.as_i64())
+                    .unwrap_or(-1);
                 let bounded = bounded_fold_at(events.clone(), v);
                 let agree = bounded_fold_agrees(&bounded, v, d);
                 let (bv, bd, bc) = match &bounded {
                     Ok(b) => (b.version, b.digest.clone(), b.applied_count as i64),
                     Err(e) => (-1, format!("REFUSED {e:?}"), -1),
                 };
-                if !agree { disagree += 1; }
+                if !agree {
+                    disagree += 1;
+                }
                 println!(
                     "  {} v={v} stored_ac={ac} bounded_v={bv} bounded_ac={bc}\n      stored  ={d}\n      bounded ={bd}",
                     if agree { "AGREE " } else { "DIVERGE" }
                 );
             }
-            println!("=== BOUNDED RESULT: {}/{} diverge ===", disagree, recs.len());
+            println!(
+                "=== BOUNDED RESULT: {}/{} diverge ===",
+                disagree,
+                recs.len()
+            );
         }
 
         println!("=== HARNESS (keep_refs={keep_refs}) ===");
@@ -4533,9 +4561,13 @@ mod differing_fields_tests {
         }
         println!("leaves: stored={} verifier={}", a.len(), b.len());
         println!("--- ONLY IN STORED ({}) ---", only_stored.len());
-        for k in only_stored.iter().take(40) { println!("   {k}"); }
+        for k in only_stored.iter().take(40) {
+            println!("   {k}");
+        }
         println!("--- ONLY IN VERIFIER ({}) ---", only_verifier.len());
-        for k in only_verifier.iter().take(40) { println!("   {k}"); }
+        for k in only_verifier.iter().take(40) {
+            println!("   {k}");
+        }
         println!("--- DIFFERING VALUES ({}) ---", differing.len());
         for (k, v1, v2) in differing.iter().take(40) {
             println!("   {k}\n      stored  = {v1}\n      verifier= {v2}");
@@ -4624,9 +4656,10 @@ mod differing_fields_tests {
         }
     }
 
-    async fn hydrated(mut events: Vec<crate::db::models::Event>, keep_refs: bool)
-        -> Vec<crate::db::models::Event>
-    {
+    async fn hydrated(
+        mut events: Vec<crate::db::models::Event>,
+        keep_refs: bool,
+    ) -> Vec<crate::db::models::Event> {
         let pool = sqlx::postgres::PgPoolOptions::new()
             .connect_lazy("postgres://g:g@127.0.0.1:1/g")
             .expect("lazy pool");
@@ -4658,14 +4691,21 @@ mod differing_fields_tests {
         // …and specifically the fingerprint the kind run measured.
         let h = serde_json::to_string(&hyd[0].result).unwrap();
         assert!(h.contains("_store"), "hydration must surface `_store`: {h}");
-        assert!(h.contains("\"count\":400"), "hydration must surface `extracted`: {h}");
         assert!(
-            !serde_json::to_string(&raw[0].result).unwrap().contains("_store"),
+            h.contains("\"count\":400"),
+            "hydration must surface `extracted`: {h}"
+        );
+        assert!(
+            !serde_json::to_string(&raw[0].result)
+                .unwrap()
+                .contains("_store"),
             "the RAW event must not already carry `_store`, or the diff proves nothing"
         );
 
         let d_raw = fold(FoldSource::WalSpine, raw).expect("fold raw").digest;
-        let d_hyd = fold(FoldSource::Postgres, hyd).expect("fold hydrated").digest;
+        let d_hyd = fold(FoldSource::Postgres, hyd)
+            .expect("fold hydrated")
+            .digest;
         assert_ne!(
             d_raw, d_hyd,
             "folding raw and hydrated events produced the SAME digest — the two \

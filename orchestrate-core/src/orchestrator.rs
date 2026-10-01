@@ -10,8 +10,8 @@ use std::collections::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
-use crate::event::Event;
 use crate::error::{CoreError, CoreResult};
+use crate::event::Event;
 use crate::playbook::{LoopMode, NextSpec, Playbook, Step};
 
 use crate::commands::{Command, CommandBuilder, IteratorMetadata};
@@ -76,9 +76,7 @@ fn prefix_loop_step_error(step_name: &str, e: CoreError) -> CoreError {
         CoreError::Validation(msg) => {
             CoreError::Validation(format!("loop step '{step_name}': {msg}"))
         }
-        CoreError::Template(msg) => {
-            CoreError::Template(format!("loop step '{step_name}': {msg}"))
-        }
+        CoreError::Template(msg) => CoreError::Template(format!("loop step '{step_name}': {msg}")),
     }
 }
 
@@ -550,8 +548,10 @@ impl WorkflowOrchestrator {
                         .and_then(|m| m.get("_context_updates"))
                         .and_then(|v| v.as_object())
                     {
-                        let mutations: HashMap<String, serde_json::Value> =
-                            updates.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                        let mutations: HashMap<String, serde_json::Value> = updates
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect();
                         apply_set_mutations(&mut context, &mutations);
                     }
                 }
@@ -1023,8 +1023,7 @@ impl WorkflowOrchestrator {
                 // Dispatch the next body command(s), bounded by row_concurrency.
                 let in_flight = frame.body_issued.saturating_sub(frame.body_completed);
                 if frame.body_issued < k && in_flight < row_concurrency {
-                    let can_issue =
-                        (row_concurrency - in_flight).min(k - frame.body_issued);
+                    let can_issue = (row_concurrency - in_flight).min(k - frame.body_issued);
                     for r in frame.body_issued..(frame.body_issued + can_issue) {
                         let iter_meta = IteratorMetadata {
                             parent_execution_id: state.execution_id,
@@ -1069,11 +1068,8 @@ impl WorkflowOrchestrator {
         // Without this two-pass ordering, HashMap iteration order
         // determined whether `summarize` got dispatched in the same
         // pass as `start`'s step.skipped for `process_low`.
-        let mut per_step_evals: Vec<(
-            String,
-            &Step,
-            Vec<crate::evaluator::EvaluationResult>,
-        )> = Vec::new();
+        let mut per_step_evals: Vec<(String, &Step, Vec<crate::evaluator::EvaluationResult>)> =
+            Vec::new();
         for step_name in state.steps.keys() {
             if !state.is_step_completed(step_name) {
                 continue;
@@ -1493,8 +1489,7 @@ impl WorkflowOrchestrator {
                         let mut rendered: HashMap<String, serde_json::Value> =
                             HashMap::with_capacity(set_vars.len());
                         for (key, val) in set_vars {
-                            let rendered_val = match self.renderer.render_value(val, &shimmed_set)
-                            {
+                            let rendered_val = match self.renderer.render_value(val, &shimmed_set) {
                                 Ok(v) => v,
                                 Err(e) => {
                                     warn!(
@@ -1712,10 +1707,8 @@ impl WorkflowOrchestrator {
                                     Some(serde_json::Value::Object(m)) => m,
                                     _ => serde_json::Map::new(),
                                 };
-                                enter_obj.insert(
-                                    "__cursor_loop".to_string(),
-                                    serde_json::json!(true),
-                                );
+                                enter_obj
+                                    .insert("__cursor_loop".to_string(), serde_json::json!(true));
                                 events_to_emit.push(EventToEmit {
                                     event_type: "step.enter".to_string(),
                                     node_name: Some(current_step_name.clone()),
@@ -1724,16 +1717,15 @@ impl WorkflowOrchestrator {
                                     result: None,
                                     error: None,
                                 });
-                                let claim_cmd =
-                                    self.command_builder.build_cursor_claim_command(
-                                        state.execution_id,
-                                        state.catalog_id,
-                                        current_step,
-                                        cursor,
-                                        &current_ctx,
-                                        0,
-                                        max_rows,
-                                    )?;
+                                let claim_cmd = self.command_builder.build_cursor_claim_command(
+                                    state.execution_id,
+                                    state.catalog_id,
+                                    current_step,
+                                    cursor,
+                                    &current_ctx,
+                                    0,
+                                    max_rows,
+                                )?;
                                 commands.push(claim_cmd);
                                 info!(
                                     "Cursor loop '{}' entered — claiming frame 0 (max_rows={})",
@@ -2126,7 +2118,11 @@ workflow:
             .filter(|e| e.event_type == "step.skipped")
             .filter_map(|e| e.node_name.clone())
             .collect();
-        let cmds: Vec<String> = result.commands.iter().map(|c| c.step_name.clone()).collect();
+        let cmds: Vec<String> = result
+            .commands
+            .iter()
+            .map(|c| c.step_name.clone())
+            .collect();
         assert!(
             !skipped.contains(&"err_cb".to_string()),
             "err_cb arc must fire (start.error defined + request_id truthy), not skip. \
@@ -3006,7 +3002,11 @@ workflow:
         assert!(
             result.commands.iter().any(|c| c.step_name == "validate"),
             "expected `validate` to dispatch on loop.done; got commands: {:?}",
-            result.commands.iter().map(|c| c.step_name.clone()).collect::<Vec<_>>(),
+            result
+                .commands
+                .iter()
+                .map(|c| c.step_name.clone())
+                .collect::<Vec<_>>(),
         );
         // ...and `validate` must NOT be skipped.
         assert!(
@@ -4092,8 +4092,11 @@ workflow:
             .evaluate(&events, &playbook, Some("command.completed"))
             .unwrap();
 
-        let dispatched: Vec<String> =
-            result.commands.iter().map(|c| c.step_name.clone()).collect();
+        let dispatched: Vec<String> = result
+            .commands
+            .iter()
+            .map(|c| c.step_name.clone())
+            .collect();
         assert!(
             dispatched.contains(&"setup_facility_work".to_string()),
             "setup_facility_work must dispatch despite the open back-edge from \
@@ -4247,9 +4250,12 @@ workflow:
                 step: "loop_step".to_string(),
                 when: None,
                 set_vars: Some(
-                    [("ctx.items".to_string(), serde_json::json!("{{ setup.items }}"))]
-                        .into_iter()
-                        .collect(),
+                    [(
+                        "ctx.items".to_string(),
+                        serde_json::json!("{{ setup.items }}"),
+                    )]
+                    .into_iter()
+                    .collect(),
                 ),
             }],
         }));
@@ -4450,7 +4456,11 @@ workflow:
             result.commands.len(),
             1,
             "expected exactly one re-dispatch command; got {:?}",
-            result.commands.iter().map(|c| &c.step_name).collect::<Vec<_>>(),
+            result
+                .commands
+                .iter()
+                .map(|c| &c.step_name)
+                .collect::<Vec<_>>(),
         );
         assert_eq!(result.commands[0].step_name, "fetch_page");
 
@@ -4582,11 +4592,7 @@ workflow:
     // ----- noetl/ai-meta#85: durable loop-variable propagation -----
 
     /// A step carrying a step-level `set:` map.
-    fn make_step_with_set(
-        name: &str,
-        next: NextSpec,
-        set: &[(&str, &str)],
-    ) -> Step {
+    fn make_step_with_set(name: &str, next: NextSpec, set: &[(&str, &str)]) -> Step {
         let mut s = make_step(name, None);
         s.next = Some(next);
         let mut m = HashMap::new();
@@ -4860,7 +4866,8 @@ workflow:
             work_dispatched_counters,
         );
         assert_eq!(
-            work_dispatched_counters, vec![0, 1, 2],
+            work_dispatched_counters,
+            vec![0, 1, 2],
             "counter must advance 0->1->2 monotonically, not thrash",
         );
     }
@@ -4940,7 +4947,8 @@ workflow:
             fetch_dispatched_counters,
         );
         assert_eq!(
-            fetch_dispatched_counters, vec![0, 1, 2],
+            fetch_dispatched_counters,
+            vec![0, 1, 2],
             "self-loop must re-enter fetch 0->1->2 then exit, not wedge after the first iteration",
         );
     }

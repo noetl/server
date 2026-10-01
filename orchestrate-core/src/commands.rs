@@ -283,10 +283,7 @@ impl CommandBuilder {
         // so the claim SQL's templates resolve (execution_id, ctx.*, workload.*,
         // __frame_max_rows).
         let mut render_ctx = context.clone();
-        render_ctx.insert(
-            "__frame_max_rows".to_string(),
-            serde_json::json!(max_rows),
-        );
+        render_ctx.insert("__frame_max_rows".to_string(), serde_json::json!(max_rows));
         let ctx_value = serde_json::to_value(&render_ctx).unwrap_or(serde_json::Value::Null);
         render_ctx
             .entry("ctx".to_string())
@@ -376,7 +373,10 @@ impl CommandBuilder {
         // persisted on — this command (noetl/ai-meta#151).  Every other
         // template renders exactly as before.
         let config = if let Some(cfg) = config_value {
-            Some(self.renderer.render_value_deferring_keychain(&cfg, context)?)
+            Some(
+                self.renderer
+                    .render_value_deferring_keychain(&cfg, context)?,
+            )
         } else {
             None
         };
@@ -494,8 +494,7 @@ fn render_pipeline_config(
             let spec_obj = match spec.as_object() {
                 Some(o) => o,
                 None => {
-                    rendered_item
-                        .insert(label.clone(), renderer.render_value(spec, context)?);
+                    rendered_item.insert(label.clone(), renderer.render_value(spec, context)?);
                     continue;
                 }
             };
@@ -579,8 +578,7 @@ fn render_pipeline_config(
                 rendered_spec.insert("command".to_string(), cmd);
             }
 
-            rendered_item
-                .insert(label.clone(), serde_json::Value::Object(rendered_spec));
+            rendered_item.insert(label.clone(), serde_json::Value::Object(rendered_spec));
         }
         result.push(serde_json::Value::Object(rendered_item));
     }

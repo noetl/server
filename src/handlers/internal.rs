@@ -399,8 +399,7 @@ pub async fn events_project(
         .await;
     }
 
-    let (projected, duplicates, inserted) =
-        svc::project_events(&state.db, &request.events).await?;
+    let (projected, duplicates, inserted) = svc::project_events(&state.db, &request.events).await?;
     info!(projected, duplicates, "events/project done");
 
     // Mirror what this sink just wrote (noetl/ai-meta#307).
@@ -684,6 +683,19 @@ pub async fn events_materialize(
         }
     };
     let materialized = result.rows_affected() as i64;
+    // Advance each execution's chain certificate (noetl/ai-meta#366), after the
+    // INSERT succeeded. This is the materializer's writer — another site that
+    // bypasses `event_write::emit_events`, so it owes the chain an observe for
+    // the same reason it owes the tier a mirror.
+    for r in rows.iter() {
+        crate::services::certified_fold::observe(
+            r.execution_id,
+            r.event_id,
+            &r.event_type,
+            Some(r.node_name.as_str()),
+            &r.status,
+        );
+    }
     let duplicates = (total - materialized).max(0);
     crate::metrics::record_events_materialized(materialized as u64);
     info!(materialized, duplicates, "events/materialize done");
