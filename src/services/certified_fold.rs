@@ -422,6 +422,61 @@ mod tests {
              ({mentions} mention, the definition), so the skip can never fire. \
              This is the noetl/server#484 defect."
         );
+
+        // ⚠ And the call must be REACHED, not merely present.
+        //
+        // Re-running the D10 control on merged main showed the weakness: a plant
+        // that leaves `rebuild_or_skip` in the file and bypasses it with an
+        // early `return rebuild_state_uncached(..)` passed the check above,
+        // because a text search cannot see control flow. So require the skip to
+        // be the FIRST statement of `rebuild_state`'s body — nothing may return
+        // ahead of it.
+        let body = code
+            .split("async fn rebuild_state(")
+            .nth(1)
+            .and_then(|t| t.split_once(") -> AppResult<RebuildResult> {"))
+            .map(|(_, rest)| rest.split("\nasync fn ").next().unwrap_or(rest))
+            .unwrap_or("");
+        assert!(
+            !body.is_empty(),
+            "could not locate `rebuild_state`'s body — the guard's parse is stale, \
+             fix the guard rather than deleting it"
+        );
+        let first_stmt = body
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty() && !l.starts_with('#'))
+            .unwrap_or("");
+        assert!(
+            first_stmt.contains("certified_fold::rebuild_or_skip"),
+            "`rebuild_state` must reach the skip before anything else, but its \
+             first statement is `{first_stmt}`. A `rebuild_or_skip` call that is \
+             present in the file but jumped over is an inert feature that passes \
+             a text check — which is how the D10 control slipped through on \
+             merged main."
+        );
+    }
+
+    /// ⚠ What the reachability guard above CANNOT prove.
+    ///
+    /// It is static analysis. It establishes that the skip is wired into a
+    /// function with live callers and that nothing returns ahead of it. It does
+    /// NOT execute `rebuild_state`, because that needs a database, so it cannot
+    /// prove the skip fires against real traffic.
+    ///
+    /// That residual gap is covered by `the_wired_skip_actually_avoids_the_second_rebuild`
+    /// (the mechanism skips) plus the ramp's own `skipped` counter, which is the
+    /// only thing that proves it on real data. **A ramp whose `skipped` stays
+    /// zero means the feature is inert, not that it is safe** — that is the
+    /// reading to watch for, and it is recorded here because it is the exact
+    /// mistake noetl/server#484 would have produced.
+    #[test]
+    fn the_runtime_proof_is_the_ramps_skipped_counter() {
+        // The counters must exist and be readable, or the ramp has no way to
+        // tell "working" from "inert".
+        let (_observed, _decided, _skipped, _refolded, _div) = counters();
+        // And `divergences` must be separately readable as the rollback signal.
+        let _ = divergences();
     }
 
     /// Every direct `noetl.event` INSERT must also advance the chain.
