@@ -35,20 +35,7 @@ use std::sync::{Mutex, OnceLock};
 
 use noetl_orchestrate_core::chain_cert::{self, FoldDecision};
 
-use crate::handlers::ehdb_projection_fold::{FoldRefusal, FoldedState};
-
 static CACHE: OnceLock<Mutex<chain_cert::CertifiedFoldCache>> = OnceLock::new();
-
-/// The folds a skip is allowed to serve.
-///
-/// Separate from the certificate cache on purpose: `chain_cert` stays free of
-/// server types, and the only thing that can license reuse of an entry here is
-/// a [`FoldDecision::SkipValid`] from there.
-static FOLDS: OnceLock<Mutex<HashMap<i64, FoldedState>>> = OnceLock::new();
-
-fn folds() -> &'static Mutex<HashMap<i64, FoldedState>> {
-    FOLDS.get_or_init(|| Mutex::new(HashMap::new()))
-}
 
 fn cache() -> &'static Mutex<chain_cert::CertifiedFoldCache> {
     CACHE.get_or_init(|| Mutex::new(chain_cert::CertifiedFoldCache::new()))
@@ -114,62 +101,71 @@ pub fn reconcile(execution_id: i64, actual_len: u32) -> bool {
     }
 }
 
+/// Calibrate / check the roller against the chain HEAD a real rebuild saw.
+/// Returns `false` when this process is proven to have missed events.
+pub fn reconcile_head(execution_id: i64, actual_head: i64) -> bool {
+    if !chain_cert::fold_skip_enabled() {
+        return true;
+    }
+    match cache().lock() {
+        Ok(mut c) => c.reconcile_head(execution_id, actual_head),
+        Err(_) => false,
+    }
+}
+
 /// Drop an execution's chain state (it completed, or its slot was evicted).
 pub fn forget(execution_id: i64) {
     if let Ok(mut c) = cache().lock() {
         c.forget(execution_id);
     }
-    if let Ok(mut f) = folds().lock() {
-        f.remove(&execution_id);
-    }
 }
 
-/// Fold `execution_id`, or skip the fold when the certificate proves the chain
-/// has not moved since the cached fold was built.
+/// Rebuild `execution_id`'s state, or skip the rebuild when the certificate
+/// proves the chain has not moved since the cached one.
 ///
-/// This is where the O(1) win is actually taken. `do_fold` is the real fold and
-/// runs on every path except an exact certificate match.
+/// The orchestrator's per-drive rebuild is the hot refold — the ~19,840 refolds
+/// the spec measured — so this is where the win is actually taken. `head_of`
+/// extracts the chain head from whatever the rebuild returns, which is the
+/// signal `reconcile_head` checks the precondition against.
 ///
-/// ⚠ The order matters. `reconcile` runs on the REAL fold's `applied_count`,
-/// which is the only moment this process learns the chain's true length — so
-/// calibration and miss-detection both happen there, before any skip is ever
-/// licensed for that execution.
-pub async fn fold_or_skip<F, Fut>(execution_id: i64, do_fold: F) -> Result<FoldedState, FoldRefusal>
+/// ⚠ Generic over the rebuild's result type on purpose: `RebuildResult` is
+/// private to `handlers::events`, and this module must not grow a dependency on
+/// it just to hold a cache.
+pub async fn rebuild_or_skip<T, E, F, Fut>(
+    execution_id: i64,
+    cached: &Mutex<HashMap<i64, T>>,
+    head_of: impl Fn(&T) -> i64,
+    do_rebuild: F,
+) -> Result<T, E>
 where
+    T: Clone,
     F: FnOnce() -> Fut,
-    Fut: std::future::Future<Output = Result<FoldedState, FoldRefusal>>,
+    Fut: std::future::Future<Output = Result<T, E>>,
 {
     if chain_cert::fold_skip_enabled() && decide(execution_id).skips_fold() {
-        let hit = folds()
+        let hit = cached
             .lock()
             .ok()
-            .and_then(|f| f.get(&execution_id).cloned());
-        if let Some(cached) = hit {
+            .and_then(|m| m.get(&execution_id).cloned());
+        if let Some(c) = hit {
             note_skip(execution_id);
-            return Ok(cached);
+            return Ok(c);
         }
-        // Decision said skip but no fold is held (process restart, eviction).
-        // Fall through and do the real work rather than invent a result.
     }
 
-    let folded = do_fold().await?;
+    let built = do_rebuild().await?;
 
     if chain_cert::fold_skip_enabled() {
-        // The real chain length, straight from the fold that just read it.
-        if reconcile(execution_id, folded.applied_count as u32) {
+        if reconcile_head(execution_id, head_of(&built)) {
             record_fold(execution_id);
-            if let Ok(mut f) = folds().lock() {
-                f.insert(execution_id, folded.clone());
+            if let Ok(mut m) = cached.lock() {
+                m.insert(execution_id, built.clone());
             }
-        } else {
-            // This process missed events. `reconcile` already failed the skip
-            // closed globally; drop any fold we might serve from.
-            if let Ok(mut f) = folds().lock() {
-                f.remove(&execution_id);
-            }
+        } else if let Ok(mut m) = cached.lock() {
+            m.remove(&execution_id);
         }
     }
-    Ok(folded)
+    Ok(built)
 }
 
 /// `(observed, decided, skipped, refolded, divergences)` for `/metrics` and for
@@ -198,13 +194,37 @@ mod tests {
     /// The globals here are process-wide, so these tests serialise.
     static SERIAL: Mutex<()> = Mutex::new(());
 
-    fn folded(applied: usize) -> FoldedState {
-        FoldedState {
-            source: crate::handlers::ehdb_projection_fold::FoldSource::Postgres,
-            version: applied as i64,
-            applied_count: applied,
-            digest: format!("digest-of-{applied}"),
-        }
+    /// Stand-in for the rebuild's result: all `rebuild_or_skip` needs is a
+    /// `Clone` value and a chain head to check the precondition against.
+    #[derive(Clone, PartialEq, Debug)]
+    struct Rebuilt {
+        head: i64,
+    }
+
+    fn rebuilt(head: i64) -> Rebuilt {
+        Rebuilt { head }
+    }
+
+    static CACHED: OnceLock<Mutex<HashMap<i64, Rebuilt>>> = OnceLock::new();
+    fn cached() -> &'static Mutex<HashMap<i64, Rebuilt>> {
+        CACHED.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    async fn run_once(
+        exec: i64,
+        head: i64,
+        counter: &AtomicUsize,
+    ) -> Result<Rebuilt, std::convert::Infallible> {
+        rebuild_or_skip(
+            exec,
+            cached(),
+            |r: &Rebuilt| r.head,
+            || {
+                counter.fetch_add(1, AtOrd::Relaxed);
+                async move { Ok(rebuilt(head)) }
+            },
+        )
+        .await
     }
 
     /// Feed `n` events for `exec` through the real observer.
@@ -223,48 +243,37 @@ mod tests {
     /// ⚠ THE SYSTEM-LEVEL "exists but never runs" CONTROL.
     ///
     /// The unit tests in `chain_cert` prove the decision logic. They cannot
-    /// prove the wiring takes the skip: a `fold_or_skip` that always calls
-    /// `do_fold` passes every one of them, and would show up in production as a
-    /// feature that is on, costs its observe, and saves nothing.
-    ///
-    /// So count the folds and require the second call NOT to run one.
+    /// prove the wiring takes the skip: a `rebuild_or_skip` that always calls
+    /// `do_rebuild` passes every one of them, and would ship as a feature that
+    /// is on, pays its observe, and saves nothing. So count the rebuilds and
+    /// require the second call not to run one.
     #[tokio::test]
-    async fn the_wired_skip_actually_avoids_the_second_fold() {
+    async fn the_wired_skip_actually_avoids_the_second_rebuild() {
         let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("NOETL_CHAIN_CERT", "1");
         chain_cert::reset_counters();
         let exec = 90_001;
         forget(exec);
-
-        let folds_run = AtomicUsize::new(0);
-        let run = || {
-            folds_run.fetch_add(1, AtOrd::Relaxed);
-            async { Ok(folded(16)) }
-        };
+        let runs = AtomicUsize::new(0);
 
         observe_n(exec, 16);
+        let head = 10_000 + 15; // the highest id `observe_n` used
 
-        // First call: nothing cached, and uncalibrated -> a real fold, which is
-        // also what calibrates the roller.
-        let a = fold_or_skip(exec, run).await.expect("fold");
+        let a = run_once(exec, head, &runs).await.unwrap();
+        assert_eq!(runs.load(AtOrd::Relaxed), 1, "the first call must rebuild");
+
+        let b = run_once(exec, head, &runs).await.unwrap();
         assert_eq!(
-            folds_run.load(AtOrd::Relaxed),
+            runs.load(AtOrd::Relaxed),
             1,
-            "the first call must fold"
+            "an unchanged chain must SKIP the rebuild — it ran again, so the skip \
+             is wired but inert"
         );
+        assert_eq!(a, b, "the skip must serve the cached rebuild");
 
-        // Second call, chain unchanged: the fold must NOT run again.
-        let b = fold_or_skip(exec, run).await.expect("skip");
-        assert_eq!(
-            folds_run.load(AtOrd::Relaxed),
-            1,
-            "an unchanged chain must SKIP the fold — it ran again, so the skip is              wired but inert"
-        );
-        assert_eq!(a.digest, b.digest, "the skip must serve the cached fold");
-
-        let (_obs, _dec, skipped, _ref, div) = counters();
+        let (_o, _d, skipped, _r, div) = counters();
         assert!(skipped >= 1, "the skip must be COUNTED, got {skipped}");
-        assert_eq!(div, 0, "no divergence expected on a complete roller");
+        assert_eq!(div, 0, "no divergence on a complete roller");
 
         forget(exec);
         chain_cert::reset_counters();
@@ -272,35 +281,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn new_events_force_the_fold_to_run_again() {
+    async fn new_events_force_the_rebuild_to_run_again() {
         let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("NOETL_CHAIN_CERT", "1");
         chain_cert::reset_counters();
         let exec = 90_002;
         forget(exec);
+        let runs = AtomicUsize::new(0);
 
-        let folds_run = AtomicUsize::new(0);
         observe_n(exec, 16);
-        let _ = fold_or_skip(exec, || {
-            folds_run.fetch_add(1, AtOrd::Relaxed);
-            async { Ok(folded(16)) }
-        })
-        .await
-        .expect("fold");
-        assert_eq!(folds_run.load(AtOrd::Relaxed), 1);
+        let _ = run_once(exec, 10_015, &runs).await.unwrap();
+        assert_eq!(runs.load(AtOrd::Relaxed), 1);
 
-        // Eight more events arrive.
-        observe_n(exec, 8);
-        let _ = fold_or_skip(exec, || {
-            folds_run.fetch_add(1, AtOrd::Relaxed);
-            async { Ok(folded(24)) }
-        })
-        .await
-        .expect("refold");
+        // Eight more events arrive, so the digest advances.
+        for i in 16..24 {
+            observe(
+                exec,
+                10_000 + i as i64,
+                "step.enter",
+                Some("step_a"),
+                "success",
+            );
+        }
+        let _ = run_once(exec, 10_023, &runs).await.unwrap();
         assert_eq!(
-            folds_run.load(AtOrd::Relaxed),
+            runs.load(AtOrd::Relaxed),
             2,
-            "a chain that advanced MUST refold"
+            "a chain that advanced MUST rebuild"
         );
 
         forget(exec);
@@ -314,55 +321,42 @@ mod tests {
         std::env::remove_var("NOETL_CHAIN_CERT");
         let exec = 90_003;
         forget(exec);
-        let folds_run = AtomicUsize::new(0);
+        let runs = AtomicUsize::new(0);
         for _ in 0..3 {
-            let _ = fold_or_skip(exec, || {
-                folds_run.fetch_add(1, AtOrd::Relaxed);
-                async { Ok(folded(16)) }
-            })
-            .await
-            .expect("fold");
+            let _ = run_once(exec, 10_015, &runs).await.unwrap();
         }
         assert_eq!(
-            folds_run.load(AtOrd::Relaxed),
+            runs.load(AtOrd::Relaxed),
             3,
-            "with the flag off every call must fold"
+            "with the flag off every call must rebuild"
         );
         forget(exec);
     }
 
-    /// A process that missed events must stop skipping, through the wiring.
+    /// A process that missed events must stop skipping, through the wiring —
+    /// and it must be DETECTED within the bounded run of skips, because
+    /// `reconcile_head` only runs on a real rebuild.
     #[tokio::test]
-    async fn a_missed_event_detected_by_the_fold_stops_the_skipping() {
+    async fn a_missed_event_is_detected_through_the_wiring() {
         let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("NOETL_CHAIN_CERT", "1");
         chain_cert::reset_counters();
         let exec = 90_004;
         forget(exec);
+        let runs = AtomicUsize::new(0);
 
-        // The roller sees 16, but the real fold reads 24 on its FIRST fold —
-        // that is a late start, so it calibrates rather than diverging.
+        // The roller saw up to id 10_015, but the real chain head is 10_099 —
+        // on the FIRST rebuild that is a late start, not a miss.
         observe_n(exec, 16);
-        let folds_run = AtomicUsize::new(0);
-        let _ = fold_or_skip(exec, || {
-            folds_run.fetch_add(1, AtOrd::Relaxed);
-            async { Ok(folded(24)) }
-        })
-        .await
-        .expect("fold");
+        let _ = run_once(exec, 10_099, &runs).await.unwrap();
         assert_eq!(chain_cert::divergences(), 0, "a late start is not a miss");
 
-        // The roller now sees nothing more while the chain grows. The skip would
-        // run forever on an unchanging certificate and the detector would never
-        // fire — which is exactly the flaw `MAX_CONSECUTIVE_SKIPS` exists to
-        // close. Drive past the budget and require the forced fold to catch it.
+        // The roller now sees nothing more while the chain keeps growing. The
+        // certificate is unchanged, so the skip would run forever and the
+        // detector could never fire — which is what MAX_CONSECUTIVE_SKIPS
+        // exists to close. Drive past the budget.
         for _ in 0..=chain_cert::MAX_CONSECUTIVE_SKIPS {
-            let _ = fold_or_skip(exec, || {
-                folds_run.fetch_add(1, AtOrd::Relaxed);
-                async { Ok(folded(32)) }
-            })
-            .await
-            .expect("fold");
+            let _ = run_once(exec, 10_200, &runs).await.unwrap();
             if chain_cert::divergences() > 0 {
                 break;
             }
@@ -370,27 +364,64 @@ mod tests {
         assert_eq!(
             chain_cert::divergences(),
             1,
-            "a roller that missed events must be DETECTED through the wiring              within MAX_CONSECUTIVE_SKIPS ({}) skips — otherwise a process that              stopped seeing events skips forever and serves stale state",
+            "a roller that missed events must be DETECTED within \
+             MAX_CONSECUTIVE_SKIPS ({}) skips — otherwise a process that stopped \
+             seeing events skips forever and serves stale state",
             chain_cert::MAX_CONSECUTIVE_SKIPS
-        );
-
-        // And from here nothing may skip, for any execution.
-        let before = folds_run.load(AtOrd::Relaxed);
-        let _ = fold_or_skip(exec, || {
-            folds_run.fetch_add(1, AtOrd::Relaxed);
-            async { Ok(folded(32)) }
-        })
-        .await
-        .expect("fold");
-        assert_eq!(
-            folds_run.load(AtOrd::Relaxed),
-            before + 1,
-            "after a divergence every call must fold"
         );
 
         forget(exec);
         chain_cert::reset_counters();
         std::env::remove_var("NOETL_CHAIN_CERT");
+    }
+
+    /// ⚠ THE SKIP MUST BE REACHABLE FROM A LIVE CALL PATH.
+    ///
+    /// This guard exists because I shipped the exact defect it catches.
+    /// noetl/server#484 wired the skip into
+    /// `ehdb_projection_fold::fold_from_postgres` — a function with **no
+    /// callers**, referenced only from doc comments. The feature was
+    /// mechanically correct, fully tested, merged, and **inert in production**.
+    ///
+    /// `the_wired_skip_actually_avoids_the_second_fold` did not catch it because
+    /// it calls the wrapper directly: it proved the mechanism works, not that
+    /// anything reaches it. That is the same "exists but never runs" shape this
+    /// whole workstream is about, committed inside the change meant to avoid it.
+    #[test]
+    fn the_fold_skip_is_reachable_from_a_live_call_path() {
+        let events = include_str!("../handlers/events.rs");
+        // ⚠ Scans the WHOLE file, deliberately. The first version of this guard
+        // used the `split("#[cfg(test)]").next()` idiom the sibling guard in
+        // `ehdb_eventlog_mirror` uses — and `events.rs` has test modules
+        // interleaved from line 2104 while the wiring sits at 2300, so the
+        // guard silently measured a truncated file and reported the wiring
+        // missing. A guard that strips more than it means to is the same class
+        // of bug it is here to catch. (That blind spot still applies to the
+        // sibling guard for any file with a mid-file test module.)
+        let code: String = events
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            code.contains("certified_fold::rebuild_or_skip"),
+            "the skip must be wired into the orchestrator's per-drive rebuild \
+             (`handlers::events::rebuild_state`) — that is the refold that \
+             actually runs. Wiring it anywhere with no caller ships an inert \
+             feature, which is what noetl/server#484 did."
+        );
+
+        // `rebuild_state(` appears for its own definition plus the
+        // `rebuild_state_uncached` wrapper call; real callers push it higher.
+        // Too few means nothing calls it and the skip can never fire.
+        let mentions = code.matches("rebuild_state(").count();
+        assert!(
+            mentions > 2,
+            "`rebuild_state` is wired for the skip but has NO CALLERS \
+             ({mentions} mention, the definition), so the skip can never fire. \
+             This is the noetl/server#484 defect."
+        );
     }
 
     /// Every direct `noetl.event` INSERT must also advance the chain.

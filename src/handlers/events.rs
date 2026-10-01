@@ -2184,6 +2184,7 @@ fn parse_event_rows(rows: Vec<sqlx::postgres::PgRow>) -> Vec<crate::db::models::
 /// rebuild folds in every event after the snapshot, so the state reflects all
 /// events; any straggler the window still missed is caught by the next
 /// trigger's count mismatch.
+#[derive(Clone)]
 struct RebuildResult {
     state: crate::engine::state::WorkflowState,
     last_event_id: i64,
@@ -2268,7 +2269,44 @@ fn extract_claim_rows(data: &serde_json::Value) -> Option<Vec<serde_json::Value>
         .and_then(|d| d.get("rows").and_then(|r| r.as_array()).cloned())
 }
 
+/// Cached rebuilds the chain certificate may license reuse of
+/// (noetl/ai-meta#366). Empty and unused unless `NOETL_CHAIN_CERT` is on.
+static REBUILD_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<i64, RebuildResult>>,
+> = std::sync::OnceLock::new();
+
+fn rebuild_cache() -> &'static std::sync::Mutex<std::collections::HashMap<i64, RebuildResult>> {
+    REBUILD_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// The orchestrator's per-drive state rebuild — **the hot refold**.
+///
+/// Wrapped by the chain-certificate skip (noetl/ai-meta#366): when the digest
+/// proves the chain has not advanced since the last rebuild, the whole thing
+/// (snapshot load, event query, fold) is skipped. Inert unless
+/// `NOETL_CHAIN_CERT` is on.
+///
+/// ⚠ The precondition is checked on `last_event_id`, not on an event count:
+/// `rebuild_state_uncached`'s snapshot branch applies only events after the
+/// snapshot and so never learns the full chain length, while both branches
+/// always return the head. A guard that cannot run on the branch the hot path
+/// takes is not a guard.
 async fn rebuild_state(
+    pool: &crate::db::DbPool,
+    result_store: &crate::services::result_store::ResultStoreService,
+    execution_id: i64,
+    keep_refs: bool,
+) -> AppResult<RebuildResult> {
+    crate::services::certified_fold::rebuild_or_skip(
+        execution_id,
+        rebuild_cache(),
+        |r: &RebuildResult| r.last_event_id,
+        || rebuild_state_uncached(pool, result_store, execution_id, keep_refs),
+    )
+    .await
+}
+
+async fn rebuild_state_uncached(
     pool: &crate::db::DbPool,
     result_store: &crate::services::result_store::ResultStoreService,
     execution_id: i64,
