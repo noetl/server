@@ -782,8 +782,7 @@ fn produce_again() {
         // split form under-counts. A guard built on it reports fewer sites than
         // exist and passes while a real site goes unguarded.
         assert!(
-            truncated.matches("INSERT_MARKER").count()
-                < whole.matches("INSERT_MARKER").count(),
+            truncated.matches("INSERT_MARKER").count() < whole.matches("INSERT_MARKER").count(),
             "the split form must UNDER-count relative to whole-file scanning"
         );
     }
