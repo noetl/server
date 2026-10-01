@@ -174,14 +174,15 @@ pub async fn fold_from_postgres(
     pool: &DbPool,
     execution_id: i64,
 ) -> Result<FoldedState, FoldRefusal> {
-    // noetl/ai-meta#366 — skip the read+fold entirely when the chain
-    // certificate proves nothing has moved since the last one. Inert unless
-    // `NOETL_CHAIN_CERT` is on; see `services::certified_fold`.
-    crate::services::certified_fold::fold_or_skip(execution_id, || async move {
-        let events = events_from_postgres(pool, execution_id).await?;
-        fold(FoldSource::Postgres, events)
-    })
-    .await
+    // ⚠ The chain-certificate skip is deliberately NOT here. noetl/server#484
+    // wired it into this function — which has no callers, only doc references —
+    // so the feature was mechanically correct, fully tested, merged, and inert
+    // in production. The skip now wraps `handlers::events::rebuild_state`, the
+    // orchestrator's per-drive rebuild, which is the refold that actually runs.
+    // `certified_fold::the_fold_skip_is_reachable_from_a_live_call_path` guards
+    // against repeating it.
+    let events = events_from_postgres(pool, execution_id).await?;
+    fold(FoldSource::Postgres, events)
 }
 
 /// As [`events_from_postgres`], but with **result references hydrated** — the

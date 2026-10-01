@@ -150,6 +150,14 @@ pub fn decide(cached: Option<ChainCert>, current: Option<ChainCert>) -> FoldDeci
 #[derive(Debug, Clone)]
 struct ChunkRoller {
     hasher: Sha256,
+    /// Highest `event_id` this roller has absorbed.
+    ///
+    /// The precondition check compares against the chain HEAD rather than an
+    /// event COUNT, because the orchestrator's rebuild has two branches — an
+    /// incremental one that applies only events after a snapshot, and a full
+    /// fold — and only one of them ever knows the full chain length. Both
+    /// always know the head id.
+    max_event_id: i64,
     len: u32,
     sealed_len: u32,
     sealed_digest: Option<[u8; 32]>,
@@ -160,11 +168,20 @@ impl ChunkRoller {
     fn new() -> Self {
         Self {
             hasher: Sha256::new(),
+            max_event_id: 0,
             len: 0,
             sealed_len: 0,
             sealed_digest: None,
             open: false,
         }
+    }
+
+    #[inline]
+    fn absorb_with_id(&mut self, event_id: i64, body: &[u8]) {
+        if event_id > self.max_event_id {
+            self.max_event_id = event_id;
+        }
+        self.absorb(body);
     }
 
     #[inline]
@@ -272,6 +289,8 @@ pub struct CertifiedFoldCache {
     /// how long a missed event can go undetected — see
     /// [`MAX_CONSECUTIVE_SKIPS`].
     skips_since_fold: HashMap<i64, u32>,
+    /// Executions whose baseline has been established by a `reconcile_head`.
+    calibrated: std::collections::HashSet<i64>,
 }
 
 impl CertifiedFoldCache {
@@ -318,7 +337,22 @@ impl CertifiedFoldCache {
         body.extend_from_slice(node_name.unwrap_or("").as_bytes());
         body.push(0x1f);
         body.extend_from_slice(status.as_bytes());
-        self.observe(execution_id, &body);
+
+        OBSERVED.fetch_add(1, Ordering::Relaxed);
+        if let Some(r) = self.rollers.get_mut(&execution_id) {
+            r.absorb_with_id(event_id, &body);
+        } else {
+            let mut r = ChunkRoller::new();
+            r.absorb_with_id(event_id, &body);
+            self.rollers.insert(execution_id, r);
+        }
+    }
+
+    /// Highest `event_id` observed for `execution_id`.
+    pub fn observed_head(&self, execution_id: i64) -> i64 {
+        self.rollers
+            .get(&execution_id)
+            .map_or(0, |r| r.max_event_id)
     }
 
     pub fn observe(&mut self, execution_id: i64, body: &[u8]) {
@@ -444,13 +478,46 @@ impl CertifiedFoldCache {
         }
     }
 
+    /// ⚠ THE PRECONDITION CHECK, by chain HEAD rather than by count.
+    ///
+    /// Call after every real rebuild with the head `event_id` it actually saw.
+    /// Compares against the highest id this process observed:
+    ///
+    /// * `observed >= actual_head` — consistent. (Strictly greater is benign:
+    ///   an event landed between the rebuild's read and this call, so the next
+    ///   decision refolds anyway because the digest advanced.)
+    /// * `observed < actual_head` — this process has not seen the newest
+    ///   event(s). On the FIRST call for an execution that is a late start
+    ///   (flag flipped mid-flight, process restart), so it calibrates. After
+    ///   that it is a real miss: [`divergences`] increments and the skip fails
+    ///   closed GLOBALLY.
+    ///
+    /// Head rather than count because the orchestrator's rebuild has an
+    /// incremental branch that never learns the full chain length, and a
+    /// guard that cannot run on the hot path is not a guard.
+    pub fn reconcile_head(&mut self, execution_id: i64, actual_head: i64) -> bool {
+        let observed = self.observed_head(execution_id);
+        if observed >= actual_head {
+            self.calibrated.insert(execution_id);
+            return true;
+        }
+        if self.calibrated.contains(&execution_id) {
+            DIVERGENCES.fetch_add(1, Ordering::Relaxed);
+            self.forget(execution_id);
+            return false;
+        }
+        // Late start: adopt and move on.
+        self.calibrated.insert(execution_id);
+        true
+    }
+
     /// Has this execution's baseline been calibrated by a `reconcile` yet?
     ///
     /// Until it has, the roller's length is unanchored, so a skip could be
     /// licensed by a digest covering a prefix nobody verified. `decide_for`
     /// refuses to skip before calibration.
     pub fn is_calibrated(&self, execution_id: i64) -> bool {
-        self.offsets.contains_key(&execution_id)
+        self.offsets.contains_key(&execution_id) || self.calibrated.contains(&execution_id)
     }
 
     /// Note that a skip was taken, for the revalidation budget. Called by the
@@ -482,6 +549,7 @@ impl CertifiedFoldCache {
         self.cached.remove(&execution_id);
         self.offsets.remove(&execution_id);
         self.skips_since_fold.remove(&execution_id);
+        self.calibrated.remove(&execution_id);
     }
 
     pub fn tracked(&self) -> usize {
