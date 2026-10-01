@@ -94,8 +94,20 @@ impl CertVerdict {
 ///    trusted from the producer. That is what closes A8: rounding and truncating
 ///    producers converge on the same bytes.
 pub fn canonical(event: &Event) -> Vec<u8> {
-    let mut value = serde_json::to_value(event).unwrap_or(serde_json::Value::Null);
-    normalize_timestamp(&mut value);
+    // ⚠ The timestamp normalisation that used to happen HERE now happens in
+    // `Event`'s `Serialize` impl (`serialize_timestamp_micros`), because the
+    // integrated certificate digests the bytes the WAL stored — so the
+    // normalisation has to be in the path that PRODUCES those bytes, not in a
+    // re-derivation beside it.
+    //
+    // The local copy was removed rather than kept "for safety": with the
+    // serialiser normalising, deleting the copy broke no test, which made it an
+    // inert guard that still read like protection. The A8 property is now
+    // asserted against the serialiser
+    // (`producers_differing_below_the_normalisation_granularity_agree` fails if
+    // `serialize_timestamp_micros` is removed), which is where the behaviour
+    // actually lives.
+    let value = serde_json::to_value(event).unwrap_or(serde_json::Value::Null);
     serde_json::to_vec(&value).unwrap_or_default()
 }
 
@@ -104,16 +116,6 @@ pub fn canonical(event: &Event) -> Vec<u8> {
 /// The choice between rounding and truncating is arbitrary; agreeing on one is
 /// not. Truncation is chosen because it is monotone in the input and cannot
 /// carry a value into the next second.
-fn normalize_timestamp(value: &mut serde_json::Value) {
-    if let Some(obj) = value.as_object_mut() {
-        if let Some(ts) = obj.get("timestamp").and_then(|v| v.as_str()) {
-            if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(ts) {
-                let micros = parsed.timestamp_micros();
-                obj.insert("timestamp".to_string(), serde_json::Value::from(micros));
-            }
-        }
-    }
-}
 
 /// One step of the rolling digest.
 ///
