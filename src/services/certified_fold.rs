@@ -727,6 +727,66 @@ mod tests {
         );
     }
 
+    /// Pins WHY these guards scan whole files instead of splitting on
+    /// `#[cfg(test)]`, with the two extractions compared side by side.
+    ///
+    /// The `split("#[cfg(test)]").next()` idiom — used by the sibling mirror
+    /// guards in `handlers::ehdb_eventlog_mirror` — truncates at the FIRST
+    /// occurrence, which may be an inline attribute on a single item rather than
+    /// a trailing test module. Everything after it is invisible to the guard.
+    ///
+    /// It blinded two guards in this workstream: the reachability guard here
+    /// (`events.rs` has test modules from line 2104, wiring at 2300) and an
+    /// index-gauge guard in noetl/worker (inline `#[cfg(test)]` at line 908,
+    /// gauge sites at ~1919). In both cases a correctness guard silently
+    /// measured an empty or partial region.
+    ///
+    /// Demonstrated on a synthetic source rather than by planting an attribute in
+    /// real code: an attribute in the places that matter is not valid Rust, so a
+    /// plant there fails to compile instead of showing the blindness. This is the
+    /// honest demonstration.
+    #[test]
+    fn splitting_on_cfg_test_hides_code_that_whole_file_scanning_sees() {
+        let synthetic = "fn produce() {
+    INSERT_MARKER;
+}
+#[cfg(test)]
+const INLINE_ATTR_NOT_A_TEST_MODULE: () = ();
+fn produce_again() {
+    INSERT_MARKER;
+}
+";
+
+        // The old idiom: everything after the first `#[cfg(test)]` is lost.
+        let truncated = synthetic.split("#[cfg(test)]").next().unwrap_or("");
+        assert_eq!(
+            truncated.matches("INSERT_MARKER").count(),
+            1,
+            "the split form must lose the second marker — if it does not, this \
+             test no longer demonstrates the hazard and should be rewritten"
+        );
+
+        // What these guards do now.
+        let whole: String = synthetic
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            whole.matches("INSERT_MARKER").count(),
+            2,
+            "whole-file scanning must see both markers"
+        );
+
+        // The consequence, stated as the assertion: the two disagree, and the
+        // split form under-counts. A guard built on it reports fewer sites than
+        // exist and passes while a real site goes unguarded.
+        assert!(
+            truncated.matches("INSERT_MARKER").count() < whole.matches("INSERT_MARKER").count(),
+            "the split form must UNDER-count relative to whole-file scanning"
+        );
+    }
+
     /// Every direct `noetl.event` INSERT must also advance the chain.
     ///
     /// Shaped after `ehdb_eventlog_mirror::every_in_tx_event_insert_is_mirrored`,
@@ -757,10 +817,22 @@ mod tests {
         let mut total_inserts = 0usize;
         let mut problems = Vec::new();
         for (name, src) in files {
-            // Strip tests and comments so the guard measures the CODE, not
-            // itself or its own documentation.
-            let code = src.split("#[cfg(test)]").next().unwrap_or("");
-            let code: String = code
+            // ⚠ Scans the WHOLE file, comments stripped.
+            //
+            // This used `split("#[cfg(test)]").next()` — the idiom the sibling
+            // mirror guards use. That truncates at the FIRST `#[cfg(test)]`,
+            // which may be an inline attribute on a single item rather than a
+            // trailing test module, and anything after it becomes invisible.
+            // It blinded two guards in this workstream: the reachability guard
+            // here (events.rs has test modules from line 2104 while the wiring
+            // sits at 2300) and an index-gauge guard in noetl/worker
+            // (an inline `#[cfg(test)]` at line 908, gauge sites at ~1919).
+            //
+            // Today's layout happens to put every INSERT before every
+            // `#[cfg(test)]` in all five files, so the old form measured
+            // correctly — by luck, not by construction. One test module added
+            // earlier, or one INSERT added later, and it silently under-counts.
+            let code: String = src
                 .lines()
                 .filter(|l| !l.trim_start().starts_with("//"))
                 .collect::<Vec<_>>()
@@ -788,12 +860,24 @@ mod tests {
             problems.join("\n  ")
         );
 
-        // Self-check: a guard that found nothing is not measuring anything.
-        assert!(
-            total_inserts >= 5,
-            "expected at least 5 INSERT sites across the server; found \
-             {total_inserts}. Either the guard's file list is stale or the \
-             inserts moved — fix the guard, do not lower the number."
+        // Self-check, EXACT rather than a floor.
+        //
+        // `>= 5` was too weak to do its job: there are 6 INSERT sites across
+        // these 5 files, so truncation that hid exactly one still yielded 5 and
+        // passed. An anti-vacuity check that cannot detect losing a site is not
+        // an anti-vacuity check.
+        //
+        // Exact means adding a 7th site fails here as well as in the per-file
+        // comparison above — which is correct: a new writer of `noetl.event` is
+        // a deliberate act that owes the chain an observe, and should have to
+        // say so here.
+        const EXPECTED_INSERT_SITES: usize = 6;
+        assert_eq!(
+            total_inserts, EXPECTED_INSERT_SITES,
+            "expected exactly {EXPECTED_INSERT_SITES} `noetl.event` INSERT sites \
+             across the guarded files, found {total_inserts}. If a site was \
+             legitimately added or removed, update this count AND make sure the \
+             new site observes the chain — do not relax the assertion."
         );
     }
 }
