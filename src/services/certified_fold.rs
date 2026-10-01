@@ -57,9 +57,11 @@ pub fn observe(
     if !chain_cert::fold_skip_enabled() {
         return;
     }
+    crate::metrics::record_chain_cert_observed(1);
     let mut evicted = Vec::new();
     if let Ok(mut c) = cache().lock() {
         c.observe_event(execution_id, event_id, event_type, node_name, status);
+        crate::metrics::set_chain_cert_tracked(c.tracked_executions() as i64);
         // An execution that just ended will never fold again, so drop it now
         // rather than waiting for the bound to push it out. Uses the existing
         // classifier (`db::queries::event_chain::TERMINAL_EVENT_TYPES`) rather
@@ -94,13 +96,36 @@ pub fn register_rebuild_evictor(f: fn(i64)) {
     let _ = REBUILD_EVICTOR.set(f);
 }
 
+/// The `/metrics` label for a decision. Must cover every variant, or an
+/// outcome lands in no series and the ramp cannot see it.
+fn outcome_label(d: FoldDecision) -> &'static str {
+    match d {
+        FoldDecision::SkipValid => "skipped",
+        FoldDecision::RefoldNoCachedState => "refold_no_cached_state",
+        FoldDecision::RefoldNoCertificate => "refold_no_certificate",
+        FoldDecision::RefoldChainAdvanced => "refold_chain_advanced",
+        FoldDecision::RefoldCachedAhead => "refold_cached_ahead",
+        FoldDecision::RefoldDigestMismatch => "refold_digest_mismatch",
+        FoldDecision::RefoldUncalibrated => "refold_uncalibrated",
+        FoldDecision::RefoldRevalidationDue => "refold_revalidation_due",
+        FoldDecision::RefoldDivergenceDetected => "refold_divergence_detected",
+    }
+}
+
 /// Whether a fold for `execution_id` can be skipped. Never skips with the flag
 /// off, and never skips on a poisoned lock.
 pub fn decide(execution_id: i64) -> FoldDecision {
-    match cache().lock() {
+    let d = match cache().lock() {
         Ok(c) => c.decide_for(execution_id),
         Err(_) => FoldDecision::RefoldNoCachedState,
+    };
+    // Exported, not just counted in-process: a ramp cannot read an atomic, and
+    // `skipped` is the only thing that distinguishes "working" from "enabled
+    // and inert".
+    if chain_cert::fold_skip_enabled() {
+        crate::metrics::record_chain_cert_decision(outcome_label(d));
     }
+    d
 }
 
 /// Note that a skip was taken, for the revalidation budget.
@@ -139,10 +164,15 @@ pub fn reconcile_head(execution_id: i64, actual_head: i64) -> bool {
     if !chain_cert::fold_skip_enabled() {
         return true;
     }
-    match cache().lock() {
+    let ok = match cache().lock() {
         Ok(mut c) => c.reconcile_head(execution_id, actual_head),
         Err(_) => false,
+    };
+    if !ok {
+        // THE rollback signal. Exported so a ramp can alert on it.
+        crate::metrics::record_chain_cert_divergence();
     }
+    ok
 }
 
 /// Drop an execution's chain state (it completed, or its slot was evicted).
@@ -596,6 +626,105 @@ mod tests {
         let (_observed, _decided, _skipped, _refolded, _div) = counters();
         // And `divergences` must be separately readable as the rollback signal.
         let _ = divergences();
+    }
+
+    /// Every decision outcome must have a PINNED series, or it is invisible.
+    ///
+    /// Two ways an outcome disappears from `/metrics`, both of which make a ramp
+    /// unreadable: a variant whose label is missing from
+    /// `metrics::CHAIN_CERT_OUTCOMES` is never pinned, so its family is pruned
+    /// until it first fires — and "absent" then reads identically to "zero",
+    /// which have opposite meanings here. This is the same trap
+    /// `init_materialize_outcome_series` was written for.
+    #[test]
+    fn every_decision_outcome_has_a_pinned_series() {
+        let all = [
+            FoldDecision::SkipValid,
+            FoldDecision::RefoldNoCachedState,
+            FoldDecision::RefoldNoCertificate,
+            FoldDecision::RefoldChainAdvanced,
+            FoldDecision::RefoldCachedAhead,
+            FoldDecision::RefoldDigestMismatch,
+            FoldDecision::RefoldUncalibrated,
+            FoldDecision::RefoldRevalidationDue,
+            FoldDecision::RefoldDivergenceDetected,
+        ];
+        for d in all {
+            let label = outcome_label(d);
+            assert!(
+                crate::metrics::CHAIN_CERT_OUTCOMES.contains(&label),
+                "{d:?} maps to label `{label}`, which is not in \
+                 CHAIN_CERT_OUTCOMES — so it is never pinned, its series is \
+                 pruned until it first fires, and a ramp cannot tell `absent` \
+                 from `zero`"
+            );
+        }
+        // And the pinned set must not carry labels nothing produces, which would
+        // read as a permanently-zero outcome that cannot happen.
+        let produced: Vec<&str> = all.iter().map(|d| outcome_label(*d)).collect();
+        for pinned in crate::metrics::CHAIN_CERT_OUTCOMES {
+            assert!(
+                produced.contains(pinned),
+                "`{pinned}` is pinned but no FoldDecision produces it"
+            );
+        }
+    }
+
+    /// `skipped` on its own cannot tell "inert" from "off" — so the denominator
+    /// must be exported too.
+    #[test]
+    fn the_inert_vs_off_discriminator_is_exported() {
+        crate::metrics::init_chain_cert_series();
+        let text = crate::metrics::gather_text().expect("metrics render");
+        for required in [
+            "noetl_chain_cert_decisions_total",
+            "noetl_chain_cert_observed_total",
+            "noetl_chain_cert_divergences_total",
+        ] {
+            assert!(
+                text.contains(required),
+                "`{required}` is not registered. Without `observed` beside \
+                 `skipped`, a zero `skipped` cannot be told from the flag being \
+                 off — which is the reading that would mistake an inert feature \
+                 for a clean ramp."
+            );
+        }
+        // And `skipped` specifically must be present at zero, not pruned.
+        assert!(
+            text.contains("noetl_chain_cert_decisions_total{outcome=\"skipped\"}"),
+            "the `skipped` series must be PINNED and visible at zero; pruned, a \
+             ramp reading no series would conclude the wrong thing"
+        );
+    }
+
+    /// The server must pin the series AT STARTUP, not only in tests.
+    ///
+    /// Added because control D15 — deleting `init_chain_cert_series()` from
+    /// `main.rs` — broke nothing: `the_inert_vs_off_discriminator_is_exported`
+    /// calls `init_chain_cert_series()` itself, so it proves the function works,
+    /// not that the server invokes it. Unpinned in the real binary, the families
+    /// are pruned until they first fire, and a ramp reading no `skipped` series
+    /// cannot tell that from a zero.
+    ///
+    /// ⚠ This is the THIRD time this exact shape has appeared here (D13 the
+    /// rebuild evictor, D15 this): a startup registration that tests bypass by
+    /// performing it themselves. A test that sets up the thing it is checking
+    /// cannot check that anyone else sets it up.
+    #[test]
+    fn the_server_pins_the_series_at_startup() {
+        let main_rs = include_str!("../main.rs");
+        let code: String = main_rs
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            code.contains("init_chain_cert_series()"),
+            "`main.rs` must call `metrics::init_chain_cert_series()` at startup. \
+             Without it the chain-certificate families are pruned from /metrics \
+             until they first fire, so a ramp cannot distinguish `absent` from \
+             `zero` — which is the whole reason these metrics exist."
+        );
     }
 
     /// Every direct `noetl.event` INSERT must also advance the chain.

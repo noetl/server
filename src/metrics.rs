@@ -3338,6 +3338,141 @@ pub fn init_embedded_read_series() {
 /// ⚠ Labels are a closed set pinned at 0 in [`init_chain_populate_series`].
 /// `opened` is the one series that separates *the populator never ran* from
 /// *it ran and rejected everything* — without it both are silence.
+/// Chain-certificate decisions (noetl/ai-meta#366).
+///
+/// ⚠⚠ THESE EXIST SO "WORKING" CAN BE TOLD FROM "INERT".
+///
+/// The feature's whole risk is that it is enabled, costs its observe, and
+/// saves nothing — which looks exactly like a clean result. Read the three
+/// series together:
+///
+/// | observed | skipped | meaning |
+/// |---|---|---|
+/// | 0 | 0 | flag off, or no traffic |
+/// | >0 | **0** | **flag on and INERT** — the failure mode |
+/// | >0 | >0 | working |
+///
+/// `skipped` alone cannot distinguish the first two, which is why `observed` is
+/// exported alongside it rather than left as an in-process atomic.
+///
+/// Labels are a closed set pinned at 0 in [`init_chain_cert_series`]: an
+/// unpinned family is pruned from `/metrics` until it fires, so "absent" would
+/// read identically to "zero" — and that ambiguity is the exact thing these
+/// metrics are here to remove.
+pub fn chain_cert_decisions_total() -> &'static prometheus::IntCounterVec {
+    static M: std::sync::OnceLock<prometheus::IntCounterVec> = std::sync::OnceLock::new();
+    M.get_or_init(|| {
+        let m = prometheus::IntCounterVec::new(
+            prometheus::Opts::new(
+                "noetl_chain_cert_decisions_total",
+                "Chain-certificate fold decisions by outcome (skipped vs refolded, \
+                 with the refold reason)",
+            ),
+            &["outcome"],
+        )
+        .expect("valid metric");
+        registry().register(Box::new(m.clone())).ok();
+        m
+    })
+}
+
+/// Events absorbed into a chain. The denominator for `skipped`.
+pub fn chain_cert_observed_total() -> &'static prometheus::IntCounter {
+    static M: std::sync::OnceLock<prometheus::IntCounter> = std::sync::OnceLock::new();
+    M.get_or_init(|| {
+        let m = prometheus::IntCounter::new(
+            "noetl_chain_cert_observed_total",
+            "Events absorbed into a per-execution chain certificate",
+        )
+        .expect("valid metric");
+        registry().register(Box::new(m.clone())).ok();
+        m
+    })
+}
+
+/// ⚠ THE RAMP'S ROLLBACK SIGNAL. Any increment means this process is proven to
+/// have missed events, so the skip has failed closed globally and the flag
+/// should be turned off.
+pub fn chain_cert_divergences_total() -> &'static prometheus::IntCounter {
+    static M: std::sync::OnceLock<prometheus::IntCounter> = std::sync::OnceLock::new();
+    M.get_or_init(|| {
+        let m = prometheus::IntCounter::new(
+            "noetl_chain_cert_divergences_total",
+            "Times a rebuild proved this process had MISSED events — the skip's \
+             precondition is violated and it has failed closed globally",
+        )
+        .expect("valid metric");
+        registry().register(Box::new(m.clone())).ok();
+        m
+    })
+}
+
+/// Executions currently holding chain state — watches the bound.
+pub fn chain_cert_tracked_executions() -> &'static prometheus::IntGauge {
+    static M: std::sync::OnceLock<prometheus::IntGauge> = std::sync::OnceLock::new();
+    M.get_or_init(|| {
+        let m = prometheus::IntGauge::new(
+            "noetl_chain_cert_tracked_executions",
+            "Executions holding chain-certificate state (bounded by \
+             MAX_TRACKED_EXECUTIONS)",
+        )
+        .expect("valid metric");
+        registry().register(Box::new(m.clone())).ok();
+        m
+    })
+}
+
+/// Every decision outcome, so none is pruned from `/metrics` before it fires.
+pub const CHAIN_CERT_OUTCOMES: &[&str] = &[
+    "skipped",
+    "refold_no_cached_state",
+    "refold_no_certificate",
+    "refold_chain_advanced",
+    "refold_cached_ahead",
+    "refold_digest_mismatch",
+    "refold_uncalibrated",
+    "refold_revalidation_due",
+    "refold_divergence_detected",
+];
+
+/// Pin every chain-certificate series at 0.
+///
+/// Without this, a ramp that reads no `skipped` series cannot tell whether the
+/// skip never fired or the family was simply pruned — and those have opposite
+/// meanings.
+pub fn init_chain_cert_series() {
+    for o in CHAIN_CERT_OUTCOMES {
+        chain_cert_decisions_total()
+            .with_label_values(&[o])
+            .inc_by(0);
+    }
+    chain_cert_observed_total().inc_by(0);
+    chain_cert_divergences_total().inc_by(0);
+    chain_cert_tracked_executions().set(0);
+}
+
+/// Record one chain-certificate decision.
+pub fn record_chain_cert_decision(outcome: &str) {
+    chain_cert_decisions_total()
+        .with_label_values(&[outcome])
+        .inc();
+}
+
+/// Record `n` events absorbed into chain state.
+pub fn record_chain_cert_observed(n: u64) {
+    chain_cert_observed_total().inc_by(n);
+}
+
+/// Record a proven missed event — the rollback signal.
+pub fn record_chain_cert_divergence() {
+    chain_cert_divergences_total().inc();
+}
+
+/// Publish how many executions hold chain state.
+pub fn set_chain_cert_tracked(n: i64) {
+    chain_cert_tracked_executions().set(n);
+}
+
 pub fn chain_populate_total() -> &'static prometheus::IntCounterVec {
     static M: std::sync::OnceLock<prometheus::IntCounterVec> = std::sync::OnceLock::new();
     M.get_or_init(|| {
@@ -3592,7 +3727,9 @@ pub fn record_materialize_outcome(outcome: &str, n: u64) {
 /// unpinned `parked` is absent and reads like a build that cannot park.
 pub fn init_materialize_outcome_series() {
     for o in MATERIALIZE_OUTCOMES {
-        materialize_outcome_total().with_label_values(&[o]).inc_by(0);
+        materialize_outcome_total()
+            .with_label_values(&[o])
+            .inc_by(0);
     }
 }
 

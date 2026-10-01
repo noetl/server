@@ -1078,6 +1078,9 @@ async fn main() -> anyhow::Result<()> {
     // noetl/ai-meta#332 step 5 — pinned so an unrun shadow reads 0, not absent.
     noetl_server::metrics::init_embedded_shadow_series();
     noetl_server::metrics::init_chain_populate_series();
+    // noetl/ai-meta#366 — pin the chain-certificate series so a zero reads as a
+    // zero rather than as an absent family (see init_chain_cert_series).
+    noetl_server::metrics::init_chain_cert_series();
     noetl_server::metrics::init_chain_head_hydrate_series();
     noetl_server::metrics::init_projected_unlinked_series();
     noetl_server::metrics::init_chain_root_invariant_series();
