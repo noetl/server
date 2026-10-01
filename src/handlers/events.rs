@@ -2276,7 +2276,24 @@ static REBUILD_CACHE: std::sync::OnceLock<
 > = std::sync::OnceLock::new();
 
 fn rebuild_cache() -> &'static std::sync::Mutex<std::collections::HashMap<i64, RebuildResult>> {
-    REBUILD_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+    // Register the eviction hook the first time the cache is touched, so the
+    // certificate cache can drop entries here when it bounds itself. Without
+    // it this map — which holds a whole `WorkflowState` per execution —
+    // outlives the certificate cache and grows without bound.
+    REBUILD_CACHE.get_or_init(|| {
+        crate::services::certified_fold::register_rebuild_evictor(forget_rebuild);
+        std::sync::Mutex::new(std::collections::HashMap::new())
+    })
+}
+
+/// Drop one execution's cached rebuild. Registered with `certified_fold` so a
+/// bound enforcement or a terminal event clears both caches together.
+fn forget_rebuild(execution_id: i64) {
+    if let Some(m) = REBUILD_CACHE.get() {
+        if let Ok(mut m) = m.lock() {
+            m.remove(&execution_id);
+        }
+    }
 }
 
 /// The orchestrator's per-drive state rebuild — **the hot refold**.

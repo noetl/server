@@ -57,9 +57,41 @@ pub fn observe(
     if !chain_cert::fold_skip_enabled() {
         return;
     }
+    let mut evicted = Vec::new();
     if let Ok(mut c) = cache().lock() {
         c.observe_event(execution_id, event_id, event_type, node_name, status);
+        // An execution that just ended will never fold again, so drop it now
+        // rather than waiting for the bound to push it out. Uses the existing
+        // classifier (`db::queries::event_chain::TERMINAL_EVENT_TYPES`) rather
+        // than a second list, which would drift from it.
+        if crate::db::queries::event_chain::is_terminal_event_type(event_type) {
+            c.forget(execution_id);
+            evicted.push(execution_id);
+        }
+        evicted.extend(c.take_evicted());
     }
+    // Mirror the eviction into the parallel rebuild cache, or it outlives the
+    // certificate cache and the bound buys nothing.
+    if !evicted.is_empty() {
+        if let Some(drop_fn) = REBUILD_EVICTOR.get() {
+            for id in evicted {
+                drop_fn(id);
+            }
+        }
+    }
+}
+
+/// How this module drops an entry from the server's rebuild cache.
+///
+/// A function pointer rather than a direct call because `RebuildResult` is
+/// private to `handlers::events`; that module registers its evictor at startup.
+/// Without this, bounding the certificate cache would leave the rebuild cache —
+/// the one holding whole `WorkflowState` values — growing unbounded anyway.
+static REBUILD_EVICTOR: OnceLock<fn(i64)> = OnceLock::new();
+
+/// Register the rebuild cache's eviction hook. Idempotent; first call wins.
+pub fn register_rebuild_evictor(f: fn(i64)) {
+    let _ = REBUILD_EVICTOR.set(f);
 }
 
 /// Whether a fold for `execution_id` can be skipped. Never skips with the flag
@@ -375,6 +407,60 @@ mod tests {
         std::env::remove_var("NOETL_CHAIN_CERT");
     }
 
+    /// A terminal event must drop the execution from BOTH caches.
+    ///
+    /// `forget` had no callers at all, so with the flag on every execution the
+    /// process ever saw kept chain state — and the rebuild cache kept a whole
+    /// `WorkflowState` beside it — for the process lifetime. On a server that
+    /// runs for days that is a leak, and it would have surfaced during the ramp
+    /// rather than in a test.
+    #[tokio::test]
+    async fn a_terminal_event_drops_the_execution_from_both_caches() {
+        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("NOETL_CHAIN_CERT", "1");
+        chain_cert::reset_counters();
+        let exec = 90_010;
+        forget(exec);
+
+        observe_n(exec, 16);
+        let runs = AtomicUsize::new(0);
+        let _ = run_once(exec, 10_015, &runs).await.unwrap();
+        assert_eq!(runs.load(AtOrd::Relaxed), 1);
+        // Cached, so the next call would skip.
+        let _ = run_once(exec, 10_015, &runs).await.unwrap();
+        assert_eq!(
+            runs.load(AtOrd::Relaxed),
+            1,
+            "precondition: it was skipping"
+        );
+
+        // The execution ends. Uses the real classifier, not a second list.
+        assert!(
+            crate::db::queries::event_chain::is_terminal_event_type("playbook.completed"),
+            "fixture is vacuous unless this really is a terminal type"
+        );
+        observe(
+            exec,
+            10_016,
+            "playbook.completed",
+            Some("playbook"),
+            "success",
+        );
+
+        // Chain state is gone, so a further call must rebuild rather than skip.
+        let _ = run_once(exec, 10_016, &runs).await.unwrap();
+        assert_eq!(
+            runs.load(AtOrd::Relaxed),
+            2,
+            "after a terminal event the execution must be forgotten, so the next \
+             call rebuilds instead of serving cached state"
+        );
+
+        forget(exec);
+        chain_cert::reset_counters();
+        std::env::remove_var("NOETL_CHAIN_CERT");
+    }
+
     /// ⚠ THE SKIP MUST BE REACHABLE FROM A LIVE CALL PATH.
     ///
     /// This guard exists because I shipped the exact defect it catches.
@@ -454,6 +540,39 @@ mod tests {
              present in the file but jumped over is an inert feature that passes \
              a text check — which is how the D10 control slipped through on \
              merged main."
+        );
+    }
+
+    /// The rebuild cache must register its eviction hook.
+    ///
+    /// Added because the D13 control — deleting the `register_rebuild_evictor`
+    /// call — broke NOTHING. The terminal-eviction test above uses its own map,
+    /// so it cannot see `REBUILD_CACHE`, and nothing else looked. Without the
+    /// registration the certificate cache bounds itself while the rebuild cache
+    /// (a whole `WorkflowState` per execution) grows unbounded anyway, which is
+    /// most of the leak this work set out to close.
+    ///
+    /// Static, like the reachability guard, and for the same reason: the hook is
+    /// installed lazily inside `rebuild_cache()`, and a `OnceLock` means a test
+    /// cannot reliably install a competing one.
+    #[test]
+    fn the_rebuild_cache_registers_its_eviction_hook() {
+        let events = include_str!("../handlers/events.rs");
+        let code: String = events
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            code.contains("register_rebuild_evictor("),
+            "`handlers::events` must register its rebuild-cache evictor with \
+             `certified_fold`, or bounding the certificate cache leaves the \
+             rebuild cache — which holds a whole WorkflowState per execution — \
+             growing without limit."
+        );
+        assert!(
+            code.contains("fn forget_rebuild("),
+            "the registered evictor function is missing"
         );
     }
 

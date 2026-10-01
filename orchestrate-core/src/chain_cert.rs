@@ -73,6 +73,21 @@ pub const CHUNK_EVENTS: u32 = 8;
 /// without re-deriving both numbers.
 pub const MAX_CONSECUTIVE_SKIPS: u32 = 16;
 
+/// Most executions this cache will track at once.
+///
+/// ⚠ WITHOUT THIS THE CACHE IS A MEMORY LEAK. `forget` had no callers, so with
+/// the flag on every execution the process ever saw kept a roller, a cached
+/// certificate, an offset, a calibration marker and a skip counter — and the
+/// server's own rebuild cache kept a whole `WorkflowState` alongside — for the
+/// lifetime of the process. A server that runs for days would grow without
+/// bound. (Flag off, neither populates, so this was never a risk before the
+/// ramp.)
+///
+/// Eviction is ALWAYS SAFE here, which is what makes a simple policy correct:
+/// this is a cache, and a miss costs one real fold. Oldest-first by insertion
+/// is enough; no LRU bookkeeping is justified.
+pub const MAX_TRACKED_EXECUTIONS: usize = 2048;
+
 /// `(chain_len, chain_digest)` for one execution — 36 bytes, 44 with the id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChainCert {
@@ -291,6 +306,11 @@ pub struct CertifiedFoldCache {
     skips_since_fold: HashMap<i64, u32>,
     /// Executions whose baseline has been established by a `reconcile_head`.
     calibrated: std::collections::HashSet<i64>,
+    /// Insertion order, for bounding the cache — see [`MAX_TRACKED_EXECUTIONS`].
+    order: std::collections::VecDeque<i64>,
+    /// Executions dropped by the last bound enforcement, for a parallel cache
+    /// to mirror. Drained by [`Self::take_evicted`].
+    evicted: Vec<i64>,
 }
 
 impl CertifiedFoldCache {
@@ -338,14 +358,59 @@ impl CertifiedFoldCache {
         body.push(0x1f);
         body.extend_from_slice(status.as_bytes());
 
+        self.absorb_into(execution_id, event_id, &body);
+    }
+
+    /// The ONE place a roller is created or advanced.
+    ///
+    /// ⚠ Both `observe` and `observe_event` route through here. They were
+    /// separate insertion paths at first, and only `observe_event` enforced the
+    /// bound — so the cache still grew without limit through the other one. One
+    /// path, one bound.
+    fn absorb_into(&mut self, execution_id: i64, event_id: i64, body: &[u8]) {
         OBSERVED.fetch_add(1, Ordering::Relaxed);
         if let Some(r) = self.rollers.get_mut(&execution_id) {
-            r.absorb_with_id(event_id, &body);
+            r.absorb_with_id(event_id, body);
         } else {
             let mut r = ChunkRoller::new();
-            r.absorb_with_id(event_id, &body);
+            r.absorb_with_id(event_id, body);
             self.rollers.insert(execution_id, r);
+            self.order.push_back(execution_id);
+            self.evict_to_bound();
         }
+    }
+
+    /// Drop oldest-first until the cache is within [`MAX_TRACKED_EXECUTIONS`].
+    ///
+    /// Returns the executions evicted, so a caller holding a parallel cache
+    /// (the server's rebuild cache) can drop them too rather than outliving
+    /// this one.
+    fn evict_to_bound(&mut self) -> Vec<i64> {
+        let mut evicted = Vec::new();
+        while self.rollers.len() > MAX_TRACKED_EXECUTIONS {
+            match self.order.pop_front() {
+                Some(old) => {
+                    // Skip ids already forgotten by other means.
+                    if self.rollers.contains_key(&old) {
+                        self.forget_inner(old);
+                        evicted.push(old);
+                        self.evicted.push(old);
+                    }
+                }
+                None => break,
+            }
+        }
+        evicted
+    }
+
+    /// Executions evicted by the most recent bound enforcement, drained.
+    pub fn take_evicted(&mut self) -> Vec<i64> {
+        std::mem::take(&mut self.evicted)
+    }
+
+    /// How many executions are currently tracked.
+    pub fn tracked_executions(&self) -> usize {
+        self.rollers.len()
     }
 
     /// Highest `event_id` observed for `execution_id`.
@@ -356,14 +421,7 @@ impl CertifiedFoldCache {
     }
 
     pub fn observe(&mut self, execution_id: i64, body: &[u8]) {
-        OBSERVED.fetch_add(1, Ordering::Relaxed);
-        if let Some(r) = self.rollers.get_mut(&execution_id) {
-            r.absorb(body);
-        } else {
-            let mut r = ChunkRoller::new();
-            r.absorb(body);
-            self.rollers.insert(execution_id, r);
-        }
+        self.absorb_into(execution_id, 0, body);
     }
 
     /// This execution's current certificate, if a chunk has sealed.
@@ -545,15 +603,15 @@ impl CertifiedFoldCache {
 
     /// Drop an execution's state (it completed, or the cache slot was evicted).
     pub fn forget(&mut self, execution_id: i64) {
+        self.forget_inner(execution_id);
+    }
+
+    fn forget_inner(&mut self, execution_id: i64) {
         self.rollers.remove(&execution_id);
         self.cached.remove(&execution_id);
         self.offsets.remove(&execution_id);
         self.skips_since_fold.remove(&execution_id);
         self.calibrated.remove(&execution_id);
-    }
-
-    pub fn tracked(&self) -> usize {
-        self.rollers.len()
     }
 }
 
@@ -764,7 +822,7 @@ mod tests {
         let a = c.current(1).expect("exec 1 sealed");
         let b = c.current(2).expect("exec 2 sealed");
         assert_ne!(a.chain_digest, b.chain_digest);
-        assert_eq!(c.tracked(), 2);
+        assert_eq!(c.tracked_executions(), 2);
     }
 
     #[test]
@@ -1036,6 +1094,83 @@ mod tests {
             eliminated >= 90.0,
             "MAX_CONSECUTIVE_SKIPS={MAX_CONSECUTIVE_SKIPS} eliminates only              {eliminated:.1}% of folds, below the >=90% gate"
         );
+    }
+
+    #[test]
+    fn the_cache_is_bounded_so_it_cannot_leak() {
+        // Holds the serialisation lock and resets the counters: `observe`
+        // increments the process-global OBSERVED, which would otherwise break
+        // the tests that assert exact counter values.
+        let _g = FLAG.lock().unwrap_or_else(|e| e.into_inner());
+        // `forget` had no callers, so with the flag on every execution the
+        // process ever saw kept state forever — a leak in a server that runs for
+        // days. Prove the bound holds under more executions than it allows.
+        let mut c = CertifiedFoldCache::new();
+        for exec in 0..(MAX_TRACKED_EXECUTIONS as i64 + 500) {
+            c.observe(exec, &body(0));
+        }
+        assert!(
+            c.tracked_executions() <= MAX_TRACKED_EXECUTIONS,
+            "tracked {} executions, bound is {MAX_TRACKED_EXECUTIONS}",
+            c.tracked_executions()
+        );
+        // Oldest-first: the earliest executions are the ones dropped.
+        assert!(
+            c.current(0).is_none(),
+            "execution 0 should have been evicted first"
+        );
+        let newest = MAX_TRACKED_EXECUTIONS as i64 + 499;
+        assert!(
+            c.observed_len(newest) > 0,
+            "the newest execution must still be tracked"
+        );
+        reset_counters();
+    }
+
+    #[test]
+    fn eviction_is_reported_so_a_parallel_cache_can_follow() {
+        // Holds the serialisation lock and resets the counters: `observe`
+        // increments the process-global OBSERVED, which would otherwise break
+        // the tests that assert exact counter values.
+        let _g = FLAG.lock().unwrap_or_else(|e| e.into_inner());
+        // The server keeps a rebuild cache alongside this one. If evictions are
+        // not reported, bounding this cache leaves that one — the one holding a
+        // whole WorkflowState per execution — growing unbounded anyway.
+        let mut c = CertifiedFoldCache::new();
+        for exec in 0..(MAX_TRACKED_EXECUTIONS as i64 + 10) {
+            c.observe(exec, &body(0));
+        }
+        let evicted = c.take_evicted();
+        assert!(
+            !evicted.is_empty(),
+            "evictions must be reported for the parallel cache to mirror"
+        );
+        assert!(
+            evicted.contains(&0),
+            "the oldest execution must appear in the eviction report"
+        );
+        assert!(
+            c.take_evicted().is_empty(),
+            "take_evicted must drain, or the caller re-drops the same ids forever"
+        );
+        reset_counters();
+    }
+
+    #[test]
+    fn an_evicted_execution_refolds_rather_than_skipping() {
+        // Eviction must be SAFE, which is what licenses the simple policy: a
+        // dropped entry costs one real fold, never a wrong answer.
+        with_flag_on(|| {
+            let mut c = CertifiedFoldCache::new();
+            fill_calibrated(&mut c, 7, 16);
+            c.record_fold(7);
+            assert!(c.decide_for(7).skips_fold());
+            c.forget(7);
+            assert!(
+                !c.decide_for(7).skips_fold(),
+                "an evicted execution must refold, not skip on state that is gone"
+            );
+        });
     }
 
     #[test]
