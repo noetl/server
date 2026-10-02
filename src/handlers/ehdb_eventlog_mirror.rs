@@ -1355,9 +1355,6 @@ mod tests {
                 if !same_table(src, i) {
                     continue; // a different table that merely shares the prefix
                 }
-            if !same_table(src, i) {
-                continue; // a different table that merely shares the prefix
-            }
                 // Strip `--` comments BEFORE locating the parens, not after: a
                 // comment containing a `)` — e.g. "(emit_events publishes rather
                 // than inserting)" — otherwise closes the column list early and the
@@ -1484,9 +1481,6 @@ mod tests {
                 if !same_table(src, i) {
                     continue; // a different table that merely shares the prefix
                 }
-            if !same_table(src, i) {
-                continue; // a different table that merely shares the prefix
-            }
                 let rest = &src[i..];
                 let open = rest.find('(').expect("column list opens");
                 let close = rest.find(')').expect("column list closes");
@@ -1851,6 +1845,104 @@ mod tests {
             "expected exactly the 5 known `noetl.event` insert-site files; found {:?}. \
              A new file writing this table must be registered above.",
             found.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// ⚠ The truncation these guards rely on must hide no PRODUCTION code.
+    ///
+    /// Several guards here extract `src.split("#[cfg(test)]").next()` before
+    /// counting. That is deliberate and **load-bearing**: this file contains 7
+    /// `INSERT INTO noetl.event` strings inside its own tests, and counting them
+    /// would make `every_event_insert_in_the_crate_mirrors_or_is_registered`
+    /// flag this file as an unregistered writer. So the truncation must stay.
+    ///
+    /// But it also means **everything below that point is invisible**. In
+    /// `handlers/events.rs` the invisible region is roughly two thirds of the
+    /// file — and both noetl/ai-meta#263 and #332 were new direct-write sites in
+    /// exactly that file. A third one landing below its test module would be
+    /// unseen, `mirrors == shadows` would still hold over the visible pair, and
+    /// `the_embedded_shadow_covers_every_site_the_mirror_covers` would **pass**.
+    /// Same shape for the crate walk: a hidden INSERT leaves `found.len()` at 5
+    /// and the per-file `mirrors < inserts` comparison blind.
+    ///
+    /// Two of these guards fail SAFE under truncation and are fine:
+    /// `gating_the_sink_mirror_did_not_break_the_insert_registry` and the
+    /// `MIRRORED_BY_CALLER` leg both assert `contains(...)`, so a hidden needle
+    /// causes a false ALARM, not a missed defect. The two that COMPARE COUNTS
+    /// within the slice are the ones this protects.
+    ///
+    /// Rather than rewrite the extraction (brace-matching a test module is its
+    /// own source of bugs), this asserts the extraction's PRECONDITION: no
+    /// production needle sits below the cut. If one ever does, this fails with
+    /// instructions instead of a guard quietly going blind.
+    ///
+    /// Verified at the time of writing: all five production files have zero
+    /// needles below their cut; this file has all 7 below it, which is correct.
+    #[test]
+    fn the_guards_truncation_point_hides_no_production_code() {
+        // (file, needles whose presence below the cut would blind a guard)
+        let scanned: &[(&str, &[&str])] = &[
+            (
+                "handlers/events.rs",
+                &[
+                    "INSERT INTO noetl.event",
+                    "ehdb_eventlog_mirror::mirror_rows(",
+                    "ehdb_embedded::shadow_append(",
+                ],
+            ),
+            ("handlers/event_write.rs", &["INSERT INTO noetl.event"]),
+            ("handlers/internal.rs", &["INSERT INTO noetl.event"]),
+            ("db/queries/event.rs", &["INSERT INTO noetl.event"]),
+            ("services/internal.rs", &["INSERT INTO noetl.event"]),
+            // NOT this file: its 7 occurrences are test prose and belong below
+            // the cut. That is exactly what the truncation is for.
+        ];
+
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut problems = Vec::new();
+        let mut checked = 0usize;
+
+        for (rel, needles) in scanned {
+            let src = std::fs::read_to_string(root.join(rel))
+                .unwrap_or_else(|e| panic!("{rel} must be readable: {e}"));
+            let Some(cut) = src.find("#[cfg(test)]") else {
+                // No test module: nothing is truncated away, nothing to check.
+                continue;
+            };
+            checked += 1;
+            for needle in *needles {
+                let Some(last) = src.rfind(needle) else {
+                    continue;
+                };
+                if last > cut {
+                    let line = src[..last].lines().count();
+                    let cut_line = src[..cut].lines().count();
+                    problems.push(format!(
+                        "{rel}: `{needle}` occurs at line ~{line}, BELOW the first \
+                         `#[cfg(test)]` at line ~{cut_line}. The guards in \
+                         ehdb_eventlog_mirror truncate there, so that occurrence is \
+                         invisible to them and a count comparison over the visible \
+                         sites can still pass. Move the site above the test module, \
+                         or change those guards to exclude test modules properly."
+                    ));
+                }
+            }
+        }
+
+        // Anti-vacuity: if nothing was checked, the premise moved.
+        assert_eq!(
+            checked,
+            scanned.len(),
+            "expected to check all {} scanned files; only {checked} had a \
+             `#[cfg(test)]` to truncate at. If a file lost its test module the \
+             list above is stale — fix it rather than letting this pass.",
+            scanned.len()
+        );
+        assert!(
+            problems.is_empty(),
+            "{} truncation-blindness problem(s):\n  {}",
+            problems.len(),
+            problems.join("\n  ")
         );
     }
 
