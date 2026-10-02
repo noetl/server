@@ -30,7 +30,6 @@
 //! So the first test asserts the fixture is the one expected, and the harness that
 //! ran it killed the forward and confirmed the probe died.
 
-use std::sync::Arc;
 
 use noetl_server::chain_advance::{decide, AdvanceDecision, ChainSource};
 use noetl_server::state::{ChainHeadHydrator, HydrateOutcome};
