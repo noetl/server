@@ -68,4 +68,30 @@ jobs:
         run: cargo test --workspace --all-targets --locked
 
       - name: clippy (visible, non-gating)
-        run: cargo clippy --workspace --all-targets --locked || true
+        # `|| true` was here, which made this step UNABLE to fail: it ran on every PR,
+        # appeared in every log, cost its full runtime, and could not report anything
+        # (noetl/ai-meta#374). `-D warnings` now gates, with the EXISTING backlog
+        # allow-listed by lint NAME so a NEW lint of any other kind fails the build.
+        #
+        # Measured on origin/main before this change: a bare `-D warnings` produced 22
+        # errors across 14 distinct lint kinds, so flipping it outright would have made
+        # this job red on arrival — a gate that is red the day it lands is one people
+        # learn to skip. Each -A below is tracked debt, not an opinion; deleting one
+        # should make the build fail until that lint is fixed. Sweep tracked in
+        # noetl/ai-meta#378.
+        run: |
+          cargo clippy --workspace --all-targets --locked -- -D warnings \
+            -A clippy::assertions-on-constants \
+            -A clippy::bool-assert-comparison \
+            -A clippy::default-constructed-unit-structs \
+            -A clippy::empty-line-after-doc-comments \
+            -A clippy::field-reassign-with-default \
+            -A clippy::filter-next \
+            -A clippy::items-after-test-module \
+            -A clippy::manual-is-multiple-of \
+            -A clippy::type-complexity \
+            -A clippy::useless-conversion \
+            -A dead-code \
+            -A duplicate-macro-attributes \
+            -A non-snake-case \
+            -A unused-variables
