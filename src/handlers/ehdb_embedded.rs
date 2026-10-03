@@ -673,7 +673,6 @@ mod tests {
         std::env::remove_var(EMBEDDED_DIR_ENV);
     }
 
-    #[test]
     /// The positive controls must all pass on the real comparator.
     ///
     /// ⚠ This is the guard on the guard. If `compare_reads` is ever weakened so a
@@ -733,6 +732,7 @@ mod tests {
         }
     }
 
+    #[test]
     fn labels_are_a_closed_set() {
         assert_eq!(ShadowVerdict::Agreed.label(), "agreed");
         assert_eq!(ShadowVerdict::Skipped.label(), "skipped");

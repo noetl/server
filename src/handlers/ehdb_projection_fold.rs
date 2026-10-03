@@ -2754,9 +2754,8 @@ mod tests {
             "AppConfig::refs_in_state no longer defaults true; the verifier's \
              default must move with it or the two sides digest different shapes"
         );
-        assert_eq!(
+        assert!(
             refs_in_state_from_raw(None),
-            true,
             "the verifier's default drifted from the config's"
         );
     }
@@ -3370,6 +3369,13 @@ mod tests {
             .timestamp_opt(1_756_184_493, 645_451_798)
             .single()
             .unwrap();
+        assert_eq!(
+            truncate_to_micros(high).timestamp_subsec_micros(),
+            645_451,
+            "a 798 ns remainder truncates like every other — this case had a \
+             binding and no assertion, so it was the one member of the \
+             up/down/nearly/high family that proved nothing"
+        );
         // ⚠ THE MINORITY CASE, KEPT DELIBERATELY.
         //
         // Execution 352467520122265600 event 352467520235511808 has a 798 ns
@@ -4177,7 +4183,10 @@ mod differing_fields_tests {
         // mutation below must surface exactly its own field — this is the
         // positive control for coverage, not just for equality.
         let base = ev(1);
-        let cases: Vec<(&str, Box<dyn Fn(&mut crate::db::models::Event)>)> = vec![
+        // Named rather than inline: the inline form is what `type_complexity`
+        // reports, and a name is also what makes the vec's purpose legible.
+        type MutationCase<'a> = (&'a str, Box<dyn Fn(&mut crate::db::models::Event)>);
+        let cases: Vec<MutationCase> = vec![
             (
                 "event_type",
                 Box::new(|e: &mut crate::db::models::Event| e.event_type = "x".into()),

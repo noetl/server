@@ -646,10 +646,12 @@ mod pool_sizing_tests {
             "the pre-fix value of 10 must FAIL the headroom guard, otherwise the guard \
              would not have caught the bug it was written for"
         );
-        assert!(
-            10_000 > PGBOUNCER_DEFAULT_POOL_SIZE,
-            "an absurdly large pool must fail the downstream-cap guard"
-        );
+        const {
+            assert!(
+                10_000 > PGBOUNCER_DEFAULT_POOL_SIZE,
+                "an absurdly large pool must fail the downstream-cap guard"
+            );
+        }
     }
 
     /// The acquire timeout is what turns exhaustion into a 30s hang rather than

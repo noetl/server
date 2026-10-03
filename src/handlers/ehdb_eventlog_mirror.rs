@@ -1126,7 +1126,6 @@ mod tests {
     ///
     /// Checks the count, which is what actually goes wrong; the order is asserted
     /// on the tail the noetl/ai-meta#326 fix appended, where the risk is.
-    #[test]
     /// The embedded shadow must cover **every** site the mirror covers.
     ///
     /// ⚠ Both exist for the same reason: `emit_events` is NOT the only writer of
@@ -1170,6 +1169,7 @@ mod tests {
         );
     }
 
+    #[test]
     fn insert_column_and_bind_counts_agree() {
         let src = include_str!("events.rs");
         // The TABLE is `noetl.event`, so the match must end at a table-name

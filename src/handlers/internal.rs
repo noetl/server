@@ -602,7 +602,7 @@ pub async fn events_materialize(
         for (execution_id, idxs) in by_exec {
             let ids: Vec<i64> = idxs.iter().map(|&i| rows[i].event_id).collect();
             let prevs = state.chain_heads.link_batch(execution_id, &ids).await;
-            for (&i, prev) in idxs.iter().zip(prevs.into_iter()) {
+            for (&i, prev) in idxs.iter().zip(prevs) {
                 rows[i].prev_event_id = prev;
             }
         }

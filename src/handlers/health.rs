@@ -192,36 +192,6 @@ pub async fn metrics() -> Response {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_health_check() {
-        let response = health_check().await;
-        assert_eq!(response.status, "ok");
-    }
-
-    #[tokio::test]
-    async fn test_metrics_endpoint_returns_ok() {
-        // Ensure at least one observation exists in the registry so
-        // the response is non-trivial.  This also covers the happy
-        // path of `gather_text` end-to-end through the handler.
-        crate::metrics::record_event_ingest("test.metrics_endpoint", "ok", 0.001);
-        let response = metrics().await;
-        assert_eq!(response.status(), StatusCode::OK);
-        let content_type = response
-            .headers()
-            .get(header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        assert!(
-            content_type.contains("text/plain"),
-            "expected text/plain, got: {content_type}"
-        );
-    }
-}
-
 /// `GET /api/health/ready` — readiness that exercises a real read path.
 ///
 /// ⚠⚠ This exists because `/api/health` returned **200 for the entire six
@@ -269,5 +239,35 @@ pub async fn readiness(
                 "error": e.to_string(),
             })),
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_health_check() {
+        let response = health_check().await;
+        assert_eq!(response.status, "ok");
+    }
+
+    #[tokio::test]
+    async fn test_metrics_endpoint_returns_ok() {
+        // Ensure at least one observation exists in the registry so
+        // the response is non-trivial.  This also covers the happy
+        // path of `gather_text` end-to-end through the handler.
+        crate::metrics::record_event_ingest("test.metrics_endpoint", "ok", 0.001);
+        let response = metrics().await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let content_type = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            content_type.contains("text/plain"),
+            "expected text/plain, got: {content_type}"
+        );
     }
 }
