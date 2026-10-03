@@ -353,7 +353,7 @@ impl Default for ChainHeads {
         Self {
             map: std::sync::Mutex::new(std::collections::HashMap::new()),
             hydrator: std::sync::Mutex::new(None),
-            coherence: Arc::new(crate::coherence::CoherenceKv::default()),
+            coherence: Arc::new(crate::coherence::CoherenceKv),
         }
     }
 }
@@ -645,7 +645,7 @@ impl Default for ExecDescriptors {
     fn default() -> Self {
         Self {
             map: std::sync::Mutex::new(std::collections::HashMap::new()),
-            coherence: Arc::new(crate::coherence::CoherenceKv::default()),
+            coherence: Arc::new(crate::coherence::CoherenceKv),
         }
     }
 }

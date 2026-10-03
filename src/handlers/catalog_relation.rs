@@ -155,9 +155,7 @@ impl CatalogRelation {
     /// every execution does, and an archived entry is retired.
     pub fn get_latest(&self, path: &str) -> Option<&Entry> {
         self.by_key
-            .range((path.to_string(), i32::MIN)..=(path.to_string(), i32::MAX))
-            .filter(|((p, _), e)| p == path && !e.archived)
-            .next_back()
+            .range((path.to_string(), i32::MIN)..=(path.to_string(), i32::MAX)).rfind(|((p, _), e)| p == path && !e.archived)
             .map(|(_, e)| e)
     }
 

@@ -5981,7 +5981,7 @@ mod reconcile_cap_tests {
                  the budget, which is exactly what shipped in noetl/ai-meta#462"
             );
             // A real event arrives and does NOT advance the execution.
-            if rounds % REAL_EVENT_EVERY == 0 {
+            if rounds.is_multiple_of(REAL_EVENT_EVERY) {
                 tombs.clear(ID);
                 real_events += 1;
             }

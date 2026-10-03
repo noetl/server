@@ -355,10 +355,6 @@ fn is_terminal_event_type(event_type: &str) -> bool {
     )
 }
 
-/// Lazily build (once) + return the `noetl_events` publisher.  Returns `None`
-/// only if NATS is absent or the stream can't be ensured — callers then fall
-/// back to the synchronous INSERT.
-
 /// Write one `noetl.event` row through the chokepoint.
 ///
 /// `pool` is the per-execution pool the caller would have inserted into
@@ -605,6 +601,53 @@ async fn insert_rows(pool: &DbPool, rows: &[EventRow]) -> AppResult<()> {
         );
     }
     Ok(())
+}
+
+/// Mirror one event onto the EHDB events feed (noetl/ai-meta#212 L1 T3).
+///
+/// **Failure semantics differ by mode, deliberately.**
+///
+/// In `shadow`, NATS is authoritative and this publish is an observation. A
+/// failure is logged and counted but must **not** fail the caller's request —
+/// shadow exists to de-risk the cutover, and a shadow path that can take down
+/// event ingest is a bigger risk than the one it is measuring.
+///
+/// In `ehdb`, this is the only path the durable event log has. A failure is
+/// returned so the caller sees a 500 and retries, rather than the event being
+/// dropped silently. Fail-closed is the right posture once nothing is behind it.
+async fn publish_event_to_ehdb(
+    state: &crate::state::AppState,
+    execution_id: i64,
+    event_id: i64,
+    event_type: &str,
+    bytes: &[u8],
+) -> Result<(), crate::error::AppError> {
+    let Some(publisher) = state.ehdb_event_publisher.as_ref() else {
+        return Ok(());
+    };
+    match publisher.publish_event(execution_id, event_id, bytes).await {
+        Ok(_) => {
+            crate::metrics::record_ehdb_event_published(event_type);
+            Ok(())
+        }
+        Err(e) if state.event_bus_mode == crate::event_bus::EventBusMode::Shadow => {
+            crate::metrics::record_ehdb_event_publish_error(event_type);
+            tracing::warn!(
+                execution_id,
+                event_id,
+                event_type,
+                error = %e,
+                "EHDB shadow event publish failed; NATS remains authoritative"
+            );
+            Ok(())
+        }
+        Err(e) => {
+            crate::metrics::record_ehdb_event_publish_error(event_type);
+            Err(crate::error::AppError::Internal(format!(
+                "EHDB event publish: {e}"
+            )))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -922,6 +965,10 @@ mod tests {
     /// `populate_from_log` is now the SOLE writer. It populates on read, from
     /// committed truth, and there is no second commit point to disagree with.
     #[test]
+    // The capital is deliberate and load-bearing: it is the word that makes the
+    // test name state its own verdict. Renaming it to snake case would make the
+    // name read as the opposite claim at a glance.
+    #[allow(non_snake_case)]
     fn the_chain_populator_is_NOT_wired_to_the_emit_chokepoint() {
         let body = emit_events_body();
         assert!(
@@ -1079,52 +1126,5 @@ mod tests {
              gate on it runs AFTER emit_events for the same event, so the batch is \
              appended twice and the shadow reports a divergence it caused itself."
         );
-    }
-}
-
-/// Mirror one event onto the EHDB events feed (noetl/ai-meta#212 L1 T3).
-///
-/// **Failure semantics differ by mode, deliberately.**
-///
-/// In `shadow`, NATS is authoritative and this publish is an observation. A
-/// failure is logged and counted but must **not** fail the caller's request —
-/// shadow exists to de-risk the cutover, and a shadow path that can take down
-/// event ingest is a bigger risk than the one it is measuring.
-///
-/// In `ehdb`, this is the only path the durable event log has. A failure is
-/// returned so the caller sees a 500 and retries, rather than the event being
-/// dropped silently. Fail-closed is the right posture once nothing is behind it.
-async fn publish_event_to_ehdb(
-    state: &crate::state::AppState,
-    execution_id: i64,
-    event_id: i64,
-    event_type: &str,
-    bytes: &[u8],
-) -> Result<(), crate::error::AppError> {
-    let Some(publisher) = state.ehdb_event_publisher.as_ref() else {
-        return Ok(());
-    };
-    match publisher.publish_event(execution_id, event_id, bytes).await {
-        Ok(_) => {
-            crate::metrics::record_ehdb_event_published(event_type);
-            Ok(())
-        }
-        Err(e) if state.event_bus_mode == crate::event_bus::EventBusMode::Shadow => {
-            crate::metrics::record_ehdb_event_publish_error(event_type);
-            tracing::warn!(
-                execution_id,
-                event_id,
-                event_type,
-                error = %e,
-                "EHDB shadow event publish failed; NATS remains authoritative"
-            );
-            Ok(())
-        }
-        Err(e) => {
-            crate::metrics::record_ehdb_event_publish_error(event_type);
-            Err(crate::error::AppError::Internal(format!(
-                "EHDB event publish: {e}"
-            )))
-        }
     }
 }

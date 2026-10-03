@@ -1507,9 +1507,11 @@ mod projection_sampler_tests {
     /// An interval of 0 disables the sampler without disabling the endpoint.
     #[test]
     fn interval_zero_disables_the_sampler() {
-        let mut cfg = AppConfig::default();
-        cfg.ehdb_projection_parity_enabled = true;
-        cfg.ehdb_projection_parity_interval_secs = 0;
+        let cfg = AppConfig {
+            ehdb_projection_parity_enabled: true,
+            ehdb_projection_parity_interval_secs: 0,
+            ..AppConfig::default()
+        };
         assert_eq!(cfg.ehdb_projection_parity_interval_secs, 0);
         let src = include_str!("ehdb_projection_parity.rs");
         assert!(

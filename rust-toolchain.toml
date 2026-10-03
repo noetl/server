@@ -1,0 +1,16 @@
+# Pinned so clippy's lint set cannot move on its own.
+#
+# The workflow installs `dtolnay/rust-toolchain@stable`, but cargo honours this file
+# over the rustup default, so THIS is the version that lints. Verified empirically:
+# noetl/cli (pinned 1.91.1) emitted a CI lint citing `rust-clippy/rust-1.91.0`,
+# while unpinned noetl/tools emitted `rust-1.99.0` from the same action. ⚠ The
+# action's console banner prints the stable version it INSTALLED, which is not what
+# cargo used -- reading that banner is what briefly suggested the pin did not work.
+#
+# 1.99.0 is what this repo was already effectively using (CI's stable on
+# 2026-10-03), so pinning changes nothing today and prevents a Rust release from
+# reddening `main` with no code change. Bump deliberately, with the lint sweep.
+[toolchain]
+channel = "1.99.0"
+profile = "minimal"
+components = ["rustfmt", "clippy"]

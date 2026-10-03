@@ -442,10 +442,12 @@ mod tests {
     /// The default cap clears the largest content measured in a live catalog.
     #[test]
     fn the_default_cap_clears_the_largest_real_playbook() {
-        assert!(
-            DEFAULT_MAX_BYTES > 267_388,
-            "the default cap must not silently start omitting the itinerary planner"
-        );
+        const {
+            assert!(
+                DEFAULT_MAX_BYTES > 267_388,
+                "the default cap must not silently start omitting the itinerary planner"
+            );
+        }
     }
 
     #[test]

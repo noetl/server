@@ -185,7 +185,7 @@ async fn hydrate_rows(state: &AppState, execution_id: i64, rows: &mut [EventRow]
     crate::handlers::events::hydrate_result_references(&mut shells, &result_store, false).await;
 
     let mut changed = 0usize;
-    for (row, shell) in rows.iter_mut().zip(shells.into_iter()) {
+    for (row, shell) in rows.iter_mut().zip(shells) {
         if row.result != shell.result {
             row.result = shell.result;
             changed += 1;

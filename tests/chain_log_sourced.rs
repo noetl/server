@@ -242,6 +242,10 @@ async fn view_for(
 /// of them (Postgres 7, store 6, watermark `1:7`). The log source recomputes the
 /// edge from log order, so the chain is whole and singly-rooted.
 #[tokio::test]
+// The capital is deliberate and load-bearing: it is the word that makes the
+// test name state its own verdict. Renaming it to snake case would make the
+// name read as the opposite claim at a glance.
+#[allow(non_snake_case)]
 async fn a362_a_post_restart_multi_root_execution_is_REFUSED_not_recovered() {
     let Some(p) = pool().await else {
         eprintln!("SKIP: NOETL_TEST_PG_URL unset");

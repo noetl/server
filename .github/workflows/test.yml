@@ -67,31 +67,25 @@ jobs:
       - name: test
         run: cargo test --workspace --all-targets --locked
 
-      - name: clippy (gating — see the allow-list below)
-        # `|| true` was here, which made this step UNABLE to fail: it ran on every PR,
-        # appeared in every log, cost its full runtime, and could not report anything
-        # (noetl/ai-meta#374). `-D warnings` now gates, with the EXISTING backlog
-        # allow-listed by lint NAME so a NEW lint of any other kind fails the build.
-        #
-        # Measured on origin/main before this change: a bare `-D warnings` produced 22
-        # errors across 14 distinct lint kinds, so flipping it outright would have made
-        # this job red on arrival — a gate that is red the day it lands is one people
-        # learn to skip. Each -A below is tracked debt, not an opinion; deleting one
-        # should make the build fail until that lint is fixed. Sweep tracked in
-        # noetl/ai-meta#378.
-        run: |
-          cargo clippy --workspace --all-targets --locked -- -D warnings \
-            -A clippy::assertions-on-constants \
-            -A clippy::bool-assert-comparison \
-            -A clippy::default-constructed-unit-structs \
-            -A clippy::empty-line-after-doc-comments \
-            -A clippy::field-reassign-with-default \
-            -A clippy::filter-next \
-            -A clippy::items-after-test-module \
-            -A clippy::manual-is-multiple-of \
-            -A clippy::type-complexity \
-            -A clippy::useless-conversion \
-            -A dead-code \
-            -A duplicate-macro-attributes \
-            -A non-snake-case \
-            -A unused-variables
+      # Gating with NO allow-list as of noetl/ai-meta#378.
+      #
+      # It previously carried 14 `-A` entries covering 22 lint instances. All 22 are
+      # now resolved at their sites. A workflow-level `-A` is not reviewable and
+      # nothing revisits it: `-A dead-code` here was hiding noetl/ai-meta#361 --
+      # two tests that carried no `#[test]` and had never run.
+      #
+      # Three sites keep an allow, scoped to the function and carrying its reason:
+      # `non_snake_case` on three test names whose capital is the word that makes
+      # the name state its own verdict (`..._BOTH_gates_are_on`,
+      # `..._is_REFUSED_not_recovered`, `..._is_NOT_wired_to_...`). Renaming them to
+      # snake case makes each read as the opposite claim at a glance.
+      #
+      # Two assertions moved to `const { assert!(..) }`, which promotes them from
+      # test-run time to BUILD time. Note they fail `cargo build`, not `cargo check`
+      # -- check is metadata-only and skips const evaluation of function-body inline
+      # consts, so the build step above is what catches them.
+      #
+      # If an `-A` is added back here it needs a sentence saying why it cannot be
+      # fixed or scoped. An unexplained `-A` is how a gate quietly stops gating.
+      - name: clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings

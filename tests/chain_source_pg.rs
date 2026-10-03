@@ -303,6 +303,10 @@ async fn with_gates<T, Fut: std::future::Future<Output = T>>(
 /// a chain source exists. Any other combination leaves the poller on today's
 /// path — which is what makes merging and deploying this inert.
 #[tokio::test]
+// The capital is deliberate and load-bearing: it is the word that makes the
+// test name state its own verdict. Renaming it to snake case would make the
+// name read as the opposite claim at a glance.
+#[allow(non_snake_case)]
 async fn a_source_is_built_only_when_BOTH_gates_are_on() {
     let Some(p) = pool().await else {
         eprintln!("SKIP: NOETL_TEST_PG_URL unset");
