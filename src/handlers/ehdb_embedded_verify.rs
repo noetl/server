@@ -74,6 +74,16 @@ pub async fn verify_execution(
     })?;
 
     let Some(embedded) = read_embedded(&execution_id) else {
+        // ⚠ Recorded BEFORE the early return, and that is the whole point of this
+        // line: `engine_unavailable` is pinned in `EMBEDDED_READ_OUTCOMES` but was
+        // reachable by no caller, because this arm returned without touching the
+        // metric and the only other call site passes `verdict.label()`, which
+        // `ReadVerdict` cannot produce.
+        //
+        // So the series existed, read 0 for ever, and anyone watching it concluded
+        // the engine was always available. A pinned series nothing can increment is
+        // worse than an absent one: absence at least prompts the question.
+        crate::metrics::record_embedded_read("engine_unavailable");
         return Ok(Json(json!({
             "action": "ehdb.embedded.verify",
             "outcome": "engine_unavailable",

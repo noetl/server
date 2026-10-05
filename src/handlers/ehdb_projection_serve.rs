@@ -223,4 +223,58 @@ mod tests {
         assert_eq!(s.outcome_label(), "stale_within_window");
         assert_ne!(e.outcome_label(), s.outcome_label());
     }
+
+    /// Every `RefuseReason` label is pinned, and nothing is pinned that no reason
+    /// can produce.
+    ///
+    /// `PROJECTION_SERVE_REFUSALS` is pinned at 0 so healthy is distinguishable
+    /// from "this binary does not have the metric". Nothing checked that the pinned
+    /// list and `as_str()` agreed, so a fifth variant would have left its series
+    /// ABSENT while the other four read 0 — and absence and zero are the same pixel
+    /// on a dashboard. noetl/ai-meta#415.
+    ///
+    /// ⚠ `stored_ahead` is the one that must never be missing: it is the
+    /// silently-wrong case, where the stored record claims a version the spine has
+    /// not reached. An absent series there reads as "never happened".
+    #[test]
+    fn every_refuse_reason_is_pinned_and_distinct() {
+        let all = [
+            RefuseReason::StoredAhead,
+            RefuseReason::DigestMismatch,
+            RefuseReason::NoStoredRecord,
+            RefuseReason::SpineRefused,
+        ];
+        for r in all {
+            // Total match: a new variant breaks the build here rather than
+            // silently adding an unpinned label.
+            let expect = match r {
+                RefuseReason::StoredAhead => "stored_ahead",
+                RefuseReason::DigestMismatch => "digest_mismatch",
+                RefuseReason::NoStoredRecord => "no_stored_record",
+                RefuseReason::SpineRefused => "spine_refused",
+            };
+            assert_eq!(r.as_str(), expect, "as_str() drifted from this guard");
+            assert!(
+                crate::metrics::PROJECTION_SERVE_REFUSALS.contains(&r.as_str()),
+                "{} is emitted but not pinned; its series is absent until it fires",
+                r.as_str()
+            );
+        }
+
+        let mut seen: Vec<&str> = all.iter().map(|r| r.as_str()).collect();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), all.len(), "two refusals share a label");
+
+        // The other direction: a pinned label no reason can produce reads 0 for
+        // ever and looks healthy. That exact bug was live on the sibling metric
+        // `EMBEDDED_READ_OUTCOMES`, where `engine_unavailable` was pinned and
+        // unreachable.
+        let mut pinned: Vec<&str> = crate::metrics::PROJECTION_SERVE_REFUSALS.to_vec();
+        pinned.sort_unstable();
+        assert_eq!(
+            seen, pinned,
+            "the pinned set and the set a refusal can actually produce disagree"
+        );
+    }
 }
