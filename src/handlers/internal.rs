@@ -313,6 +313,83 @@ pub struct EventsDeadLetterResponse {
     pub durable: usize,
 }
 
+/// Query for [`events_dead_letter_list`].
+#[derive(Debug, Deserialize)]
+pub struct DeadLetterListQuery {
+    /// Narrow to one run.
+    pub execution_id: Option<i64>,
+    /// Include rows already marked resolved. Default false.
+    #[serde(default)]
+    pub include_resolved: bool,
+    /// Rows to return. Clamped to 1..=1000.
+    pub limit: Option<i64>,
+}
+
+/// What a listing returns.
+///
+/// ⚠ `outstanding` is reported separately from `rows` on purpose: the list can be
+/// truncated by `limit`, and the failure this table exists for is a backlog nobody
+/// noticed. Reporting only what fits would hide exactly the case that matters.
+#[derive(Debug, Serialize)]
+pub struct DeadLetterListResponse {
+    /// Total unresolved rows in the table, ignoring `limit` and `execution_id`.
+    pub outstanding: i64,
+    /// How many rows this response carries.
+    pub returned: usize,
+    /// The limit actually applied, after clamping.
+    pub limit: i64,
+    pub rows: Vec<crate::db::queries::event_dead_letter::ParkedEvent>,
+}
+
+/// **List parked events — metadata only, never payloads.**
+///
+/// `noetl.event_dead_letter` was write-only until this existed: the only other read
+/// against it reads back the rows an insert just wrote, to decide whether the caller
+/// may ack. That is durability confirmation, not a consumer. Since parking **acks the
+/// poison** — removing it from the durable log — a parked row is the only remaining
+/// copy of that event, and having no way to look at it is the gap this closes
+/// (noetl/ai-meta#422).
+///
+/// ⚠⚠ **No payload.** A parked payload can carry resolved credential values, and this
+/// path has no response-boundary scrub. Rather than wire one and hope its coverage is
+/// right, the query does not read the column —
+/// `the_listing_select_never_reads_payload` enforces that. The listing is therefore
+/// **enough to triage and not enough to replay**, deliberately; replay needs the
+/// payload and is a separate decision with its own scrub design.
+///
+/// Gated by `RequireInternalApiToken` exactly as its sibling writer is: it enumerates
+/// execution ids, which user playbooks have no business reading.
+pub async fn events_dead_letter_list(
+    State(state): State<AppState>,
+    _token: RequireInternalApiToken,
+    axum::extract::Query(q): axum::extract::Query<DeadLetterListQuery>,
+) -> AppResult<Json<DeadLetterListResponse>> {
+    // Clamped rather than rejected: an operator reaching for this during an incident
+    // should get a bounded answer, not a 400.
+    let limit = q.limit.unwrap_or(100).clamp(1, 1000);
+    let outstanding = crate::db::queries::event_dead_letter::outstanding_count(&state.db).await?;
+    let rows = crate::db::queries::event_dead_letter::list_parked(
+        &state.db,
+        q.execution_id,
+        q.include_resolved,
+        limit,
+    )
+    .await?;
+    debug!(
+        outstanding,
+        returned = rows.len(),
+        limit,
+        execution_id = ?q.execution_id,
+        "events/dead-letter list"
+    );
+    Ok(Json(DeadLetterListResponse {
+        outstanding,
+        returned: rows.len(),
+        limit,
+        rows,
+    }))
+}
+
 /// `POST /api/internal/events/dead-letter`
 ///
 /// Park events `noetl.event` will never accept, and report per-event whether the

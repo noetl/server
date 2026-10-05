@@ -265,9 +265,19 @@ fn build_router(
         // The landing spot for events `noetl.event` will never accept.  Same
         // internal-token gate as its sibling: this writes durable rows, and a
         // caller's ack decision depends on its answer.
+        // ⚠ Do NOT reformat this file. `tests/auth_gate_wiring.rs` searches it for
+        // the literal `.merge(<name>.layer(`, so rustfmt splitting a merge across
+        // lines makes 12 privileged routers read as UNGATED. Observed on this very
+        // change: one `cargo fmt` run turned that guard red.
         .route(
             "/api/internal/events/dead-letter",
-            post(handlers::internal::events_dead_letter),
+            post(handlers::internal::events_dead_letter)
+                // The reader for the same table. Until this existed the table was
+                // write-only: the only other SELECT reads back the rows an insert
+                // just wrote. Since parking ACKS the poison, a parked row is the
+                // only remaining copy of that event (noetl/ai-meta#422).
+                // Metadata only — never payloads; see the handler.
+                .get(handlers::internal::events_dead_letter_list),
         )
         .with_state(state.clone());
 
