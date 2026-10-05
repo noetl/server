@@ -19,6 +19,22 @@ RUN cargo build --release --bin noetl-control-plane
 # built explicitly; the artifact is baked into the runtime image + seeded into
 # the plug-in registry on boot.
 FROM chef AS wasmbuilder
+# ⚠ ORDER IS LOAD-BEARING: the toolchain pin must be in place BEFORE the target is
+# added, or the target is installed for the wrong toolchain.
+#
+# This base image pins Rust 1.91.1. `rust-toolchain.toml` pins 1.99.0, and cargo
+# honours that file over the rustup default — so `rustup target add` run before the
+# file exists installs wasm32 std for 1.91.1, and the build then switches to 1.99.0,
+# which has no wasm32 std:
+#
+#     #14 rustup target add  -> downloading 'rust-std' for 'wasm32-unknown-unknown'
+#     #18 cargo build        -> syncing channel updates for '1.99.0-...'
+#                               error[E0463]: can't find crate for `core`
+#                               note: the `wasm32-unknown-unknown` target may not be installed
+#
+# Copying only the pin first keeps this layer cached across source-only changes,
+# which `COPY . .` before it would not.
+COPY rust-toolchain.toml ./
 RUN rustup target add wasm32-unknown-unknown
 COPY . .
 RUN cargo build --release --target wasm32-unknown-unknown \
