@@ -745,4 +745,124 @@ mod tests {
             "diverged"
         );
     }
+
+    /// Every `ShadowVerdict` label is pinned, and nothing is pinned that no caller
+    /// can produce.
+    ///
+    /// `labels_are_a_closed_set` above asserts the labels are what we think they
+    /// are. It does **not** connect them to `EMBEDDED_SHADOW_OUTCOMES`, so a fourth
+    /// variant with a new label would pass it while its series stayed ABSENT — and
+    /// absent reads identically to zero. noetl/ai-meta#415.
+    ///
+    /// The literal arm matters as much as the enum arm: three of the six pinned
+    /// values (`opened`, `open_failed`, `append_failed`) are passed as literals at
+    /// call sites rather than coming from the verdict, so a guard over the enum
+    /// alone would call a complete set incomplete.
+    #[test]
+    fn every_shadow_outcome_is_pinned_and_nothing_is_pinned_that_cannot_fire() {
+        let cases = [
+            (ShadowVerdict::Agreed, "agreed"),
+            (
+                ShadowVerdict::Diverged {
+                    embedded: 1,
+                    authoritative: 2,
+                },
+                "diverged",
+            ),
+            (ShadowVerdict::Skipped, "skipped"),
+        ];
+        let mut reachable: Vec<&str> = Vec::new();
+        for (v, expect) in &cases {
+            // Total match: a new variant breaks the build here.
+            let computed = match v {
+                ShadowVerdict::Agreed => "agreed",
+                ShadowVerdict::Diverged { .. } => "diverged",
+                ShadowVerdict::Skipped => "skipped",
+            };
+            assert_eq!(computed, *expect);
+            assert_eq!(v.label(), *expect, "label() drifted from this guard");
+            assert!(
+                crate::metrics::EMBEDDED_SHADOW_OUTCOMES.contains(expect),
+                "{expect} is emitted but not pinned; its series is absent until it fires"
+            );
+            reachable.push(expect);
+        }
+
+        // The three the verdict cannot produce, passed as literals by their callers.
+        for l in ["opened", "open_failed", "append_failed"] {
+            assert!(
+                crate::metrics::EMBEDDED_SHADOW_OUTCOMES.contains(&l),
+                "{l} is recorded at a call site but not pinned"
+            );
+            reachable.push(l);
+        }
+
+        reachable.sort_unstable();
+        reachable.dedup();
+        let mut pinned: Vec<&str> = crate::metrics::EMBEDDED_SHADOW_OUTCOMES.to_vec();
+        pinned.sort_unstable();
+        assert_eq!(
+            reachable, pinned,
+            "the pinned set and the set a caller can actually record disagree"
+        );
+    }
+
+    /// The same contract for the READ comparison, where it was already violated.
+    ///
+    /// `EMBEDDED_READ_OUTCOMES` pins four values; `ReadVerdict::label()` produces
+    /// three. The fourth, `engine_unavailable`, was pinned and **unreachable** — the
+    /// verify handler returned early without touching the metric, so the series read
+    /// 0 for ever while the condition it names did happen. Fixed by recording it at
+    /// that arm; this guard is what keeps it fixed, in both directions.
+    #[test]
+    fn every_read_outcome_is_pinned_and_nothing_is_pinned_that_cannot_fire() {
+        let cases = [
+            (ReadVerdict::Agreed { events: 1 }, "agreed"),
+            (
+                ReadVerdict::Diverged {
+                    embedded_only: vec![1],
+                    authoritative_only: vec![],
+                    type_mismatches: vec![],
+                },
+                "diverged",
+            ),
+            (ReadVerdict::OutOfCoverage, "out_of_coverage"),
+        ];
+        let mut reachable: Vec<&str> = Vec::new();
+        for (v, expect) in &cases {
+            // Total match: a new variant fails the build here.
+            let computed = match v {
+                ReadVerdict::Agreed { .. } => "agreed",
+                ReadVerdict::Diverged { .. } => "diverged",
+                ReadVerdict::OutOfCoverage => "out_of_coverage",
+            };
+            assert_eq!(computed, *expect);
+            assert_eq!(v.label(), *expect);
+            assert!(
+                crate::metrics::EMBEDDED_READ_OUTCOMES.contains(expect),
+                "{expect} is emitted but not pinned"
+            );
+            reachable.push(expect);
+        }
+
+        // `engine_unavailable` comes from the verify handler, not the verdict.
+        // Asserted against the SOURCE, because what regressed is a missing CALL,
+        // and only a call-site assertion can see a missing call.
+        let verify_src = include_str!("ehdb_embedded_verify.rs");
+        assert!(
+            verify_src.contains("record_embedded_read(\"engine_unavailable\")"),
+            "the engine-unavailable arm no longer records its outcome, so that \
+             pinned series is unreachable again and reads 0 while the condition happens"
+        );
+        reachable.push("engine_unavailable");
+
+        reachable.sort_unstable();
+        reachable.dedup();
+        let mut pinned: Vec<&str> = crate::metrics::EMBEDDED_READ_OUTCOMES.to_vec();
+        pinned.sort_unstable();
+        assert_eq!(
+            reachable, pinned,
+            "the pinned set and the set a caller can actually record disagree"
+        );
+    }
 }
