@@ -247,7 +247,31 @@ fn matching_rows_for(
     for_count: bool,
 ) -> String {
     let body = body_columns(opts.include_content);
-    let kind_pred = if kind.is_some() { "kind = $1" } else { "1 = 1" };
+    // ⚠ `LOWER(kind)`, not `kind` — and the bound value is lowercased too.
+    //
+    // BOTH halves are required, and each alone leaves a different half of prod
+    // wrong. Measured on prod 2026-10-06 across 1,527 catalog rows:
+    //
+    //     kind = 'Playbook'   875 rows
+    //     kind = 'playbook'   650 rows
+    //     kind = 'mcp'          2 rows
+    //
+    // `register` has lowercased unconditionally since f0301e86 (2026-06-09), but
+    // that fix normalised future writes and never backfilled the past, so the
+    // column holds both spellings. With a case-sensitive predicate a filter for
+    // `playbook` returned 650 of 1,525 playbooks and one for `Playbook` returned
+    // 875 — **neither empty**, which is the dangerous part: a partial result
+    // looks exactly like a working query. Normalising only the parameter would
+    // still return 650 and still look fine.
+    //
+    // There is no index on `kind` to lose to the function call (the table carries
+    // only the PK and `UNIQUE (path, version)`), so this costs nothing today. If
+    // one is ever added it must be `ON noetl.catalog (LOWER(kind))` to match.
+    let kind_pred = if kind.is_some() {
+        "LOWER(kind) = $1"
+    } else {
+        "1 = 1"
+    };
     let payload = payload_column(opts.include_content);
     let cols = if for_count {
         "path, version".to_string()
@@ -292,7 +316,13 @@ pub async fn list_catalog_entries(
         "SELECT count(*) FROM ({}) t",
         matching_rows_for(kind, archived, &count_opts, true)
     );
-    let total: (i64,) = if let Some(k) = kind {
+    // Lowercased to match the `LOWER(kind)` predicate. Callers legitimately send
+    // the capitalised form — the CLI's own help text says `Playbook`, and so does
+    // this module's rustdoc — so the normalisation belongs here rather than being
+    // every caller's problem.
+    let kind_lower = kind.map(str::to_lowercase);
+
+    let total: (i64,) = if let Some(k) = kind_lower.as_deref() {
         sqlx::query_as(&count_sql).bind(k).fetch_one(pool).await?
     } else {
         sqlx::query_as(&count_sql).fetch_one(pool).await?
@@ -312,7 +342,7 @@ pub async fn list_catalog_entries(
          created_at AT TIME ZONE 'UTC' as created_at FROM ({}) t ORDER BY created_at DESC{window}",
         matching_rows(kind, archived, opts)
     );
-    let entries = if let Some(k) = kind {
+    let entries = if let Some(k) = kind_lower.as_deref() {
         sqlx::query_as::<_, CatalogEntry>(&sql)
             .bind(k)
             .fetch_all(pool)
@@ -722,8 +752,9 @@ mod catalog_listing_shape {
              newest version is only selected if that ordering is version DESC: {page}"
         );
         assert!(
-            page.contains("kind = $1"),
-            "the kind filter must reach the row source: {page}"
+            page.contains("LOWER(kind) = $1"),
+            "the kind filter must reach the row source, and it must be \
+             case-insensitive: {page}"
         );
         assert!(
             page.contains("AND archived_at IS NULL"),
@@ -747,6 +778,103 @@ mod catalog_listing_shape {
             "absent kind must leave a valid predicate: {sql}"
         );
     }
+
+    /// The kind filter must be case-insensitive on BOTH sides, and each side
+    /// alone is insufficient.
+    ///
+    /// Measured on prod 2026-10-06 across 1,527 catalog rows: `kind` holds
+    /// `'Playbook'` 875 times and `'playbook'` 650 times, because `register` has
+    /// lowercased unconditionally since f0301e86 (2026-06-09) and that fix never
+    /// backfilled the rows written before it.
+    ///
+    /// With a case-sensitive predicate, `list {"resource_type":"playbook"}`
+    /// returned **650 of 1,525** playbooks and `"Playbook"` returned **875**.
+    /// ⚠ Neither returned zero. That is what made this survive: an empty result
+    /// gets reported, a 43%-complete one gets believed. No test covered it — the
+    /// string `resource_type` appeared in 0 of 27 files under `tests/`.
+    ///
+    /// Both halves are asserted here because fixing either one alone still
+    /// returns a wrong-but-plausible count:
+    ///   - predicate only: a caller sending `Playbook` binds `Playbook`, which
+    ///     `LOWER(kind)` never equals, so the result is empty.
+    ///   - parameter only: `kind = 'playbook'` still misses the 875 legacy rows.
+    #[test]
+    fn the_kind_filter_is_case_insensitive_on_both_the_column_and_the_parameter() {
+        // Half 1 — the column side, in every shape the row source can take.
+        for latest_only in [false, true] {
+            for include_content in [false, true] {
+                let opts = CatalogListOptions {
+                    latest_only,
+                    include_content,
+                    ..CatalogListOptions::default()
+                };
+                let sql = matching_rows(Some("Playbook"), "", &opts);
+                assert!(
+                    sql.contains("LOWER(kind) = $1"),
+                    "latest_only={latest_only} include_content={include_content}: \
+                     the kind predicate must be case-insensitive, got {sql}"
+                );
+                assert!(
+                    !sql.contains("WHERE kind = $1") && !sql.contains("AND kind = $1"),
+                    "latest_only={latest_only} include_content={include_content}: \
+                     a bare case-sensitive `kind = $1` must not survive: {sql}"
+                );
+            }
+        }
+
+        // Half 2 — the parameter side. A source-text guard, in the house style,
+        // because the bind happens inside an async fn that needs a live pool.
+        //
+        // ⚠ Scanned over the CODE only, not the whole file. The first draft used
+        // `include_str!` unsliced and counted its OWN assertion messages, which
+        // name the needles verbatim — it reported 4 uses where the code has 2 and
+        // failed with the fix correctly in place. A guard that measures itself is
+        // the same defect as a comment counting as a caller.
+        //
+        // Cut at the LAST `#[cfg(test)]` via `rfind`, not the first via
+        // `split(..).next()`: this file has an earlier `#[cfg(test)]` block around
+        // line 503 with real code after it, so the split idiom would discard ~90
+        // lines of the code being measured and still report a plausible number.
+        let whole = include_str!("catalog.rs");
+        let code = &whole[..whole
+            .rfind("#[cfg(test)]")
+            .expect("this file must contain a test module for this guard to slice")];
+
+        // ⚠ Assert the extraction BEFORE asserting about it. A guard that reads
+        // an empty or truncated region finds no violations and reports success.
+        assert!(
+            code.len() > 10_000,
+            "the pre-test slice of catalog.rs is only {} bytes of {} — this guard \
+             is measuring nothing and must not report a pass",
+            code.len(),
+            whole.len()
+        );
+        let src = code;
+
+        assert!(
+            src.contains("let kind_lower = kind.map(str::to_lowercase);"),
+            "the bound kind must be lowercased to match LOWER(kind); without it \
+             a caller sending `Playbook` matches nothing at all"
+        );
+
+        // Neither bind site may pass the caller's string through unnormalised.
+        let raw_binds = src.matches(".bind(k)").count();
+        let normalised_sources = src.matches("kind_lower.as_deref()").count();
+        assert_eq!(
+            normalised_sources, 2,
+            "both the count and the page must take the kind from the lowercased \
+             value; found {normalised_sources} uses of kind_lower.as_deref()"
+        );
+        assert_eq!(
+            raw_binds, 2,
+            "expected exactly 2 `.bind(k)` sites (count + page); found \
+             {raw_binds}. If a third was added it needs the same normalisation, \
+             so update this guard deliberately rather than relaxing it"
+        );
+        assert!(
+            !src.contains("if let Some(k) = kind {"),
+            "a bind site is still destructuring the RAW `kind`; it must come from \
+             `kind_lower` or the parameter is case-sensitive again"
+        );
+    }
 }
-
-
