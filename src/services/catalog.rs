@@ -484,8 +484,55 @@ fn collect_tool_kinds(node: &serde_yaml::Value, step: Option<String>, out: &mut 
                 .map(str::to_string)
                 .or(step);
             if let Some(tool) = map.get(serde_yaml::Value::from("tool")) {
-                if let Some(k) = tool.get(serde_yaml::Value::from("kind")).and_then(|v| v.as_str()) {
-                    out.push((here.clone().unwrap_or_else(|| "<unnamed>".into()), k.to_string()));
+                // ⚠ `tool:` is written BOTH ways, and only the mapping form used to be
+                // read. `serde_yaml::Value::get("kind")` on a `Sequence` returns
+                // `None`, and the recursion below cannot recover it either: each
+                // sequence item is a `{name, kind, …}` mapping with no `tool` key of
+                // its own, so the push never fired.
+                //
+                // Measured against the e2e fixture corpus (166 files carrying a
+                // `tool:` key — the denominator): **59 files** had tool kinds the
+                // walker could not see, roughly **219 of 1,178** kinds in total.
+                // Hand-verified on `fixtures/playbooks/vars_test/test_vars_block.yaml`,
+                // which has five list-form blocks each carrying `kind: python` and
+                // from which the old walker extracted **zero**.
+                //
+                // The consequence was not a crash: `validate_tool_kinds` simply had
+                // nothing to validate, so an unknown kind registered cleanly and
+                // failed when the step ran — the precise failure noetl/ai-meta#256
+                // exists to prevent. noetl/ai-meta#432.
+                match tool {
+                    serde_yaml::Value::Sequence(items) => {
+                        for item in items {
+                            if let Some(k) = item
+                                .get(serde_yaml::Value::from("kind"))
+                                .and_then(|v| v.as_str())
+                            {
+                                // Prefer the tool item's own `name`: a step with
+                                // several tools would otherwise report every kind
+                                // against the step name, and the error message would
+                                // not say which tool was wrong.
+                                let label = item
+                                    .get(serde_yaml::Value::from("name"))
+                                    .and_then(|v| v.as_str())
+                                    .map(str::to_string)
+                                    .or_else(|| here.clone())
+                                    .unwrap_or_else(|| "<unnamed>".into());
+                                out.push((label, k.to_string()));
+                            }
+                        }
+                    }
+                    _ => {
+                        if let Some(k) = tool
+                            .get(serde_yaml::Value::from("kind"))
+                            .and_then(|v| v.as_str())
+                        {
+                            out.push((
+                                here.clone().unwrap_or_else(|| "<unnamed>".into()),
+                                k.to_string(),
+                            ));
+                        }
+                    }
                 }
             }
             for (_k, v) in map {
@@ -947,6 +994,105 @@ mod tool_kind_validation_tests {
             );
             assert!(e.contains("noop"), "the valid set must be offered: {e}");
         }
+    }
+
+    /// ⚠ `tool:` is written as a SEQUENCE as well as a mapping, and the sequence
+    /// form used to be invisible to the walker — so `validate_tool_kinds` had
+    /// nothing to validate and an unknown kind registered cleanly.
+    ///
+    /// Measured against the e2e fixture corpus before the fix: of **166** files
+    /// carrying a `tool:` key, **59** had kinds the walker could not see — roughly
+    /// **219 of 1,178**. Hand-verified on
+    /// `fixtures/playbooks/vars_test/test_vars_block.yaml`, five list-form blocks
+    /// each carrying `kind: python`, from which the walker extracted **zero**.
+    ///
+    /// noetl/ai-meta#432.
+    #[test]
+    fn a_list_form_tool_is_validated_and_not_silently_skipped() {
+        // The real fixture shape, verbatim in structure.
+        let bad_list = yaml(
+            "workflow:\n  - step: s\n    tool:\n    - name: t1\n      kind: totally_bogus_kind\n",
+        );
+        let e = validate_tool_kinds(&bad_list)
+            .expect_err(
+                "a bogus kind in LIST form must be rejected; before noetl/ai-meta#432 \
+                 the walker collected nothing here and registration SUCCEEDED",
+            )
+            .to_string();
+        assert!(e.contains("totally_bogus_kind"), "the kind must be quoted: {e}");
+        assert!(
+            e.contains("t1"),
+            "the offending TOOL must be named — a step with several tools would \
+             otherwise not say which one was wrong: {e}"
+        );
+
+        // And the valid list form still registers, so the fix is not "reject lists".
+        let good_list = yaml(
+            "workflow:\n  - step: s\n    tool:\n    - name: t1\n      kind: noop\n    - name: t2\n      kind: python\n",
+        );
+        assert!(
+            validate_tool_kinds(&good_list).is_ok(),
+            "two valid list-form tools must register"
+        );
+
+        // Every tool in the list is seen, not just the first or the last. This is the
+        // count assertion — a walker that saw only one would still pass the two tests
+        // above.
+        let mut found = Vec::new();
+        collect_tool_kinds(
+            good_list.get(serde_yaml::Value::from("workflow")).expect("workflow"),
+            None,
+            &mut found,
+        );
+        assert_eq!(
+            found.len(),
+            2,
+            "both list items must be collected, got {found:?}"
+        );
+        let labels: Vec<&str> = found.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(
+            labels.contains(&"t1") && labels.contains(&"t2"),
+            "each tool must be labelled by its own name: {found:?}"
+        );
+    }
+
+    /// A file mixing both shapes must have every kind seen. The fixture corpus has
+    /// **37** files using both forms, so this is the common case rather than a
+    /// contrived one.
+    #[test]
+    fn a_playbook_mixing_both_tool_shapes_has_every_kind_collected() {
+        let mixed = yaml(
+            "workflow:\n\
+             \x20 - step: mapping_step\n\
+             \x20   tool:\n\
+             \x20     kind: noop\n\
+             \x20 - step: list_step\n\
+             \x20   tool:\n\
+             \x20   - name: a\n\
+             \x20     kind: python\n\
+             \x20   - name: b\n\
+             \x20     kind: http\n",
+        );
+        let mut found = Vec::new();
+        collect_tool_kinds(
+            mixed.get(serde_yaml::Value::from("workflow")).expect("workflow"),
+            None,
+            &mut found,
+        );
+        assert_eq!(
+            found.len(),
+            3,
+            "one mapping-form tool plus two list-form tools = 3; got {found:?}. \
+             Before the fix this was 1."
+        );
+        let kinds: std::collections::BTreeSet<&str> =
+            found.iter().map(|(_, k)| k.as_str()).collect();
+        assert_eq!(
+            kinds,
+            ["http", "noop", "python"].into_iter().collect(),
+            "every kind must survive both shapes: {found:?}"
+        );
+        assert!(validate_tool_kinds(&mixed).is_ok(), "all three kinds are valid");
     }
 
     /// A nested step must not hide behind a clean top level. The consolidated
