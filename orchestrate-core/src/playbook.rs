@@ -302,9 +302,26 @@ pub struct ToolSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub connection: Option<String>,
 
-    /// HTTP params.
+    /// Tool params. A raw `Value`, for the same reason `command` above is one.
+    ///
+    /// ⚠ This was `Option<HashMap<String, Value>>`, i.e. map-only, and a SEQUENCE of
+    /// positional SQL parameters therefore failed the untagged `ToolDefinition` enum
+    /// outright — `data did not match any variant of untagged enum ToolDefinition`,
+    /// a 400 at `POST /api/execute` with no execution and no clue which field was at
+    /// fault. Measured 2026-10-07: that rejected **all 53 registered `adiona/v1/*`
+    /// playbooks**, which bind `$1` positionally.
+    ///
+    /// The dispatcher has always wanted an array here. `noetl-tools`'
+    /// `tools/postgres.rs` declares `pub params: Vec<serde_json::Value>` and binds it
+    /// positionally; its own tests use `"params": [42]`, and `duckdb.rs` uses
+    /// `[1, "hello"]`. Only `http.rs` uses a map. So the map-only type contradicted
+    /// the dispatcher for every SQL tool kind while matching it for exactly one.
+    ///
+    /// Carrying the raw `Value` lets both forms pass through unchanged. The server has
+    /// no other reader of this field — it deserialises and re-serialises it for the
+    /// worker — so widening it changes nothing else.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub params: Option<HashMap<String, serde_json::Value>>,
+    pub params: Option<serde_json::Value>,
 
     /// HTTP headers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1807,5 +1824,95 @@ mod tool_kind_tests {
             !s.contains("agent"),
             "the invalid kinds must not be advertised"
         );
+    }
+}
+
+#[cfg(test)]
+mod params_sequence_tests {
+    use super::*;
+
+    /// ⚠ RED-before-GREEN. `params` was `Option<HashMap<String, Value>>`, so a
+    /// SEQUENCE of positional SQL parameters failed the untagged `ToolDefinition`
+    /// enum outright:
+    ///
+    /// ```text
+    /// workflow[0]: data did not match any variant of untagged enum ToolDefinition
+    /// ```
+    ///
+    /// Measured 2026-10-07: that rejected **every one of the 53 registered
+    /// `adiona/v1/*` playbooks** at `POST /api/execute`, with a 400 and no execution.
+    /// They bind `$1` positionally, which is the whole point of a parameterised query.
+    ///
+    /// The worker has always wanted an array here: `noetl-tools`'
+    /// `postgres.rs` declares `pub params: Vec<serde_json::Value>` and binds it
+    /// positionally, and its own tests use `"params": [42]`; `duckdb.rs` uses
+    /// `[1, "hello"]`. Only `http.rs` uses a map. So the server's map-only type
+    /// contradicted the dispatcher for every SQL tool kind.
+    ///
+    /// This is the same defect `command` already had and was fixed for, with the same
+    /// remedy and the same reasoning recorded above it: carry the raw `Value` so a
+    /// sequence reaches the worker unchanged.
+    #[test]
+    fn a_sequence_of_positional_sql_params_parses() {
+        let y = r#"
+kind: postgres
+auth: adiona_actor
+params:
+  - "{{ request | tojson | b64encode }}"
+command: "SELECT $1::text"
+"#;
+        // Type-agnostic on purpose: this body compiles against the OLD map type too,
+        // so the RED is a runtime parse failure rather than a compile error. A compile
+        // error proves the test cannot pass; only a runtime failure proves the DEFECT.
+        let parsed: Result<ToolDefinition, _> = serde_yaml::from_str(y);
+        let t = parsed.expect("a params SEQUENCE must parse");
+        let ToolDefinition::Single(spec) = t else {
+            panic!("expected the Single variant")
+        };
+        let as_json = serde_json::to_value(spec.params.as_ref().expect("params present")).unwrap();
+        assert!(
+            as_json.is_array(),
+            "a sequence must stay a sequence, got {as_json:?}"
+        );
+        assert_eq!(as_json.as_array().unwrap().len(), 1);
+    }
+
+    /// The map form must keep working — it is what `http` uses.
+    #[test]
+    fn a_map_of_http_params_still_parses() {
+        let y = r#"
+kind: http
+params:
+  offset: 10
+  limit: 25
+"#;
+        let t: ToolDefinition = serde_yaml::from_str(y).expect("a params MAP must parse");
+        let ToolDefinition::Single(spec) = t else {
+            panic!("expected the Single variant")
+        };
+        let as_json = serde_json::to_value(spec.params.as_ref().expect("params present")).unwrap();
+        assert!(
+            as_json.is_object(),
+            "a map must stay a map, got {as_json:?}"
+        );
+        assert_eq!(as_json.get("limit").and_then(|v| v.as_i64()), Some(25));
+    }
+
+    /// And a round trip must not reshape either form, because the worker reads what
+    /// the server re-serialises.
+    #[test]
+    fn neither_form_is_reshaped_by_a_round_trip() {
+        for y in [
+            "kind: postgres\nparams:\n  - 42\n",
+            "kind: http\nparams:\n  a: 1\n",
+        ] {
+            let t: ToolDefinition = serde_yaml::from_str(y).unwrap();
+            let json = serde_json::to_string(&t).unwrap();
+            let back: ToolDefinition = serde_json::from_str(&json).unwrap();
+            let (ToolDefinition::Single(a), ToolDefinition::Single(b)) = (t, back) else {
+                panic!("expected Single")
+            };
+            assert_eq!(a.params, b.params, "round trip changed params for {y:?}");
+        }
     }
 }
