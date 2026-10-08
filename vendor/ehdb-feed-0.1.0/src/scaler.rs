@@ -37,19 +37,43 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use ehdb_l0::ShardUnreplicated;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 use crate::cursor::ResumeReport;
 
 /// One shard consumer group's lag sample.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// ⚠ `Default` is derived so a downstream literal can use `..Default::default()` and
+/// survive a new field. The fields stay public because this is a plain sample type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ShardLag {
     pub shard: u32,
     /// The group's committed-through cursor (acked prefix).
     pub committed: u64,
     /// Backlog: shard records past `committed` (undelivered + unacked).
     pub lag: u64,
+    /// **Records assigned to a consumer and not yet acked** — the in-flight depth
+    /// (noetl/ai-meta#455 C6).
+    ///
+    /// ⭐ Not derivable from [`lag`](Self::lag), and the pair answers a question neither
+    /// answers alone. `lag` is the whole backlog: undelivered **plus** unacked. So:
+    ///
+    /// | lag | inflight | what is happening |
+    /// | --: | --: | :-- |
+    /// | high | **0** | nothing is being worked on — consumers absent, stalled, or not polling |
+    /// | high | at cap | consumers saturated and making progress |
+    /// | 0 | 0 | drained |
+    ///
+    /// The first two rows are opposite operational conditions — one is an outage, the
+    /// other is healthy under load — and **`lag` alone renders them identically.**
+    ///
+    /// `ShardConsumerGroup::inflight_len` has existed all along and **no `render_*`
+    /// function emitted it**, so a scrape could not tell those two rows apart. That is
+    /// the "recorder exists, nothing calls it" shape: the accessor's existence made the
+    /// capability look present.
+    pub inflight: u64,
 }
 
 /// One routing subject's backlog — the per-pool slice of a shard's lag.
@@ -84,7 +108,11 @@ impl LagSnapshot {
 const LAG_METRIC: &str = "ehdb_feed_shard_lag";
 const TOTAL_METRIC: &str = "ehdb_feed_total_lag";
 const COMMITTED_METRIC: &str = "ehdb_feed_shard_committed";
+const INFLIGHT_METRIC: &str = "ehdb_feed_shard_inflight";
+const TOTAL_INFLIGHT_METRIC: &str = "ehdb_feed_total_inflight";
 const SUBJECT_METRIC: &str = "ehdb_feed_subject_lag";
+const UNREPL_AGE_METRIC: &str = "ehdb_l0_unreplicated_age_seconds";
+const UNREPL_RECORDS_METRIC: &str = "ehdb_l0_unreplicated_records";
 
 /// Render shard lags as Prometheus exposition text (v0.0.4).
 pub fn render_prometheus(samples: &[ShardLag]) -> String {
@@ -127,6 +155,25 @@ pub fn render_snapshot(snapshot: &LagSnapshot) -> String {
             s.shard, s.committed
         ));
     }
+    // In-flight depth. A NEW family appended after the existing ones, so every
+    // byte of the lag/committed lines a ScaledObject matches on is unchanged.
+    out.push_str(&format!(
+        "# HELP {INFLIGHT_METRIC} Records assigned to a consumer and not yet acked, per shard. With {LAG_METRIC}: high lag and zero inflight is a stalled consumer, high lag and high inflight is a busy one.\n"
+    ));
+    out.push_str(&format!("# TYPE {INFLIGHT_METRIC} gauge\n"));
+    for s in &ordered {
+        out.push_str(&format!(
+            "{INFLIGHT_METRIC}{{shard=\"{}\"}} {}\n",
+            s.shard, s.inflight
+        ));
+    }
+    let total_inflight: u64 = ordered.iter().map(|s| s.inflight).sum();
+    out.push_str(&format!(
+        "# HELP {TOTAL_INFLIGHT_METRIC} Total in-flight (assigned, unacked) records across all shards.\n"
+    ));
+    out.push_str(&format!("# TYPE {TOTAL_INFLIGHT_METRIC} gauge\n"));
+    out.push_str(&format!("{TOTAL_INFLIGHT_METRIC} {total_inflight}\n"));
+
     let total: u64 = ordered.iter().map(|s| s.lag).sum();
     out.push_str(&format!(
         "# HELP {TOTAL_METRIC} Total consumer-group backlog across all shards.\n"
@@ -148,6 +195,79 @@ pub fn render_snapshot(snapshot: &LagSnapshot) -> String {
             s.subject, s.lag
         ));
     }
+
+    out
+}
+
+/// Render the **D1 durability window** per shard (noetl/ehdb#328).
+///
+/// ⚠ These are NOT the `ehdb_feed_*_lag` families. Those measure **consumer
+/// backlog** — how far a reader is behind the writer. These measure
+/// **durability**: how long an acknowledged record has sat on one disk without
+/// reaching the substrate. The names are adjacent and the meanings unrelated,
+/// which is exactly the confusion an alert author falls into, so they carry a
+/// distinct prefix and explicit HELP text.
+///
+/// Headers are emitted unconditionally and the caller pins a row per shard, so a
+/// shard with nothing pending reads `0` rather than disappearing — absence would
+/// otherwise be indistinguishable from a binary too old to have the metric.
+pub fn render_unreplicated(rows: &[ShardUnreplicated]) -> String {
+    let mut unrepl = rows.to_vec();
+    unrepl.sort_by_key(|u| u.shard);
+    let mut out = String::new();
+    out.push_str(&format!(
+        "# HELP {UNREPL_AGE_METRIC} Age of the oldest acknowledged record not yet durable on the substrate, per shard. The D1 durability window, measured from the APPEND (not from the seal).\n"
+    ));
+    out.push_str(&format!("# TYPE {UNREPL_AGE_METRIC} gauge\n"));
+    for u in &unrepl {
+        out.push_str(&format!(
+            "{UNREPL_AGE_METRIC}{{shard=\"{}\"}} {:.3}\n",
+            u.shard,
+            u.oldest_age_millis as f64 / 1000.0
+        ));
+    }
+    out.push_str(&format!(
+        "# HELP {UNREPL_RECORDS_METRIC} Acknowledged records not yet durable on the substrate, per shard.\n"
+    ));
+    out.push_str(&format!("# TYPE {UNREPL_RECORDS_METRIC} gauge\n"));
+    for u in &unrepl {
+        out.push_str(&format!(
+            "{UNREPL_RECORDS_METRIC}{{shard=\"{}\"}} {}\n",
+            u.shard, u.records
+        ));
+    }
+    out
+}
+
+/// Render the **append → substrate-durable** latency histogram (noetl/ehdb#328).
+///
+/// ⚠ A histogram, not the mean that already exists. A durability window is
+/// bounded by its **maximum**; `mean_upload_lag_micros` is an average *and* is
+/// measured from the seal, so it can read healthy while records sit unreplicated.
+pub fn render_replicated_lag(metrics: &ehdb_l0::L0Metrics) -> String {
+    let (cumulative, count, sum_seconds) = metrics.replicated_lag.snapshot();
+    let mut out = String::new();
+    out.push_str(
+        "# HELP ehdb_l0_replicated_lag_seconds Append to substrate-durable latency (the D1 durability window, end to end).\n",
+    );
+    out.push_str("# TYPE ehdb_l0_replicated_lag_seconds histogram\n");
+    for (i, bound) in ehdb_l0::metrics::REPLICATED_LAG_BUCKETS_SECONDS
+        .iter()
+        .enumerate()
+    {
+        out.push_str(&format!(
+            "ehdb_l0_replicated_lag_seconds_bucket{{le=\"{bound}\"}} {}\n",
+            cumulative[i]
+        ));
+    }
+    out.push_str(&format!(
+        "ehdb_l0_replicated_lag_seconds_bucket{{le=\"+Inf\"}} {}\n",
+        cumulative[cumulative.len() - 1]
+    ));
+    out.push_str(&format!(
+        "ehdb_l0_replicated_lag_seconds_sum {sum_seconds:.6}\n"
+    ));
+    out.push_str(&format!("ehdb_l0_replicated_lag_seconds_count {count}\n"));
     out
 }
 

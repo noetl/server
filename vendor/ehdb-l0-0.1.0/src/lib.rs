@@ -135,25 +135,47 @@
 
 pub mod blob;
 pub mod bloom;
+pub mod cache_role;
 pub mod catalog;
+pub mod chain;
+pub mod chain_alt;
+#[cfg(feature = "chain-cert")]
+pub mod chain_cert;
+pub mod chain_populator;
+pub mod chain_store_durable;
+pub mod closed_timestamp;
 pub mod columnar;
 pub mod command_queue;
+pub mod cursor;
 pub mod dataset;
+pub mod dedupe;
 pub mod engine;
+pub mod failure_domain;
+pub mod fault;
 pub mod feed;
+pub mod format_version;
 pub mod frame;
+pub mod hlc_policy;
 pub mod kv;
+pub mod membership;
 pub mod merge;
 pub mod metrics;
 pub mod part;
+pub mod placement;
 pub mod projection;
 pub mod provider;
+pub mod region_routing;
 pub mod registry;
+pub mod replica_targets;
 pub mod retention;
 pub mod runtime;
+pub mod secret_ref;
+pub mod store_role;
 pub mod substrate;
+pub mod unreplicated;
 pub mod vector;
 pub mod wasm;
+pub mod write_failover;
 
 pub use blob::{content_digest, BlobOp, BlobRegistry, BlobStore, DATASET_D5_BLOB};
 pub use bloom::Bloom;
@@ -168,6 +190,10 @@ pub use dataset::{
     DEFAULT_SHARD_COUNT,
 };
 pub use engine::{L0Config, L0Engine, L0EventLogEngine, ReplicaTarget};
+pub use failure_domain::{
+    check_replica_domains, survives_node_loss, validate_replica_domains, DomainViolation,
+    FailureDomain, ReplicaDomain,
+};
 pub use feed::ChangeFeed;
 pub use kv::{KvDataset, KvEntry, KvOp, KvStore, DATASET_D4_KV};
 pub use merge::{MergePlan, MergePolicy};
@@ -185,9 +211,12 @@ pub use registry::{
 };
 pub use retention::{plan_keep_last, plan_retention, RetentionPlan};
 pub use runtime::{
-    RuntimeDataset, RuntimeEvent, RuntimeOp, RuntimeState, RuntimeStore, DATASET_D8_RUNTIME,
+    RuntimeDataset, RuntimeEvent, RuntimeKind, RuntimeOp, RuntimeState, RuntimeStore,
+    DATASET_D8_RUNTIME,
 };
-pub use substrate::{CountingSubstrate, DurableSubstrate, LocalFsSubstrate};
+pub use secret_ref::{SecretRef, MAX_SECRET_REF_LEN};
+pub use substrate::{CountingSubstrate, DurableSubstrate, InMemorySubstrate, LocalFsSubstrate};
+pub use unreplicated::{ShardUnreplicated, UnreplicatedTracker};
 pub use vector::{VectorDataset, VectorHit, VectorOp, VectorStore, DATASET_D6_VECTOR};
 pub use wasm::{
     wasm_key, WasmBinding, WasmDataset, WasmModule, WasmOp, WasmOpKind, WasmStore, DATASET_D9_WASM,

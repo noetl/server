@@ -25,21 +25,60 @@ readme = false
 license = "Apache-2.0"
 repository = "https://github.com/noetl/ehdb"
 
+[features]
+chain-cert = ["ehdb-l0/chain-cert"]
+chain-cert-asm = [
+    "chain-cert",
+    "ehdb-l0/chain-cert-asm",
+]
+
 [lib]
 name = "ehdb_feed"
 path = "src/lib.rs"
+
+[[example]]
+name = "append_cert_bench"
+path = "examples/append_cert_bench.rs"
+
+[[example]]
+name = "chain_cert_validate"
+path = "examples/chain_cert_validate.rs"
 
 [[example]]
 name = "dispatch_bench"
 path = "examples/dispatch_bench.rs"
 
 [[test]]
+name = "chain_cert_integration"
+path = "tests/chain_cert_integration.rs"
+
+[[test]]
 name = "claim"
 path = "tests/claim.rs"
 
 [[test]]
+name = "dedupe_reporting"
+path = "tests/dedupe_reporting.rs"
+
+[[test]]
 name = "delivery_loss"
 path = "tests/delivery_loss.rs"
+
+[[test]]
+name = "departed_connection_releases_inflight"
+path = "tests/departed_connection_releases_inflight.rs"
+
+[[test]]
+name = "durability_window_metrics"
+path = "tests/durability_window_metrics.rs"
+
+[[test]]
+name = "events_liveness"
+path = "tests/events_liveness.rs"
+
+[[test]]
+name = "face_survives_bad_clients"
+path = "tests/face_survives_bad_clients.rs"
 
 [[test]]
 name = "group"
@@ -50,6 +89,18 @@ name = "group_commit"
 path = "tests/group_commit.rs"
 
 [[test]]
+name = "inflight_exposition"
+path = "tests/inflight_exposition.rs"
+
+[[test]]
+name = "ingest_failure_observable"
+path = "tests/ingest_failure_observable.rs"
+
+[[test]]
+name = "ingest_transient_failure"
+path = "tests/ingest_transient_failure.rs"
+
+[[test]]
 name = "inprocess"
 path = "tests/inprocess.rs"
 
@@ -58,8 +109,16 @@ name = "latency"
 path = "tests/latency.rs"
 
 [[test]]
+name = "named_groups"
+path = "tests/named_groups.rs"
+
+[[test]]
 name = "publish"
 path = "tests/publish.rs"
+
+[[test]]
+name = "read_hard_ceiling"
+path = "tests/read_hard_ceiling.rs"
 
 [[test]]
 name = "restart_recovery"
@@ -74,12 +133,21 @@ name = "scaler"
 path = "tests/scaler.rs"
 
 [[test]]
+name = "seal_and_close"
+path = "tests/seal_and_close.rs"
+
+[[test]]
 name = "sse"
 path = "tests/sse.rs"
 
 [[test]]
 name = "subject_lag"
 path = "tests/subject_lag.rs"
+
+[[bench]]
+name = "drain"
+path = "benches/drain.rs"
+harness = false
 
 [dependencies.ehdb-core]
 path = "../ehdb-core"
@@ -111,4 +179,15 @@ features = [
 ]
 default-features = false
 
+[dependencies.tracing]
+version = "0.1"
+
 [dev-dependencies]
+hex = "0.4"
+
+[dev-dependencies.criterion]
+version = "0.5"
+
+[dev-dependencies.sha2]
+version = "0.10"
+features = ["asm"]

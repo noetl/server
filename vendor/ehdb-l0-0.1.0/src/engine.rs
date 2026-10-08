@@ -29,7 +29,7 @@ use std::path::PathBuf;
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use ehdb_core::{EhdbError, Result};
 
@@ -40,6 +40,7 @@ use crate::merge::{plan_next_merge, MergePlan, MergePolicy};
 use crate::metrics::L0Metrics;
 use crate::part::{build_merged_part, substrate_key_for, FlushPolicy, PartWriter, SealedPart};
 use crate::substrate::DurableSubstrate;
+use crate::unreplicated::{ShardUnreplicated, UnreplicatedTracker};
 
 /// Back-compat alias: the D1 event-log engine is the generic [`L0Engine`]
 /// specialized to [`D1EventLog`]. It carries the D1 convenience API
@@ -52,6 +53,19 @@ pub const DEFAULT_GRANULE_SIZE: u32 = 16;
 pub const DEFAULT_SEAL_MAX_RECORDS: u64 = 1024;
 /// Default seal threshold by byte size (8 MiB — the #254 `DEFAULT_SEGMENT_MAX_BYTES`).
 pub const DEFAULT_SEAL_MAX_BYTES: u64 = 8 * 1024 * 1024;
+/// Default number of **versioned manifest snapshots** kept on the substrate,
+/// besides `LATEST` (noetl/ehdb#344).
+///
+/// Each manifest write emits a full snapshot listing every part, so snapshot
+/// size grows with part count while the number of snapshots grows with write
+/// count — retaining all of them costs **O(parts x writes)**. On prod that was
+/// 6,770 snapshots totalling 19.4 GB behind 71.8 MB of actual data, which
+/// filled the volume and stopped every append.
+///
+/// Nothing reads these files; `LATEST` is the only manifest the engine loads.
+/// They are kept purely so a human can inspect recent manifest history, so the
+/// bound is small on purpose.
+pub const DEFAULT_MANIFEST_RETAIN: usize = 32;
 
 /// L0 engine configuration for one dataset.
 #[derive(Debug, Clone)]
@@ -68,10 +82,64 @@ pub struct L0Config {
     pub seal_max_bytes: u64,
     /// Seal a part once it reaches this record count.
     pub seal_max_records: u64,
+    /// **Age-based seal trigger** (noetl/ehdb#329). Seal an active part once its
+    /// oldest record is this old, whatever its size or count.
+    ///
+    /// `None` — the default — is today's behavior, and today's behavior leaves
+    /// the durability window **unbounded in time**: a shard that appends a few
+    /// records and goes quiet never seals, so those records never reach the
+    /// substrate. Off by default so enabling it is deliberate and reversible.
+    ///
+    /// ⚠ Setting this is necessary but not sufficient. An idle shard takes no
+    /// appends, so something must drive [`L0Engine::seal_aged_parts`] on a
+    /// timer; the flag alone is inert on exactly the shard it protects.
+    pub seal_max_age: Option<Duration>,
     /// Durability-window posture (D1 default = [`FlushPolicy::EveryAppend`]).
     pub flush: FlushPolicy,
+    /// Maintain per-execution chain certificates (noetl/ai-meta#366).
+    ///
+    /// **Off by default**, and additionally gated at compile time by the
+    /// `chain-cert` feature — with the feature off this field is inert. Two
+    /// gates because the compile-time one keeps `sha2` out of a default build
+    /// while the runtime one lets the certificate be turned on in a deployed
+    /// binary without a rebuild (and A/B'd in one process).
+    ///
+    /// ⚠ Turning this on does NOT change the bytes written. The digest covers
+    /// the stored bytes, so if the flag altered them, flipping it would fork
+    /// every chain.
+    pub chain_cert: bool,
+    /// Keys remembered per shard for append-time idempotency (noetl/ai-meta#313).
+    /// `0` disables dedupe entirely.
+    pub dedupe_capacity: usize,
+    /// **Refuse a replica set that does not spread failure domains** (#332 F5).
+    ///
+    /// `false` — the default — is today's behaviour: violations are *counted and
+    /// logged* but the open succeeds. Shadow first, enforce deliberately, the
+    /// same shape `seal_max_age` and the fencing work use.
+    ///
+    /// ⚠ Only consulted for a set of **two or more** replicas. A single replica
+    /// makes no spreading claim, so there is nothing to falsify; enforcing there
+    /// would only reject substrates that decline to declare a domain.
+    pub require_distinct_domains: bool,
+    /// How much loss the replica set must survive (M4).
+    ///
+    /// [`SurvivalGoal::Zone`] — the default — is exactly today's behaviour:
+    /// `check_region_survival` returns no violations for it, so the region
+    /// check below is a strict no-op unless an operator asks for `Region`.
+    pub survival_goal: crate::failure_domain::SurvivalGoal,
+    /// M2 clock mode. `None` — the default — reads `NOETL_EHDB_HLC`.
+    ///
+    /// Injectable so tests choose the mode WITHOUT touching the process env:
+    /// `cargo test` does not serialise tests, so an env-driven test would race
+    /// every other test in the binary.
+    pub hlc_mode: Option<crate::hlc_policy::HlcMode>,
     /// L0.3 background merge/compaction policy.
     pub merge_policy: MergePolicy,
+    /// How many versioned manifest snapshots to keep besides `LATEST`
+    /// (noetl/ehdb#344). `0` disables pruning entirely — the pre-fix behaviour,
+    /// which is unbounded and is what filled the prod volume. See
+    /// [`DEFAULT_MANIFEST_RETAIN`].
+    pub manifest_retain: usize,
 }
 
 impl L0Config {
@@ -85,8 +153,15 @@ impl L0Config {
             granule_size: DEFAULT_GRANULE_SIZE,
             seal_max_bytes: DEFAULT_SEAL_MAX_BYTES,
             seal_max_records: DEFAULT_SEAL_MAX_RECORDS,
+            seal_max_age: None,
+            require_distinct_domains: false,
+            survival_goal: crate::failure_domain::SurvivalGoal::Zone,
+            hlc_mode: None,
             flush: FlushPolicy::EveryAppend,
+            chain_cert: false,
+            dedupe_capacity: crate::dedupe::DEFAULT_DEDUPE_CAPACITY,
             merge_policy: MergePolicy::d1(DEFAULT_SEAL_MAX_RECORDS),
+            manifest_retain: DEFAULT_MANIFEST_RETAIN,
         }
     }
 
@@ -101,6 +176,17 @@ impl L0Config {
     }
 
     /// Set the partition (shard) count.
+    /// Keys remembered per shard for append-time idempotency (#313).
+    ///
+    /// `0` disables dedupe and is byte-for-byte today's behaviour. Default is
+    /// [`crate::dedupe::DEFAULT_DEDUPE_CAPACITY`]; it is inert regardless until a
+    /// record actually carries a [`crate::dataset::Dataset::dedupe_key`], which
+    /// no producer sends yet.
+    pub fn with_dedupe_capacity(mut self, capacity: usize) -> Self {
+        self.dedupe_capacity = capacity;
+        self
+    }
+
     pub fn with_shard_count(mut self, shard_count: u32) -> Self {
         self.shard_count = shard_count;
         self
@@ -124,12 +210,52 @@ impl L0Config {
         self.merge_policy = merge_policy;
         self
     }
+
+    /// Set how many versioned manifest snapshots to retain besides `LATEST`
+    /// (noetl/ehdb#344). `0` restores the unbounded pre-fix behaviour and is
+    /// only useful for proving, in a test, that the bound is what does the work.
+    pub fn with_manifest_retain(mut self, manifest_retain: usize) -> Self {
+        self.manifest_retain = manifest_retain;
+        self
+    }
     /// Set the byte-size seal threshold.
+    /// Enable the **age-based seal trigger** (noetl/ehdb#329). `None` restores
+    /// the size/count-only default.
+    pub fn with_seal_max_age(mut self, seal_max_age: Option<Duration>) -> Self {
+        self.seal_max_age = seal_max_age;
+        self
+    }
+
+    /// Enforce failure-domain spread across the replica set (#332 F5).
+    pub fn with_require_distinct_domains(mut self, require: bool) -> Self {
+        self.require_distinct_domains = require;
+        self
+    }
+
+    /// Set the survival goal (M4). `Zone` (default) leaves the region check
+    /// inert; `Region` requires copies in distinct **declared** regions.
+    pub fn with_survival_goal(mut self, goal: crate::failure_domain::SurvivalGoal) -> Self {
+        self.survival_goal = goal;
+        self
+    }
+
+    /// Set the M2 clock mode explicitly, bypassing `NOETL_EHDB_HLC`.
+    pub fn with_hlc_mode(mut self, mode: crate::hlc_policy::HlcMode) -> Self {
+        self.hlc_mode = Some(mode);
+        self
+    }
+
     pub fn with_seal_max_bytes(mut self, seal_max_bytes: u64) -> Self {
         self.seal_max_bytes = seal_max_bytes;
         self
     }
     /// Set the durability-window posture.
+    /// Enable per-execution chain certificates (noetl/ai-meta#366).
+    pub fn with_chain_cert(mut self, on: bool) -> Self {
+        self.chain_cert = on;
+        self
+    }
+
     pub fn with_flush(mut self, flush: FlushPolicy) -> Self {
         self.flush = flush;
         self
@@ -152,15 +278,38 @@ pub struct ReplicaTarget {
     pub id: String,
     /// The replica's durable byte-sink.
     pub substrate: Arc<dyn DurableSubstrate>,
+    /// Where this replica physically lives (M1).
+    ///
+    /// ⭐ **Undeclared by default, and that is the safe direction.** A replica
+    /// that declares nothing is never *assumed* to be in a distinct region —
+    /// `check_region_survival` refuses an undeclared replica under
+    /// [`SurvivalGoal::Region`] rather than counting it as spread. Same posture
+    /// as `FailureDomain::Undeclared`: silence is not independence.
+    ///
+    /// Consulted only by the [`SurvivalGoal::Region`] check, which is a strict
+    /// no-op under the default `Zone` goal — so a caller that never sets this
+    /// gets byte-identical behaviour.
+    pub locality: crate::placement::Locality,
 }
 
 impl ReplicaTarget {
-    /// Construct a replica target.
+    /// Construct a replica target with **undeclared** locality.
+    ///
+    /// The signature is unchanged on purpose: every existing call site keeps
+    /// compiling and keeps its current behaviour. Locality is opt-in through
+    /// [`ReplicaTarget::with_locality`].
     pub fn new(id: impl Into<String>, substrate: Arc<dyn DurableSubstrate>) -> Self {
         Self {
             id: id.into(),
             substrate,
+            locality: crate::placement::Locality::undeclared(),
         }
+    }
+
+    /// Declare where this replica lives (M1).
+    pub fn with_locality(mut self, locality: crate::placement::Locality) -> Self {
+        self.locality = locality;
+        self
     }
 }
 
@@ -169,6 +318,9 @@ struct UploadJob {
     substrate_key: String,
     local_path: String,
     part_id: String,
+    /// The part's shard — needed to close its durability window on the
+    /// [`UnreplicatedTracker`] when the upload lands (noetl/ehdb#328).
+    shard: u32,
     sealed_at: Instant,
 }
 
@@ -196,11 +348,25 @@ pub struct L0Engine<D: Dataset> {
     /// not advance its shard's tail — the ascending-contract-violation canary
     /// behind [`L0Metrics::out_of_order_appends`] (noetl/ai-meta#203).
     shard_tail_max: HashMap<u32, u64>,
+    /// Append-time idempotency window (noetl/ai-meta#313).
+    dedupe: crate::dedupe::DedupeIndex,
+    /// The M2 commit clock, and the mode that decides whether it is consulted.
+    ///
+    /// Held on the engine rather than created per append because the whole
+    /// point of `HlcClock` is that it never returns a value less than or equal
+    /// to one it already returned — a fresh clock per append would reset that
+    /// guarantee every time.
+    hlc_mode: crate::hlc_policy::HlcMode,
+    hlc: ehdb_core::hlc::HlcClock,
     /// Sender to the uploader thread (dropped on close to stop it).
     upload_tx: Option<Sender<UploadJob>>,
     upload_handle: Option<JoinHandle<()>>,
     /// Outstanding upload count + condvar for `flush_and_wait_uploads`.
     outstanding: Arc<(Mutex<usize>, Condvar)>,
+    /// **The D1 durability window, measured from the append** (noetl/ehdb#328).
+    /// Shared with the uploader thread, which closes a part's window when it
+    /// becomes durable. Observability only — nothing here gates an append.
+    unreplicated: Arc<UnreplicatedTracker>,
 }
 
 impl<D: Dataset> L0Engine<D> {
@@ -242,6 +408,96 @@ impl<D: Dataset> L0Engine<D> {
                 "L0 engine needs at least one replica target".into(),
             ));
         }
+        // noetl/ai-meta#332 — the on-disk format gate, BEFORE anything is read
+        // or written.  Every `open*` funnels here, so this is the one place it
+        // can be enforced.
+        //
+        // ⚠ Checked on EVERY replica, not just the first: each is an independent
+        // substrate with its own layout, and a replica written by a different
+        // build is exactly the case a single-replica check would wave through.
+        for replica in &replicas {
+            crate::format_version::verify_or_initialise(replica.substrate.as_ref())
+                .map_err(|err| EhdbError::Storage(format!("replica {}: {err}", replica.id)))?;
+        }
+        // noetl/ehdb#332 F5 — the failure-domain check, wired.
+        //
+        // ⚠ This guard existed and had NO production caller: `validate_replica_domains`
+        // was referenced only from its own tests, so a replica set that shared one
+        // disk was refused by nothing. An RF of N over one domain is an RF of 1
+        // wearing a larger number, and until this call site existed the larger
+        // number is all anyone could see.
+        //
+        // Only for a set of 2+: one replica makes no spreading claim.
+        if replicas.len() >= 2 {
+            let domains: Vec<crate::failure_domain::ReplicaDomain> = replicas
+                .iter()
+                .map(|r| {
+                    let domain = r.substrate.failure_domain();
+                    // The nesting check needs the path; only LocalDevice carries
+                    // one. A Remote replica has no local root and cannot nest.
+                    let root = match &domain {
+                        crate::failure_domain::FailureDomain::LocalDevice { root, .. } => {
+                            Some(root.clone())
+                        }
+                        _ => None,
+                    };
+                    crate::failure_domain::ReplicaDomain {
+                        replica: r.id.clone(),
+                        domain,
+                        root,
+                    }
+                })
+                .collect();
+            // M4 — the REGION survival check, at the same call site as the
+            // device/zone one.
+            //
+            // Deliberately here rather than inside `check_replica_domains`:
+            // the two ask different questions and `failure_domain`'s module
+            // note is explicit that "the two are combined by the caller, not by
+            // this module". A device-id comparison cannot establish region
+            // spread — two disks in one region are two domains and one region.
+            //
+            // ⭐ Inert by default. `check_region_survival` returns no
+            // violations for `SurvivalGoal::Zone`, so a deployment that has not
+            // asked for `Region` sees byte-identical behaviour and an
+            // undeclared `locality` costs nothing.
+            let placements: Vec<crate::failure_domain::RegionPlacement> = replicas
+                .iter()
+                .map(|r| crate::failure_domain::RegionPlacement {
+                    replica: r.id.clone(),
+                    region: r.locality.region.clone(),
+                })
+                .collect();
+            // Enforced, not shadowed, and that asymmetry with the domain check
+            // below is intentional: the domain check defaults to ON for everyone
+            // and so needs a shadow rung, whereas `Region` is never reached
+            // unless an operator explicitly asked for it. Asking for a survival
+            // goal and silently not getting it is the failure this phase exists
+            // to prevent.
+            crate::failure_domain::validate_region_survival(&placements, config.survival_goal)?;
+
+            let violations = crate::failure_domain::check_replica_domains(&domains);
+            if !violations.is_empty() {
+                metrics.set_replica_domain_violations(violations.len() as u64);
+                if config.require_distinct_domains {
+                    let joined = violations
+                        .iter()
+                        .map(|v| v.message())
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    return Err(EhdbError::InvalidState(format!(
+                        "replica set does not spread failure domains: {joined}"
+                    )));
+                }
+                // Shadow: observable, not fatal. ⚠ The signal is the COUNTER,
+                // not a log line — this crate takes no `tracing` dependency and
+                // adding one for a warning is a dependency decision, not a
+                // detail. The counter is pinned at 0 below on the healthy path
+                // so absence and zero stay distinguishable.
+            } else {
+                metrics.set_replica_domain_violations(0);
+            }
+        }
         // The dataset id is authoritative from the type — keep the config in sync
         // so a generic dataset's substrate keys / manifest keys are correct.
         config.dataset = D::NAME.to_string();
@@ -253,8 +509,35 @@ impl<D: Dataset> L0Engine<D> {
             .unwrap_or_else(|| Manifest::empty(&config.dataset));
         let global_sequence = manifest.max_sequence();
         let mut engine = Self::assemble(config, replicas, metrics, manifest, global_sequence);
+        // noetl/ai-meta#209 defect 2 — recover BEFORE anything reads or appends.
+        //
+        // Writers are opened lazily by `ensure_writer`, and recovery rides that
+        // open.  Lazy is too late on both paths: `append_writer_assigned` reads
+        // `global_sequence` to mint its key *before* calling into the append that
+        // would open the writer, so the first post-crash append lands at or below
+        // the recovered tip (the #203 silent drop); and a read never opens a
+        // writer at all, so recovered records stay invisible until something
+        // happens to append.  Both were caught by the engine-level tests and
+        // neither is visible from the writer's own unit tests.
+        engine.recover_active_parts()?;
         engine.start_uploader();
+        // ⚠ Unconditional, including on a fresh engine where every value is 0. A pin
+        // inside a config branch is not a pin (server#315): it leaves the series absent
+        // on exactly the configuration whose value someone would be reading, and an
+        // absent series is indistinguishable from a healthy zero to every alert.
+        engine.refresh_state_gauges();
         Ok(engine)
+    }
+
+    /// Open every shard's writer once at startup, so an active part left by a
+    /// crash is replayed (and the sequence reconciled) before the engine serves
+    /// anything.  A shard with no active part opens an empty writer, which is
+    /// what `ensure_writer` would have done on first append anyway.
+    fn recover_active_parts(&mut self) -> Result<()> {
+        for shard in 0..self.config.shard_count.max(1) {
+            self.ensure_writer(shard)?;
+        }
+        Ok(())
     }
 
     /// **Cold-load** a fresh node (empty local dir) from a single substrate:
@@ -321,6 +604,12 @@ impl<D: Dataset> L0Engine<D> {
         manifest: Manifest,
         global_sequence: u64,
     ) -> Self {
+        let shard_count = config.shard_count;
+        let dedupe_capacity_init =
+            crate::dedupe::DedupeIndex::with_capacity(config.dedupe_capacity);
+        let hlc_mode_resolved = config
+            .hlc_mode
+            .unwrap_or_else(crate::hlc_policy::HlcMode::from_env);
         Self {
             config,
             replicas,
@@ -329,9 +618,29 @@ impl<D: Dataset> L0Engine<D> {
             writers: HashMap::new(),
             global_sequence,
             shard_tail_max: HashMap::new(),
+            dedupe: dedupe_capacity_init,
+            // Resolved ONCE at open: a per-append env read would put a syscall
+            // on the commit path, and the mode cannot change under a running
+            // process anyway.
+            hlc_mode: hlc_mode_resolved,
+            // ⚠ Seeded from the tip the engine just recovered, not from
+            // `default()`. `HlcClock::seeded_from` exists precisely because a
+            // fresh process must not re-issue timestamps a previous one used,
+            // and the wall clock alone does not guarantee that across a restart
+            // during which it stepped back.
+            hlc: ehdb_core::hlc::HlcClock::seeded_from(
+                ehdb_core::hlc::Hlc::from_parts(0, 0),
+                Box::new(|| {
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0)
+                }),
+            ),
             upload_tx: None,
             upload_handle: None,
             outstanding: Arc::new((Mutex::new(0), Condvar::new())),
+            unreplicated: Arc::new(UnreplicatedTracker::new(shard_count)),
         }
     }
 
@@ -341,7 +650,9 @@ impl<D: Dataset> L0Engine<D> {
         let manifest = Arc::clone(&self.manifest);
         let metrics = Arc::clone(&self.metrics);
         let outstanding = Arc::clone(&self.outstanding);
+        let unreplicated = Arc::clone(&self.unreplicated);
         let dataset = self.config.dataset.clone();
+        let manifest_retain = self.config.manifest_retain;
         let handle = std::thread::Builder::new()
             .name("ehdb-l0-uploader".to_string())
             .spawn(move || {
@@ -382,10 +693,19 @@ impl<D: Dataset> L0Engine<D> {
                     };
                     // The durable manifest must exist on EVERY replica so any one
                     // of them can serve a cold-load alone.
-                    write_manifest_to_all(&replicas, &dataset, &durable);
+                    write_manifest_to_all(&replicas, &dataset, &durable, manifest_retain, &metrics);
 
                     let lag = job.sealed_at.elapsed().as_micros() as u64;
                     metrics.record_upload(bytes.len() as u64, lag);
+                    // Close this part's durability window and record the
+                    // **append→durable** latency. ⚠ `lag` above is measured from
+                    // the SEAL and cannot see the pre-seal term; this one can.
+                    // The failure paths above deliberately do NOT reach here —
+                    // a part that did not replicate is still pending, which is
+                    // what the window should keep reporting.
+                    if let Some(end_to_end) = unreplicated.on_upload_done(job.shard, &job.part_id) {
+                        metrics.record_replicated_lag(end_to_end.as_micros() as u64);
+                    }
                     decrement(&outstanding);
                 }
             })
@@ -400,7 +720,78 @@ impl<D: Dataset> L0Engine<D> {
     /// fully-formed record whose sort key is `>=` every prior record in its
     /// partition (the single-writer ascending-sort-key contract). Never touches
     /// the substrate. Returns the record's sort key.
+    /// Has this record's idempotency key already landed? Returns its position.
+    ///
+    /// `None` whenever the dataset has no key for the record — which is every
+    /// dataset except D1, and every D1 record whose producer has not been updated
+    /// to send one. So this is a no-op until something actually sends an
+    /// `event_id`, which is what makes the change inert on arrival.
+    fn dedupe_hit(&self, record: &D::Record) -> Option<u64> {
+        let key = D::dedupe_key(record)?;
+        let shard = D::partition(record, self.config.shard_count);
+        match self.dedupe.check(shard, key) {
+            crate::dedupe::DedupeVerdict::Duplicate(seq) => Some(seq),
+            crate::dedupe::DedupeVerdict::Fresh => None,
+        }
+    }
+
+    /// [`append_record`](Self::append_record), reporting **whether the record was
+    /// actually written**.
+    ///
+    /// `(sort_key, appended)`. `appended == false` means the key was already
+    /// present and the returned position is the existing record's — the caller
+    /// must treat it as an acknowledgement, not a new append.
+    ///
+    /// ⚠ This exists because the plain `append_record` return is indistinguishable
+    /// between the two cases, and the difference is load-bearing upstream: the
+    /// tier-append reply is checked for **strictly increasing** sequences and for
+    /// `log_record_count == global_sequence`. A deduplicated redelivery returns an
+    /// OLDER position and does not advance the count, so a caller that cannot tell
+    /// the two apart reports a parity **divergence** for a working dedupe
+    /// (noetl/ai-meta#313).
+    pub fn append_record_reporting(&mut self, record: D::Record) -> Result<(u64, bool)> {
+        if let Some(existing) = self.dedupe_hit(&record) {
+            self.metrics.incr_dedupe_hits();
+            return Ok((existing, false));
+        }
+        self.append_record(record).map(|seq| (seq, true))
+    }
+
+    /// [`append_writer_assigned`](Self::append_writer_assigned), reporting whether
+    /// the record was actually written. See [`Self::append_record_reporting`].
+    pub fn append_writer_assigned_reporting(&mut self, record: D::Record) -> Result<(u64, bool)> {
+        if let Some(existing) = self.dedupe_hit(&record) {
+            self.metrics.incr_dedupe_hits();
+            return Ok((existing, false));
+        }
+        self.append_writer_assigned(record).map(|seq| (seq, true))
+    }
+
     pub fn append_record(&mut self, record: D::Record) -> Result<u64> {
+        // ⚠ Before anything else. A duplicate must not touch the shard tail, must
+        // not trip the ascending canary, must not seal, and must not advance the
+        // durability window — it is not an append, it is an acknowledgement of one
+        // that already happened.
+        if let Some(existing) = self.dedupe_hit(&record) {
+            self.metrics.incr_dedupe_hits();
+            return Ok(existing);
+        }
+        // M2 — stamp the commit HLC.
+        //
+        // ⚠ AFTER the dedupe check above, never before: a duplicate is an
+        // acknowledgement of an append that already happened, not an append, so
+        // it must not burn a timestamp or overwrite the one the original
+        // carries.
+        //
+        // ⚠⚠ Nothing reads `commit_hlc`, and that is the M2 exit criterion
+        // rather than a gap — a reader appearing before M3's closed timestamps
+        // would be a phase-ordering violation. Stamping is write-only here on
+        // purpose, which is also why `off` (the default) is byte-identical:
+        // `skip_serializing_if` omits the field entirely.
+        let mut record = record;
+        if self.hlc_mode.stamps() {
+            D::stamp_commit_hlc(&mut record, self.hlc.now().as_u64());
+        }
         let sort_key = D::sort_key(&record);
         let shard = D::partition(&record, self.config.shard_count);
         // Ascending-contract canary: an append that does not advance its shard's
@@ -415,14 +806,30 @@ impl<D: Dataset> L0Engine<D> {
             }
         }
         self.ensure_writer(shard)?;
+        let dedupe_key = D::dedupe_key(&record).map(str::to_string);
         {
             let writer = self.writers.get_mut(&shard).unwrap();
             writer.append(record)?;
+        }
+        // ⚠ AFTER the append, never before. Remembering first would make a failed
+        // append poison its key: the retry that the failure exists to invite would
+        // then be answered "already present" for a record that is not there —
+        // silent loss, the exact class this removes.
+        if let Some(key) = dedupe_key {
+            self.dedupe.remember(shard, &key, sort_key);
+            self.metrics
+                .set_dedupe_window_evictions(self.dedupe.evictions());
         }
         if sort_key > self.global_sequence {
             self.global_sequence = sort_key;
         }
         self.metrics.incr_appends();
+        // Open the record's durability window. ⚠ Under `FlushPolicy::CallerDriven`
+        // the ack lands after the caller's `fsync`, so counting here can include
+        // a record for the few microseconds before it is acked. That
+        // over-reports the window and never under-reports it — the safe
+        // direction for a durability signal.
+        self.unreplicated.on_append(shard);
 
         let sealed = {
             let writer = self.writers.get_mut(&shard).unwrap();
@@ -452,6 +859,23 @@ impl<D: Dataset> L0Engine<D> {
     /// increases, the shard log is ascending by construction: a follower cursor
     /// never advances past an un-read record, and no append can land behind it.
     pub fn append_writer_assigned(&mut self, record: D::Record) -> Result<u64> {
+        // An early-out, NOT the enforcement point — and the distinction is
+        // recorded because the comment here first claimed otherwise.
+        //
+        // It originally said this check was needed so a duplicate would not burn
+        // a global sequence and leave a gap. A mutation removing it left every
+        // test green, which is how the claim was found to be false: `seq` here is
+        // only a candidate, and `self.global_sequence` advances *inside*
+        // `append_record` after its own dedupe check. So gaplessness is enforced
+        // there, and this guard only saves the `assign_sort_key` work.
+        //
+        // Both guards are kept because both entry points are public and reached:
+        // `append_record` is called directly by callers that own their sort keys.
+        // Each is covered by its own test — see `event_id_idempotency.rs`.
+        if let Some(existing) = self.dedupe_hit(&record) {
+            self.metrics.incr_dedupe_hits();
+            return Ok(existing);
+        }
         let seq = self.global_sequence + 1;
         self.append_record(D::assign_sort_key(record, seq))
     }
@@ -491,6 +915,23 @@ impl<D: Dataset> L0Engine<D> {
         }
     }
 
+    /// This execution's chain certificate from the shard that owns it
+    /// (noetl/ai-meta#366). `None` until a chunk seals.
+    #[cfg(feature = "chain-cert")]
+    pub fn chain_certificate(&self, execution_id: &str) -> Option<crate::chain_cert::ChainCert> {
+        let shard = D::read_partition(execution_id, self.config.shard_count);
+        self.writers
+            .get(&shard)
+            .and_then(|w| w.chain_certificate(execution_id))
+    }
+
+    /// Records absorbed into chain state across every open writer — proves the
+    /// path ran rather than merely existing (A9).
+    #[cfg(feature = "chain-cert")]
+    pub fn chain_absorbed(&self) -> u64 {
+        self.writers.values().map(|w| w.chain_absorbed()).sum()
+    }
+
     fn ensure_writer(&mut self, shard: u32) -> Result<()> {
         if !self.writers.contains_key(&shard) {
             let writer = PartWriter::<D>::open(
@@ -502,6 +943,54 @@ impl<D: Dataset> L0Engine<D> {
                 self.config.seal_max_records,
                 self.config.flush,
             )?;
+            let mut writer = writer;
+            writer.set_seal_max_age(self.config.seal_max_age);
+            #[cfg(feature = "chain-cert")]
+            writer.set_chain_cert(self.config.chain_cert);
+            // noetl/ai-meta#209 defect 2 — a writer that just recovered an
+            // active part left by a crash holds records the manifest does not
+            // know about, because the manifest lists sealed parts only. The
+            // engine's `global_sequence` came from that manifest, so it is
+            // *behind* the recovered tail; lift both it and the shard tail above
+            // the recovered records before anything is appended.
+            //
+            // Skipping this would let the next `append_writer_assigned` mint a
+            // key at or below the recovered tail. That append lands behind every
+            // follower cursor and is never delivered — the silent-drop class of
+            // noetl/ai-meta#203 — so recovery without this would trade a crash
+            // loss for a quieter one.
+            if let Some(recovered_tip) = writer.max_sequence() {
+                if recovered_tip > self.global_sequence {
+                    self.global_sequence = recovered_tip;
+                }
+                let tail = self.shard_tail_max.entry(shard).or_insert(recovered_tip);
+                if recovered_tip > *tail {
+                    *tail = recovered_tip;
+                }
+                let recovered = writer.pending_records().len() as u64;
+                self.metrics.add_recovered_active_records(recovered);
+                // ⚠⚠ Re-seed the idempotency window from the recovered records
+                // (noetl/ai-meta#313). Without this, a crash makes every record in
+                // the active part deduplicable-no-more: the retry that a crash
+                // most reliably produces would be answered "fresh" and appended a
+                // second time. The window would be emptiest at exactly the moment
+                // redelivery is most likely — the same "quietest when the most is
+                // at risk" shape the durability window was fixed for.
+                let seeds: Vec<(String, u64)> = writer
+                    .pending_records()
+                    .iter()
+                    .filter_map(|r| D::dedupe_key(r).map(|k| (k.to_string(), D::sort_key(r))))
+                    .collect();
+                for (key, seq) in seeds {
+                    self.dedupe.remember(shard, &key, seq);
+                }
+                // ⚠⚠ Seed the durability window too. These records are acked and
+                // `fsync`'d but not on the substrate, so they are pending by
+                // every definition the gauge uses — and without this the window
+                // reads 0 immediately after a crash, i.e. it is quietest exactly
+                // when the most is at risk.
+                self.unreplicated.on_recovered(shard, recovered);
+            }
             self.writers.insert(shard, writer);
         }
         Ok(())
@@ -521,12 +1010,17 @@ impl<D: Dataset> L0Engine<D> {
             .clone()
             .ok_or_else(|| EhdbError::InvalidState("sealed part missing local_path".into()))?;
         let part_id = sealed.meta.part_id.clone();
+        let shard = sealed.meta.partition;
+        let record_count = sealed.meta.record_count;
 
         {
             let mut m = self.manifest.lock().unwrap();
             m.push_part(sealed.meta);
         }
         self.metrics.incr_seals();
+        // The sealed part inherits the active part's first-append instant, so
+        // the window keeps measuring from the append rather than restarting.
+        self.unreplicated.on_seal(shard, &part_id, record_count);
 
         // Bump outstanding BEFORE sending so flush_and_wait never races a job.
         {
@@ -538,6 +1032,7 @@ impl<D: Dataset> L0Engine<D> {
                 substrate_key,
                 local_path,
                 part_id,
+                shard,
                 sealed_at: Instant::now(),
             };
             if tx.send(job).is_err() {
@@ -586,6 +1081,60 @@ impl<D: Dataset> L0Engine<D> {
     /// The superseded source objects are left in place for the retention/GC slice
     /// (L0.5) to reclaim; the manifest no longer references them, so reads never
     /// touch them.
+    /// **Seal every active part that has aged out** and enqueue its upload.
+    /// Returns how many parts were sealed.
+    ///
+    /// ⚠ This exists because [`PartWriter::should_seal`] is only consulted on
+    /// append, and the shard the age trigger protects is by definition the one
+    /// taking no appends. Setting `seal_max_age` without driving this on a timer
+    /// leaves the trigger **inert on exactly the shard it was added for** — the
+    /// flag would be present, the config would look correct, and nothing would
+    /// ever fire.
+    ///
+    /// A no-op when `seal_max_age` is `None`, so a caller can drive it
+    /// unconditionally.
+    pub fn seal_aged_parts(&mut self) -> Result<usize> {
+        // ⚠ A cheap short-circuit, NOT the enforcement point. Removing it
+        // changes no behavior — `PartWriter::aged_out` already returns false
+        // with no configured limit — and mutation testing confirms that. It is
+        // kept to avoid walking every writer on the default path; do not read it
+        // as the thing that keeps the trigger off.
+        if self.config.seal_max_age.is_none() {
+            return Ok(0);
+        }
+        let aged: Vec<u32> = self
+            .writers
+            .iter()
+            .filter(|(_, w)| w.aged_out())
+            .map(|(shard, _)| *shard)
+            .collect();
+        let mut sealed_count = 0;
+        for shard in aged {
+            let sealed = match self.writers.get_mut(&shard) {
+                Some(w) => w.seal()?,
+                None => None,
+            };
+            if let Some(sealed) = sealed {
+                self.register_and_upload(sealed)?;
+                sealed_count += 1;
+            }
+        }
+        self.refresh_state_gauges();
+        Ok(sealed_count)
+    }
+
+    /// The age of the oldest un-sealed record per shard — what the age trigger
+    /// is comparing against.
+    pub fn active_ages(&self) -> Vec<(u32, Duration)> {
+        let mut out: Vec<(u32, Duration)> = self
+            .writers
+            .iter()
+            .filter_map(|(shard, w)| w.active_age().map(|age| (*shard, age)))
+            .collect();
+        out.sort_by_key(|(shard, _)| *shard);
+        out
+    }
+
     pub fn run_pending_merges(&mut self) -> Result<usize> {
         let mut count = 0;
         loop {
@@ -597,6 +1146,7 @@ impl<D: Dataset> L0Engine<D> {
             self.merge_once(plan)?;
             count += 1;
         }
+        self.refresh_state_gauges();
         Ok(count)
     }
 
@@ -626,6 +1176,16 @@ impl<D: Dataset> L0Engine<D> {
             }
         }
         records.sort_by_key(D::sort_key);
+
+        // **Key-level compaction** (noetl/ehdb#391). For a dataset that declares a
+        // `supersede_key`, keep only the highest-sort-key record per key among THESE
+        // sources. Every dropped record already lost a latest-wins fold to a record that
+        // is kept, so the global per-key maximum — and therefore the fold's answer — is
+        // unchanged. A dataset that declares nothing is untouched.
+        let superseded = compact_superseded::<D>(&mut records);
+        if superseded > 0 {
+            self.metrics.add_records_superseded(superseded);
+        }
 
         // Build the merged immutable part (in a per-partition `merged/` subdir so
         // its active-file name can never collide with the append-path writer).
@@ -668,7 +1228,13 @@ impl<D: Dataset> L0Engine<D> {
             m.version += 1;
             m.durable_view()
         };
-        write_manifest_to_all(&self.replicas, &self.config.dataset, &durable);
+        write_manifest_to_all(
+            &self.replicas,
+            &self.config.dataset,
+            &durable,
+            self.config.manifest_retain,
+            &self.metrics,
+        );
 
         self.metrics
             .record_merge(sources.len() as u64, bytes.len() as u64);
@@ -738,6 +1304,7 @@ impl<D: Dataset> L0Engine<D> {
             }
         }
 
+        self.refresh_state_gauges();
         Ok(reclaimed)
     }
 
@@ -767,7 +1334,13 @@ impl<D: Dataset> L0Engine<D> {
             m.version += 1;
             m.durable_view()
         };
-        write_manifest_to_all(&self.replicas, &self.config.dataset, &durable);
+        write_manifest_to_all(
+            &self.replicas,
+            &self.config.dataset,
+            &durable,
+            self.config.manifest_retain,
+            &self.metrics,
+        );
 
         let dropped = plan.drop_ids.len();
         self.metrics.record_parts_dropped(dropped as u64);
@@ -962,6 +1535,44 @@ impl<D: Dataset> L0Engine<D> {
     /// (unsealed) hot buffer for the shard is included, so a just-appended record
     /// is visible to a follower immediately (the shadow-feed / delivery path).
     pub fn read_partition_after(&self, shard: u32, after_seq: u64) -> Result<Vec<D::Record>> {
+        self.read_partition_after_limited(shard, after_seq, usize::MAX)
+    }
+
+    /// `read_partition_after`, but delivering at most `limit` records.
+    ///
+    /// The unlimited form reads *the whole tail into one `Vec`*, and the feed
+    /// then serialises that into a single frame. At `after_seq = 0` — which is
+    /// what every replay-from-0 boot asks for — "the whole tail" is the whole
+    /// log, so the delivery buffer is O(log). On prod that reached **3313 MiB**
+    /// for 29,608 records against a 2 GiB container limit, and the system pool
+    /// OOM-crashlooped for twelve days (noetl/ai-meta#298).
+    ///
+    /// Note what was *not* wrong: the consumer's resident index was correctly
+    /// bounded the whole time (`NOETL_STATE_INDEX_MAX_BYTES`, 112 MiB resident
+    /// against a 256 MiB ceiling). The configured limit bounded the resting
+    /// index; nothing bounded the buffer the records arrive in. That is why
+    /// every limit read healthy while the pod died.
+    ///
+    /// The early break is sound because [`Manifest::prune`] returns parts sorted
+    /// by `min_sequence`: once `limit` records are in hand, every remaining part
+    /// holds strictly higher sort keys, so the lowest `limit` records after the
+    /// cursor are already collected. The hot buffer is the tail and is only read
+    /// when the limit has not been reached. Peak becomes O(one part + limit)
+    /// rather than O(log).
+    ///
+    /// Callers keep their cursor semantics unchanged: a short batch is exactly
+    /// what a caught-up feed already returns, and the caller re-polls from the
+    /// new cursor. No cursor is persisted and no ack is introduced, so the #119
+    /// self-rehydrating shape is untouched.
+    pub fn read_partition_after_limited(
+        &self,
+        shard: u32,
+        after_seq: u64,
+        limit: usize,
+    ) -> Result<Vec<D::Record>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
         let mut out: Vec<D::Record> = Vec::new();
 
         let candidate_parts: Vec<_> = {
@@ -972,6 +1583,11 @@ impl<D: Dataset> L0Engine<D> {
         };
 
         for part in &candidate_parts {
+            // Parts arrive in ascending `min_sequence`, so anything past this
+            // point is strictly higher than what is already collected.
+            if out.len() >= limit {
+                break;
+            }
             // Sparse-index start offset for the cursor; read from there to the
             // part end (the feed wants the shard's whole tail, no index narrowing).
             let start_offset = part.sparse_index.locate(after_seq + 1);
@@ -996,20 +1612,34 @@ impl<D: Dataset> L0Engine<D> {
             }
         }
 
-        // The active (unsealed) hot buffer for this shard.
-        if let Some(writer) = self.writers.get(&shard) {
-            for rec in writer.pending_records() {
-                if D::sort_key(rec) > after_seq {
-                    out.push(rec.clone());
+        // The active (unsealed) hot buffer for this shard — the tail, so it is
+        // only worth reading when the limit has not already been reached.
+        if out.len() < limit {
+            if let Some(writer) = self.writers.get(&shard) {
+                for rec in writer.pending_records() {
+                    if D::sort_key(rec) > after_seq {
+                        out.push(rec.clone());
+                    }
                 }
             }
         }
 
         out.sort_by_key(D::sort_key);
+        out.truncate(limit);
         Ok(out)
     }
 
     /// The configured shard (partition) count.
+    /// Sample the **D1 durability window** per shard — the age of the oldest
+    /// acknowledged record not yet durable on the substrate, and how many such
+    /// records there are (noetl/ehdb#328).
+    ///
+    /// ⚠ Every shard gets a row even when nothing is pending, so `0` is
+    /// distinguishable from "this binary has no such metric".
+    pub fn unreplicated_snapshot(&self) -> Vec<ShardUnreplicated> {
+        self.unreplicated.snapshot()
+    }
+
     pub fn shard_count(&self) -> u32 {
         self.config.shard_count
     }
@@ -1056,6 +1686,40 @@ impl<D: Dataset> L0Engine<D> {
     }
 
     /// A snapshot clone of the in-RAM manifest.
+    /// Recompute the four state gauges from in-RAM state (noetl/ai-meta#455 C6).
+    ///
+    /// Cheap but **not free**: it walks the manifest once, so it is O(parts). That is
+    /// why it is called on manifest *mutations* (open, seal, merge, reclaim) and not on
+    /// every append — a per-append O(parts) scan would make append cost grow with part
+    /// count, which is precisely the quadratic shape `manifest_parts` exists to detect.
+    /// Instrumenting a thing must not reproduce the defect it measures.
+    ///
+    /// Public so a scrape handler can force a refresh: between mutations the part
+    /// gauges cannot change, but `dedupe_window_records` moves on every append, so its
+    /// staleness is bounded by the seal interval unless a scraper calls this.
+    pub fn refresh_state_gauges(&self) {
+        let want_replicas = self.replicas.len();
+        let (parts, local_only, under) = {
+            let m = self.manifest.lock().unwrap_or_else(|e| e.into_inner());
+            let mut local_only = 0u64;
+            let mut under = 0u64;
+            for part in &m.parts {
+                let n = part.replica_count();
+                if n == 0 {
+                    local_only += 1;
+                } else if n < want_replicas {
+                    under += 1;
+                }
+            }
+            (m.parts.len() as u64, local_only, under)
+        };
+        let dedupe: u64 = (0..self.config.shard_count)
+            .map(|shard| self.dedupe.len(shard) as u64)
+            .sum();
+        self.metrics
+            .set_state_gauges(parts, local_only, under, dedupe);
+    }
+
     pub fn manifest_snapshot(&self) -> Manifest {
         self.manifest.lock().unwrap().clone()
     }
@@ -1094,6 +1758,35 @@ impl<D: Dataset> Drop for L0Engine<D> {
             let _ = handle.join();
         }
     }
+}
+
+/// Drop records superseded by a later record with the same [`Dataset::supersede_key`].
+///
+/// `records` must already be sorted ascending by sort key. Walks backwards keeping the
+/// first occurrence of each key — which, in ascending order, is the **last**, i.e. the
+/// maximum-sort-key record. A record whose `supersede_key` is `None` is always kept, so a
+/// dataset that does not opt in loses nothing. Returns how many were dropped.
+fn compact_superseded<D: Dataset>(records: &mut Vec<D::Record>) -> u64 {
+    let before = records.len();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut keep = vec![true; before];
+    for i in (0..before).rev() {
+        if let Some(key) = D::supersede_key(&records[i]) {
+            if !seen.insert(key.to_string()) {
+                keep[i] = false;
+            }
+        }
+    }
+    if keep.iter().all(|k| *k) {
+        return 0;
+    }
+    let mut idx = 0usize;
+    records.retain(|_| {
+        let k = keep[idx];
+        idx += 1;
+        k
+    });
+    (before - records.len()) as u64
 }
 
 fn decrement(outstanding: &Arc<(Mutex<usize>, Condvar)>) {
@@ -1170,7 +1863,13 @@ fn replicate_bytes(
 /// Write the durable manifest (LATEST pointer + versioned snapshot) to **every**
 /// replica, so any one of them can serve a cold-load alone. Best-effort per
 /// replica (a down replica is skipped; the survivors carry the manifest).
-fn write_manifest_to_all(replicas: &[ReplicaTarget], dataset: &str, durable: &Manifest) {
+fn write_manifest_to_all(
+    replicas: &[ReplicaTarget],
+    dataset: &str,
+    durable: &Manifest,
+    manifest_retain: usize,
+    metrics: &L0Metrics,
+) {
     let Ok(ser) = serde_json::to_vec(durable) else {
         return;
     };
@@ -1182,6 +1881,118 @@ fn write_manifest_to_all(replicas: &[ReplicaTarget], dataset: &str, durable: &Ma
             .substrate
             .put_if_absent(&manifest_version_key(dataset, durable.version), &ser);
     }
+    prune_manifest_versions(replicas, dataset, durable.version, manifest_retain, metrics);
+}
+
+/// Delete versioned manifest snapshots older than the retention bound
+/// (noetl/ehdb#344).
+///
+/// **Why this exists.** Every manifest write emits a *full* snapshot listing
+/// every part. Nothing has ever read one — [`manifest_latest_key`] is the only
+/// manifest the engine loads — and before this nothing deleted one, so the cost
+/// was the product of two growing quantities: snapshot size grows with part
+/// count, snapshot count grows with write count. On prod that reached 6,770
+/// snapshots / 19.4 GB behind 71.8 MB of real data, filled the volume, and made
+/// every append fail. Retention turns that from quadratic into linear.
+///
+/// **Two paths, and the sweep is the one that guarantees the bound.** The
+/// per-write delete is an O(1) fast path: version `v - retain` is the one that
+/// just fell out of the window. It is *best-effort only*. Manifest versions are
+/// allocated under the manifest lock, so every integer is produced exactly once,
+/// but the substrate writes are issued by two producers — the uploader thread
+/// and the merge/drop path — so a version's file can land **after** the delete
+/// that was meant to evict it already looked and found nothing. Those stragglers
+/// then survive forever. Removing the sweep and keeping only the fast path
+/// leaves 6 snapshots instead of 4 after 40 writes at `retain = 4`, and the
+/// stragglers are arbitrarily old (`v6` and `v49` among `v77..v80`) — so the
+/// fast path alone does not bound anything.
+///
+/// The periodic sweep is therefore the actual guarantee, and it doubles as the
+/// only way to converge a backlog that predates this policy: a sliding window
+/// can never reach below its own lower edge, so without the sweep an engine
+/// upgraded onto an existing store would keep its 19.4 GB forever. It is
+/// throttled to one pass per `retain` writes because
+/// [`DurableSubstrate::list_prefix`] walks the whole substrate root, not just
+/// the prefix. Every multiple of `retain` is produced exactly once, so the
+/// throttle cannot be skipped by the same race.
+///
+/// `LATEST` is never a candidate: it does not carry the `manifest-v` prefix that
+/// [`parse_manifest_version`] requires, and it is filtered again by name.
+fn prune_manifest_versions(
+    replicas: &[ReplicaTarget],
+    dataset: &str,
+    latest_version: u64,
+    manifest_retain: usize,
+    metrics: &L0Metrics,
+) {
+    if manifest_retain == 0 {
+        // Retention disabled — the unbounded pre-fix behaviour. Kept reachable so
+        // a test can prove the bound is what does the work.
+        return;
+    }
+    let retain = manifest_retain as u64;
+    let mut pruned = 0u64;
+
+    // O(1) steady-state path: the version that just fell out of the window.
+    if let Some(evicted) = latest_version.checked_sub(retain) {
+        if evicted > 0 {
+            let key = manifest_version_key(dataset, evicted);
+            for target in replicas {
+                if target.substrate.exists(&key).unwrap_or(false)
+                    && target.substrate.delete(&key).is_ok()
+                {
+                    pruned += 1;
+                }
+            }
+        }
+    }
+
+    // Backlog-convergence sweep, amortised one pass per `retain` writes.
+    if latest_version % retain == 0 {
+        let prefix = format!("manifest/{dataset}/");
+        let latest_name = manifest_latest_key(dataset);
+        for target in replicas {
+            let Ok(keys) = target.substrate.list_prefix(&prefix) else {
+                continue;
+            };
+            let mut versions: Vec<(u64, String)> = keys
+                .into_iter()
+                .filter(|k| k != &latest_name)
+                .filter_map(|k| parse_manifest_version(&k).map(|v| (v, k)))
+                .collect();
+            metrics.set_manifest_versions_retained(versions.len() as u64);
+            if versions.len() <= manifest_retain {
+                continue;
+            }
+            versions.sort_unstable_by_key(|(v, _)| *v);
+            let drop_count = versions.len() - manifest_retain;
+            for (_, key) in versions.into_iter().take(drop_count) {
+                if target.substrate.delete(&key).is_ok() {
+                    pruned += 1;
+                }
+            }
+            metrics.set_manifest_versions_retained(manifest_retain as u64);
+        }
+    }
+
+    if pruned > 0 {
+        metrics.add_manifest_versions_pruned(pruned);
+    }
+}
+
+/// Parse the version out of a `manifest/<dataset>/manifest-v<020>.json` key.
+///
+/// Returns `None` for anything that is not a versioned snapshot — `LATEST` most
+/// importantly, but also any unrelated key the substrate walk turns up. A prune
+/// candidate must round-trip through here, so a key that does not parse can
+/// never be deleted.
+fn parse_manifest_version(key: &str) -> Option<u64> {
+    let name = key.rsplit('/').next()?;
+    let digits = name.strip_prefix("manifest-v")?.strip_suffix(".json")?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse::<u64>().ok()
 }
 
 /// Load the durable manifest from the **first replica that has it** (L0.6): a

@@ -88,34 +88,12 @@ pub fn d1_command_subject(shard_count: u32) -> SubjectFn<EventRecord> {
 /// `ack_wait` redelivery surfaces even with no new appends.
 const DEFAULT_POLL_INTERVAL_MS: u64 = 250;
 
-/// How often a parked `claim_next` proves the coordinator is still alive to a
-/// client that asked for heartbeats (noetl/ai-meta#208).
-pub const DEFAULT_HEARTBEAT: Duration = Duration::from_secs(5);
-
-/// How many consecutive heartbeats a client waits for before it calls the
-/// connection dead and redials. Three gives a ~15 s detection window with the
-/// default interval — slack enough that a busy coordinator is never mistaken for a
-/// dead one, short enough that dispatch resumes in seconds.
-pub const HEARTBEAT_MISS_FACTOR: u32 = 3;
-
-/// The heartbeat frame the coordinator sends on a parked claim. A distinct frame
-/// rather than a variant of [`ClaimResp`], so the claim response stays
-/// byte-identical on the wire and a pre-#208 client — which never asks for
-/// heartbeats and so never receives one — is unaffected.
-const HEARTBEAT_FRAME: &[u8] = b"{\"heartbeat\":true}";
-
-#[derive(Debug, Clone, Copy, Deserialize)]
-struct HeartbeatFrame {
-    heartbeat: bool,
-}
-
-/// Is this frame a coordinator heartbeat rather than a claim? Unambiguous: a
-/// [`ClaimResp`] frame has no `heartbeat` field, so it fails to decode here.
-fn is_heartbeat(body: &[u8]) -> bool {
-    serde_json::from_slice::<HeartbeatFrame>(body)
-        .map(|h| h.heartbeat)
-        .unwrap_or(false)
-}
+// The heartbeat primitives moved to the crate root in noetl/ai-meta#225, when
+// the events group-claim (:9104) and WAL fan-out (:9108) faces adopted the same
+// mechanism this face got in #208. Re-exported here so `claim::DEFAULT_HEARTBEAT`
+// and `claim::HEARTBEAT_MISS_FACTOR` keep resolving for existing callers.
+use crate::{is_heartbeat, HEARTBEAT_FRAME};
+pub use crate::{DEFAULT_HEARTBEAT, HEARTBEAT_MISS_FACTOR};
 
 /// The shared per-shard claim coordinator: one [`ShardConsumerGroup`] behind an
 /// async mutex, over the co-located writer's engine. Every worker replica claims
@@ -135,6 +113,66 @@ pub struct ClaimCoordinator<D: Dataset> {
     /// [`resume`](Self::resume): what was stored, the reopened log's tip, and
     /// what was actually used (noetl/ai-meta#208).
     resume_report: Option<ResumeReport>,
+    /// Which in-flight sort keys each CONNECTION currently owes an ack for, plus
+    /// a reverse index so an ack is O(1).
+    ///
+    /// Keyed by connection, not by member, and that distinction is the whole
+    /// point: `EhdbCommandSource` opens TWO connections under one `MemberId` —
+    /// one to claim, one to ack — so releasing "everything this member holds"
+    /// when the ack connection redials would yank records the claim connection is
+    /// legitimately working on, manufacturing duplicate work. A delivery is owed
+    /// by the connection that received it.
+    leases: Mutex<Leases>,
+}
+
+/// In-flight ownership by connection, with a reverse index.
+#[derive(Default)]
+struct Leases {
+    by_conn: std::collections::HashMap<u64, std::collections::HashSet<u64>>,
+    conn_of: std::collections::HashMap<u64, u64>,
+}
+
+impl Leases {
+    fn assign(&mut self, conn: u64, sort_key: u64) {
+        // A redelivery moves ownership: drop the previous holder's claim first,
+        // or a released-then-reassigned record would be owed by two connections.
+        if let Some(prev) = self.conn_of.insert(sort_key, conn) {
+            if prev != conn {
+                if let Some(set) = self.by_conn.get_mut(&prev) {
+                    set.remove(&sort_key);
+                }
+            }
+        }
+        self.by_conn.entry(conn).or_default().insert(sort_key);
+    }
+
+    fn settle(&mut self, sort_key: u64) {
+        if let Some(conn) = self.conn_of.remove(&sort_key) {
+            if let Some(set) = self.by_conn.get_mut(&conn) {
+                set.remove(&sort_key);
+            }
+        }
+    }
+
+    fn take_conn(&mut self, conn: u64) -> Vec<u64> {
+        let keys: Vec<u64> = self
+            .by_conn
+            .remove(&conn)
+            .map(|s| s.into_iter().collect())
+            .unwrap_or_default();
+        for k in &keys {
+            self.conn_of.remove(k);
+        }
+        keys
+    }
+}
+
+/// Monotonic connection ids, so a reconnecting member gets a fresh lease and an
+/// old connection's release can never free a record the new one now holds.
+static NEXT_CONN_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn next_conn_id() -> u64 {
+    NEXT_CONN_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 impl<D> ClaimCoordinator<D>
@@ -264,6 +302,7 @@ where
             cursor_store,
             started_at: (from_cursor, origin),
             resume_report,
+            leases: Mutex::new(Leases::default()),
         }
     }
 
@@ -293,6 +332,47 @@ where
     /// [`SubjectFilter`](crate::subject::SubjectFilter) string, e.g.
     /// `commands.shared.>`); a command outside it is never assigned here — the
     /// isolation guarantee. Members sharing a filter compete exactly-once.
+    /// [`claim_next`](Self::claim_next) for a specific CONNECTION, recording that
+    /// the connection now owes this record's ack so
+    /// [`release_conn`](Self::release_conn) can free it the moment the connection
+    /// goes away. `conn == 0` disables lease tracking, which is what the plain
+    /// `claim_next` is, so in-process callers and existing tests are unchanged.
+    pub async fn claim_next_on(
+        &self,
+        filter: &str,
+        member: MemberId,
+        conn: u64,
+    ) -> crate::group::Delivery<D::Record> {
+        let delivery = self.claim_next(filter, member).await;
+        if conn != 0 {
+            self.leases.lock().await.assign(conn, delivery.sort_key);
+        }
+        delivery
+    }
+
+    /// Release everything `conn` still owes an ack for, making each record due
+    /// for redelivery immediately rather than after the rest of its `ack_wait`.
+    ///
+    /// Called when a claim connection closes for any reason — graceful shutdown,
+    /// crash, SIGKILL, autoscale-down, a rolled pod. Without it a record assigned
+    /// to a connection that is already gone sits in `inflight` until its deadline
+    /// passes, which measured 30.1-71.3s of dead time on kind against a 0.5-0.7s
+    /// baseline. Returns how many records were released.
+    ///
+    /// Safe for a connection holding nothing, and safe to race a real ack:
+    /// `expire_now` is a no-op for a sort key no longer in flight.
+    pub async fn release_conn(&self, conn: u64) -> usize {
+        if conn == 0 {
+            return 0;
+        }
+        let keys = self.leases.lock().await.take_conn(conn);
+        if keys.is_empty() {
+            return 0;
+        }
+        let mut group = self.group.lock().await;
+        keys.into_iter().filter(|sk| group.expire_now(*sk)).count()
+    }
+
     pub async fn claim_next(
         &self,
         filter: &str,
@@ -328,6 +408,7 @@ where
     /// Ack a claimed command (commit; do not redeliver). Returns `true` if it was
     /// in flight.
     pub async fn ack(&self, sort_key: u64) -> bool {
+        self.leases.lock().await.settle(sort_key);
         self.group.lock().await.ack(sort_key)
     }
 
@@ -472,88 +553,123 @@ where
     D::Record: Serialize + DeserializeOwned + Clone + Send + 'static,
 {
     loop {
-        let (mut sock, _peer) = listener.accept().await?;
-        crate::configure_stream(&sock)?;
+        // noetl/ehdb#311 — per-connection failures must not drop the listener.
+        // This face already spawns its handshake, so it could not be killed the
+        // way the WAL fan-out face could; but an accept error and the socket
+        // setup below both still `?`d out of the loop, and a peer that vanishes
+        // between SYN and accept is a routine, per-connection event.
+        let (mut sock, _peer) = match listener.accept().await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "claim: accept failed; face stays up");
+                continue;
+            }
+        };
+        if let Err(e) = crate::configure_stream(&sock) {
+            tracing::warn!(error = %e, "claim: rejecting connection (socket setup)");
+            continue;
+        }
         let coordinator = Arc::clone(&coordinator);
         tokio::spawn(async move {
-            // One heartbeat is sent up front on the first heartbeat-requesting
-            // claim of a connection, so the client learns *immediately* that this
-            // coordinator heartbeats and can arm its read deadline for the whole
-            // connection — rather than only after its first claim happens to park
-            // long enough. Once per connection, so the per-claim hot path
-            // (noetl/ai-meta#205) pays nothing.
-            let mut liveness_announced = false;
-            loop {
-                let body = match read_frame(&mut sock).await {
-                    Ok(b) => b,
-                    Err(_) => return,
-                };
-                let req: ClaimReq = match serde_json::from_slice(&body) {
-                    Ok(r) => r,
-                    Err(_) => return,
-                };
-                match req {
-                    ClaimReq::Next {
-                        member,
-                        filter,
-                        heartbeat_ms,
-                    } => {
-                        let claim = coordinator.claim_next(&filter, member);
-                        let delivery = match heartbeat_ms.filter(|ms| *ms > 0) {
-                            None => claim.await,
-                            Some(ms) => {
-                                if !liveness_announced {
-                                    if write_frame(&mut sock, HEARTBEAT_FRAME).await.is_err() {
-                                        return;
+            // One lease per CONNECTION (see `Leases`).
+            let conn = next_conn_id();
+            // The request loop runs inside an inner async block so that EVERY one
+            // of its exit paths — read error, decode error, the write errors, the
+            // close — lands here and releases. A release reachable from only some
+            // of them would leave exactly the stall this fixes on the paths it
+            // missed.
+            let serve = async {
+                // One heartbeat is sent up front on the first heartbeat-requesting
+                // claim of a connection, so the client learns *immediately* that this
+                // coordinator heartbeats and can arm its read deadline for the whole
+                // connection — rather than only after its first claim happens to park
+                // long enough. Once per connection, so the per-claim hot path
+                // (noetl/ai-meta#205) pays nothing.
+                let mut liveness_announced = false;
+                loop {
+                    let body = match read_frame(&mut sock).await {
+                        Ok(b) => b,
+                        Err(_) => return,
+                    };
+                    let req: ClaimReq = match serde_json::from_slice(&body) {
+                        Ok(r) => r,
+                        Err(_) => return,
+                    };
+                    match req {
+                        ClaimReq::Next {
+                            member,
+                            filter,
+                            heartbeat_ms,
+                        } => {
+                            let claim = coordinator.claim_next_on(&filter, member, conn);
+                            let delivery = match heartbeat_ms.filter(|ms| *ms > 0) {
+                                None => claim.await,
+                                Some(ms) => {
+                                    if !liveness_announced {
+                                        if write_frame(&mut sock, HEARTBEAT_FRAME).await.is_err() {
+                                            return;
+                                        }
+                                        liveness_announced = true;
                                     }
-                                    liveness_announced = true;
-                                }
-                                let beat = Duration::from_millis(ms);
-                                // `&mut claim` inside the timeout: a heartbeat only
-                                // *pauses* polling the claim, it never drops it, so
-                                // no assignment can be lost to a heartbeat tick.
-                                tokio::pin!(claim);
-                                loop {
-                                    match tokio::time::timeout(beat, &mut claim).await {
-                                        Ok(delivery) => break delivery,
-                                        Err(_) => {
-                                            if write_frame(&mut sock, HEARTBEAT_FRAME)
-                                                .await
-                                                .is_err()
-                                            {
-                                                return;
+                                    let beat = Duration::from_millis(ms);
+                                    // `&mut claim` inside the timeout: a heartbeat only
+                                    // *pauses* polling the claim, it never drops it, so
+                                    // no assignment can be lost to a heartbeat tick.
+                                    tokio::pin!(claim);
+                                    loop {
+                                        match tokio::time::timeout(beat, &mut claim).await {
+                                            Ok(delivery) => break delivery,
+                                            Err(_) => {
+                                                if write_frame(&mut sock, HEARTBEAT_FRAME)
+                                                    .await
+                                                    .is_err()
+                                                {
+                                                    return;
+                                                }
                                             }
                                         }
                                     }
                                 }
+                            };
+                            let resp = ClaimResp {
+                                sort_key: delivery.sort_key,
+                                redelivered: delivery.redelivered,
+                                record: delivery.record,
+                            };
+                            let bytes = match serde_json::to_vec(&resp) {
+                                Ok(b) => b,
+                                Err(_) => return,
+                            };
+                            if write_frame(&mut sock, &bytes).await.is_err() {
+                                return;
                             }
-                        };
-                        let resp = ClaimResp {
-                            sort_key: delivery.sort_key,
-                            redelivered: delivery.redelivered,
-                            record: delivery.record,
-                        };
-                        let bytes = match serde_json::to_vec(&resp) {
-                            Ok(b) => b,
-                            Err(_) => return,
-                        };
-                        if write_frame(&mut sock, &bytes).await.is_err() {
-                            return;
                         }
-                    }
-                    ClaimReq::Ack { sort_key } => {
-                        coordinator.ack(sort_key).await;
-                        if write_frame(&mut sock, b"1").await.is_err() {
-                            return;
+                        ClaimReq::Ack { sort_key } => {
+                            coordinator.ack(sort_key).await;
+                            if write_frame(&mut sock, b"1").await.is_err() {
+                                return;
+                            }
                         }
-                    }
-                    ClaimReq::Nack { sort_key } => {
-                        coordinator.nack(sort_key).await;
-                        if write_frame(&mut sock, b"1").await.is_err() {
-                            return;
+                        ClaimReq::Nack { sort_key } => {
+                            coordinator.nack(sort_key).await;
+                            if write_frame(&mut sock, b"1").await.is_err() {
+                                return;
+                            }
                         }
                     }
                 }
+            };
+            serve.await;
+            // Always: the connection is finished, so whatever it still owes an
+            // ack for must not wait out ack_wait under a holder that is gone.
+            let released = coordinator.release_conn(conn).await;
+            if released > 0 {
+                tracing::warn!(
+                    conn,
+                    released,
+                    "claim connection closed holding unacked records; released them for \
+                     immediate redelivery instead of waiting out ack_wait"
+                );
             }
         });
     }
@@ -583,6 +699,9 @@ pub struct ClaimClient {
     /// Has this connection ever seen a heartbeat? Only then is a missed one
     /// evidence of a dead peer.
     peer_heartbeats: bool,
+    /// Has a deadline miss already demoted this connection to the hard ceiling?
+    /// A second miss at the ceiling is treated as a dead peer (noetl/ai-meta#297).
+    deadline_demoted: bool,
 }
 
 impl ClaimClient {
@@ -624,6 +743,7 @@ impl ClaimClient {
             heartbeat,
             read_deadline: heartbeat.map(|hb| hb * HEARTBEAT_MISS_FACTOR),
             peer_heartbeats: false,
+            deadline_demoted: false,
         })
     }
 
@@ -658,10 +778,31 @@ impl ClaimClient {
                             )));
                         }
                         Err(_) => {
-                            // Never heartbeated: treat the peer as heartbeat-unaware
-                            // rather than dead, and let keepalive own liveness.
-                            self.read_deadline = None;
-                            continue;
+                            // Never heartbeated. Do NOT disarm — that is an
+                            // unbounded park, and keepalive cannot see a peer
+                            // that is alive but stuck (noetl/ai-meta#297).
+                            // Demote to the hard ceiling once; a miss at the
+                            // ceiling means dead, so error and let the caller
+                            // redial.
+                            match crate::hard_read_ceiling() {
+                                Some(ceiling) if !self.deadline_demoted => {
+                                    self.deadline_demoted = true;
+                                    self.read_deadline = Some(ceiling);
+                                    continue;
+                                }
+                                Some(ceiling) => {
+                                    return Err(io_err(format!(
+                                        "claim coordinator silent for {}ms with no heartbeat; \
+                                         treating as dead (noetl/ai-meta#297)",
+                                        ceiling.as_millis()
+                                    )));
+                                }
+                                None => {
+                                    // Explicitly disabled by the operator.
+                                    self.read_deadline = None;
+                                    continue;
+                                }
+                            }
                         }
                     }
                 }

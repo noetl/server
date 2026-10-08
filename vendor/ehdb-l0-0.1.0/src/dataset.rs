@@ -47,6 +47,77 @@ pub trait Dataset: 'static {
     /// dimension). This is what lets a per-index lookup prune to one partition.
     fn read_partition(index_value: &str, shard_count: u32) -> u32;
 
+    /// The record's **idempotency key**, if the dataset has one.
+    ///
+    /// A key returned here makes an append idempotent: a record whose key the
+    /// engine has already seen is acknowledged at its **existing** position
+    /// rather than appended a second time.
+    ///
+    /// ⚠ The default is `None`, which is exactly today's behaviour — no dedupe,
+    /// every append lands. A dataset opts in by returning a key that is
+    /// **unique per logical record and stable across redeliveries**. A key that
+    /// changes between deliveries (a per-attempt id) is worse than none: it
+    /// would deduplicate nothing while implying it deduplicates everything.
+    ///
+    /// This exists because redelivery was not a no-op. Re-appending a record
+    /// mints a fresh sort key it does not need, or reuses one that no longer
+    /// advances the shard tail — and the engine's own comment on that case says
+    /// such a record "lands behind any follower cursor and is silently never
+    /// delivered". noetl/ai-meta#313 observed 11 duplicates from exactly this.
+    fn dedupe_key(_record: &Self::Record) -> Option<&str> {
+        None
+    }
+
+    /// **Key-level compaction identity** (noetl/ehdb#391). `Some(key)` declares that a
+    /// later record with the same key makes an earlier one *semantically dead*, so a merge
+    /// may drop the earlier one. `None` — the default — means no compaction, and every
+    /// record survives every merge exactly as before.
+    ///
+    /// # This is a claim about READERS, not a performance switch
+    ///
+    /// A latest-wins fold answers, for each key, *the record with the maximum sort key*. A
+    /// compacting merge keeps, for each key, the maximum-sort-key record **among its own
+    /// sources**, so every record it drops already lost that fold and the answer cannot
+    /// move. That argument holds only if **nothing reads this dataset's history**.
+    ///
+    /// ⚠⚠ Concretely, [`crate::RuntimeDataset`] (D8) must **not** opt in, even though its
+    /// `RuntimeStore` get/list paths are latest-wins folds: `RuntimeStore::watch_since`
+    /// returns the **op log** after a cursor, so compacting D8 would silently delete the
+    /// history a watcher resumes from. One history reader is enough to disqualify a
+    /// dataset.
+    ///
+    /// Likewise `D1EventLog` must never opt in — the event log is append-only and immutable
+    /// by platform rule, and replay is the source of truth.
+    ///
+    /// # Not `dedupe_key`, and not `index_key`
+    ///
+    /// [`Self::dedupe_key`] is an **append-time idempotency window**: it suppresses a
+    /// *duplicate* append. It says nothing about one record superseding another, and its
+    /// window is bounded, so it cannot be reused here.
+    ///
+    /// [`Self::index_key`] is the **partition and index dimension** — for
+    /// [`crate::VectorDataset`] that is the *collection*, while the compaction identity is
+    /// the *point id*. They are different granularities and conflating them would collapse
+    /// a whole collection to one record.
+    ///
+    /// # Tombstones
+    ///
+    /// A tombstone is the maximum-sort-key record for its key, so the rule above keeps it
+    /// and a delete cannot be resurrected. Tombstones therefore accumulate until retention
+    /// drops their part — deliberately: dropping one early is data corruption, not a missed
+    /// optimisation.
+    ///
+    /// # Merge policy interaction
+    ///
+    /// Merge is one-level: an output larger than
+    /// [`MergePolicy::small_part_max_records`](crate::MergePolicy::small_part_max_records)
+    /// is never re-merged. A compacting dataset should therefore set that bound **at or
+    /// above its expected live-set size**, or compaction stalls after the first pass with
+    /// one big part per merged run.
+    fn supersede_key(_record: &Self::Record) -> Option<&str> {
+        None
+    }
+
     /// Stamp a **writer-assigned** sort key onto a record at append time,
     /// returning the re-keyed record. The default returns it unchanged — the
     /// caller's sort key is authoritative (the intrinsic case: an op-log id, a
@@ -73,6 +144,19 @@ pub trait Dataset: 'static {
     fn assign_sort_key(record: Self::Record, _writer_seq: u64) -> Self::Record {
         record
     }
+
+    /// Stamp the commit HLC on a record at append time (M2).
+    ///
+    /// Default is a **no-op**, so a dataset with no HLC column is unaffected —
+    /// the same shape as [`assign_sort_key`](Self::assign_sort_key), which is
+    /// the established way this trait lets one dataset opt into engine
+    /// behaviour without changing the others.
+    ///
+    /// Placed on the DATASET rather than in the engine because the engine is
+    /// generic over `D` and cannot name a `D::Record` field. Stamping in the
+    /// engine would mean either a trait bound no other dataset can satisfy, or
+    /// a downcast.
+    fn stamp_commit_hlc(_record: &mut Self::Record, _hlc: u64) {}
 }
 
 /// **D1 — the event log** (`noetl.event`). Sort key = `global_sequence`;
@@ -102,6 +186,14 @@ impl Dataset for D1EventLog {
     /// (noetl-server) assigned snowflake ids that raced out of order under
     /// concurrent publish (noetl/ai-meta#203). The command's identity is carried
     /// in `execution_id` / the payload, not in this key.
+    /// D1 carries the HLC column, so it opts in.
+    fn stamp_commit_hlc(record: &mut EventRecord, hlc: u64) {
+        record.commit_hlc = Some(hlc);
+    }
+
+    fn dedupe_key(record: &EventRecord) -> Option<&str> {
+        record.event_id.as_deref()
+    }
     fn assign_sort_key(mut record: EventRecord, writer_seq: u64) -> EventRecord {
         record.global_sequence = writer_seq;
         record
@@ -128,7 +220,15 @@ const SHARD_HASH_SEED: u64 = 0;
 /// `EventLogRecordView` / `SegmentFrame::Event` fields so an L0 part is a
 /// pruneable, range-readable #254 segment.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+// ⚠ `deny_unknown_fields` was REMOVED here deliberately, and removing it is a
+// migration step in its own right.
+//
+// Records persist as `serde_json` frames on disk (`part.rs:277`). With
+// `deny_unknown_fields`, a binary that predates a new field **errors** when it
+// reads a record carrying it — so adding any column would make a rollback
+// unable to read what the newer binary wrote, on a tier that serves `primary`.
+// Tolerating unknown fields must therefore ship and be deployed BEFORE anything
+// writes one. See `event_id` below.
 pub struct EventRecord {
     /// The monotonic gapless global sequence assigned at append time (the D1
     /// sort key). Ascending within a partition (a single writer serializes
@@ -142,6 +242,45 @@ pub struct EventRecord {
     pub transaction_id: String,
     /// The opaque event payload (noetl-internal; never a secret value).
     pub payload: String,
+    /// **The idempotency key** — the producer's `event_id`, promoted out of
+    /// `payload` into a column (noetl/ai-meta#313).
+    ///
+    /// `None` for every record written before this field existed, and for any
+    /// producer that has not been updated to send it. That is not a degraded
+    /// state to be fixed at read time: a `None` record simply does not
+    /// participate in dedupe, exactly as before.
+    ///
+    /// ⚠ Why a column rather than reading it out of `payload`: the engine
+    /// dedupes at append, on the hot path, under the engine lock. Parsing an
+    /// opaque JSON string per append to find a key would put a parse in the
+    /// commit path and would silently stop working the day the payload shape
+    /// changes — the dedupe would degrade to "never matches", which is
+    /// indistinguishable from working.
+    ///
+    /// ⚠ Why `Option` + `skip_serializing_if`: a record with no `event_id`
+    /// serialises **byte-identically to today**, so a rollback can still read
+    /// everything written while the producer has not been switched on. Only
+    /// records that actually carry a key differ on disk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_id: Option<String>,
+    /// **The commit HLC** (M2) — a hybrid logical timestamp stamped by the
+    /// writer at append.
+    ///
+    /// `None` for every record written before this field existed and for every
+    /// append under `NOETL_EHDB_HLC=off`, which is the default.
+    ///
+    /// ⚠⚠ **Nothing reads this, and that is the phase's exit criterion, not a
+    /// gap.** M2 ships the clock and the stamp; a reader appearing here before
+    /// M3's closed timestamps would be a phase-ordering violation. The value is
+    /// write-only on purpose.
+    ///
+    /// ⚠ `Option` + `skip_serializing_if` is load-bearing for the same reason
+    /// it is on [`EventRecord::event_id`]: a record without an HLC serialises
+    /// **byte-identically to today**, so a rollback binary keeps reading
+    /// everything written while the flag is off. Serialising `0` instead of
+    /// skipping would break that — it is planted defect #5 in the M2 spec.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_hlc: Option<u64>,
 }
 
 impl EventRecord {
@@ -157,7 +296,17 @@ impl EventRecord {
             execution_id: execution_id.into(),
             transaction_id: transaction_id.into(),
             payload: payload.into(),
+            event_id: None,
+            commit_hlc: None,
         }
+    }
+
+    /// Attach the producer's `event_id`, making this record idempotent on
+    /// append. Builder-style so every existing `new(..)` call site keeps
+    /// compiling and keeps its current (non-deduped) behaviour.
+    pub fn with_event_id(mut self, event_id: impl Into<String>) -> Self {
+        self.event_id = Some(event_id.into());
+        self
     }
 }
 

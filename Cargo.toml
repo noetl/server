@@ -112,6 +112,28 @@ gcp_auth = "0.12"
 # the same on-disk layout. That is the exact corruption vector the paragraph
 # above is about, reached by bumping only one line.
 #
+# v0.5.0 = the north-star registry (P1-P6) + key-level compaction.
+# `RuntimeKind` + `discover(kind, now, ttl)` make D8 a service registry rather than
+# a worker table; `watch_since` gives a resumable op-log cursor; `SecretRef` is a
+# pointer that cannot hold material.  Four new state GAUGES on `L0Metrics`
+# (`manifest_parts`, `parts_local_only`, `parts_under_replicated`,
+# `dedupe_window_records`) plus `records_superseded`, all pinned at 0 and proven to
+# move.  `Dataset::supersede_key` lets a merge collapse superseded keys: a vector
+# collection went 4,608 stored records / 65.02 ms -> 500 / 7.13 ms.
+#
+# ⚠ ADDITIVE ONLY for this consumer.  `ShardLag` gained `inflight` (and derives
+# `Default`) and `L0MetricsSnapshot` gained five fields, but the server constructs
+# neither literally, so neither is a break here.
+#
+# ⚠⚠ UPGRADE ORDER IS READERS BEFORE WRITERS.  `RuntimeOp` carries
+# `#[serde(deny_unknown_fields)]`, so a pre-v0.5.0 reader REJECTS a record carrying
+# the new `kind` / `last_seen_micros` fields rather than ignoring it.  Both are
+# `#[serde(default)]`, so a v0.5.0 reader handles a pre-v0.5.0 record fine — which
+# is why the server (a reader) moves first and a writer must not get ahead of it.
+#
+# FORMAT_VERSION is still 1, so the on-disk layout gate does not refuse the
+# existing prod store.
+#
 # v0.4.5 = the chain is ordered by FOLLOWING LINKS, never by event_id
 # (noetl/ai-meta#362).  `order_by_links` never compares two event_ids, so an event
 # that commits into the MIDDLE of an id-ordered read is just a link rather than a
@@ -140,8 +162,8 @@ gcp_auth = "0.12"
 # ⚠ v0.4.1 must not be adopted: its populator could create authority out of a
 # failure. v0.4.2 lacks `populate_from_log` and coverage, so a reader built on it
 # cannot tell a truncated partition from a whole one.
-ehdb-feed = { git = "https://github.com/noetl/ehdb", tag = "v0.4.5" }
-ehdb-l0 = { git = "https://github.com/noetl/ehdb", tag = "v0.4.5" }
+ehdb-feed = { git = "https://github.com/noetl/ehdb", tag = "v0.5.0" }
+ehdb-l0 = { git = "https://github.com/noetl/ehdb", tag = "v0.5.0" }
 # Value type for the JetStream KV puts in `src/coherence.rs` (multi-replica
 # watermark/descriptor coherence, RFC #115 program-scale).  Matches the version
 # async-nats already pulls in transitively.
