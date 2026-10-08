@@ -228,6 +228,44 @@ fn engine() -> Option<&'static Arc<std::sync::Mutex<L0Engine<D1EventLog>>>> {
     EMBEDDED.get_or_init(open_embedded).as_ref()
 }
 
+/// Render the embedded engine's L0 metrics as Prometheus text, or `None` when the
+/// embedded engine is not open.
+///
+/// ⚠⚠ WHY THIS EXISTS. `ehdb-l0` carries 31 counters and gauges and this process
+/// never rendered **one** of them: measured on prod v3.124.0, `/metrics` served
+/// **zero** `ehdb_l0_*` series. The engine's own exposition existed, and nothing
+/// called it — the "recorder exists, nothing calls it" shape, one level up, in the
+/// consumer rather than the library. Four of those series are the state gauges
+/// from noetl/ai-meta#455 C6, and `ehdb_l0_parts_under_replicated` closes a real
+/// hole: a part that landed 1 of N replica copies is `is_durable()`,
+/// `on_upload_done` fires, and the age-based durability window reports it **done**.
+/// Nothing else reports a standing replication deficit.
+///
+/// ⚠ `try_lock`, never `lock`. This runs on a scrape, and the same mutex serialises
+/// every append. A scrape that blocks the write path is a liability, not evidence —
+/// the same reasoning `shadow_append` is written under. A contended scrape simply
+/// omits the block and the next one picks it up; absent-for-one-interval is the
+/// right failure for an observability surface.
+///
+/// ⚠ The state gauges are recomputed on manifest **mutations** (open/seal/merge/
+/// reclaim) because a per-append manifest walk would be O(parts) per append — the
+/// very quadratic `manifest_parts` exists to detect. A scrape is the other moment
+/// their value matters, so it refreshes them first.
+pub fn render_l0_metrics() -> Option<String> {
+    let engine = engine()?;
+    // Deliberately `try_lock`: see the note above.
+    let guard = match engine.try_lock() {
+        Ok(g) => g,
+        Err(_) => return None,
+    };
+    guard.refresh_state_gauges();
+    Some(guard.metrics().snapshot().render_prometheus(DATASET))
+}
+
+/// The dataset label every rendered series carries, so one process serving several
+/// datasets stays separable.
+const DATASET: &str = "d1_event_log";
+
 /// Append the batch that is about to become authoritative to the embedded
 /// engine, and record whether the engine accepted all of it.
 ///
