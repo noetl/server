@@ -170,17 +170,43 @@ pub async fn pool_status(State(state): State<AppState>) -> Json<PoolStatusRespon
 /// Principles 1+2, every substantive code change ships a
 /// counter/histogram alongside the implementation; this endpoint
 /// is the surface those metrics are scraped from.
+/// Compose the scrape body: the process registry's text plus the embedded L0
+/// engine's own exposition, when there is one.
+///
+/// Split out so the composition is testable without an embedded engine: the
+/// engine lives behind a process-wide `OnceLock` keyed off an env flag, which a
+/// unit test cannot set up reliably.
+pub(crate) fn compose_metrics(base: String, l0: Option<String>) -> String {
+    match l0 {
+        Some(extra) if !extra.is_empty() => {
+            let mut out = base;
+            if !out.ends_with('\n') {
+                out.push('\n');
+            }
+            out.push_str(&extra);
+            out
+        }
+        _ => base,
+    }
+}
+
 pub async fn metrics() -> Response {
     match crate::metrics::gather_text() {
-        Ok(text) => (
-            StatusCode::OK,
-            [(
-                header::CONTENT_TYPE,
-                "text/plain; version=0.0.4; charset=utf-8",
-            )],
-            text,
-        )
-            .into_response(),
+        Ok(text) => {
+            let text = compose_metrics(
+                text,
+                crate::handlers::ehdb_embedded::render_l0_metrics(),
+            );
+            (
+                StatusCode::OK,
+                [(
+                    header::CONTENT_TYPE,
+                    "text/plain; version=0.0.4; charset=utf-8",
+                )],
+                text,
+            )
+                .into_response()
+        }
         Err(e) => {
             tracing::warn!(error = %e, "Failed to gather Prometheus metrics");
             (
@@ -269,5 +295,66 @@ mod tests {
             content_type.contains("text/plain"),
             "expected text/plain, got: {content_type}"
         );
+    }
+}
+
+#[cfg(test)]
+mod l0_exposition_tests {
+    use super::compose_metrics;
+
+    #[test]
+    fn the_l0_block_is_appended_when_present() {
+        let base = "# HELP a x\na 1\n".to_string();
+        let l0 = Some("# HELP ehdb_l0_manifest_parts y\nehdb_l0_manifest_parts{dataset=\"d1_event_log\"} 0\n".to_string());
+        let out = compose_metrics(base.clone(), l0);
+        assert!(out.starts_with(&base), "the registry's own text must survive");
+        assert!(
+            out.contains("ehdb_l0_manifest_parts{dataset=\"d1_event_log\"} 0"),
+            "the L0 block must be appended: {out}"
+        );
+    }
+
+    #[test]
+    fn a_missing_or_empty_l0_block_changes_nothing() {
+        // `None` is the contended-scrape and engine-absent case. It must not
+        // corrupt the body or append a stray newline-only block.
+        let base = "a 1\n".to_string();
+        assert_eq!(compose_metrics(base.clone(), None), base);
+        assert_eq!(compose_metrics(base.clone(), Some(String::new())), base);
+    }
+
+    #[test]
+    fn a_base_without_a_trailing_newline_does_not_glue_two_series_together() {
+        // Prometheus parses line-wise; "a 1ehdb_l0_x 0" is one corrupt line and
+        // would take the whole scrape down, not just the appended block.
+        let out = compose_metrics("a 1".to_string(), Some("ehdb_l0_x 0\n".to_string()));
+        assert!(out.contains("a 1\nehdb_l0_x 0"), "lines must stay separate: {out:?}");
+    }
+
+    /// The series this process promises to expose must actually exist in the
+    /// library, by name. If ehdb renames one, this fails instead of the series
+    /// silently vanishing from prod — which is exactly how it was absent before.
+    #[test]
+    fn the_promised_state_gauges_exist_in_the_library() {
+        let names = ehdb_l0::L0MetricsSnapshot::series_names();
+        assert!(
+            names.len() >= 25,
+            "parsed only {} series names — a near-empty list would make every \
+             assertion below pass vacuously",
+            names.len()
+        );
+        for promised in [
+            "manifest_parts",
+            "parts_local_only",
+            "parts_under_replicated",
+            "dedupe_window_records",
+            "records_superseded",
+        ] {
+            assert!(
+                names.contains(&promised),
+                "ehdb-l0 no longer exports `{promised}`; prod would lose the series \
+                 silently. Known names: {names:?}"
+            );
+        }
     }
 }
