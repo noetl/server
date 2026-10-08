@@ -426,6 +426,18 @@ fn build_router(
     // real, and it should not be the thing that quietly widens an
     // unauthenticated surface. Shadow-mode today, so gating costs nothing now
     // and covers this route by construction when #303 enforcement lands.
+    // noetl/ai-meta#455 P1-P4 — the discovery surface over the D8 runtime registry.
+    //
+    // ⚠ GATED. These routes ENUMERATE service ids and contracts, and enumeration is a
+    // capability distinct from reporting on an id the caller already holds — the same
+    // reasoning that gated `ehdb_equivalence_routes` below and `ehdb_object_parity_routes`.
+    let runtime_topology_routes = Router::new()
+        .route(
+            "/api/runtime/topology",
+            get(handlers::runtime_topology::topology),
+        )
+        .route("/api/runtime/watch", get(handlers::runtime_topology::watch));
+
     let ehdb_equivalence_routes = Router::new()
         .route(
             "/api/ehdb/projection-recovery/equivalence",
@@ -901,6 +913,10 @@ fn build_router(
             "internal",
             noetl_server::auth_gate::gate,
         )))
+        .merge(runtime_topology_routes.layer(axum::middleware::from_fn_with_state(
+            "internal",
+            noetl_server::auth_gate::gate,
+        )))
         .merge(subscription_routes)
         .merge(replay_routes)
         .merge(result_store_routes)
@@ -1088,6 +1104,10 @@ async fn main() -> anyhow::Result<()> {
     // noetl/ai-meta#332 step 5 — pinned so an unrun shadow reads 0, not absent.
     noetl_server::metrics::init_embedded_shadow_series();
     noetl_server::metrics::init_chain_populate_series();
+    // noetl/ai-meta#455 — pinned so "the server never registered itself" reads as
+    // `registered` staying 0 rather than as an absent series. Before this, the
+    // registry's only evidence of not running was silence.
+    noetl_server::metrics::init_runtime_registry_series();
     // noetl/ai-meta#366 — pin the chain-certificate series so a zero reads as a
     // zero rather than as an absent family (see init_chain_cert_series).
     noetl_server::metrics::init_chain_cert_series();
@@ -1408,6 +1428,19 @@ async fn main() -> anyhow::Result<()> {
     // noetl/ai-meta#342 — the mirror-repair sweep. A no-op unless armed, so the
     // decision lives in one place (the flag), not split across a call site.
     noetl_server::handlers::ehdb_mirror_repair_sweep::spawn(state.clone());
+
+    // noetl/ai-meta#455 P1-P4 — register this instance in the D8 runtime registry and
+    // keep its lease renewed.
+    //
+    // ⚠ Before the listener binds, so an instance is discoverable from the moment it can
+    // serve rather than one heartbeat later.
+    //
+    // ⚠ Neither call can fail a start: `self_register` swallows and logs, and the
+    // heartbeat task is spawned only when the store opened. A registry that can take the
+    // server down would be a liability rather than a capability — the same posture the
+    // embedded shadow is written under.
+    noetl_server::runtime_registry::self_register();
+    noetl_server::runtime_registry::spawn_heartbeat();
 
     let app = build_router(
         state,

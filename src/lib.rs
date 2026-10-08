@@ -59,6 +59,7 @@ pub mod event_bus;
 pub mod handlers;
 pub mod metrics;
 pub mod playbook;
+pub mod runtime_registry;
 pub mod result_ext;
 pub mod sanitize;
 pub mod secrets;
