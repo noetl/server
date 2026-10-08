@@ -28,6 +28,18 @@ repository = "https://github.com/noetl/ehdb"
 name = "ehdb_core"
 path = "src/lib.rs"
 
+[[test]]
+name = "hlc"
+path = "tests/hlc.rs"
+
+[[test]]
+name = "plan"
+path = "tests/plan.rs"
+
+[[test]]
+name = "workspace_target_hygiene"
+path = "tests/workspace_target_hygiene.rs"
+
 [dependencies.arrow-schema]
 version = "53"
 features = ["serde"]

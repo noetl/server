@@ -25,17 +25,55 @@ readme = false
 license = "Apache-2.0"
 repository = "https://github.com/noetl/ehdb"
 
+[features]
+chain-cert = [
+    "dep:sha2",
+    "dep:hex",
+]
+chain-cert-asm = [
+    "chain-cert",
+    "sha2/asm",
+]
+
 [lib]
 name = "ehdb_l0"
 path = "src/lib.rs"
+
+[[example]]
+name = "durability_soak"
+path = "examples/durability_soak.rs"
 
 [[example]]
 name = "l0_selfcheck"
 path = "examples/l0_selfcheck.rs"
 
 [[test]]
+name = "age_seal"
+path = "tests/age_seal.rs"
+
+[[test]]
+name = "append_failure_paths"
+path = "tests/append_failure_paths.rs"
+
+[[test]]
 name = "blob"
 path = "tests/blob.rs"
+
+[[test]]
+name = "chain_durable_p1"
+path = "tests/chain_durable_p1.rs"
+
+[[test]]
+name = "chain_o1_prodsize"
+path = "tests/chain_o1_prodsize.rs"
+
+[[test]]
+name = "chain_populator"
+path = "tests/chain_populator.rs"
+
+[[test]]
+name = "closed_timestamp"
+path = "tests/closed_timestamp.rs"
 
 [[test]]
 name = "columnar"
@@ -46,12 +84,52 @@ name = "command_queue"
 path = "tests/command_queue.rs"
 
 [[test]]
+name = "commit_hlc_stamp"
+path = "tests/commit_hlc_stamp.rs"
+
+[[test]]
+name = "concurrency_measures"
+path = "tests/concurrency_measures.rs"
+
+[[test]]
+name = "crash_recovery"
+path = "tests/crash_recovery.rs"
+
+[[test]]
+name = "durability_window"
+path = "tests/durability_window.rs"
+
+[[test]]
+name = "event_id_idempotency"
+path = "tests/event_id_idempotency.rs"
+
+[[test]]
+name = "exec_chain"
+path = "tests/exec_chain.rs"
+
+[[test]]
 name = "feed"
 path = "tests/feed.rs"
 
 [[test]]
+name = "feed_batch_bytes"
+path = "tests/feed_batch_bytes.rs"
+
+[[test]]
+name = "feed_bounded_batch"
+path = "tests/feed_bounded_batch.rs"
+
+[[test]]
+name = "frame_format_invariants"
+path = "tests/frame_format_invariants.rs"
+
+[[test]]
 name = "generic_dataset"
 path = "tests/generic_dataset.rs"
+
+[[test]]
+name = "invariant_measures"
+path = "tests/invariant_measures.rs"
 
 [[test]]
 name = "inverted_index"
@@ -62,12 +140,48 @@ name = "kv"
 path = "tests/kv.rs"
 
 [[test]]
+name = "lifecycle_measures"
+path = "tests/lifecycle_measures.rs"
+
+[[test]]
+name = "manifest_forward_compat"
+path = "tests/manifest_forward_compat.rs"
+
+[[test]]
+name = "manifest_retention"
+path = "tests/manifest_retention.rs"
+
+[[test]]
+name = "membership"
+path = "tests/membership.rs"
+
+[[test]]
+name = "memory_measures"
+path = "tests/memory_measures.rs"
+
+[[test]]
 name = "merge"
 path = "tests/merge.rs"
 
 [[test]]
+name = "metrics_exposition"
+path = "tests/metrics_exposition.rs"
+
+[[test]]
+name = "multiregion_scaffolds"
+path = "tests/multiregion_scaffolds.rs"
+
+[[test]]
 name = "nway_replication"
 path = "tests/nway_replication.rs"
+
+[[test]]
+name = "placement"
+path = "tests/placement.rs"
+
+[[test]]
+name = "plan_type_identity"
+path = "tests/plan_type_identity.rs"
 
 [[test]]
 name = "projection"
@@ -78,8 +192,24 @@ name = "provider"
 path = "tests/provider.rs"
 
 [[test]]
+name = "read_consistency_env"
+path = "tests/read_consistency_env.rs"
+
+[[test]]
+name = "region_survival_gate"
+path = "tests/region_survival_gate.rs"
+
+[[test]]
 name = "registry"
 path = "tests/registry.rs"
+
+[[test]]
+name = "registry_discovery"
+path = "tests/registry_discovery.rs"
+
+[[test]]
+name = "replica_domain_gate"
+path = "tests/replica_domain_gate.rs"
 
 [[test]]
 name = "retention"
@@ -94,8 +224,40 @@ name = "runtime"
 path = "tests/runtime.rs"
 
 [[test]]
+name = "runtime_ttl_liveness"
+path = "tests/runtime_ttl_liveness.rs"
+
+[[test]]
+name = "state_gauges"
+path = "tests/state_gauges.rs"
+
+[[test]]
+name = "store_role"
+path = "tests/store_role.rs"
+
+[[test]]
+name = "substrate_failure_domains"
+path = "tests/substrate_failure_domains.rs"
+
+[[test]]
+name = "supersede_compaction"
+path = "tests/supersede_compaction.rs"
+
+[[test]]
+name = "survival_goal"
+path = "tests/survival_goal.rs"
+
+[[test]]
+name = "tail_latency"
+path = "tests/tail_latency.rs"
+
+[[test]]
 name = "vector"
 path = "tests/vector.rs"
+
+[[test]]
+name = "vector_recall"
+path = "tests/vector_recall.rs"
 
 [[test]]
 name = "wasm"
@@ -105,8 +267,22 @@ path = "tests/wasm.rs"
 name = "writer_assigned"
 path = "tests/writer_assigned.rs"
 
+[[bench]]
+name = "l0_engine"
+path = "benches/l0_engine.rs"
+harness = false
+
+[[bench]]
+name = "vector_query"
+path = "benches/vector_query.rs"
+harness = false
+
 [dependencies.ehdb-core]
 path = "../ehdb-core"
+
+[dependencies.hex]
+version = "0.4"
+optional = true
 
 [dependencies.serde]
 version = "1"
@@ -115,9 +291,19 @@ features = ["derive"]
 [dependencies.serde_json]
 version = "1"
 
+[dependencies.sha2]
+version = "0.10"
+optional = true
+
 [dependencies.twox-hash]
 version = "1.6"
 features = ["serialize"]
+
+[dev-dependencies]
+tempfile = "3"
+
+[dev-dependencies.criterion]
+version = "0.5"
 
 [dev-dependencies.serde_json]
 version = "1"
