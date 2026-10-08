@@ -3744,6 +3744,53 @@ pub fn init_chain_populate_series() {
     }
 }
 
+/// Runtime-registry lifecycle outcomes (noetl/ai-meta#455 P1-P4).
+///
+/// ⚠ Labels are a closed set pinned at 0 in [`init_runtime_registry_series`], so
+/// "the server never registered itself" is visible as `registered` staying **0**
+/// rather than as an absent series. That distinction is the whole point: before
+/// this, `register_kind` had zero callers and the only evidence was silence.
+pub fn runtime_registry_total() -> &'static prometheus::IntCounterVec {
+    static M: std::sync::OnceLock<prometheus::IntCounterVec> = std::sync::OnceLock::new();
+    M.get_or_init(|| {
+        let m = prometheus::IntCounterVec::new(
+            prometheus::Opts::new(
+                "noetl_runtime_registry_total",
+                "D8 runtime-registry lifecycle outcomes (register/heartbeat/expiry)",
+            ),
+            &["outcome"],
+        )
+        .expect("valid metric");
+        registry().register(Box::new(m.clone())).ok();
+        m
+    })
+}
+
+/// The closed label set.
+pub const RUNTIME_REGISTRY_OUTCOMES: [&str; 5] = [
+    "registered",
+    "register_failed",
+    "heartbeat",
+    "heartbeat_failed",
+    "reregistered",
+];
+
+/// Record one runtime-registry outcome.
+pub fn record_runtime_registry(outcome: &str) {
+    runtime_registry_total().with_label_values(&[outcome]).inc();
+}
+
+/// Pin every runtime-registry label at 0, **unconditionally**.
+///
+/// ⚠ Unconditional on purpose. A pin placed inside a config branch is not a pin:
+/// it leaves the series absent on exactly the configuration whose value someone
+/// would be reading.
+pub fn init_runtime_registry_series() {
+    for o in RUNTIME_REGISTRY_OUTCOMES {
+        runtime_registry_total().with_label_values(&[o]).inc_by(0);
+    }
+}
+
 pub fn record_embedded_shadow(outcome: &str) {
     embedded_shadow_total().with_label_values(&[outcome]).inc();
 }

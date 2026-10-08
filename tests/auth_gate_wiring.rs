@@ -119,7 +119,7 @@ fn every_privileged_router_is_gated_in_main() {
     let src = include_str!("../src/main.rs");
     // Router groups that expose credentials, keychain material, or the internal
     // control surface. Kept explicit so adding one is a deliberate act.
-    const PRIVILEGED: [&str; 17] = [
+    const PRIVILEGED: [&str; 18] = [
         "credential_routes",
         "sealed_credential_routes",
         "keychain_routes",
@@ -148,6 +148,11 @@ fn every_privileged_router_is_gated_in_main() {
         // keys under a prefix — and those keys carry tenant, project and
         // execution ids. Enumeration is a new capability, small but real.
         "ehdb_object_parity_routes",
+        // noetl/ai-meta#455 P1-P4 — serves /api/runtime/topology and /watch, which
+        // ENUMERATE live service ids and contracts. Enumeration is a capability
+        // distinct from reporting on an id the caller already holds, which is the
+        // same reason the two routers above carry the gate.
+        "runtime_topology_routes",
     ];
     let mut ungated = Vec::new();
     for name in PRIVILEGED {

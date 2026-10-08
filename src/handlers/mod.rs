@@ -20,6 +20,7 @@ pub mod dashboard;
 pub mod database;
 pub mod ehdb;
 pub mod ehdb_embedded;
+pub mod runtime_topology;
 pub mod ehdb_embedded_verify;
 pub mod ehdb_eventlog_mirror;
 pub mod ehdb_mirror_repair_sweep;
