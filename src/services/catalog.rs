@@ -106,6 +106,19 @@ impl CatalogService {
         // user at invocation.
         validate_tool_kinds(&yaml)?;
 
+        // noetl/ai-meta#455 P5 — a catalog entry names a secret by REFERENCE; the material
+        // lives in the keychain. Refuse inline material here because registration is the
+        // last point at which the answer can still be "no": the catalog is EHDB-backed and
+        // `noetl.event` is append-only, immutable and never purged, so a credential pasted
+        // into a playbook cannot be removed afterwards — and it travels into
+        // `command.issued` when the step dispatches.
+        let secret_scan = crate::services::secret_material::scan(&yaml);
+        if !secret_scan.findings.is_empty() {
+            return Err(AppError::Validation(
+                crate::services::secret_material::describe(&secret_scan),
+            ));
+        }
+
         // Get next version
         let version = queries::get_next_version(&self.pool, &path).await?;
 
