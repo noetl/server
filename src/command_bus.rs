@@ -172,6 +172,16 @@ impl EhdbCommandPublisher {
     }
 
     /// Whether any writer address is configured.
+    /// The writer address this publisher routes `execution_id` to, if configured.
+    ///
+    /// Uses the same `shard_for_execution` the dataset partitions on, so the answer is the
+    /// writer a publish for that execution actually reaches rather than a guess.
+    pub fn addr_for_execution(&self, execution_id: i64) -> Option<&str> {
+        let shard =
+            ehdb_l0::shard_for_execution(&execution_id.to_string(), self.shard_count);
+        self.addrs.get(&shard).map(|s| s.as_str())
+    }
+
     pub fn is_configured(&self) -> bool {
         !self.addrs.is_empty()
     }
