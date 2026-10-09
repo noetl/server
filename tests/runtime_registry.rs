@@ -523,3 +523,235 @@ fn the_mirror_is_a_harmless_no_op_when_the_registry_is_off() {
     assert!(reg::topology().is_none());
     assert!(reg::watch(0).is_none());
 }
+
+// ---------------------------------------------------------------------------
+// The write-rate throttle, and P4's ephemeral executions.
+// ---------------------------------------------------------------------------
+
+/// ⚠⚠ The throttle exists because of a MEASUREMENT, not a guess. With the real 7-member
+/// prod fleet the mirror appended **22.9 ops/min** for **6.7 MB/day** — 22x the
+/// ~0.3 MB/day I had estimated from one member at 60 s. The per-record size was right
+/// (203 B measured); the rate was wrong on both member count and interval. D8 cannot be
+/// compacted, because `watch_since` reads history, so the only lever is writing fewer ops.
+#[test]
+fn the_throttle_skips_a_redundant_beat_without_affecting_liveness() {
+    let (mut st, root) = store("throttle");
+    let t0 = 1_000 * SEC;
+    let ttl = 180 * SEC;
+    let floor = ttl / 3; // 60s
+
+    assert_eq!(
+        reg::upsert_throttled_in(&mut st, RuntimeKind::Worker, "wk-t", "c", t0, floor).unwrap(),
+        reg::UpsertOutcome::Registered,
+        "first call is a fresh registration"
+    );
+
+    // A beat 18s later — the real observed interval — is redundant and must be skipped.
+    assert_eq!(
+        reg::upsert_throttled_in(
+            &mut st,
+            RuntimeKind::Worker,
+            "wk-t",
+            "c",
+            t0 + 18 * SEC,
+            floor
+        )
+        .unwrap(),
+        reg::UpsertOutcome::Skipped,
+        "a beat inside the floor must not append an op"
+    );
+
+    // ⭐ And the skip costs nothing: the member is still live, because the floor is well
+    // inside the lease. A throttle that could expire a healthy member would be a bug.
+    assert_eq!(
+        reg::discover_in(&st, RuntimeKind::Worker, t0 + 18 * SEC, ttl)
+            .unwrap()
+            .len(),
+        1,
+        "skipping a beat must not affect liveness"
+    );
+
+    // Past the floor, it renews.
+    assert_eq!(
+        reg::upsert_throttled_in(
+            &mut st,
+            RuntimeKind::Worker,
+            "wk-t",
+            "c",
+            t0 + floor + SEC,
+            floor
+        )
+        .unwrap(),
+        reg::UpsertOutcome::Renewed,
+        "a beat past the floor must renew"
+    );
+    // ...and the renewal actually moved the lease, so renewing keeps it alive indefinitely.
+    assert_eq!(
+        reg::discover_in(&st, RuntimeKind::Worker, t0 + floor + ttl, ttl)
+            .unwrap()
+            .len(),
+        1,
+        "the renewal must have moved last_seen, not merely returned Renewed"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A record with no timestamp predates the field, so it is renewed rather than skipped —
+/// the one case where writing is the conservative choice, because its liveness is unknown.
+#[test]
+fn a_timestampless_record_is_renewed_rather_than_skipped() {
+    let (mut st, root) = store("throttle0");
+    let t0 = 1_000 * SEC;
+    // `register` (not `register_at`) writes the pre-P1 shape with no timestamp.
+    st.register("legacy-wk", "c").unwrap();
+    let got = st.get("legacy-wk").unwrap().expect("registered");
+    assert_eq!(
+        got.last_seen_micros, 0,
+        "precondition: this fixture must actually have no timestamp, or the test is vacuous"
+    );
+    assert_eq!(
+        reg::upsert_throttled_in(&mut st, RuntimeKind::Worker, "legacy-wk", "c", t0, 60 * SEC)
+            .unwrap(),
+        reg::UpsertOutcome::Renewed,
+        "an unknown last_seen must be renewed, never skipped"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn is_terminal_event_matches_both_spellings_prod_actually_stores() {
+    // ⚠ Both spellings. Prod stores `playbook.completed` and historically
+    // `playbook_completed`; knowing only one would leave half of all executions to expire
+    // by TTL instead of being removed promptly — a silent half-failure.
+    for t in [
+        "playbook.completed",
+        "playbook_completed",
+        "playbook.failed",
+        "playbook_failed",
+        "execution.completed",
+        "execution.failed",
+    ] {
+        assert!(reg::is_terminal_event(t), "{t} must be terminal");
+    }
+    for t in [
+        "playbook.initialized",
+        "playbook_started",
+        "command.issued",
+        "call.done",
+        "step.completed",
+        "",
+    ] {
+        assert!(
+            !reg::is_terminal_event(t),
+            "{t} must NOT be terminal — removing an execution mid-run would make a running \
+             one undiscoverable"
+        );
+    }
+}
+
+/// ⭐ P4 end to end: an execution is discoverable while it runs and gone once it finishes.
+#[test]
+fn an_execution_is_discoverable_while_running_and_removed_when_it_finishes() {
+    let (mut st, root) = store("p4");
+    let t0 = 1_000 * SEC;
+    let exec_ttl = 300 * SEC;
+
+    reg::register_in(&mut st, RuntimeKind::Execution, "exec-12345", "execution", t0).unwrap();
+    let live = reg::discover_in(&st, RuntimeKind::Execution, t0 + 5 * SEC, exec_ttl).unwrap();
+    assert_eq!(live.len(), 1, "a running execution must be discoverable");
+    assert_eq!(live[0].id(), "exec-12345");
+
+    // The terminal event's effect.
+    assert!(st.deregister("exec-12345").unwrap());
+    assert!(
+        reg::discover_in(&st, RuntimeKind::Execution, t0 + 6 * SEC, exec_ttl)
+            .unwrap()
+            .is_empty(),
+        "a finished execution must leave discovery at once, not wait out its lease"
+    );
+
+    // ⭐ The backstop: one that crashes without a terminal event still goes away.
+    reg::register_in(&mut st, RuntimeKind::Execution, "exec-crashed", "execution", t0).unwrap();
+    assert_eq!(
+        reg::discover_in(&st, RuntimeKind::Execution, t0 + 10 * SEC, exec_ttl)
+            .unwrap()
+            .len(),
+        1,
+        "still live well inside its lease"
+    );
+    assert!(
+        reg::discover_in(&st, RuntimeKind::Execution, t0 + exec_ttl + SEC, exec_ttl)
+            .unwrap()
+            .is_empty(),
+        "an execution that never emitted a terminal event must expire by lease"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn an_execution_gets_a_longer_lease_than_a_heartbeating_member() {
+    // An execution does not heartbeat, so sharing the fleet lease would drop a
+    // long-running one out of discovery while it is still running.
+    let fleet = reg::ttl_for(RuntimeKind::Worker);
+    let exec = reg::ttl_for(RuntimeKind::Execution);
+    assert_eq!(fleet, reg::ttl_micros());
+    assert_eq!(exec, reg::execution_ttl_micros());
+    assert!(
+        exec > fleet,
+        "the execution lease ({exec}) must exceed the fleet lease ({fleet}), or a \
+         long-running execution vanishes from discovery while running"
+    );
+}
+
+/// The heartbeat floor must sit strictly inside the lease, or the throttle could skip the
+/// beat that would have kept a member alive.
+#[test]
+fn the_heartbeat_floor_is_strictly_inside_the_lease() {
+    let floor = reg::heartbeat_floor_micros();
+    let ttl = reg::ttl_micros();
+    assert!(floor > 0, "a zero floor would skip nothing");
+    assert!(
+        floor * 2 < ttl,
+        "the floor ({floor}) must leave room for a missed beat inside the lease ({ttl})"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Call-site proofs. A hook nobody calls is the noetl/ai-meta#326 defect: the
+// embedded shadow lived on the materializer, which prod's scheduled traffic never
+// reaches, and sat armed and unexercised reporting the all-zero series a healthy
+// shadow reports. These assert the wiring, not just the function.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_execution_registration_is_called_from_the_execute_path() {
+    let src = include_str!("../src/handlers/execute.rs");
+    assert!(
+        src.contains("mirror_execution_started("),
+        "execute.rs must call mirror_execution_started, or a live execution is never \
+         registered and P4 is dormant"
+    );
+    // It must sit on the "started" outcome, not the duplicate branch.
+    let at = src
+        .find("mirror_execution_started(")
+        .expect("call site present");
+    let tail = &src[at..];
+    assert!(
+        tail.contains("status: \"started\""),
+        "the registration must be on the started outcome; a duplicate started nothing"
+    );
+}
+
+#[test]
+fn the_execution_deregistration_is_called_from_the_emit_chokepoint() {
+    let src = include_str!("../src/handlers/event_write.rs");
+    assert!(
+        src.contains("mirror_execution_finished("),
+        "event_write.rs must call mirror_execution_finished, or a finished execution is \
+         only ever removed by its lease lapsing"
+    );
+    assert!(
+        src.contains("is_terminal_event("),
+        "the removal must be gated on a terminal event, not fire for every row"
+    );
+}

@@ -3767,7 +3767,7 @@ pub fn runtime_registry_total() -> &'static prometheus::IntCounterVec {
 }
 
 /// The closed label set.
-pub const RUNTIME_REGISTRY_OUTCOMES: [&str; 7] = [
+pub const RUNTIME_REGISTRY_OUTCOMES: [&str; 10] = [
     "registered",
     "register_failed",
     "heartbeat",
@@ -3775,6 +3775,9 @@ pub const RUNTIME_REGISTRY_OUTCOMES: [&str; 7] = [
     "reregistered",
     "deregistered",
     "mirror_failed",
+    "heartbeat_skipped",
+    "execution_registered",
+    "execution_finished",
 ];
 
 /// Record one runtime-registry outcome.
