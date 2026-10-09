@@ -1183,6 +1183,7 @@ pub async fn archive_pass<F>(
     candidates: &[ArchiveCandidate],
     now: DateTime<Utc>,
     known_archived: &mut std::collections::HashSet<i64>,
+    known_out_of_coverage: &mut std::collections::HashSet<i64>,
     mut read_records: F,
 ) -> PassReport
 where
@@ -1226,6 +1227,21 @@ where
             rep.already_archived += 1;
             continue;
         }
+        // ⚠⚠ Same treatment, for the same reason, and its absence BLOCKED THE DRAIN on prod.
+        //
+        // An out-of-coverage execution can never become archivable: the engine holds no
+        // records for it because it predates the volume. But the check that discovers that
+        // happens AFTER `budget -= 1`, so each one cost a unit of budget — and nothing
+        // remembered the answer. On prod `out_of_coverage` hit exactly `max_per_pass=100`
+        // every pass: the budget was entirely consumed re-deciding the same 100 unarchivable
+        // executions, `archived` sat at 0, and the ~2,479 genuinely archivable executions
+        // further down the list were never reached. This is defect #514's shape reached by a
+        // different route — work repeated because its result was not retained.
+        if known_out_of_coverage.contains(id) {
+            rep.out_of_coverage += 1;
+            crate::metrics::record_ehdb_archive("out_of_coverage");
+            continue;
+        }
         // Not known: read the archive BACK to find out, which is also the idempotency
         // check — no separate bookkeeping store that could drift from the truth.
         match archive_state(store, *id).await {
@@ -1256,7 +1272,13 @@ where
             // ⚠ Out of coverage: the engine holds nothing for this execution because it
             // predates the volume. NOT an error, and NOT archivable — an empty archive
             // would later verify clean and authorise pruning events never copied.
+            //
+            // Remembered so the next pass skips it for free. The condition is monotonic: the
+            // engine only ever holds records appended since it opened, so an execution with
+            // none now will never acquire any.
             rep.out_of_coverage += 1;
+            known_out_of_coverage.insert(*id);
+            crate::metrics::record_ehdb_archive("out_of_coverage");
             continue;
         }
 
@@ -1368,6 +1390,13 @@ pub fn spawn_archive_pass(service: crate::services::execution::ExecutionService)
         // archivable list. Empty on restart, which is correct: the GETs come back for one
         // cycle and re-establish the truth from the archive itself.
         let mut known_archived: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        // ⚠ Lives across passes for the same reason `known_archived` does, and its absence
+        // was worse: an out-of-coverage execution costs budget to discover and can never
+        // become archivable, so re-deciding it every pass consumed the entire budget and
+        // the drain stopped dead. Empty on restart, which is correct — one pass re-discovers
+        // the set, and the cost is bounded by `max_per_pass` per pass rather than forever.
+        let mut known_out_of_coverage: std::collections::HashSet<i64> =
+            std::collections::HashSet::new();
         loop {
             tick.tick().await;
             let candidates = match collect_candidates(&service).await {
@@ -1383,7 +1412,8 @@ pub fn spawn_archive_pass(service: crate::services::execution::ExecutionService)
                 &candidates.candidates,
                 Utc::now(),
                 &mut known_archived,
-                |id| crate::handlers::ehdb_embedded::read_archive_records(&id.to_string()),
+                &mut known_out_of_coverage,
+                |id: i64| crate::handlers::ehdb_embedded::read_archive_records(&id.to_string()),
             )
             .await;
 
@@ -1391,11 +1421,23 @@ pub fn spawn_archive_pass(service: crate::services::execution::ExecutionService)
             // updated — the executions this process has verified durable AND indexed. It is
             // deliberately a separate pass: archival is unaffected by whether pruning is on,
             // and the floor refuses by itself while any archivable execution is unarchived.
+            // ⚠⚠ The floor's "satisfied" set is archived UNION out-of-coverage, not just
+            // archived — and the difference is the whole reason prune could not run.
+            //
+            // An out-of-coverage execution is archivable by age and will never be archived
+            // (the engine holds no records for it), so counting it as backlog means
+            // `AwaitingBacklog` forever. Treating it as satisfied is safe because the floor
+            // exists to protect parts that still hold an unarchived execution's records, and
+            // an execution with no records is in no part.
+            let satisfied: std::collections::HashSet<i64> = known_archived
+                .union(&known_out_of_coverage)
+                .copied()
+                .collect();
             let prep = prune_pass(
                 &cfg,
                 &candidates,
                 Utc::now(),
-                &known_archived,
+                &satisfied,
                 crate::handlers::ehdb_embedded::hot_footprint,
                 crate::handlers::ehdb_embedded::prune_below,
             );
@@ -1557,6 +1599,16 @@ pub fn compute_prune_floor(
     footprint: &[HotExecution],
 ) -> FloorBasis {
     // Group 2 first: a backlog blocks everything.
+    //
+    // ⚠⚠ "Archived" here must include OUT-OF-COVERAGE executions, and leaving them out made
+    // the floor permanently un-computable on prod. An out-of-coverage execution is archivable
+    // by age and will never be archived, because the engine holds no records for it — so
+    // counting it as a backlog item means `AwaitingBacklog` forever and prune can never run.
+    //
+    // It is also SAFE to treat it as satisfied, and that is the load-bearing half: the floor
+    // exists to stop a part being dropped while it still holds an unarchived execution's
+    // records. An execution the engine has no records for cannot be in any part, so no part
+    // drop can lose it. Nothing to copy, nothing to protect.
     let unarchived = scan
         .archivable
         .iter()
