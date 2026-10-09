@@ -4183,7 +4183,7 @@ pub fn ehdb_archive_total() -> &'static prometheus::IntCounterVec {
 /// they are different failures with different fixes — and both must be readable as 0 rather
 /// than absent, since "a prune was never refused" and "this build has no such reason" are
 /// not the same claim.
-pub const EHDB_ARCHIVE_OUTCOMES: [&str; 10] = [
+pub const EHDB_ARCHIVE_OUTCOMES: [&str; 11] = [
     "archived",
     "archive_failed",
     "already_archived",
@@ -4194,6 +4194,16 @@ pub const EHDB_ARCHIVE_OUTCOMES: [&str; 10] = [
     "pruned",
     "prune_refused_not_durable",
     "prune_refused_unindexed",
+    // ⚠⚠ Added 2026-10-09 because its ABSENCE hid a blocked drain for hours.
+    //
+    // An execution the engine holds no records for is "out of coverage" — it predates the
+    // volume, so there is nothing to archive. That was reported in the pass's log line and
+    // NOWHERE in /metrics, while on prod it was the number that mattered:
+    // `out_of_coverage=100` exactly equalled `max_per_pass`, so the whole budget was spent
+    // re-discovering the same unarchivable executions every pass and `archived` sat at 0.
+    // Every published gauge read healthy. A count that can block the system belongs on
+    // /metrics, not only in a log line.
+    "out_of_coverage",
 ];
 
 /// Pin every retention series at 0 **unconditionally**.
