@@ -54,7 +54,7 @@ fn cand(id: i64, status: &str, done_h: Option<i64>) -> ea::ArchiveCandidate {
 async fn a_pass_archives_indexes_and_verifies_an_expired_execution() {
     let store = FakeArchiveStore::new();
     let cands = vec![cand(1, "COMPLETED", Some(0)), cand(2, "FAILED", Some(1))];
-    let rep = ea::archive_pass(&store, &cfg_on(), &cands, t(100), |id| {
+    let rep = ea::archive_pass(&store, &cfg_on(), &cands, t(100), &mut Default::default(), |id| {
         Some(recs(10, 1_000 + id as u64 * 100))
     })
     .await;
@@ -86,11 +86,11 @@ async fn a_pass_archives_indexes_and_verifies_an_expired_execution() {
 async fn a_second_pass_is_a_no_op_and_says_so() {
     let store = FakeArchiveStore::new();
     let cands = vec![cand(5, "COMPLETED", Some(0))];
-    let first = ea::archive_pass(&store, &cfg_on(), &cands, t(100), |_| Some(recs(4, 1))).await;
+    let first = ea::archive_pass(&store, &cfg_on(), &cands, t(100), &mut Default::default(), |_| Some(recs(4, 1))).await;
     assert_eq!(first.archived, 1);
     let before = store.len();
 
-    let second = ea::archive_pass(&store, &cfg_on(), &cands, t(100), |_| Some(recs(4, 1))).await;
+    let second = ea::archive_pass(&store, &cfg_on(), &cands, t(100), &mut Default::default(), |_| Some(recs(4, 1))).await;
     assert_eq!(second.archived, 0);
     assert_eq!(second.already_archived, 1, "{}", second.describe());
     assert_eq!(store.len(), before, "a second pass must create no objects");
@@ -102,7 +102,7 @@ async fn a_second_pass_is_a_no_op_and_says_so() {
 async fn an_execution_the_hot_store_does_not_hold_is_skipped_not_archived_empty() {
     let store = FakeArchiveStore::new();
     let cands = vec![cand(7, "COMPLETED", Some(0))];
-    let rep = ea::archive_pass(&store, &cfg_on(), &cands, t(100), |_| Some(vec![])).await;
+    let rep = ea::archive_pass(&store, &cfg_on(), &cands, t(100), &mut Default::default(), |_| Some(vec![])).await;
     assert_eq!(rep.out_of_coverage, 1, "{}", rep.describe());
     assert_eq!(rep.archived, 0);
     assert!(store.is_empty(), "nothing may be written: {:?}", store.keys());
@@ -113,7 +113,7 @@ async fn an_execution_the_hot_store_does_not_hold_is_skipped_not_archived_empty(
 async fn a_closed_engine_stops_the_pass_with_a_reason() {
     let store = FakeArchiveStore::new();
     let cands = vec![cand(8, "COMPLETED", Some(0))];
-    let rep = ea::archive_pass(&store, &cfg_on(), &cands, t(100), |_| None).await;
+    let rep = ea::archive_pass(&store, &cfg_on(), &cands, t(100), &mut Default::default(), |_| None).await;
     assert!(rep.skipped.as_deref().unwrap_or("").contains("not open"), "{rep:?}");
     assert!(store.is_empty());
 }
@@ -127,7 +127,7 @@ async fn the_pass_respects_the_retention_window_and_skips_non_terminal() {
         cand(11, "COMPLETED", Some(99)),  // 1h old   -> within retention
         cand(12, "RUNNING", None),        // not terminal
     ];
-    let rep = ea::archive_pass(&store, &cfg_on(), &cands, t(100), |_| Some(recs(3, 1))).await;
+    let rep = ea::archive_pass(&store, &cfg_on(), &cands, t(100), &mut Default::default(), |_| Some(recs(3, 1))).await;
     assert_eq!(rep.examined, 3);
     assert_eq!(rep.archivable, 1, "{}", rep.describe());
     assert_eq!(rep.archived, 1);
@@ -142,7 +142,7 @@ async fn the_pass_is_a_no_op_when_the_flag_or_bucket_is_missing() {
     let store = FakeArchiveStore::new();
     let cands = vec![cand(20, "COMPLETED", Some(0))];
 
-    let off = ea::archive_pass(&store, &ea::RetentionConfig::default(), &cands, t(100), |_| {
+    let off = ea::archive_pass(&store, &ea::RetentionConfig::default(), &cands, t(100), &mut Default::default(), |_| {
         Some(recs(3, 1))
     })
     .await;
@@ -150,7 +150,7 @@ async fn the_pass_is_a_no_op_when_the_flag_or_bucket_is_missing() {
     assert!(store.is_empty());
 
     let no_bucket = ea::RetentionConfig { archive_enabled: true, ..Default::default() };
-    let nb = ea::archive_pass(&store, &no_bucket, &cands, t(100), |_| Some(recs(3, 1))).await;
+    let nb = ea::archive_pass(&store, &no_bucket, &cands, t(100), &mut Default::default(), |_| Some(recs(3, 1))).await;
     assert!(nb.skipped.as_deref().unwrap_or("").contains("NOETL_EHDB_ARCHIVE_BUCKET"), "{nb:?}");
     assert!(store.is_empty(), "a flag with no bucket must write nothing");
 }
@@ -162,7 +162,7 @@ async fn an_archive_that_does_not_verify_is_not_counted_as_success() {
     let cands = vec![cand(30, "COMPLETED", Some(0))];
     // Make the data object vanish on read, so the write "succeeds" and verification cannot.
     store.vanish(&ea::data_key(30, 1, 3));
-    let rep = ea::archive_pass(&store, &cfg_on(), &cands, t(100), |_| Some(recs(3, 1))).await;
+    let rep = ea::archive_pass(&store, &cfg_on(), &cands, t(100), &mut Default::default(), |_| Some(recs(3, 1))).await;
     assert_eq!(rep.archived, 1, "the write itself succeeded");
     assert_eq!(rep.verified, 0, "but it must NOT count as verified: {}", rep.describe());
     assert_eq!(rep.verify_failed, 1);
@@ -176,7 +176,7 @@ async fn the_pass_is_bounded_by_max_per_pass() {
     let store = FakeArchiveStore::new();
     let cands: Vec<_> = (0..50).map(|i| cand(100 + i, "COMPLETED", Some(0))).collect();
     let cfg = ea::RetentionConfig { max_per_pass: 7, ..cfg_on() };
-    let rep = ea::archive_pass(&store, &cfg, &cands, t(100), |_| Some(recs(2, 1))).await;
+    let rep = ea::archive_pass(&store, &cfg, &cands, t(100), &mut Default::default(), |_| Some(recs(2, 1))).await;
     assert_eq!(rep.archivable, 50, "all 50 are archivable");
     assert_eq!(rep.archived, 7, "but only max_per_pass are done: {}", rep.describe());
 }
@@ -199,7 +199,7 @@ fn the_prune_refusal_names_the_reason() {
 async fn a_none_event_id_round_trips_as_absent() {
     let store = FakeArchiveStore::new();
     let cands = vec![cand(40, "COMPLETED", Some(0))];
-    ea::archive_pass(&store, &cfg_on(), &cands, t(100), |_| Some(recs(4, 1))).await;
+    ea::archive_pass(&store, &cfg_on(), &cands, t(100), &mut Default::default(), |_| Some(recs(4, 1))).await;
     let (_, back) = ea::read_archived(&store, 40).await.unwrap().unwrap();
     assert_eq!(back.len(), 4);
     assert!(back.iter().any(|r| r.event_id.is_none()), "None must survive the round trip");
@@ -252,5 +252,63 @@ fn every_archive_primitive_has_a_production_caller() {
     assert!(
         src.contains("read_archive_records("),
         "the pass must source records from the embedded engine"
+    );
+}
+
+/// ⚠⚠⚠ THE BUG THIS FIX EXISTS FOR: a pass must be able to progress PAST `max_per_pass`.
+///
+/// The first version wrote `scan.archivable.iter().take(cfg.max_per_pass)`, which took the
+/// SAME first N ids every pass. Once those were archived, every later pass re-checked them,
+/// reported `archived=0 already=N`, and the backlog stopped draining at exactly N. Observed
+/// on prod: three consecutive passes of `archived=0 already=100` against 6,230 archivable.
+#[tokio::test]
+async fn consecutive_passes_drain_the_backlog_instead_of_re_checking_the_same_head() {
+    let store = FakeArchiveStore::new();
+    let cands: Vec<_> = (1..=25).map(|i| cand(i, "COMPLETED", Some(0))).collect();
+    let cfg = ea::RetentionConfig { max_per_pass: 10, ..cfg_on() };
+    let mut known = std::collections::HashSet::new();
+
+    let p1 = ea::archive_pass(&store, &cfg, &cands, t(100), &mut known, |_| Some(recs(2, 1))).await;
+    assert_eq!(p1.archived, 10, "pass 1: {}", p1.describe());
+
+    let p2 = ea::archive_pass(&store, &cfg, &cands, t(100), &mut known, |_| Some(recs(2, 1))).await;
+    assert_eq!(
+        p2.archived, 10,
+        "⚠⚠⚠ pass 2 archived {} — the backlog is NOT draining, which is the exact prod \
+         defect (archived=0 already=N forever): {}",
+        p2.archived,
+        p2.describe()
+    );
+
+    let p3 = ea::archive_pass(&store, &cfg, &cands, t(100), &mut known, |_| Some(recs(2, 1))).await;
+    assert_eq!(p3.archived, 5, "pass 3 finishes the tail: {}", p3.describe());
+
+    let p4 = ea::archive_pass(&store, &cfg, &cands, t(100), &mut known, |_| Some(recs(2, 1))).await;
+    assert_eq!(p4.archived, 0, "pass 4 has nothing left");
+    assert_eq!(p4.already_archived, 25);
+
+    // ⭐ All 25 actually in the store, by set equality — not just a count of 25.
+    for id in 1..=25 {
+        assert!(
+            ea::archive_state(&store, id).await.unwrap().is_safe_to_prune(),
+            "execution {id} was counted but is not durably archived"
+        );
+    }
+}
+
+/// ⚠ The known-archived set must be populated only AFTER verification. A set filled on
+/// write would let a later pass skip an execution whose archive never landed.
+#[tokio::test]
+async fn an_unverified_archive_is_not_remembered_as_done() {
+    let store = FakeArchiveStore::new();
+    let cands = vec![cand(90, "COMPLETED", Some(0))];
+    store.vanish(&ea::data_key(90, 1, 2));
+    let mut known = std::collections::HashSet::new();
+    let p1 = ea::archive_pass(&store, &cfg_on(), &cands, t(100), &mut known, |_| Some(recs(2, 1))).await;
+    assert_eq!(p1.verify_failed, 1);
+    assert!(
+        !known.contains(&90),
+        "an archive that did not verify must NOT be remembered as done — a later pass \
+         would skip it and the prune floor would advance past data that never landed"
     );
 }

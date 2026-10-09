@@ -1182,6 +1182,7 @@ pub async fn archive_pass<F>(
     cfg: &RetentionConfig,
     candidates: &[ArchiveCandidate],
     now: DateTime<Utc>,
+    known_archived: &mut std::collections::HashSet<i64>,
     mut read_records: F,
 ) -> PassReport
 where
@@ -1206,11 +1207,30 @@ where
     rep.examined = scan.examined;
     rep.archivable = scan.archivable.len();
 
-    for id in scan.archivable.iter().take(cfg.max_per_pass) {
-        // Already done? `archive_state` reads the archive back, so this is also the
-        // idempotency check — no separate bookkeeping store to drift from the truth.
+    // ⚠⚠ The budget bounds WORK, not candidates, and the known-archived set is skipped
+    // before it is spent.
+    //
+    // The first version wrote `scan.archivable.iter().take(cfg.max_per_pass)`, which took
+    // the SAME first 100 ids every pass. Once those were archived every later pass
+    // re-checked them, reported `archived=0 already=100`, and THE BACKLOG STOPPED DRAINING
+    // at exactly max_per_pass executions. Caught on prod by the `already` counter — the
+    // metric earned its place.
+    let mut budget = cfg.max_per_pass;
+    for id in scan.archivable.iter() {
+        if budget == 0 {
+            break;
+        }
+        // Skipped for free: no GET, no budget. This is what lets a pass reach past the
+        // first max_per_pass of a 6,230-long list.
+        if known_archived.contains(id) {
+            rep.already_archived += 1;
+            continue;
+        }
+        // Not known: read the archive BACK to find out, which is also the idempotency
+        // check — no separate bookkeeping store that could drift from the truth.
         match archive_state(store, *id).await {
             Ok(ArchiveState::SafeToPrune { .. }) => {
+                known_archived.insert(*id);
                 rep.already_archived += 1;
                 crate::metrics::record_ehdb_archive("already_archived");
                 continue;
@@ -1218,11 +1238,13 @@ where
             Ok(_) => {}
             Err(e) => {
                 tracing::warn!(execution_id = id, error = %e, "archive state unreadable");
+                budget -= 1;
                 rep.failed += 1;
                 crate::metrics::record_ehdb_archive("archive_failed");
                 continue;
             }
         }
+        budget -= 1;
 
         let Some(records) = read_records(*id) else {
             // The engine is not open at all — stop the pass rather than logging this once
@@ -1268,6 +1290,10 @@ where
         // expressible at all.
         match verify_archived(store, *id).await {
             Ok(d) if d.is_durable() => {
+                // ⚠ Recorded as known-archived ONLY after verification, never after the
+                // write. A set populated on write would let a later pass skip an execution
+                // whose archive never landed.
+                known_archived.insert(*id);
                 rep.verified += 1;
                 crate::metrics::record_ehdb_archive("verified_durable");
             }
@@ -1334,6 +1360,10 @@ pub fn spawn_archive_pass(service: crate::services::execution::ExecutionService)
     );
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(cfg.interval_secs));
+        // ⚠ Lives across passes so a pass can progress past the first max_per_pass of the
+        // archivable list. Empty on restart, which is correct: the GETs come back for one
+        // cycle and re-establish the truth from the archive itself.
+        let mut known_archived: std::collections::HashSet<i64> = std::collections::HashSet::new();
         loop {
             tick.tick().await;
             let candidates = match collect_candidates(&service).await {
@@ -1343,9 +1373,14 @@ pub fn spawn_archive_pass(service: crate::services::execution::ExecutionService)
                     continue;
                 }
             };
-            let rep = archive_pass(store.as_ref(), &cfg, &candidates, Utc::now(), |id| {
-                crate::handlers::ehdb_embedded::read_archive_records(&id.to_string())
-            })
+            let rep = archive_pass(
+                store.as_ref(),
+                &cfg,
+                &candidates,
+                Utc::now(),
+                &mut known_archived,
+                |id| crate::handlers::ehdb_embedded::read_archive_records(&id.to_string()),
+            )
             .await;
             tracing::info!(report = %rep.describe(), "archive pass complete");
         }
