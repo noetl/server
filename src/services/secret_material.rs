@@ -78,15 +78,29 @@ pub fn classify(s: &str) -> Option<Marker> {
         return None;
     }
 
+    // ⭐ Checked BEFORE the bare PEM test, not after. Requiring a PEM inside the JSON
+    // made this class unreachable when the PEM test ran first — a marker that exists and
+    // can never fire, which is the defect this codebase keeps finding one level up. The
+    // specific label is what the author needs: "a service-account key" is actionable in a
+    // way "a PEM block" is not.
+    // ⚠⚠ Both key names AND an actual PEM body. Measured against 494 real playbooks
+    // (26,081 string values): requiring only the two key names produced exactly one
+    // finding, and it was a FALSE POSITIVE that would have broken a legitimate
+    // registration — `ops/automation/agents/mcp/vertex-ai.yaml` embeds Python that READS
+    // a service-account credential (`info.get("private_key")`,
+    // `info.get("client_email")`), so the code handling the credential names both keys
+    // while containing no material at all. Any genuine service-account key JSON carries
+    // the PEM inside `private_key`, so demanding it costs no true positives and removes
+    // the whole class of credential-handling code.
+    if s.contains("\"private_key\"") && s.contains("\"client_email\"") && s.contains("-----BEGIN")
+    {
+        return Some(Marker::ServiceAccountJson);
+    }
     if s.contains("-----BEGIN") && s.contains("PRIVATE KEY") {
         return Some(Marker::PemBlock);
     }
     if s.contains("-----BEGIN CERTIFICATE") {
         return Some(Marker::PemBlock);
-    }
-    // Both keys required: `private_key` alone appears in documentation and in field lists.
-    if s.contains("\"private_key\"") && s.contains("\"client_email\"") {
-        return Some(Marker::ServiceAccountJson);
     }
     if looks_like_jwt(t) {
         return Some(Marker::Jwt);
@@ -256,13 +270,43 @@ mod tests {
             classify("-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----"),
             Some(Marker::PemBlock)
         );
-        let sa = r#"{"type":"service_account","private_key":"-x-","client_email":"a@b.iam"}"#;
+        // A realistic service-account key: the PEM lives inside `private_key`.
+        let sa = r#"{"type":"service_account","private_key":"-----BEGIN PRIVATE KEY-----\nMIIB\n-----END PRIVATE KEY-----\n","client_email":"a@b.iam"}"#;
         assert_eq!(classify(sa), Some(Marker::ServiceAccountJson));
         let jwt = format!("eyJ{}.eyJ{}.{}", "a".repeat(30), "b".repeat(30), "c".repeat(30));
         assert_eq!(classify(&jwt), Some(Marker::Jwt));
         assert_eq!(classify("AKIAIOSFODNN7EXAMPLE"), Some(Marker::ProviderToken));
+        // ⚠⚠ Reachability of the SPECIFIC class, not merely "something fired". Requiring a
+        // PEM inside the JSON put this class behind the bare-PEM test, where it could
+        // never be reached; a plain `is_some()` here would have passed on PemBlock and
+        // hidden that.
+        assert_ne!(
+            classify(sa),
+            Some(Marker::PemBlock),
+            "the service-account class is shadowed by the bare PEM test and can never fire"
+        );
         assert_eq!(classify(&format!("ghp_{}", "a".repeat(36))), Some(Marker::ProviderToken));
         assert_eq!(classify(&format!("xoxb-{}", "1".repeat(40))), Some(Marker::ProviderToken));
+    }
+
+    /// ⚠⚠ The exact false positive a real-population sweep found, kept as a regression
+    /// guard. Code that CONSUMES a service-account credential names both of its keys; it
+    /// is not material, and refusing it would have broken a legitimate registration
+    /// (`ops/automation/agents/mcp/vertex-ai.yaml`). This is the single finding out of
+    /// 26,081 string values across 494 playbooks, and it was wrong.
+    #[test]
+    fn code_that_reads_a_service_account_credential_is_not_material() {
+        let code = "info = json.loads(raw)\n\
+                    private_key = info.get(\"private_key\")\n\
+                    client_email = info.get(\"client_email\")\n\
+                    if not private_key or not client_email:\n\
+                        raise VertexMcpError(\"missing private_key or client_email\")\n";
+        assert_eq!(
+            classify(code),
+            None,
+            "credential-handling code was flagged as material; a guard that refuses the \
+             correct usage is worse than no guard"
+        );
     }
 
     /// ⚠⚠ The error must never contain the material. This is the property that makes the
