@@ -20,7 +20,7 @@ fn recs(n: usize, base_seq: u64) -> Vec<ea::ArchiveRecord> {
     (0..n)
         .map(|i| ea::ArchiveRecord {
             global_sequence: base_seq + i as u64,
-            event_id: 9_000 + i as i64,
+            event_id: Some(format!("ev-{i}")),
             event_type: if i == n - 1 {
                 "playbook.completed".into()
             } else {
@@ -86,8 +86,8 @@ async fn an_archived_execution_round_trips_by_execution_id() {
 
     // ⭐ SET EQUALITY against ground truth, not a count. A count matches when the wrong 50
     // records are stored.
-    let mut want: Vec<(u64, i64)> = records.iter().map(|r| (r.global_sequence, r.event_id)).collect();
-    let mut got: Vec<(u64, i64)> = back.iter().map(|r| (r.global_sequence, r.event_id)).collect();
+    let mut want: Vec<(u64, Option<String>)> = records.iter().map(|r| (r.global_sequence, r.event_id.clone())).collect();
+    let mut got: Vec<(u64, Option<String>)> = back.iter().map(|r| (r.global_sequence, r.event_id.clone())).collect();
     want.sort();
     got.sort();
     assert_eq!(got, want, "the archived record set must equal the input set");
@@ -319,8 +319,8 @@ async fn the_real_gcs_client_archives_and_round_trips_against_the_emulator() {
     assert_eq!(m2.data_sha256, m.data_sha256);
 
     // ⭐ Set equality against ground truth, and the denominator printed.
-    let mut want: Vec<(u64, i64)> = records.iter().map(|r| (r.global_sequence, r.event_id)).collect();
-    let mut got: Vec<(u64, i64)> = back.iter().map(|r| (r.global_sequence, r.event_id)).collect();
+    let mut want: Vec<(u64, Option<String>)> = records.iter().map(|r| (r.global_sequence, r.event_id.clone())).collect();
+    let mut got: Vec<(u64, Option<String>)> = back.iter().map(|r| (r.global_sequence, r.event_id.clone())).collect();
     want.sort();
     got.sort();
     println!("  round-tripped {} of {} records", got.len(), want.len());

@@ -22,7 +22,7 @@ fn recs(n: usize) -> Vec<ea::ArchiveRecord> {
     (0..n)
         .map(|i| ea::ArchiveRecord {
             global_sequence: 1 + i as u64,
-            event_id: 1 + i as i64,
+            event_id: Some(format!("ev-{i}")),
             event_type: "step.completed".into(),
             body: serde_json::json!({"i": i}),
         })

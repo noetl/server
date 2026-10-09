@@ -25,7 +25,7 @@ fn recs(n: usize, base: u64) -> Vec<ea::ArchiveRecord> {
     (0..n)
         .map(|i| ea::ArchiveRecord {
             global_sequence: base + i as u64,
-            event_id: 500 + i as i64,
+            event_id: Some(format!("ev-{i}")),
             event_type: "step.completed".into(),
             body: serde_json::json!({"i": i}),
         })
@@ -75,16 +75,16 @@ async fn a_pruned_execution_is_still_fully_readable_from_the_archive() {
     }
 
     // ⭐ Set equality against the pre-prune set, not a count.
-    let mut want: Vec<(u64, i64)> =
-        before_prune.iter().map(|x| (x.global_sequence, x.event_id)).collect();
-    let mut got: Vec<(u64, i64)> = r.records.iter().map(|x| (x.global_sequence, x.event_id)).collect();
+    let mut want: Vec<(u64, Option<String>)> =
+        before_prune.iter().map(|x| (x.global_sequence, x.event_id.clone())).collect();
+    let mut got: Vec<(u64, Option<String>)> = r.records.iter().map(|x| (x.global_sequence, x.event_id.clone())).collect();
     want.sort();
     got.sort();
     assert_eq!(got, want, "the archive must return exactly the pre-prune event set");
     // And byte-for-byte on the bodies, so a lossy encode would fail here.
     assert_eq!(r.records, {
         let mut s = before_prune.clone();
-        s.sort_by_key(|x| (x.global_sequence, x.event_id));
+        s.sort_by(|a, b| (a.global_sequence, &a.event_id).cmp(&(b.global_sequence, &b.event_id)));
         s
     });
 }
@@ -226,7 +226,7 @@ async fn retrieval_round_trips_by_id_and_by_date_against_the_emulator() {
         .with_ymd_and_hms(2028, 3, tag as u32, 8, 0, 0)
         .unwrap();
 
-    let mut truth: std::collections::BTreeMap<i64, Vec<(u64, i64)>> = Default::default();
+    let mut truth: std::collections::BTreeMap<i64, Vec<(u64, Option<String>)>> = Default::default();
     for k in 0..6i64 {
         let id = 900_000 + tag * 1_000 + k;
         let r = recs(20 + k as usize, 50_000 + k as u64 * 1_000);
@@ -239,7 +239,7 @@ async fn retrieval_round_trips_by_id_and_by_date_against_the_emulator() {
         ea::archive_execution_indexed(&store, &m, &r, Utc::now())
             .await
             .expect("archive+index");
-        truth.insert(id, r.iter().map(|x| (x.global_sequence, x.event_id)).collect());
+        truth.insert(id, r.iter().map(|x| (x.global_sequence, x.event_id.clone())).collect());
     }
     println!("  archived {} executions for date={day}", truth.len());
 
@@ -256,8 +256,8 @@ async fn retrieval_round_trips_by_id_and_by_date_against_the_emulator() {
             }
             other => panic!("execution {id} must be served from the archive, got {other:?}"),
         }
-        let mut got: Vec<(u64, i64)> =
-            r.records.iter().map(|x| (x.global_sequence, x.event_id)).collect();
+        let mut got: Vec<(u64, Option<String>)> =
+            r.records.iter().map(|x| (x.global_sequence, x.event_id.clone())).collect();
         let mut w = want.clone();
         got.sort();
         w.sort();

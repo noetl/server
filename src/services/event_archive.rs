@@ -353,7 +353,17 @@ use sha2::{Digest, Sha256};
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ArchiveRecord {
     pub global_sequence: u64,
-    pub event_id: i64,
+    /// The producer's event id, **as the source actually carries it**.
+    ///
+    /// ⚠⚠ `Option<String>`, not `i64`. The shadow append path builds records with
+    /// `EventRecord::new(..)`, which does not set that column, so it is `None` on **every
+    /// record the shadow wrote** — and the shadow is exactly what gets archived. An `i64`
+    /// would have forced a fabricated 0 for every record, collapsing the whole set onto
+    /// one value: the same mistake `read_embedded` documents avoiding in the comparator.
+    ///
+    /// Changed before anything was archived. The archive is append-only-forever storage,
+    /// so this was free now and would have been a migration later.
+    pub event_id: Option<String>,
     pub event_type: String,
     pub body: serde_json::Value,
 }
@@ -410,7 +420,7 @@ pub fn manifest_key(execution_id: i64) -> String {
 /// bucket, so the format is greppable with tools an operator already has.
 pub fn encode_records(records: &[ArchiveRecord]) -> Result<Vec<u8>, String> {
     let mut sorted: Vec<&ArchiveRecord> = records.iter().collect();
-    sorted.sort_by_key(|r| (r.global_sequence, r.event_id));
+    sorted.sort_by(|a, b| (a.global_sequence, &a.event_id).cmp(&(b.global_sequence, &b.event_id)));
     let mut out = Vec::new();
     for r in sorted {
         let line = serde_json::to_vec(r).map_err(|e| format!("encode record: {e}"))?;
@@ -1089,4 +1099,295 @@ pub fn open_archive_store() -> Option<std::sync::Arc<dyn ArchiveStore>> {
             None
         }
     }
+}
+
+// ===========================================================================
+// The pass driver — the piece that was missing.
+// ===========================================================================
+//
+// ⚠⚠ P1–P6 shipped the primitives (config, archive, verify, floor, prune, metrics,
+// retrieval) and NOTHING CALLED THEM. Verified with a control grep against `origin/main`:
+// `archive_execution_indexed`, `archive_execution`, `verify_archived`, `archive_state`,
+// `export_floor` and `export_scan` had zero callers outside their own module, and there was
+// no spawn in `main.rs`. So `NOETL_EHDB_ARCHIVE_ENABLED=true` would have archived nothing
+// while every flag and metric read exactly as a working deployment does.
+//
+// That is the "built ahead of its consumers" pattern this program keeps finding in other
+// code, committed here across four PRs by the same author who was writing the issue
+// comments about it. The driver below is the consumer.
+
+/// One execution the pass may archive.
+///
+/// ⚠ A struct rather than a tuple: clippy flagged the 4-tuple as "very complex", and it was
+/// right for a better reason than lint — the first draft of the pass re-found the same
+/// candidate twice with `.iter().find(..)` to pull fields back out of positions, which is
+/// exactly the fragility a named type removes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchiveCandidate {
+    pub execution_id: i64,
+    pub status: String,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub started_at: DateTime<Utc>,
+}
+
+/// What one pass did, with the population it looked at.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct PassReport {
+    pub examined: usize,
+    pub archivable: usize,
+    pub already_archived: usize,
+    pub archived: usize,
+    pub out_of_coverage: usize,
+    pub failed: usize,
+    pub verified: usize,
+    pub verify_failed: usize,
+    /// Set when the pass did not run, with the reason.
+    pub skipped: Option<String>,
+}
+
+impl PassReport {
+    pub fn describe(&self) -> String {
+        if let Some(why) = &self.skipped {
+            return format!("skipped: {why}");
+        }
+        format!(
+            "examined={} archivable={} archived={} already={} out_of_coverage={} \
+             verified={} verify_failed={} failed={}",
+            self.examined,
+            self.archivable,
+            self.archived,
+            self.already_archived,
+            self.out_of_coverage,
+            self.verified,
+            self.verify_failed,
+            self.failed
+        )
+    }
+}
+
+/// One archive pass.
+///
+/// `candidates` is `(execution_id, status, completed_at, started_at)` — supplied by the
+/// caller so this is testable without a database.
+/// `read_records` sources the records; `None` means the hot store has nothing for that
+/// execution (out of coverage), which is **skipped, never archived as empty**.
+///
+/// ⚠⚠ This pass **never prunes**. Pruning needs the per-execution minimum-sequence
+/// footprint of the whole hot store to compute a safe floor, and there is no cheap source
+/// for that yet — see [`prune_readiness_note`]. Archive-only is the correct first
+/// increment: it is additive, and the prune cannot be safe before the archive is verified
+/// anyway.
+pub async fn archive_pass<F>(
+    store: &dyn ArchiveStore,
+    cfg: &RetentionConfig,
+    candidates: &[ArchiveCandidate],
+    now: DateTime<Utc>,
+    mut read_records: F,
+) -> PassReport
+where
+    F: FnMut(i64) -> Option<Vec<ArchiveRecord>>,
+{
+    let mut rep = PassReport::default();
+
+    let readiness = cfg.archive_readiness();
+    if !readiness.is_ready() {
+        rep.skipped = Some(readiness.reason());
+        return rep;
+    }
+
+    let retention = cfg.retention();
+    let mut scan = ArchivableScan::default();
+    let rows: Vec<(i64, String, Option<DateTime<Utc>>)> = candidates
+        .iter()
+        .map(|c| (c.execution_id, c.status.clone(), c.completed_at))
+        .collect();
+    classify_into(&mut scan, &rows, now, retention);
+    export_scan(&scan);
+    rep.examined = scan.examined;
+    rep.archivable = scan.archivable.len();
+
+    for id in scan.archivable.iter().take(cfg.max_per_pass) {
+        // Already done? `archive_state` reads the archive back, so this is also the
+        // idempotency check — no separate bookkeeping store to drift from the truth.
+        match archive_state(store, *id).await {
+            Ok(ArchiveState::SafeToPrune { .. }) => {
+                rep.already_archived += 1;
+                crate::metrics::record_ehdb_archive("already_archived");
+                continue;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(execution_id = id, error = %e, "archive state unreadable");
+                rep.failed += 1;
+                crate::metrics::record_ehdb_archive("archive_failed");
+                continue;
+            }
+        }
+
+        let Some(records) = read_records(*id) else {
+            // The engine is not open at all — stop the pass rather than logging this once
+            // per candidate.
+            rep.skipped = Some("the embedded engine is not open".into());
+            return rep;
+        };
+        if records.is_empty() {
+            // ⚠ Out of coverage: the engine holds nothing for this execution because it
+            // predates the volume. NOT an error, and NOT archivable — an empty archive
+            // would later verify clean and authorise pruning events never copied.
+            rep.out_of_coverage += 1;
+            continue;
+        }
+
+        let c = candidates
+            .iter()
+            .find(|c| c.execution_id == *id)
+            .expect("the candidate the scan selected is in the input");
+        let meta = ExecutionMeta {
+            execution_id: c.execution_id,
+            status: c.status.clone(),
+            started_at: c.started_at,
+            completed_at: c.completed_at,
+        };
+
+        match archive_execution_indexed(store, &meta, &records, now).await {
+            Ok(_) => {
+                rep.archived += 1;
+                crate::metrics::record_ehdb_archive("archived");
+                crate::metrics::record_ehdb_archive("indexed");
+            }
+            Err(e) => {
+                tracing::warn!(execution_id = id, error = %e, "archive failed");
+                rep.failed += 1;
+                crate::metrics::record_ehdb_archive("archive_failed");
+                continue;
+            }
+        }
+
+        // ⭐ Verify by reading back, in the same pass. "Uploaded" and "verified durable"
+        // must never be the same state — that distinction is what makes a later prune
+        // expressible at all.
+        match verify_archived(store, *id).await {
+            Ok(d) if d.is_durable() => {
+                rep.verified += 1;
+                crate::metrics::record_ehdb_archive("verified_durable");
+            }
+            Ok(d) => {
+                tracing::warn!(execution_id = id, reason = %d.reason(),
+                    "archive wrote but did NOT verify durable");
+                rep.verify_failed += 1;
+                crate::metrics::record_ehdb_archive("verify_failed");
+            }
+            Err(e) => {
+                tracing::warn!(execution_id = id, error = %e, "verification errored");
+                rep.verify_failed += 1;
+                crate::metrics::record_ehdb_archive("verify_failed");
+            }
+        }
+    }
+    rep
+}
+
+/// Why pruning is not yet performed even when `NOETL_EHDB_PRUNE_ENABLED=true`.
+///
+/// ⚠⚠ Returned and **logged loudly** rather than silently no-opping. An operator who sets
+/// the flag and sees nothing happen must be told why — a flag that appears to work while
+/// doing nothing is the defect this whole program keeps finding.
+pub fn prune_readiness_note() -> &'static str {
+    "pruning is NOT implemented in the pass yet: a safe floor needs the per-execution \
+     minimum-sequence footprint of the entire hot store, and there is no cheap source for \
+     it (PartMeta carries a bloom, which cannot enumerate). Archiving continues; nothing \
+     is deleted. See noetl/ai-meta#459."
+}
+
+/// Spawn the periodic archive pass.
+///
+/// ⚠ A no-op when archiving is not configured, and it says so **once** rather than
+/// spinning a loop that logs every interval.
+pub fn spawn_archive_pass(service: crate::services::execution::ExecutionService) {
+    let cfg = match RetentionConfig::from_env() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(error = %e, "retention config invalid; the archive pass will not run");
+            return;
+        }
+    };
+    let readiness = cfg.archive_readiness();
+    if !readiness.is_ready() {
+        tracing::info!(reason = %readiness.reason(), "archive pass not started");
+        return;
+    }
+    let Some(store) = open_archive_store() else {
+        tracing::warn!("archive pass not started: the store could not be opened");
+        return;
+    };
+    if cfg.prune_enabled {
+        // ⚠⚠ Loud, not silent. An operator who set the flag must learn that nothing will
+        // be deleted from the log rather than from the absence of reclaimed bytes.
+        tracing::warn!(note = prune_readiness_note(), "PRUNE_ENABLED is set but pruning is not performed");
+    }
+    tracing::info!(
+        retention_hours = cfg.retention_hours,
+        interval_secs = cfg.interval_secs,
+        max_per_pass = cfg.max_per_pass,
+        store = %store.describe(),
+        "archive pass starting (archive-only; nothing is deleted)"
+    );
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(cfg.interval_secs));
+        loop {
+            tick.tick().await;
+            let candidates = match collect_candidates(&service).await {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(error = %e, "archive pass could not list executions");
+                    continue;
+                }
+            };
+            let rep = archive_pass(store.as_ref(), &cfg, &candidates, Utc::now(), |id| {
+                crate::handlers::ehdb_embedded::read_archive_records(&id.to_string())
+            })
+            .await;
+            tracing::info!(report = %rep.describe(), "archive pass complete");
+        }
+    });
+}
+
+/// Page the executions listing into pass candidates.
+///
+/// ⚠ Pages on `offset`. `GET /api/executions` caps `limit` at 100 and says so in
+/// `x-noetl-limit-applied`; one call returned 100 where paging returned **6,467**, so a
+/// single call would silently examine the newest page only — which is the page least
+/// likely to contain anything archivable.
+pub async fn collect_candidates(
+    service: &crate::services::execution::ExecutionService,
+) -> Result<Vec<ArchiveCandidate>, String> {
+    let mut out = Vec::new();
+    let mut offset = 0i32;
+    // Bounded so a pathological listing cannot spin the pass forever.
+    const MAX_PAGES: usize = 200;
+    for _ in 0..MAX_PAGES {
+        let filter = crate::services::execution::ExecutionFilter {
+            limit: Some(100),
+            offset: Some(offset),
+            ..Default::default()
+        };
+        let page = service.list(&filter).await.map_err(|e| e.to_string())?;
+        if page.is_empty() {
+            break;
+        }
+        let n = page.len();
+        for e in page {
+            out.push(ArchiveCandidate {
+                execution_id: e.execution_id,
+                status: e.status,
+                completed_at: e.completed_at,
+                started_at: e.started_at,
+            });
+        }
+        offset += n as i32;
+        if n < 100 {
+            break;
+        }
+    }
+    Ok(out)
 }
