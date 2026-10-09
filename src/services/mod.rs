@@ -8,6 +8,7 @@ pub mod cell_registry;
 pub mod certified_fold;
 pub mod credential;
 pub mod event;
+pub mod event_archive;
 pub mod execution;
 pub mod internal;
 pub mod keychain;
