@@ -97,30 +97,7 @@ impl RetentionConfig {
         let mut c = Self::default();
 
         if let Some(raw) = present(RETENTION_VAR) {
-            let hours: u64 = raw.parse().map_err(|_| {
-                format!(
-                    "{RETENTION_VAR}={raw:?} is not a whole number of hours. \
-                     Default {DEFAULT_RETENTION_HOURS}; 24 is supported."
-                )
-            })?;
-            if hours == 0 {
-                // ⚠⚠ Zero is refused, not clamped. "Retain nothing" would archive and prune
-                // an execution the instant it completed, which is indistinguishable from a
-                // misconfiguration and is never what an operator means.
-                return Err(format!(
-                    "{RETENTION_VAR}=0 would retain nothing and prune executions as they \
-                     complete. Set a positive number of hours (default \
-                     {DEFAULT_RETENTION_HOURS})."
-                ));
-            }
-            if hours > MAX_RETENTION_HOURS {
-                return Err(format!(
-                    "{RETENTION_VAR}={hours} exceeds the {MAX_RETENTION_HOURS}h ceiling; \
-                     a value this large is almost always a typo and would silently never \
-                     archive."
-                ));
-            }
-            c.retention_hours = hours;
+            c.retention_hours = parse_retention_hours(&raw)?;
         }
 
         c.archive_enabled = flag(ARCHIVE_ENABLED_VAR)?;
@@ -297,6 +274,50 @@ pub fn classify_into(
     }
 }
 
+/// Parse the retention window.
+///
+/// Public and pure **so the rejection paths are testable without mutating process env** —
+/// `cargo test` does not serialise tests, and these are the branches that decide whether
+/// data gets deleted, so they are the last place to settle for a decorative assertion.
+pub fn parse_retention_hours(raw: &str) -> Result<u64, String> {
+    let hours: u64 = raw.trim().parse().map_err(|_| {
+        format!(
+            "{RETENTION_VAR}={raw:?} is not a whole number of hours. \
+             Default {DEFAULT_RETENTION_HOURS}; 24 is supported."
+        )
+    })?;
+    if hours == 0 {
+        // ⚠⚠ Zero is refused, not clamped. "Retain nothing" would archive and prune an
+        // execution the instant it completed — indistinguishable from a misconfiguration,
+        // and never what an operator means.
+        return Err(format!(
+            "{RETENTION_VAR}=0 would retain nothing and prune executions as they complete. \
+             Set a positive number of hours (default {DEFAULT_RETENTION_HOURS})."
+        ));
+    }
+    if hours > MAX_RETENTION_HOURS {
+        return Err(format!(
+            "{RETENTION_VAR}={hours} exceeds the {MAX_RETENTION_HOURS}h ceiling; a value \
+             this large is almost always a typo and would silently never archive."
+        ));
+    }
+    Ok(hours)
+}
+
+/// Parse a boolean flag value. Public and pure for the same reason as
+/// [`parse_retention_hours`].
+pub fn parse_flag(var: &str, raw: &str) -> Result<bool, String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => Err(format!(
+            "{var}={raw:?} is not a boolean (use true/false, 1/0, yes/no, on/off). Refused \
+             rather than read as false, because a typo in a data-deleting flag must not \
+             look like 'off'."
+        )),
+    }
+}
+
 fn present(var: &str) -> Option<String> {
     match std::env::var(var) {
         Ok(v) if !v.trim().is_empty() => Some(v.trim().to_string()),
@@ -313,14 +334,6 @@ fn present(var: &str) -> Option<String> {
 fn flag(var: &str) -> Result<bool, String> {
     match present(var) {
         None => Ok(false),
-        Some(raw) => match raw.to_ascii_lowercase().as_str() {
-            "1" | "true" | "yes" | "on" => Ok(true),
-            "0" | "false" | "no" | "off" => Ok(false),
-            _ => Err(format!(
-                "{var}={raw:?} is not a boolean (use true/false, 1/0, yes/no, on/off). \
-                 Refused rather than read as false, because a typo in a data-deleting flag \
-                 must not look like 'off'."
-            )),
-        },
+        Some(raw) => parse_flag(var, &raw),
     }
 }

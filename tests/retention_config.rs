@@ -174,19 +174,57 @@ fn the_scan_accounts_for_every_row_it_examined() {
     assert_eq!(scan.accounted(), 10);
 }
 
-/// ⚠ A 0 window is refused rather than clamped, and an unparseable flag is an error rather
-/// than a silent false — a typo in a data-deleting flag must not look like "off".
+/// ⚠⚠ The rejection paths, driven through the REAL parsers. These are the branches that
+/// decide whether data gets deleted, so they are the last place to accept a decorative
+/// assertion — the first version of this test asserted
+/// `MAX_RETENTION_HOURS > DEFAULT_RETENTION_HOURS`, which clippy correctly called out as a
+/// constant that can never fail at runtime.
 #[test]
-fn the_config_rejects_values_that_would_silently_delete_or_never_run() {
-    // Driven through the public messages rather than the env, for the race reason above.
-    let c = ea::RetentionConfig {
-        retention_hours: ea::DEFAULT_RETENTION_HOURS,
-        ..Default::default()
-    };
-    assert_eq!(c.retention(), Duration::hours(48));
-    // The ceiling exists and is sane relative to the default.
-    assert!(ea::MAX_RETENTION_HOURS > ea::DEFAULT_RETENTION_HOURS);
-    assert_eq!(ea::MAX_RETENTION_HOURS, 24 * 365);
+fn a_zero_window_and_a_typo_are_refused_not_silently_accepted() {
+    // 0 is refused, not clamped: it would archive and prune an execution as it completed.
+    let e = ea::parse_retention_hours("0").unwrap_err();
+    assert!(e.contains("retain nothing"), "{e}");
+    assert!(e.contains("NOETL_EHDB_RETENTION_HOURS"), "must name the var: {e}");
+
+    // Garbage is an error, not a fallback to the default.
+    for bad in ["", " ", "forty-eight", "48h", "-1", "4.8", "0x30"] {
+        assert!(
+            ea::parse_retention_hours(bad).is_err(),
+            "{bad:?} must be refused rather than read as the default"
+        );
+    }
+    // A fat-fingered extra digit must not silently mean "never archive".
+    assert!(ea::parse_retention_hours("480000").is_err());
+
+    // Positive control: the parser DOES accept the real values, so the refusals above are
+    // measuring the guards and not a function that rejects everything.
+    assert_eq!(ea::parse_retention_hours("48").unwrap(), 48);
+    assert_eq!(ea::parse_retention_hours("24").unwrap(), 24);
+    assert_eq!(ea::parse_retention_hours(" 72 ").unwrap(), 72);
+}
+
+/// ⚠⚠ A typo in a data-deleting flag must not look like "off".
+#[test]
+fn an_unrecognised_flag_value_is_an_error_not_a_silent_false() {
+    for bad in ["treu", "TRUE!", "enabled", "2", "", "y", "t"] {
+        assert!(
+            ea::parse_flag("NOETL_EHDB_PRUNE_ENABLED", bad).is_err(),
+            "{bad:?} must be refused, not read as false"
+        );
+    }
+    // Accepted forms, case- and space-insensitive — the gateway's NOETL_AUTH_SYNC takes
+    // only exactly "true"/"1", so "TRUE" silently means false there; a value copied
+    // between components changing meaning is a documented trap worth not repeating.
+    for (v, want) in [
+        ("true", true), ("TRUE", true), (" On ", true), ("yes", true), ("1", true),
+        ("false", false), ("FALSE", false), ("off", false), ("no", false), ("0", false),
+    ] {
+        assert_eq!(
+            ea::parse_flag("X", v).unwrap(),
+            want,
+            "{v:?} should parse to {want}"
+        );
+    }
 }
 
 /// Every `Readiness` variant must produce an actionable, distinct message. Three identical
