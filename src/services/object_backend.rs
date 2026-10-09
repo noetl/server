@@ -334,10 +334,44 @@ impl ObjectBackend {
 }
 
 impl GcsBackend {
+    /// Build a backend pointed at an explicit **non-Google** endpoint with no credential —
+    /// the fake-gcs-server emulator, in tests and on kind.
+    ///
+    /// ⚠⚠ Refuses a `googleapis.com` endpoint. A constructor that silently produced an
+    /// unauthenticated client for *real* GCS would turn a test helper into a footgun: every
+    /// request would 401, and the first guess would be the credential rather than the
+    /// constructor. `from_env` resolves auth from the endpoint for exactly this reason
+    /// (`GcsAuth::from_env`), and this keeps that invariant when the endpoint is explicit.
+    pub fn open_unauthenticated(endpoint: &str, bucket: &str) -> Result<Self, String> {
+        let endpoint = endpoint.trim().trim_end_matches('/').to_string();
+        if endpoint.is_empty() {
+            return Err("GcsBackend::open_unauthenticated: endpoint is empty".into());
+        }
+        if bucket.trim().is_empty() {
+            return Err("GcsBackend::open_unauthenticated: bucket is empty".into());
+        }
+        if is_real_gcs(&endpoint) {
+            return Err(format!(
+                "GcsBackend::open_unauthenticated refuses {endpoint:?}: it is a real GCS host,                  and an unauthenticated client there fails every request. Use                  ObjectBackend::from_env (which resolves ADC/Workload Identity) instead."
+            ));
+        }
+        Ok(Self {
+            client: reqwest::Client::new(),
+            endpoint,
+            bucket: bucket.trim().to_string(),
+            auth: GcsAuth::None,
+        })
+    }
+
+    /// The bucket this backend writes to.
+    pub fn bucket(&self) -> &str {
+        &self.bucket
+    }
+
     /// Upload via the GCS JSON API `uploadType=media` (the object name rides as a
     /// query param, so `reqwest` URL-encodes it). Works against real GCS and the
     /// fake-gcs-server emulator alike.
-    async fn put(&self, key: &str, media_type: &str, bytes: &[u8]) -> AppResult<()> {
+    pub(crate) async fn put(&self, key: &str, media_type: &str, bytes: &[u8]) -> AppResult<()> {
         let url = format!("{}/upload/storage/v1/b/{}/o", self.endpoint, self.bucket);
         let mut req = self
             .client
@@ -367,7 +401,7 @@ impl GcsBackend {
     /// Download via the GCS JSON API `alt=media`. The object name is a path
     /// segment, so it is percent-encoded (slashes become `%2F`). Returns `None`
     /// on 404 (so the resolver falls back fail-safe), errors on other non-2xx.
-    async fn get(&self, key: &str) -> AppResult<Option<ObjectRow>> {
+    pub(crate) async fn get(&self, key: &str) -> AppResult<Option<ObjectRow>> {
         let url = format!(
             "{}/storage/v1/b/{}/o/{}",
             self.endpoint,
@@ -418,7 +452,7 @@ impl GcsBackend {
     /// keys are collected or the listing is exhausted. The `prefix` rides as a
     /// query param (the client URL-encodes it). Works against real GCS and the
     /// fake-gcs-server emulator alike.
-    async fn list(&self, prefix: &str, limit: usize) -> AppResult<Vec<String>> {
+    pub(crate) async fn list(&self, prefix: &str, limit: usize) -> AppResult<Vec<String>> {
         let url = format!("{}/storage/v1/b/{}/o", self.endpoint, self.bucket);
         let mut keys: Vec<String> = Vec::new();
         let mut page_token: Option<String> = None;
@@ -472,7 +506,7 @@ impl GcsBackend {
     /// Delete the object at `key` via the GCS JSON API
     /// (`DELETE …/o/<percent-encoded-key>`). Idempotent: a 404 (already gone) is
     /// `Ok(false)`; a 2xx is `Ok(true)`; other non-2xx errors.
-    async fn delete(&self, key: &str) -> AppResult<bool> {
+    pub(crate) async fn delete(&self, key: &str) -> AppResult<bool> {
         let url = format!(
             "{}/storage/v1/b/{}/o/{}",
             self.endpoint,
