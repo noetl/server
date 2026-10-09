@@ -129,18 +129,16 @@ fn a_cold_load_from_an_untouched_bucket_recovers_nothing() {
     let cold_root = unique_dir("cold-empty");
     let empty = gcs("ehdb-empty", &format!("never-written-{}", std::process::id()));
 
-    match L0EventLogEngine::cold_load(cfg(&cold_root), empty) {
-        // Either outcome is correct — what must NOT happen is records appearing.
-        Ok(engine) => {
-            let recovered = engine.replay_all().unwrap_or_default();
-            assert!(
-                recovered.is_empty(),
-                "a cold-load from an untouched prefix returned {} records; the positive test \
-                 is then not evidence that anything crossed to GCS",
-                recovered.len()
-            );
-        }
-        Err(_) => {}
+    // Either outcome is correct — a cold-load against an untouched prefix may refuse
+    // outright. What must NOT happen is records appearing.
+    if let Ok(engine) = L0EventLogEngine::cold_load(cfg(&cold_root), empty) {
+        let recovered = engine.replay_all().unwrap_or_default();
+        assert!(
+            recovered.is_empty(),
+            "a cold-load from an untouched prefix returned {} records; the positive test is \
+             then not evidence that anything crossed to GCS",
+            recovered.len()
+        );
     }
     let _ = std::fs::remove_dir_all(&cold_root);
 }
