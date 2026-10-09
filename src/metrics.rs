@@ -3906,7 +3906,12 @@ pub fn init_replica_reality_series() {
     // `noetl_server_build_info` exists to disambiguate: the running version either has this
     // metric or it does not. The attempt COUNTER below is what makes absence readable at
     // zero, because a counter can be pinned without inventing data.
-    for outcome in ["ok", "failed"] {
+    // ⚠ Every known outcome, including `already_present` — a pinned set that omits one
+    // value reintroduces the absent-series bug on exactly that value, while the rest read 0
+    // and the set looks complete. `already_present` is the idempotent-reupload case from
+    // `GcsBackend::put_if_absent`, and it is the one an operator would read to tell
+    // "replication is re-sending work" from "replication is not running".
+    for outcome in ["ok", "failed", "already_present"] {
         for backend in ["gcs", "postgres"] {
             object_store_put_total().with_label_values(&[backend, outcome]).inc_by(0);
         }

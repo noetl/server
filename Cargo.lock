@@ -1387,6 +1387,7 @@ dependencies = [
  "chrono",
  "ctor",
  "dotenvy",
+ "ehdb-core",
  "ehdb-feed",
  "ehdb-l0",
  "envy",
