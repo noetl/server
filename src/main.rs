@@ -436,7 +436,19 @@ fn build_router(
             "/api/runtime/topology",
             get(handlers::runtime_topology::topology),
         )
-        .route("/api/runtime/watch", get(handlers::runtime_topology::watch));
+        .route("/api/runtime/watch", get(handlers::runtime_topology::watch))
+        // How a worker / gateway / EHDB instance joins. Per
+        // agents/rules/data-access-boundary.md, `noetl.runtime` is server-owned, so a
+        // member registers through this API rather than opening its own D8 store — and a
+        // member writing its own store would be invisible to the topology above anyway.
+        .route(
+            "/api/runtime/register",
+            post(handlers::runtime_topology::register),
+        )
+        .route(
+            "/api/runtime/deregister",
+            post(handlers::runtime_topology::deregister),
+        );
 
     let ehdb_equivalence_routes = Router::new()
         .route(

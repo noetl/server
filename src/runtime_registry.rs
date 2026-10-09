@@ -217,6 +217,75 @@ pub fn topology_in(store: &RuntimeStore, now: u64, ttl: u64) -> Result<Topology,
     })
 }
 
+/// Parse a kind name from an API caller.
+///
+/// ⚠ Rejects an unknown name rather than defaulting to `Worker`. `RuntimeKind`'s `Default`
+/// IS `Worker` — for a good reason, since every pre-P2 record was one — but silently
+/// coercing a caller's typo into `Worker` would file a gateway under the wrong role and make
+/// `discover(Gateway)` wrong in a way nothing reports.
+pub fn parse_kind(name: &str) -> Option<RuntimeKind> {
+    match name.to_ascii_lowercase().as_str() {
+        "server" => Some(RuntimeKind::Server),
+        "gateway" => Some(RuntimeKind::Gateway),
+        "ehdb" => Some(RuntimeKind::Ehdb),
+        "worker" => Some(RuntimeKind::Worker),
+        "playbook" => Some(RuntimeKind::Playbook),
+        "execution" => Some(RuntimeKind::Execution),
+        _ => None,
+    }
+}
+
+/// Register, or renew if already present — the call a fleet member makes on a timer.
+///
+/// Returns `true` when this was a fresh registration and `false` when it renewed an
+/// existing lease, so a caller (and a test) can tell the two apart.
+///
+/// ⚠ Upsert rather than two endpoints a client must sequence. A client that has to call
+/// `register` once and `heartbeat` thereafter has to remember which it has done across its
+/// own restarts, and gets it wrong exactly when a pod is replaced. One idempotent call on a
+/// timer has no such state.
+pub fn upsert_in(
+    store: &mut RuntimeStore,
+    kind: RuntimeKind,
+    id: &str,
+    contract: &str,
+    now: u64,
+) -> Result<bool, String> {
+    // Renew first: a heartbeat preserves the kind and the contract already recorded, and
+    // shows up as a `Heartbeat` in `watch_since` rather than a spurious re-arrival.
+    if heartbeat_in(store, id, now)? {
+        return Ok(false);
+    }
+    register_in(store, kind, id, contract, now)?;
+    Ok(true)
+}
+
+/// Register or renew a fleet member in the process-wide store.
+pub fn upsert(kind: RuntimeKind, id: &str, contract: &str) -> Result<bool, String> {
+    let store = store().ok_or_else(|| "runtime registry unavailable".to_string())?;
+    let mut guard = match store.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    let fresh = upsert_in(&mut guard, kind, id, contract, now_micros())?;
+    crate::metrics::record_runtime_registry(if fresh { "registered" } else { "heartbeat" });
+    Ok(fresh)
+}
+
+/// Drop a member immediately rather than waiting out its lease — a clean shutdown.
+pub fn deregister(id: &str) -> Result<bool, String> {
+    let store = store().ok_or_else(|| "runtime registry unavailable".to_string())?;
+    let mut guard = match store.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    let gone = guard.deregister(id).map_err(|e| e.to_string())?;
+    if gone {
+        crate::metrics::record_runtime_registry("deregistered");
+    }
+    Ok(gone)
+}
+
 /// One live member of the fleet.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct Member {
