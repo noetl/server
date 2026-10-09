@@ -8,6 +8,7 @@ pub mod catalog;
 pub mod catalog_log;
 pub mod db_routes_policy;
 pub mod dead_data;
+pub mod archive_read;
 pub mod catalog_read;
 pub mod catalog_relation;
 pub mod catalog_snapshot;
