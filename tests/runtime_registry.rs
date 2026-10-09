@@ -263,3 +263,150 @@ fn the_heartbeat_interval_is_clamped_below_the_ttl() {
          between its own renewals"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The registration API's core: how a worker / gateway / EHDB instance joins.
+//
+// `agents/rules/data-access-boundary.md` lists `noetl.runtime` as server-owned, so a
+// member registers through the server's API rather than opening its own D8 store. That is
+// also the only thing that WORKS: a member writing its own local store would be invisible
+// to the server's topology, because the stores are separate.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn upsert_registers_once_then_renews() {
+    let (mut st, root) = store("upsert");
+    let t0 = 1_000 * SEC;
+    let ttl = 180 * SEC;
+
+    let fresh = reg::upsert_in(&mut st, RuntimeKind::Worker, "wk-1", "noetl-worker/1", t0).unwrap();
+    assert!(fresh, "the first call must be a fresh registration");
+
+    let again =
+        reg::upsert_in(&mut st, RuntimeKind::Worker, "wk-1", "noetl-worker/1", t0 + 60 * SEC)
+            .unwrap();
+    assert!(
+        !again,
+        "the second call must RENEW, not re-register — otherwise every heartbeat reads as \
+         a fresh arrival in watch_since and a consumer cannot tell a restart from a beat"
+    );
+
+    let live = reg::discover_in(&st, RuntimeKind::Worker, t0 + 60 * SEC, ttl).unwrap();
+    assert_eq!(live.len(), 1, "one worker, not two");
+    assert_eq!(live[0].id(), "wk-1");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn upsert_preserves_the_kind_across_a_renewal() {
+    // The same ehdb P2 hazard, now through the API path: a renewal must not reclassify.
+    let (mut st, root) = store("upsertkind");
+    let t0 = 1_000 * SEC;
+    let ttl = 180 * SEC;
+    reg::upsert_in(&mut st, RuntimeKind::Gateway, "gw-9", "noetl-gateway/1", t0).unwrap();
+    reg::upsert_in(&mut st, RuntimeKind::Gateway, "gw-9", "noetl-gateway/1", t0 + 60 * SEC)
+        .unwrap();
+
+    assert_eq!(
+        reg::discover_in(&st, RuntimeKind::Gateway, t0 + 60 * SEC, ttl)
+            .unwrap()
+            .len(),
+        1,
+        "still a Gateway after renewal"
+    );
+    assert!(
+        reg::discover_in(&st, RuntimeKind::Worker, t0 + 60 * SEC, ttl)
+            .unwrap()
+            .is_empty(),
+        "a renewal must not reclassify a Gateway as a Worker"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// ⚠ An unknown kind must be REFUSED, not silently coerced.
+///
+/// `RuntimeKind::default()` is `Worker` — correctly, since every pre-P2 record was one. So
+/// a caller's typo defaulting to `Worker` would file a gateway under the wrong role and
+/// make `discover(Gateway)` wrong in a way nothing reports.
+#[test]
+fn an_unknown_kind_is_refused_rather_than_defaulted_to_worker() {
+    assert_eq!(reg::parse_kind("worker"), Some(RuntimeKind::Worker));
+    assert_eq!(reg::parse_kind("Gateway"), Some(RuntimeKind::Gateway));
+    assert_eq!(reg::parse_kind("EHDB"), Some(RuntimeKind::Ehdb));
+    assert_eq!(reg::parse_kind("execution"), Some(RuntimeKind::Execution));
+    for bad in ["wrker", "", "worker ", "Workers", "node", "servers"] {
+        assert_eq!(
+            reg::parse_kind(bad),
+            None,
+            "{bad:?} must be refused; defaulting it to Worker would misfile a member"
+        );
+    }
+}
+
+#[test]
+fn the_whole_fleet_registers_through_one_store_and_discovery_separates_it() {
+    let (mut st, root) = store("fleetapi");
+    let t0 = 1_000 * SEC;
+    let ttl = 180 * SEC;
+    for (kind, id) in [
+        (RuntimeKind::Server, "noetl-server-rust-embedded-0:2"),
+        (RuntimeKind::Worker, "noetl-worker-rust-abc"),
+        (RuntimeKind::Worker, "noetl-worker-system-pool-def"),
+        (RuntimeKind::Gateway, "noetl-gateway-xyz"),
+        (RuntimeKind::Ehdb, "noetl-cmdbus-writer-0"),
+    ] {
+        assert!(
+            reg::upsert_in(&mut st, kind, id, "c", t0).unwrap(),
+            "{id} must register fresh"
+        );
+    }
+    let t = reg::topology_in(&st, t0, ttl).unwrap();
+    let by: std::collections::BTreeMap<&str, usize> =
+        t.kinds.iter().map(|g| (g.kind.as_str(), g.count)).collect();
+    assert_eq!(by.get("Server"), Some(&1));
+    assert_eq!(by.get("Worker"), Some(&2), "both worker pools");
+    assert_eq!(by.get("Gateway"), Some(&1));
+    assert_eq!(by.get("Ehdb"), Some(&1));
+    assert_eq!(t.live_total, 5);
+    assert_eq!(t.unknown_timestamp, 0);
+
+    // ⭐ And the whole fleet drops out on TTL together when nothing renews — the lease is
+    // the guarantee, so correctness does not depend on any shutdown hook running.
+    let later = reg::topology_in(&st, t0 + ttl + SEC, ttl).unwrap();
+    assert_eq!(
+        later.live_total, 0,
+        "every member must expire by lease once renewals stop; got {later:?}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn deregister_is_a_shortcut_and_the_lease_is_still_the_guarantee() {
+    let (mut st, root) = store("dereg");
+    let t0 = 1_000 * SEC;
+    let ttl = 180 * SEC;
+    reg::upsert_in(&mut st, RuntimeKind::Worker, "wk-bye", "c", t0).unwrap();
+    assert_eq!(
+        reg::discover_in(&st, RuntimeKind::Worker, t0, ttl).unwrap().len(),
+        1
+    );
+
+    assert!(st.deregister("wk-bye").unwrap(), "a clean departure removes it");
+    assert!(
+        reg::discover_in(&st, RuntimeKind::Worker, t0 + SEC, ttl)
+            .unwrap()
+            .is_empty(),
+        "deregistered immediately, without waiting out the lease"
+    );
+
+    // The control: a member that does NOT deregister still goes away. Correctness must not
+    // depend on a shutdown hook, which is exactly what a crashed pod never runs.
+    reg::upsert_in(&mut st, RuntimeKind::Worker, "wk-crash", "c", t0).unwrap();
+    assert!(
+        reg::discover_in(&st, RuntimeKind::Worker, t0 + ttl + SEC, ttl)
+            .unwrap()
+            .is_empty(),
+        "a crashed member must expire by lease even though it never deregistered"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
