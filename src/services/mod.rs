@@ -22,6 +22,7 @@ pub mod result_store;
 pub mod result_tier_gc;
 pub mod runtime;
 pub mod secret_audit;
+pub mod secret_material;
 pub mod ui_schema;
 pub mod wallet_rotate;
 
