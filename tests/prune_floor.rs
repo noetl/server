@@ -81,7 +81,18 @@ fn a_live_execution_pins_the_floor_and_its_part_is_not_droppable() {
     let all: HashSet<i64> = [1, 2, 3].into_iter().collect();
     let scan2 = scan_of(&[cand(1, "COMPLETED", Some(0)), cand(2, "COMPLETED", Some(1)), cand(3, "COMPLETED", Some(2))], 100);
     let basis2 = ea::compute_prune_floor(&scan2, &all, &footprint);
-    assert!(matches!(basis2, ea::FloorBasis::NoFootprint), "{basis2:?}");
+    // ⚠ This assertion read `NoFootprint` until 2026-10-09, which pinned a real defect: with
+    // everything archived the floor refused, so a drained log reclaimed NOTHING while every
+    // call returned `Ok`. A non-empty footprint whose every member is archived is the
+    // opposite of no evidence — it is evidence that all of it is safe. The floor must clear
+    // the highest sequence those executions occupy (999), not their highest first sequence.
+    match basis2 {
+        ea::FloorBasis::Computed { keep_from_sequence, constrained_by } => {
+            assert_eq!(keep_from_sequence, 1000, "the floor must clear the measured tip");
+            assert_eq!(constrained_by, 0, "nothing constrains once all are archived");
+        }
+        other => panic!("expected the floor to advance, got {other:?}"),
+    }
     let d2 = ea::retention_floor(&footprint, &[1, 2, 3]);
     assert!(d2.part_is_droppable(100, 200));
 }
@@ -107,7 +118,14 @@ fn an_unarchived_backlog_refuses_to_advance_the_floor() {
     // ⭐ Positive control: with the last one archived, the floor computes.
     let all: HashSet<i64> = (1..=50).collect();
     let b2 = ea::compute_prune_floor(&scan, &all, &footprint);
-    assert!(matches!(b2, ea::FloorBasis::NoFootprint | ea::FloorBasis::Computed { .. }), "{b2:?}");
+    // ⚠ This accepted `NoFootprint | Computed{..}` — every variant that can reach it, so it
+    // could not fail and pinned nothing. The outcome is deterministic: footprint maxima are
+    // all 2000, so the floor clears it at 2001.
+    assert_eq!(
+        b2,
+        ea::FloorBasis::Computed { keep_from_sequence: 2001, constrained_by: 0 },
+        "with the backlog drained the floor must advance past the measured tip"
+    );
 }
 
 /// ⚠⚠ An empty footprint must NOT be read as "everything is prunable". Absence of evidence

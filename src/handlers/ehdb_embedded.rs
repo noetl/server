@@ -599,6 +599,112 @@ pub fn read_archive_records(
     )
 }
 
+/// The hot footprint of specific executions, built **from the manifest** rather than by
+/// reading their records.
+///
+/// noetl/ai-meta#459 — the obvious implementation reads each execution's records and takes
+/// the min/max `global_sequence`. At prod scale that is ~266 executions x ~235 KiB = tens of
+/// MB **read under the append lock, every pass**, on the one process that hosts both buses.
+/// The manifest already carries what the floor needs: each part's sequence range and a bloom
+/// over the `execution_id`s it holds.
+///
+/// ⚠ The bloom's error direction is what makes this sound. A false positive attributes a
+/// part to an execution that is not in it, which LOWERS that execution's `min_sequence`,
+/// which LOWERS the floor, which prunes LESS. There is no false negative. A part whose bloom
+/// is absent entirely is treated as possibly holding everything, for the same reason.
+///
+/// ⚠⚠ Records in the unsealed tail are not in the manifest, and that is fine here: the
+/// retention plan only drops parts the manifest lists, so a tail record cannot be dropped by
+/// any floor this produces.
+///
+/// `None` when the engine is not open — the caller must refuse to prune, not treat an absent
+/// footprint as "nothing constrains".
+pub fn hot_footprint(
+    ids: &[i64],
+) -> Option<Vec<crate::services::event_archive::HotExecution>> {
+    use std::collections::HashMap;
+    let engine = engine()?;
+    let manifest = {
+        let guard = match engine.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        // Snapshot and release: the bloom tests below touch no engine state, so the append
+        // lock is held only for the clone.
+        guard.manifest_snapshot()
+    };
+
+    let keys: Vec<(i64, String)> = ids.iter().map(|id| (*id, id.to_string())).collect();
+    let mut acc: HashMap<i64, (u64, u64)> = HashMap::new();
+    for part in &manifest.parts {
+        for (id, key) in &keys {
+            let may = match &part.execution_bloom {
+                Some(b) => b.maybe_contains(key),
+                // No bloom: cannot rule the execution out, so assume it is present.
+                None => true,
+            };
+            if !may {
+                continue;
+            }
+            let e = acc.entry(*id).or_insert((part.min_sequence, part.max_sequence));
+            e.0 = e.0.min(part.min_sequence);
+            e.1 = e.1.max(part.max_sequence);
+        }
+    }
+    Some(
+        acc.into_iter()
+            .map(
+                |(execution_id, (min_sequence, max_sequence))| {
+                    crate::services::event_archive::HotExecution {
+                        execution_id,
+                        min_sequence,
+                        max_sequence,
+                    }
+                },
+            )
+            .collect(),
+    )
+}
+
+/// Bytes the manifest currently accounts for, summed over live parts.
+///
+/// The reclaim number is reported as a difference of these, measured either side of the
+/// retention call — not estimated from a part count, because parts differ in size by orders
+/// of magnitude.
+pub fn manifest_bytes() -> Option<u64> {
+    let engine = engine()?;
+    let guard = match engine.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    Some(guard.manifest_snapshot().parts.iter().map(|p| p.byte_size).sum())
+}
+
+/// Drop every part lying entirely below `keep_from_sequence`.
+///
+/// ⚠⚠ This is the only call in the server that deletes from the event log. It performs no
+/// safety reasoning of its own — the floor it is handed must already have been proven safe by
+/// `compute_prune_floor`, which refuses while any archivable execution is unarchived. Calling
+/// this with a floor from anywhere else deletes data whose archived copy was never verified.
+///
+/// Returns the parts dropped and the bytes the manifest no longer accounts for.
+pub fn prune_below(keep_from_sequence: u64) -> Option<Result<(usize, u64), String>> {
+    let engine = engine()?;
+    let mut guard = match engine.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let before: u64 = guard.manifest_snapshot().parts.iter().map(|p| p.byte_size).sum();
+    match guard.apply_retention(keep_from_sequence) {
+        Ok(dropped) => {
+            let after: u64 =
+                guard.manifest_snapshot().parts.iter().map(|p| p.byte_size).sum();
+            Some(Ok((dropped, before.saturating_sub(after))))
+        }
+        Err(e) => Some(Err(e.to_string())),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

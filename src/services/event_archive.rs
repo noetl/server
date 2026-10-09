@@ -1347,9 +1347,13 @@ pub fn spawn_archive_pass(service: crate::services::execution::ExecutionService)
         return;
     };
     if cfg.prune_enabled {
-        // ⚠⚠ Loud, not silent. An operator who set the flag must learn that nothing will
-        // be deleted from the log rather than from the absence of reclaimed bytes.
-        tracing::warn!(note = prune_readiness_note(), "PRUNE_ENABLED is set but pruning is not performed");
+        // ⚠⚠ Loud, not silent. Pruning is now wired, but it only acts once the backlog is
+        // fully archived — so an operator who sets the flag and sees no reclaimed bytes must
+        // learn WHY from a log line rather than inferring it from the absence of an effect.
+        tracing::warn!(
+            note = prune_readiness_note(),
+            "PRUNE_ENABLED is set: parts below the proven floor WILL be deleted from the log"
+        );
     }
     tracing::info!(
         retention_hours = cfg.retention_hours,
@@ -1376,12 +1380,35 @@ pub fn spawn_archive_pass(service: crate::services::execution::ExecutionService)
             let rep = archive_pass(
                 store.as_ref(),
                 &cfg,
-                &candidates,
+                &candidates.candidates,
                 Utc::now(),
                 &mut known_archived,
                 |id| crate::handlers::ehdb_embedded::read_archive_records(&id.to_string()),
             )
             .await;
+
+            // ⚠ The prune step runs on the SAME known_archived set the archive pass just
+            // updated — the executions this process has verified durable AND indexed. It is
+            // deliberately a separate pass: archival is unaffected by whether pruning is on,
+            // and the floor refuses by itself while any archivable execution is unarchived.
+            let prep = prune_pass(
+                &cfg,
+                &candidates,
+                Utc::now(),
+                &known_archived,
+                crate::handlers::ehdb_embedded::hot_footprint,
+                crate::handlers::ehdb_embedded::prune_below,
+            );
+            if prep.parts_dropped > 0 {
+                tracing::info!(
+                    parts_dropped = prep.parts_dropped,
+                    bytes_reclaimed = prep.bytes_reclaimed,
+                    keep_from_sequence = prep.keep_from_sequence,
+                    "retention pruned parts below the proven floor"
+                );
+            } else {
+                tracing::debug!(summary = %prep.describe(), "prune pass");
+            }
             tracing::info!(report = %rep.describe(), "archive pass complete");
         }
     });
@@ -1393,13 +1420,28 @@ pub fn spawn_archive_pass(service: crate::services::execution::ExecutionService)
 /// `x-noetl-limit-applied`; one call returned 100 where paging returned **6,467**, so a
 /// single call would silently examine the newest page only — which is the page least
 /// likely to contain anything archivable.
+/// The candidate listing, carrying whether it is COMPLETE.
+///
+/// ⚠⚠ The completeness flag is load-bearing for pruning, not bookkeeping. The floor is
+/// computed from the executions we classified; an execution the listing never returned is
+/// invisible to it, and its records can sit below the floor and be deleted. The paging is
+/// capped, so a large-enough population silently yields a short list — which is why the cap
+/// being hit must travel with the data rather than being inferred from its length.
+#[derive(Debug, Clone, Default)]
+pub struct CandidateSet {
+    pub candidates: Vec<ArchiveCandidate>,
+    /// False when the page cap was reached with more rows possibly behind it.
+    pub complete: bool,
+}
+
 pub async fn collect_candidates(
     service: &crate::services::execution::ExecutionService,
-) -> Result<Vec<ArchiveCandidate>, String> {
+) -> Result<CandidateSet, String> {
     let mut out = Vec::new();
     let mut offset = 0i32;
     // Bounded so a pathological listing cannot spin the pass forever.
     const MAX_PAGES: usize = 200;
+    let mut complete = false;
     for _ in 0..MAX_PAGES {
         let filter = crate::services::execution::ExecutionFilter {
             limit: Some(100),
@@ -1408,6 +1450,7 @@ pub async fn collect_candidates(
         };
         let page = service.list(&filter).await.map_err(|e| e.to_string())?;
         if page.is_empty() {
+            complete = true;
             break;
         }
         let n = page.len();
@@ -1421,10 +1464,17 @@ pub async fn collect_candidates(
         }
         offset += n as i32;
         if n < 100 {
+            complete = true;
             break;
         }
     }
-    Ok(out)
+    if !complete {
+        tracing::warn!(
+            collected = out.len(),
+            "the execution listing hit its page cap; the candidate set is INCOMPLETE and              pruning will refuse this pass"
+        );
+    }
+    Ok(CandidateSet { candidates: out, complete })
 }
 
 // ===========================================================================
@@ -1537,11 +1587,29 @@ pub fn compute_prune_floor(
             keep_from_sequence: s,
             constrained_by: constrained,
         },
-        // ⚠ Nothing constrains. That is NOT licence to prune everything: it means the
-        // footprint was empty, which with a drained backlog means the engine holds nothing
-        // we measured. Refuse rather than compute a floor above the whole log from an
-        // absence of evidence.
-        None => FloorBasis::NoFootprint,
+        // ⚠⚠ Nothing constrains — and the two reasons for that are NOT the same thing.
+        //
+        // An EMPTY footprint means we measured nothing, and absence of evidence is not
+        // evidence of absence: refuse.
+        //
+        // A NON-EMPTY footprint whose every member is verified-archived is the opposite —
+        // we measured, and everything we measured is safe. Refusing there is what the first
+        // cut did, and it is why `max_sequence` exists on `HotExecution` and was then never
+        // read: once prod's backlog drains, *that* is the steady state for an idle log, so
+        // the whole prune path would have reclaimed zero while every call returned `Ok`.
+        // Caught by a positive control asserting that a fully-archived log DOES reclaim.
+        //
+        // ⚠ The floor must clear the highest sequence those executions occupy, not their
+        // highest *first* sequence — the same off-by-a-whole-log error `max_sequence` was
+        // added for.
+        None if footprint.is_empty() => FloorBasis::NoFootprint,
+        None => {
+            let tip = footprint.iter().map(|h| h.max_sequence).max().unwrap_or(0);
+            FloorBasis::Computed {
+                keep_from_sequence: tip.saturating_add(1),
+                constrained_by: 0,
+            }
+        }
     }
 }
 
@@ -1550,6 +1618,154 @@ pub fn compute_prune_floor(
 ///
 /// ⭐ Bounded by the retention window rather than by history: on prod this was **266 of
 /// 6,496**. Returning the whole population would make the floor cost O(history) per pass.
+/// What one prune pass did, or why it did nothing.
+#[derive(Debug, Default, Clone)]
+pub struct PruneReport {
+    /// The floor basis, always reported — including when it refused.
+    pub basis: Option<String>,
+    pub keep_from_sequence: Option<u64>,
+    pub parts_dropped: usize,
+    pub bytes_reclaimed: u64,
+    /// Set when the pass did not reach the retention call at all.
+    pub skipped: Option<String>,
+}
+
+impl PruneReport {
+    pub fn describe(&self) -> String {
+        if let Some(why) = &self.skipped {
+            return format!("prune skipped: {why}");
+        }
+        format!(
+            "prune floor={} parts_dropped={} bytes_reclaimed={} basis=[{}]",
+            self.keep_from_sequence
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "-".into()),
+            self.parts_dropped,
+            self.bytes_reclaimed,
+            self.basis.as_deref().unwrap_or("-")
+        )
+    }
+}
+
+/// ⚠ Above this many constraining executions the pass refuses rather than computing a floor.
+///
+/// `compute_prune_floor`'s soundness rests on the footprint covering **every** constraining
+/// execution — an absent one is read as "constrains nothing", so a truncated footprint
+/// produces a floor ABOVE live data. There is therefore no safe way to cap the footprint by
+/// truncating it; the only safe response to an implausibly large relevant set is to refuse.
+pub const MAX_FOOTPRINT_IDS: usize = 20_000;
+
+/// One prune pass: compute the floor, and drop parts below it only if it is `Computed`.
+///
+/// Kept separate from `archive_pass` so that the archive path is unchanged by the existence
+/// of pruning, and so the safety property — never advance past a live execution — can be
+/// tested against injected footprint and prune callbacks rather than a live engine.
+///
+/// `verified_archived` must be the set this process has *verified* durable and indexed, not
+/// merely written.
+pub fn prune_pass<FP, PR>(
+    cfg: &RetentionConfig,
+    set: &CandidateSet,
+    now: DateTime<Utc>,
+    verified_archived: &std::collections::HashSet<i64>,
+    mut footprint: FP,
+    mut prune: PR,
+) -> PruneReport
+where
+    FP: FnMut(&[i64]) -> Option<Vec<HotExecution>>,
+    PR: FnMut(u64) -> Option<Result<(usize, u64), String>>,
+{
+    let mut rep = PruneReport::default();
+    if !cfg.prune_enabled {
+        rep.skipped = Some("NOETL_EHDB_PRUNE_ENABLED is not set".into());
+        return rep;
+    }
+    // Belt and braces: the readiness check already refuses prune-without-archive, but the
+    // one call that deletes from the log should not depend on a caller having run it.
+    let readiness = cfg.archive_readiness();
+    if !readiness.is_ready() {
+        rep.skipped = Some(readiness.reason());
+        return rep;
+    }
+
+    // ⚠⚠ An incomplete candidate list makes the floor unsound, not merely approximate: an
+    // execution the listing never returned is invisible to the floor, so its records can lie
+    // below it and be deleted. Refuse rather than prune on a partial population.
+    if !set.complete {
+        rep.skipped = Some(format!(
+            "refusing: the candidate listing is incomplete ({} rows, page cap reached) — a              floor computed from a partial population can sit above an execution we never              classified",
+            set.candidates.len()
+        ));
+        return rep;
+    }
+    let candidates = set.candidates.as_slice();
+
+    let retention = cfg.retention();
+    let rows: Vec<(i64, String, Option<DateTime<Utc>>)> = candidates
+        .iter()
+        .map(|c| (c.execution_id, c.status.clone(), c.completed_at))
+        .collect();
+    let mut scan = ArchivableScan::default();
+    classify_into(&mut scan, &rows, now, retention);
+
+    // ⚠ The footprint covers EVERY candidate, not only the constraining ones. The archived
+    // executions do not constrain the floor, but they are what establishes how far it may
+    // rise when nothing constrains — ask only for the constraining set and a fully-archived
+    // log measures an empty footprint and reclaims nothing.
+    let relevant = floor_relevant_ids(&scan, verified_archived, candidates);
+    let all_ids: Vec<i64> = candidates.iter().map(|c| c.execution_id).collect();
+    if all_ids.len() > MAX_FOOTPRINT_IDS {
+        rep.skipped = Some(format!(
+            "refusing: {} candidates ({} constraining) exceeds MAX_FOOTPRINT_IDS={} — a \
+             truncated footprint would place the floor above live data",
+            all_ids.len(),
+            relevant.len(),
+            MAX_FOOTPRINT_IDS
+        ));
+        return rep;
+    }
+
+    let Some(fp) = footprint(&all_ids) else {
+        // ⚠ Absent footprint is NOT "nothing constrains". Refuse.
+        rep.skipped = Some("the embedded engine is not open; the footprint is unknown".into());
+        return rep;
+    };
+
+    let basis = compute_prune_floor(&scan, verified_archived, &fp);
+    rep.basis = Some(basis.reason());
+    let Some(keep_from) = basis.keep_from_sequence() else {
+        match basis {
+            FloorBasis::AwaitingBacklog { .. } => {
+                crate::metrics::record_ehdb_archive("prune_refused_not_durable")
+            }
+            _ => crate::metrics::record_ehdb_archive("prune_refused_unindexed"),
+        }
+        // ⚠ 0 means "no floor was computed", and is set explicitly so a refusal cannot be
+        // read off a stale gauge left by an earlier pass that did compute one.
+        crate::metrics::ehdb_retention_floor_sequence().set(0);
+        return rep;
+    };
+    rep.keep_from_sequence = Some(keep_from);
+    crate::metrics::ehdb_retention_floor_sequence().set(keep_from.min(i64::MAX as u64) as i64);
+
+    match prune(keep_from) {
+        Some(Ok((dropped, bytes))) => {
+            rep.parts_dropped = dropped;
+            rep.bytes_reclaimed = bytes;
+            for _ in 0..dropped {
+                crate::metrics::record_ehdb_archive("pruned");
+            }
+        }
+        Some(Err(e)) => {
+            rep.skipped = Some(format!("retention call failed: {e}"));
+        }
+        None => {
+            rep.skipped = Some("the embedded engine is not open".into());
+        }
+    }
+    rep
+}
+
 pub fn floor_relevant_ids(
     scan: &ArchivableScan,
     verified_archived: &std::collections::HashSet<i64>,
