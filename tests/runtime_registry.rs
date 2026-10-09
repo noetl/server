@@ -755,3 +755,89 @@ fn the_execution_deregistration_is_called_from_the_emit_chokepoint() {
         "the removal must be gated on a terminal event, not fire for every row"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The `Ehdb` kind: registered from a SUCCESSFUL publish, never from configuration.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn an_ehdb_tier_is_discoverable_once_registered() {
+    let (mut st, root) = store("ehdbkind");
+    let t0 = 1_000 * SEC;
+    let ttl = 180 * SEC;
+    // The exact prod address shape: dots and a colon, both legal in D8's charset.
+    let addr = "noetl-cmdbus-writer-0.noetl.svc.cluster.local:9103";
+    assert_eq!(
+        reg::sanitise_id(addr).as_deref(),
+        Some(addr),
+        "a writer address must survive sanitisation unchanged, or the id would drift from \
+         the thing it names"
+    );
+    reg::upsert_in(&mut st, RuntimeKind::Ehdb, addr, "ehdb-tier", t0).unwrap();
+
+    let found = reg::discover_in(&st, RuntimeKind::Ehdb, t0, ttl).unwrap();
+    assert_eq!(found.len(), 1, "the tier must be discoverable as Ehdb");
+    assert_eq!(found[0].id(), addr);
+    // It must NOT leak into another role.
+    assert!(
+        reg::discover_in(&st, RuntimeKind::Worker, t0, ttl)
+            .unwrap()
+            .is_empty(),
+        "an Ehdb tier must not appear as a Worker"
+    );
+    // And it expires like anything else once publishes stop.
+    assert!(
+        reg::discover_in(&st, RuntimeKind::Ehdb, t0 + ttl + SEC, ttl)
+            .unwrap()
+            .is_empty(),
+        "a tier that stops answering must expire by lease"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// ⚠⚠ The registration must be driven by a successful round-trip, not by configuration.
+///
+/// Registering a writer because an env var names it would claim liveness for an address
+/// that might be down — the representation-drift failure this registry exists to avoid. So
+/// this asserts the call site sits behind a success check.
+#[test]
+fn the_ehdb_registration_fires_only_on_a_successful_publish() {
+    let src = include_str!("../src/event_bus.rs");
+    assert!(
+        src.contains("mirror_ehdb_tier_seen("),
+        "event_bus.rs must call mirror_ehdb_tier_seen, or discover(Ehdb) stays empty"
+    );
+    let at = src.find("mirror_ehdb_tier_seen(").expect("call site");
+    let window = &src[at.saturating_sub(400)..at];
+    assert!(
+        window.contains("out.is_ok()"),
+        "the call must be gated on a successful publish; registering from configuration \
+         would claim liveness for a writer that may be down"
+    );
+    assert!(
+        window.contains("addr_for_execution("),
+        "it must register the address actually routed to, not every configured one — a \
+         single success says nothing about writers that were never contacted"
+    );
+}
+
+/// The hot path must not take the registry mutex on every publish.
+#[test]
+fn the_ehdb_hook_pre_checks_an_atomic_before_the_registry_lock() {
+    let src = include_str!("../src/runtime_registry.rs");
+    let at = src
+        .find("pub fn mirror_ehdb_tier_seen(")
+        .expect("the hook exists");
+    let body = &src[at..at + 1400];
+    let atomic_at = body.find("EHDB_LAST_SEEN.load").expect("atomic pre-check present");
+    let lock_at = body.find("try_lock").expect("the lock is taken somewhere");
+    assert!(
+        atomic_at < lock_at,
+        "the atomic pre-check must come BEFORE the lock, or every event publish queues \
+         behind the registry — an observability surface slowing the thing it observes"
+    );
+    assert!(
+        body.contains("try_lock"),
+        "the hook must use try_lock: a publish must never wait on the registry"
+    );
+}

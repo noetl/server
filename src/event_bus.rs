@@ -152,7 +152,20 @@ impl EhdbEventPublisher {
         event_id: i64,
         payload: &[u8],
     ) -> Result<u64, String> {
-        self.inner.publish(execution_id, event_id, payload).await
+        let out = self.inner.publish(execution_id, event_id, payload).await;
+        // noetl/ai-meta#455 — a SUCCESSFUL publish is evidence the tier is live, so the
+        // writer it reached is registered as an `Ehdb` member.
+        //
+        // ⚠ Only on success, and only the address actually routed to. Registering from
+        // configuration would claim liveness for a writer that might be down, and
+        // registering every configured address on one success would claim it for writers
+        // never contacted.
+        if out.is_ok() {
+            if let Some(addr) = self.inner.addr_for_execution(execution_id) {
+                crate::runtime_registry::mirror_ehdb_tier_seen(addr);
+            }
+        }
+        out
     }
 }
 

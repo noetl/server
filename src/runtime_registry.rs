@@ -538,6 +538,60 @@ pub fn mirror_execution_finished(execution_id: i64) {
     }
 }
 
+/// When the EHDB tier was last recorded as seen, as micros. Checked **before** the registry
+/// mutex.
+///
+/// ⚠⚠ This exists so the hot path stays hot. The hook below runs on every successful event
+/// publish, and the registry is behind a `Mutex` that every append and every scrape also
+/// take. Doing a throttled `get` under that lock on each publish would put the event write
+/// path behind the registry — an observability surface slowing the thing it observes, which
+/// is the same class of mistake as a scrape that stalls appends. An atomic load costs
+/// nothing and the lock is taken at most once per floor interval.
+static EHDB_LAST_SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Record that the EHDB tier at `addr` answered — i.e. register it as a **live** `Ehdb`
+/// member (noetl/ai-meta#455 P2, the `Ehdb` kind).
+///
+/// ⚠⚠ Called on a SUCCESSFUL publish, deliberately — never from configuration. Registering
+/// a writer because an env var names it would claim liveness for an address that might be
+/// down, which is precisely the representation-drift failure this registry exists to avoid:
+/// *a copy is only true while something forces it to agree.* A successful round-trip is
+/// that forcing function.
+///
+/// Fail-soft and non-blocking; the event write path must not slow or fail for this.
+pub fn mirror_ehdb_tier_seen(addr: &str) {
+    use std::sync::atomic::Ordering;
+    let now = now_micros();
+    let floor = heartbeat_floor_micros();
+    let last = EHDB_LAST_SEEN.load(Ordering::Relaxed);
+    if last != 0 && now.saturating_sub(last) < floor {
+        return;
+    }
+    // Claim the slot before doing the work, so concurrent publishes do not all write.
+    if EHDB_LAST_SEEN
+        .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+    let Some(store) = store() else { return };
+    let Some(id) = sanitise_id(addr) else { return };
+    // `try_lock`: a publish must never wait on the registry.
+    let Ok(mut guard) = store.try_lock() else {
+        return;
+    };
+    match upsert_throttled_in(&mut guard, RuntimeKind::Ehdb, &id, "ehdb-tier", now, floor) {
+        Ok(UpsertOutcome::Registered) => {
+            crate::metrics::record_runtime_registry("ehdb_registered")
+        }
+        Ok(_) => {}
+        Err(e) => {
+            tracing::debug!(target: "noetl_server::runtime_registry", error = %e, id = %id,
+                "ehdb tier not registered");
+        }
+    }
+}
+
 /// Is this event type terminal for an execution?
 ///
 /// ⚠ Matched on the names the event log actually uses, both spellings. Prod stores
