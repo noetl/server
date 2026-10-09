@@ -79,6 +79,13 @@ async fn register_pool_inner(
     Json(request): Json<RegisterRuntimeRequest>,
 ) -> Result<Json<crate::services::runtime::Runtime>, AppError> {
     let runtime = service.register(&request).await?;
+    // ⭐ Mirror into the D8 runtime registry (noetl/ai-meta#455 P2). The authoritative
+    // registration above has already succeeded, so this is strictly additive — and it is
+    // what makes `discover(Worker)` real WITHOUT changing the worker: the worker has posted
+    // this endpoint since long before the registry existed.
+    //
+    // ⚠ Fail-soft by construction; see `mirror_pool_register`.
+    crate::runtime_registry::mirror_pool_register(&request.kind, &request.name, &request.status);
     Ok(Json(runtime))
 }
 
@@ -90,6 +97,7 @@ pub async fn deregister_pool(
     Json(request): Json<DeregisterRequest>,
 ) -> Result<Json<RuntimeOperationResponse>, AppError> {
     service.deregister(&request.kind, &request.name).await?;
+    crate::runtime_registry::mirror_pool_deregister(&request.name);
     Ok(Json(RuntimeOperationResponse {
         status: "ok".to_string(),
         message: format!("Runtime {} {} deregistered", request.kind, request.name),
@@ -119,6 +127,8 @@ async fn heartbeat_inner(
     Json(request): Json<HeartbeatRequest>,
 ) -> Result<Json<RuntimeOperationResponse>, AppError> {
     service.heartbeat(&request.kind, &request.name).await?;
+    // Renew the member's D8 lease on the same beat it already sends.
+    crate::runtime_registry::mirror_pool_heartbeat(&request.kind, &request.name);
     Ok(Json(RuntimeOperationResponse {
         status: "ok".to_string(),
         message: "Heartbeat recorded".to_string(),
