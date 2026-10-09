@@ -294,26 +294,22 @@ impl ObjectBackend {
         media_type: &str,
         bytes: &[u8],
     ) -> AppResult<()> {
-        // noetl/ai-meta#460 B1 — timed, because a design decision was taken on an
-        // UNMEASURED estimate of this exact number: #460 provisionally rejected
-        // synchronous per-record remote append on the grounds that a GCS put costs "tens
-        // of ms" against a ~4 ms local fsync. This path already runs in prod, so the
-        // figure was available for the cost of an instrument rather than a guess.
-        let started = std::time::Instant::now();
-        let out = match self {
+        match self {
             ObjectBackend::Postgres => {
-                object_store::put(pool, key, digest, media_type, bytes).await
+                // The GCS arm times itself inside `GcsBackend::put` (see below), so only
+                // the Postgres arm is timed here — otherwise a GCS put through this
+                // wrapper would be counted twice.
+                let started = std::time::Instant::now();
+                let out = object_store::put(pool, key, digest, media_type, bytes).await;
+                crate::metrics::observe_object_store_put(
+                    "postgres",
+                    if out.is_ok() { "ok" } else { "failed" },
+                    started.elapsed().as_secs_f64(),
+                );
+                out
             }
             ObjectBackend::Gcs(g) => g.put(key, media_type, bytes).await,
-        };
-        // ⚠ Failures are timed too, under their own label. A latency distribution over
-        // successes only hides the case where the slow puts are the ones that fail.
-        crate::metrics::observe_object_store_put(
-            self.label(),
-            if out.is_ok() { "ok" } else { "failed" },
-            started.elapsed().as_secs_f64(),
-        );
-        out
+        }
     }
 
     /// Fetch the object at `key`, or `None` (caller → HTTP 404).
@@ -408,7 +404,31 @@ impl GcsBackend {
     /// Upload via the GCS JSON API `uploadType=media` (the object name rides as a
     /// query param, so `reqwest` URL-encodes it). Works against real GCS and the
     /// fake-gcs-server emulator alike.
+    /// ⚠⚠ Timed HERE, in the primitive, not in a caller.
+    ///
+    /// The first version timed `ObjectBackend::put`, the wrapper. Then the archive tier
+    /// shipped and called `GcsBackend::put` **directly** through its `ArchiveStore` impl —
+    /// so 300 archival objects went to GCS on prod while
+    /// `noetl_object_store_put_seconds_count{backend="gcs"}` sat at its seed value. The
+    /// instrument was not on the path that had become the dominant writer.
+    ///
+    /// Instrumenting the primitive makes that bypass unexpressible: every caller is timed
+    /// because there is nowhere else to put the bytes.
+    ///
+    /// ⚠ Failures are timed too, under their own label. A latency distribution over
+    /// successes only hides the case where the slow puts are the ones that fail.
     pub(crate) async fn put(&self, key: &str, media_type: &str, bytes: &[u8]) -> AppResult<()> {
+        let started = std::time::Instant::now();
+        let out = self.put_inner(key, media_type, bytes).await;
+        crate::metrics::observe_object_store_put(
+            "gcs",
+            if out.is_ok() { "ok" } else { "failed" },
+            started.elapsed().as_secs_f64(),
+        );
+        out
+    }
+
+    async fn put_inner(&self, key: &str, media_type: &str, bytes: &[u8]) -> AppResult<()> {
         let url = format!("{}/upload/storage/v1/b/{}/o", self.endpoint, self.bucket);
         let mut req = self
             .client
