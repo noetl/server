@@ -928,3 +928,42 @@ impl FloorDecision {
         }
     }
 }
+
+// ===========================================================================
+// P6 (partial) — export the pinned-floor hazard.
+// ===========================================================================
+
+/// Publish a floor decision to the gauges.
+///
+/// ⚠⚠ The age is passed in rather than derived here, because "how old is the execution
+/// pinning the floor" is a question about wall-clock completion times that this module
+/// deliberately does not own — and a gauge computed from the wrong clock would be worse
+/// than no gauge.
+pub fn export_floor(decision: &FloorDecision, blocking_age_secs: Option<i64>) {
+    if let Some(f) = decision.keep_from_sequence {
+        // Saturating: a u64 sequence does not fit an i64 gauge, and a wrapped negative
+        // sequence would read as a plausible number rather than as an overflow.
+        crate::metrics::ehdb_retention_floor_sequence().set(f.min(i64::MAX as u64) as i64);
+    }
+    match &decision.blocked_by {
+        Some(b) => {
+            crate::metrics::ehdb_retention_floor_blocked_by_execution().set(b.execution_id);
+            crate::metrics::ehdb_retention_oldest_non_archivable_age_seconds()
+                .set(blocking_age_secs.unwrap_or(0).max(0));
+        }
+        None => {
+            // ⚠ Reset BOTH. A stale id left behind after the block clears would name an
+            // execution that is no longer blocking anything — a representation that
+            // outlived the thing it described.
+            crate::metrics::ehdb_retention_floor_blocked_by_execution().set(0);
+            crate::metrics::ehdb_retention_oldest_non_archivable_age_seconds().set(0);
+        }
+    }
+}
+
+/// Publish an archivable-set scan to the gauges — both numbers, so the selection always
+/// carries the population it came from.
+pub fn export_scan(scan: &ArchivableScan) {
+    crate::metrics::ehdb_archive_scan_examined().set(scan.examined as i64);
+    crate::metrics::ehdb_archive_scan_archivable().set(scan.archivable.len() as i64);
+}
