@@ -215,7 +215,21 @@ pub fn open_embedded() -> Option<Arc<std::sync::Mutex<L0Engine<D1EventLog>>>> {
 
     // ⚠ This is where ehdb-l0's FORMAT_VERSION gate fires: an on-disk layout
     // written by a different build refuses here rather than being misread.
-    let config = L0Config::for_dataset("d1_event_log", format!("{dir}/local"));
+    let mut config = L0Config::for_dataset("d1_event_log", format!("{dir}/local"));
+    // noetl/ai-meta#460 B2 — the age-based seal trigger.
+    //
+    // ⚠⚠ This is HALF the mechanism. ehdb's own doc on `seal_aged_parts` says it outright:
+    // `PartWriter::should_seal` is consulted only on append, so the shard the age trigger
+    // protects is by definition the one taking no appends. Setting this value without
+    // driving the timer leaves the trigger "inert on exactly the shard it was added for —
+    // the flag would be present, the config would look correct, and nothing would ever
+    // fire." The other half is `spawn_age_seal_task`, and `the_trigger_has_both_halves`
+    // guards that they ship together.
+    if let Some(age) = seal_max_age() {
+        config = config.with_seal_max_age(Some(age));
+        tracing::info!(target: "noetl_server::ehdb_embedded", secs = age.as_secs(),
+            "age-based seal trigger configured (bounds the unsealed RF=1 tail)");
+    }
     // ⚠ `open` makes a replica set of exactly one; `open_replicated` is the N-way form. Both
     // funnel through the FORMAT_VERSION gate, and `open_replicated` checks it on EVERY
     // replica — so a bucket written by a different build refuses here rather than being
@@ -650,6 +664,89 @@ pub fn read_archive_records(
             })
             .collect(),
     )
+}
+
+/// The engine handle, for callers that need to drive it on a timer.
+///
+/// Returns `None` when the embedded engine is not open, so a caller cannot accidentally
+/// start a task against nothing.
+pub fn engine_handle() -> Option<std::sync::Arc<std::sync::Mutex<L0Engine<D1EventLog>>>> {
+    engine().cloned()
+}
+
+/// How old an un-sealed part may get before the age trigger seals it.
+///
+/// `None` (the default) leaves the trigger off, which is today's behaviour: a part seals only
+/// on record/byte limits.
+pub fn seal_max_age() -> Option<std::time::Duration> {
+    let raw = std::env::var("NOETL_EHDB_SEAL_MAX_AGE_SECS").ok()?;
+    let secs: u64 = raw.trim().parse().ok()?;
+    // ⚠ 0 is refused rather than clamped: a zero age would seal on every tick, producing one
+    // part per tick and growing the manifest without bound — the quadratic-manifest shape
+    // that filled the cmdbus volume. Refusing makes the misconfiguration loud.
+    if secs == 0 {
+        tracing::error!(target: "noetl_server::ehdb_embedded",
+            "NOETL_EHDB_SEAL_MAX_AGE_SECS=0 is refused: it would seal on every tick and grow \
+             the manifest without bound; the trigger stays OFF");
+        return None;
+    }
+    Some(std::time::Duration::from_secs(secs))
+}
+
+/// Drive the age trigger, and publish the exposure it bounds.
+///
+/// ⚠⚠ The gauges are published **unconditionally**, including when the trigger is off. The
+/// unsealed tail is an RF=1 exposure whether or not anything is configured to bound it, and
+/// a gauge that only appeared once someone enabled the fix would leave the problem invisible
+/// in exactly the configuration that has it — prod today.
+///
+/// Only the SEALING is gated. `seal_aged_parts` is itself a no-op when `seal_max_age` is
+/// `None`, so it is called unconditionally too and the gate lives in one place rather than
+/// two that can disagree.
+pub fn spawn_age_seal_task(engine: std::sync::Arc<std::sync::Mutex<L0Engine<D1EventLog>>>) {
+    let interval = std::env::var("NOETL_EHDB_SEAL_TICK_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(60);
+    crate::metrics::init_age_seal_series();
+    tracing::info!(target: "noetl_server::ehdb_embedded", interval_secs = interval,
+        trigger = ?seal_max_age().map(|d| d.as_secs()),
+        "age-seal task starting (gauges publish regardless of whether the trigger is on)");
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(interval));
+        loop {
+            tick.tick().await;
+            let mut guard = match engine.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            match guard.seal_aged_parts() {
+                Ok(0) => {}
+                Ok(n) => {
+                    crate::metrics::ehdb_age_sealed_total().inc_by(n as u64);
+                    tracing::info!(target: "noetl_server::ehdb_embedded", sealed = n,
+                        "age trigger sealed aged parts; they are now eligible for off-box \
+                         replication");
+                }
+                Err(e) => {
+                    tracing::warn!(target: "noetl_server::ehdb_embedded", error = %e,
+                        "age-based seal failed");
+                }
+            }
+            // The exposure, measured after any sealing this tick performed.
+            let oldest = guard
+                .active_ages()
+                .into_iter()
+                .map(|(_, age)| age.as_secs())
+                .max()
+                .unwrap_or(0);
+            let parts = guard.manifest_snapshot().parts.len();
+            drop(guard);
+            crate::metrics::ehdb_oldest_unsealed_age_seconds().set(oldest as i64);
+            crate::metrics::ehdb_manifest_parts().set(parts as i64);
+        }
+    });
 }
 
 /// The bucket for the off-box replica, or `None` when A2 is not configured.
