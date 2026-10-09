@@ -822,22 +822,160 @@ fn the_ehdb_registration_fires_only_on_a_successful_publish() {
 }
 
 /// The hot path must not take the registry mutex on every publish.
+///
+/// ⚠ Asserted as a PROPERTY, not as a particular mechanism: the throttle moved from a
+/// single atomic to a per-address table when a second call site appeared, and a test
+/// naming `EHDB_LAST_SEEN.load` would have failed for the mechanism change while saying
+/// nothing about whether the property still held.
 #[test]
-fn the_ehdb_hook_pre_checks_an_atomic_before_the_registry_lock() {
+fn the_ehdb_hook_throttles_before_it_takes_the_registry_lock() {
     let src = include_str!("../src/runtime_registry.rs");
     let at = src
         .find("pub fn mirror_ehdb_tier_seen(")
         .expect("the hook exists");
-    let body = &src[at..at + 1400];
-    let atomic_at = body.find("EHDB_LAST_SEEN.load").expect("atomic pre-check present");
-    let lock_at = body.find("try_lock").expect("the lock is taken somewhere");
+    let body = &src[at..at + 1800];
+
+    let throttle_at = body
+        .find("tier_seen_due(")
+        .expect("the hook must consult the throttle");
+    let store_at = body
+        .find("store()")
+        .expect("the hook must reach the registry store");
     assert!(
-        atomic_at < lock_at,
-        "the atomic pre-check must come BEFORE the lock, or every event publish queues \
-         behind the registry — an observability surface slowing the thing it observes"
+        throttle_at < store_at,
+        "the throttle must be consulted BEFORE the registry is touched, or every publish          queues behind the registry — an observability surface slowing the thing it observes"
+    );
+    // Both locks must be non-blocking: the throttle's and the registry's.
+    // ⚠ Counted as CALLS (`.try_lock()`), not as the bare token: the doc comments in this
+    // function mention `try_lock` twice, so counting the token read 4 where the answer is
+    // 2 — a comment standing in for a caller, the same false reading this repo keeps
+    // finding.
+    assert_eq!(
+        body.matches(".try_lock()").count(),
+        2,
+        "both the throttle and the registry must be taken with try_lock: a publish must          never wait on either"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// noetl/ai-meta#455 P2 — the `Ehdb` kind, reached on a path prod's traffic takes.
+//
+// ⚠⚠ v3.130.0 placed this hook on the EVENTS publish and shipped it. Prod measured
+// `ehdb_registered` = 0 for 18 minutes, because `should_publish` returns false for
+// system executions (`event_write.rs`, reason `system_execution` = 22 on prod) and
+// prod's only regular traffic — the hourly cleanup and the 3-minutely watchdog — IS
+// system executions. The events publish is therefore never called there.
+//
+// The two structural tests above PASSED throughout. They assert the call site is
+// correctly gated; neither asserts the gated path is one prod traffic traverses.
+// That is `existence != reachability` (noetl/ai-meta#326) in the one place I had
+// quoted #326 while placing a different hook correctly.
+// ---------------------------------------------------------------------------
+
+/// ⚠⚠ RED before the fix. One global last-seen slot served one call site adequately.
+/// With two buses reporting, the first address to claim the slot throttles the OTHER out
+/// for a whole floor interval — so a live tier stays unregistered while every counter
+/// reads healthy. One cap serving two addresses is the same defect as one cap serving two
+/// directions (noetl/worker#314).
+#[test]
+fn two_tier_addresses_do_not_throttle_each_other() {
+    let mut seen = Vec::new();
+    let floor = 60_000_000; // 60s
+    let t0 = 1_000_000_000u64;
+
+    let cmdbus = "noetl-cmdbus-writer-0.noetl.svc.cluster.local:9100";
+    let events = "noetl-cmdbus-writer-0.noetl.svc.cluster.local:9103";
+
+    assert!(
+        reg::tier_seen_due(&mut seen, cmdbus, t0, floor),
+        "the first sighting of an address is always due"
     );
     assert!(
-        body.contains("try_lock"),
-        "the hook must use try_lock: a publish must never wait on the registry"
+        reg::tier_seen_due(&mut seen, events, t0 + 1, floor),
+        "a DIFFERENT address one microsecond later must still be due — the two buses are \
+         two tiers, and throttling them together makes one of them invisible"
+    );
+
+    // Negative control: the throttle must still actually throttle, or this test would
+    // pass against a function that returns `true` unconditionally.
+    assert!(
+        !reg::tier_seen_due(&mut seen, cmdbus, t0 + floor - 1, floor),
+        "the SAME address inside the floor must NOT be due"
+    );
+    assert!(
+        reg::tier_seen_due(&mut seen, cmdbus, t0 + floor, floor),
+        "the same address at the floor boundary must be due again"
+    );
+}
+
+/// The throttle tracks a config-derived address set, so it is small — but an unbounded
+/// vec on the publish path is a leak waiting for a rotating address.
+#[test]
+fn the_tier_throttle_is_bounded_and_still_admits_a_new_address() {
+    let mut seen = Vec::new();
+    let floor = 60_000_000;
+    for i in 0..300 {
+        reg::tier_seen_due(&mut seen, &format!("writer-{i}:9100"), 1_000_000 + i, floor);
+    }
+    assert!(
+        seen.len() <= 64,
+        "the throttle grew to {} entries on the publish path",
+        seen.len()
+    );
+    // Eviction must not make a genuinely new tier permanently invisible.
+    assert!(
+        reg::tier_seen_due(&mut seen, "a-brand-new-writer:9100", 9_999_999_999, floor),
+        "a new address must still register once the table is full — refusing would hide a \
+         live tier forever"
+    );
+}
+
+/// ⭐ The reachability assertion the two older structural tests do not make: the hook must
+/// sit on the COMMAND publish, which prod's system executions do traverse
+/// (`noetl_command_publish_total{pool="system"}` = 4 on prod while
+/// `noetl_event_ingest_total` was absent entirely).
+#[test]
+fn the_command_publish_also_registers_the_tier() {
+    let src = include_str!("../src/handlers/execute.rs");
+    assert!(
+        src.contains("mirror_ehdb_tier_seen("),
+        "the command publish must register the tier too: the events publish is skipped for \
+         system executions, which is ALL of prod's regular traffic, so an events-only hook \
+         leaves discover(Ehdb) empty forever"
+    );
+}
+
+/// ⚠⚠ `Deferred` is NOT evidence of liveness. It means the on-path budget elapsed and a
+/// background task is still retrying — the writer may be down. Registering on it would
+/// claim liveness from a timeout, the same misclassification as `tier-load` reporting
+/// `ok:true` for an explicit refusal.
+#[test]
+fn the_tier_registration_is_not_claimed_from_a_deferred_publish() {
+    let src = include_str!("../src/handlers/execute.rs");
+    let at = src
+        .find("mirror_ehdb_tier_seen(")
+        .expect("the command-bus hook exists");
+    // Everything before the call site: the nearest preceding match arm is the one whose
+    // body the call sits in. Measured at any distance, so the length of the comment above
+    // the call cannot change the verdict.
+    let before = &src[..at];
+    let landed = before.rfind("PublishOutcome::Landed");
+    let deferred = before.rfind("PublishOutcome::Deferred");
+    let landed = landed.expect(
+        "the hook must sit inside the Landed arm — the nearest preceding arm is what the \
+         registration is claiming",
+    );
+    assert!(
+        deferred.is_none_or(|d| d < landed),
+        "the hook sits under Deferred: a publish whose on-path budget merely elapsed says \
+         nothing about whether the writer is up, so registering there would claim liveness \
+         from a timeout — the same misclassification as reporting ok on an explicit refusal"
+    );
+
+    // Positive control: the search is capable of finding a Deferred arm at all, so the
+    // assertion above is measuring arm order and not a typo that never matches.
+    assert!(
+        src.contains("PublishOutcome::Deferred"),
+        "execute.rs must still have a Deferred arm, or this test proves nothing"
     );
 }
