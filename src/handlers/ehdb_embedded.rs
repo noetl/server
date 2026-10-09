@@ -742,9 +742,30 @@ pub fn spawn_age_seal_task(engine: std::sync::Arc<std::sync::Mutex<L0Engine<D1Ev
                 .max()
                 .unwrap_or(0);
             let parts = guard.manifest_snapshot().parts.len();
+            // ⚠⚠ The WHOLE durability window, not just the unsealed part of it.
+            //
+            // `active_ages()` above stops at sealing. Replication is asynchronous, so a
+            // sealed part has a real window in which the only copy is local — and a gauge
+            // that stops at sealing reports the system safer than it is. `ehdb-l0` has
+            // tracked the full window in `UnreplicatedTracker` all along; nothing in the
+            // server read it.
+            let unrep = guard.unreplicated_snapshot();
             drop(guard);
+            let unrep_oldest = unrep.iter().map(|s| s.oldest_age_millis).max().unwrap_or(0) / 1000;
+            let unrep_records: u64 = unrep.iter().map(|s| s.records).sum();
+            // A shard counts as pending if it has records waiting, not merely a non-zero
+            // age — the age is 0 for a shard with nothing pending.
+            let unrep_shards = unrep.iter().filter(|s| s.records > 0).count();
             crate::metrics::ehdb_oldest_unsealed_age_seconds().set(oldest as i64);
             crate::metrics::ehdb_manifest_parts().set(parts as i64);
+            crate::metrics::ehdb_unreplicated_oldest_age_seconds().set(unrep_oldest as i64);
+            crate::metrics::ehdb_unreplicated_records().set(unrep_records as i64);
+            crate::metrics::ehdb_unreplicated_shards().set(unrep_shards as i64);
+            if unrep_oldest > 0 {
+                tracing::debug!(target: "noetl_server::ehdb_embedded",
+                    oldest_secs = unrep_oldest, records = unrep_records, shards = unrep_shards,
+                    "durability window");
+            }
         }
     });
 }
