@@ -1391,3 +1391,143 @@ pub async fn collect_candidates(
     }
     Ok(out)
 }
+
+// ===========================================================================
+// The prune floor — the piece the metadata could not give us.
+// ===========================================================================
+//
+// ⚠⚠ The problem: `plan_retention` drops whole parts below a sort-key floor, and a part
+// holds MANY executions interleaved. So the floor must be the minimum `global_sequence`
+// over every execution that is NOT safe to prune — and `PartMeta` carries only a bloom,
+// which cannot enumerate, so the metadata cannot answer it.
+//
+// ⭐ The way out came from the pass's own report: `examined=6496 archivable=6230`, i.e.
+// only **266 executions are not archivable**. The constraining set is small and bounded by
+// the retention window, not by history. Reading a min-sequence for 266 executions is
+// cheap; reading it for 6,496 would not be.
+//
+// So the floor is computed from three groups:
+//
+//   1. NOT archivable (non-terminal, or still inside the window) → each one constrains.
+//      ⚠ A live execution is in this group by construction, which is what makes the
+//      data-loss case impossible rather than merely unlikely.
+//   2. Archivable but NOT YET verified-archived → **the floor refuses to advance at all.**
+//      Conservative on purpose: while a backlog exists, pruning could drop a part holding
+//      an execution whose archive has not landed.
+//   3. Out of coverage — the engine holds nothing for them, so they constrain nothing.
+
+/// Why the floor is where it is. Named states, because "prune nothing" has causes that
+/// need different operator responses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FloorBasis {
+    /// Every archivable execution is verified-archived; the floor is the minimum sequence
+    /// of the executions that must stay hot.
+    Computed {
+        keep_from_sequence: u64,
+        constrained_by: usize,
+    },
+    /// ⚠ A backlog exists: some archivable execution is not yet verified-archived.
+    AwaitingBacklog { unarchived: usize },
+    /// Nothing is hot that we could measure — prune nothing.
+    NoFootprint,
+}
+
+impl FloorBasis {
+    pub fn keep_from_sequence(&self) -> Option<u64> {
+        match self {
+            FloorBasis::Computed { keep_from_sequence, .. } => Some(*keep_from_sequence),
+            _ => None,
+        }
+    }
+    pub fn may_prune(&self) -> bool {
+        matches!(self, FloorBasis::Computed { .. })
+    }
+    pub fn reason(&self) -> String {
+        match self {
+            FloorBasis::Computed { keep_from_sequence, constrained_by } => format!(
+                "keep_from_sequence={keep_from_sequence}, constrained by {constrained_by} \
+                 execution(s) that must stay hot"
+            ),
+            FloorBasis::AwaitingBacklog { unarchived } => format!(
+                "refusing to advance: {unarchived} archivable execution(s) are not yet \
+                 verified-archived, and a part may hold one of them"
+            ),
+            FloorBasis::NoFootprint => {
+                "no measurable hot footprint; nothing to prune".to_string()
+            }
+        }
+    }
+}
+
+/// Compute the floor from the scan, the verified-archived set, and the hot footprint of the
+/// constraining executions.
+///
+/// `footprint` must cover **every** execution in groups 1 and 2 that the engine holds. An
+/// execution missing from it is treated as out-of-coverage (constrains nothing) — ⚠ which is
+/// only sound because the caller builds the footprint by *reading the engine*, so absence
+/// there means the engine genuinely holds nothing.
+pub fn compute_prune_floor(
+    scan: &ArchivableScan,
+    verified_archived: &std::collections::HashSet<i64>,
+    footprint: &[HotExecution],
+) -> FloorBasis {
+    // Group 2 first: a backlog blocks everything.
+    let unarchived = scan
+        .archivable
+        .iter()
+        .filter(|id| !verified_archived.contains(id))
+        .count();
+    if unarchived > 0 {
+        return FloorBasis::AwaitingBacklog { unarchived };
+    }
+
+    // Group 1: everything that must stay hot. The footprint holds exactly those the engine
+    // has records for.
+    let mut min_seq: Option<u64> = None;
+    let mut constrained = 0usize;
+    for h in footprint {
+        if verified_archived.contains(&h.execution_id) {
+            // Archived: does not constrain.
+            continue;
+        }
+        constrained += 1;
+        min_seq = Some(match min_seq {
+            Some(m) => m.min(h.min_sequence),
+            None => h.min_sequence,
+        });
+    }
+
+    match min_seq {
+        Some(s) => FloorBasis::Computed {
+            keep_from_sequence: s,
+            constrained_by: constrained,
+        },
+        // ⚠ Nothing constrains. That is NOT licence to prune everything: it means the
+        // footprint was empty, which with a drained backlog means the engine holds nothing
+        // we measured. Refuse rather than compute a floor above the whole log from an
+        // absence of evidence.
+        None => FloorBasis::NoFootprint,
+    }
+}
+
+/// The executions whose hot footprint the floor needs — groups 1 and 2 of the comment
+/// above, never the whole population.
+///
+/// ⭐ Bounded by the retention window rather than by history: on prod this was **266 of
+/// 6,496**. Returning the whole population would make the floor cost O(history) per pass.
+pub fn floor_relevant_ids(
+    scan: &ArchivableScan,
+    verified_archived: &std::collections::HashSet<i64>,
+    all: &[ArchiveCandidate],
+) -> Vec<i64> {
+    let archivable: std::collections::HashSet<i64> = scan.archivable.iter().copied().collect();
+    all.iter()
+        .filter(|c| {
+            // Group 1: not archivable at all.
+            !archivable.contains(&c.execution_id)
+                // Group 2: archivable but not yet verified-archived.
+                || !verified_archived.contains(&c.execution_id)
+        })
+        .map(|c| c.execution_id)
+        .collect()
+}
