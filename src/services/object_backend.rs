@@ -363,6 +363,29 @@ impl GcsBackend {
         })
     }
 
+    /// Open a backend for the archive tier, resolving auth the same way `from_env` does:
+    /// ADC / Workload Identity for a real GCS host, no credential for an emulator.
+    ///
+    /// ⭐ One place decides how auth works. A second resolution path is how a deployment
+    /// ends up authenticating on one route and not another.
+    pub fn open_for_archive(endpoint: &str, bucket: &str) -> Result<Self, String> {
+        let endpoint = endpoint.trim().trim_end_matches('/').to_string();
+        if endpoint.is_empty() || bucket.trim().is_empty() {
+            return Err("archive endpoint and bucket are both required".into());
+        }
+        let auth = GcsAuth::from_env(&endpoint);
+        tracing::info!(
+            endpoint = %endpoint, bucket = %bucket, auth = %auth.label(),
+            "event archive store opened (noetl/ai-meta#459)"
+        );
+        Ok(Self {
+            client: reqwest::Client::new(),
+            endpoint,
+            bucket: bucket.trim().to_string(),
+            auth,
+        })
+    }
+
     /// The bucket this backend writes to.
     pub fn bucket(&self) -> &str {
         &self.bucket

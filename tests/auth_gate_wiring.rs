@@ -119,7 +119,7 @@ fn every_privileged_router_is_gated_in_main() {
     let src = include_str!("../src/main.rs");
     // Router groups that expose credentials, keychain material, or the internal
     // control surface. Kept explicit so adding one is a deliberate act.
-    const PRIVILEGED: [&str; 18] = [
+    const PRIVILEGED: [&str; 19] = [
         "credential_routes",
         "sealed_credential_routes",
         "keychain_routes",
@@ -153,7 +153,11 @@ fn every_privileged_router_is_gated_in_main() {
         // distinct from reporting on an id the caller already holds, which is the
         // same reason the two routers above carry the gate.
         "runtime_topology_routes",
-    ];
+            // noetl/ai-meta#459 P5. `/api/archive/executions?date=` ENUMERATES the
+        // executions archived on a date — the same enumeration-is-a-capability
+        // reasoning as `ehdb_equivalence_routes` and `runtime_topology_routes`.
+        "archive_read_routes",
+];
     let mut ungated = Vec::new();
     for name in PRIVILEGED {
         let needle = format!(".merge({name}.layer(");

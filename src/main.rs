@@ -431,6 +431,29 @@ fn build_router(
     // ⚠ GATED. These routes ENUMERATE service ids and contracts, and enumeration is a
     // capability distinct from reporting on an id the caller already holds — the same
     // reasoning that gated `ehdb_equivalence_routes` below and `ehdb_object_parity_routes`.
+    // Archived event history (noetl/ai-meta#459 P5).
+    //
+    // ⚠ GATED alongside the topology routes: the by-date route ENUMERATES executions, and
+    // enumeration is a capability distinct from reporting on an id the caller already
+    // holds — the same reasoning applied to runtime_topology_routes below.
+    //
+    // ⚠⚠ Read-only by construction. There is no delete on the ArchiveStore trait, so no
+    // route here can remove archived history even if one were added carelessly: once the
+    // hot part is pruned the archive is the surviving copy.
+    let archive_read_routes = Router::new()
+        .route(
+            "/api/archive/executions",
+            get(handlers::archive_read::list_by_date),
+        )
+        .route(
+            "/api/archive/executions/{execution_id}",
+            get(handlers::archive_read::get_execution),
+        )
+        .with_state(handlers::archive_read::ArchiveReadDeps {
+            store: noetl_server::services::event_archive::open_archive_store(),
+            configured_bucket: std::env::var("NOETL_EHDB_ARCHIVE_BUCKET").ok(),
+        });
+
     let runtime_topology_routes = Router::new()
         .route(
             "/api/runtime/topology",
@@ -926,6 +949,10 @@ fn build_router(
             noetl_server::auth_gate::gate,
         )))
         .merge(runtime_topology_routes.layer(axum::middleware::from_fn_with_state(
+            "internal",
+            noetl_server::auth_gate::gate,
+        )))
+        .merge(archive_read_routes.layer(axum::middleware::from_fn_with_state(
             "internal",
             noetl_server::auth_gate::gate,
         )))

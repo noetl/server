@@ -967,3 +967,126 @@ pub fn export_scan(scan: &ArchivableScan) {
     crate::metrics::ehdb_archive_scan_examined().set(scan.examined as i64);
     crate::metrics::ehdb_archive_scan_archivable().set(scan.archivable.len() as i64);
 }
+
+// ===========================================================================
+// P5 — retrieval: hot first, archive on miss.
+// ===========================================================================
+
+/// Where an execution's events were served from.
+///
+/// ⚠⚠ Three states, never two. A pruned-and-archived execution, an execution that
+/// predates the store, and a genuinely unknown id are different answers, and collapsing
+/// any pair of them is the failure this codebase keeps paying for — a wrong lookup that
+/// answers with silence rather than an error.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case", tag = "source")]
+pub enum ReadSource {
+    /// Served from the hot store.
+    Hot { records: usize },
+    /// The hot store no longer holds it; served from the archive.
+    Archive {
+        records: usize,
+        data_key: String,
+        archived_at: DateTime<Utc>,
+    },
+    /// Neither the hot store nor the archive has it.
+    NotFound,
+}
+
+impl ReadSource {
+    pub fn label(&self) -> &'static str {
+        match self {
+            ReadSource::Hot { .. } => "hot",
+            ReadSource::Archive { .. } => "archive",
+            ReadSource::NotFound => "not_found",
+        }
+    }
+}
+
+/// The result of a fall-through read.
+#[derive(Debug, Clone)]
+pub struct FallthroughRead {
+    pub source: ReadSource,
+    pub records: Vec<ArchiveRecord>,
+}
+
+/// Read an execution's events: the hot store if it still has them, otherwise the archive.
+///
+/// `hot` is a closure rather than an engine handle so this is testable without opening an
+/// L0 engine, and so the caller decides what "hot" means (the embedded shadow today; a
+/// serving tier later).
+///
+/// ⚠⚠ An **empty** hot result is a miss, not an answer. After a prune the hot store
+/// legitimately holds zero records for an old execution, and treating that as "the
+/// execution has no events" would turn every pruned execution into a silent empty success.
+/// That is precisely the shape of the bug this function exists to prevent.
+///
+/// ⚠⚠ A **broken** archive is an error, never a `NotFound`. If the manifest is present the
+/// execution was archived, so a missing or corrupt data object is a broken archive — and
+/// reporting it as absence would hide data loss behind a clean 404.
+pub async fn read_with_fallthrough<F>(
+    store: &dyn ArchiveStore,
+    execution_id: i64,
+    hot: F,
+) -> Result<FallthroughRead, String>
+where
+    F: FnOnce() -> Option<Vec<ArchiveRecord>>,
+{
+    if let Some(records) = hot() {
+        if !records.is_empty() {
+            let n = records.len();
+            return Ok(FallthroughRead {
+                source: ReadSource::Hot { records: n },
+                records,
+            });
+        }
+        // Fall through: an open-but-empty hot store means pruned (or never held), and the
+        // archive is the place to look.
+    }
+    match read_archived(store, execution_id).await? {
+        Some((manifest, records)) => {
+            let n = records.len();
+            Ok(FallthroughRead {
+                source: ReadSource::Archive {
+                    records: n,
+                    data_key: manifest.data_key,
+                    archived_at: manifest.archived_at,
+                },
+                records,
+            })
+        }
+        None => Ok(FallthroughRead {
+            source: ReadSource::NotFound,
+            records: Vec::new(),
+        }),
+    }
+}
+
+/// Open the archive store from env, or `None` when archiving is not configured.
+///
+/// ⚠ Returns `None` rather than a store pointed at nothing, so the read routes can answer
+/// 503-with-a-reason instead of an empty 200. "Not configured" and "nothing archived" are
+/// different facts and must not share a response.
+pub fn open_archive_store() -> Option<std::sync::Arc<dyn ArchiveStore>> {
+    let bucket = std::env::var("NOETL_EHDB_ARCHIVE_BUCKET").ok()?;
+    let bucket = bucket.trim();
+    if bucket.is_empty() {
+        return None;
+    }
+    let endpoint = std::env::var("NOETL_EHDB_ARCHIVE_ENDPOINT")
+        .or_else(|_| std::env::var("NOETL_OBJECT_STORE_GCS_ENDPOINT"))
+        .unwrap_or_else(|_| "https://storage.googleapis.com".to_string());
+
+    // Reuse the object backend's own resolution, so prod gets ADC/Workload Identity and a
+    // non-Google endpoint gets the open emulator — one place decides how auth works.
+    match crate::services::object_backend::GcsBackend::open_for_archive(&endpoint, bucket) {
+        Ok(b) => Some(std::sync::Arc::new(b)),
+        Err(e) => {
+            tracing::warn!(
+                bucket, endpoint = %endpoint, error = %e,
+                "the event archive store could not be opened; archive reads will 503"
+            );
+            None
+        }
+    }
+}
