@@ -483,6 +483,15 @@ pub(crate) async fn execute_one(
     );
 
     crate::metrics::record_execute_outcome(entry, "new");
+    // noetl/ai-meta#455 P4 — register the execution as an EPHEMERAL runtime unit, so a
+    // live execution is discoverable while it runs.
+    //
+    // ⚠ Only on "started". A duplicate collapsed onto an existing execution started
+    // nothing, and registering it would double-count the same unit.
+    //
+    // ⚠ Fail-soft: this runs on the execute path, which must not fail because a registry
+    // write did.
+    crate::runtime_registry::mirror_execution_started(execution_id);
     Ok(ExecuteOutcome {
         execution_id,
         status: "started",

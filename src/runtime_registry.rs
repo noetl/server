@@ -54,7 +54,13 @@ pub const TTL_ENV: &str = "NOETL_RUNTIME_TTL_SECS";
 /// Renewal interval. Kept well under the TTL so one missed tick is not an expiry.
 pub const HEARTBEAT_ENV: &str = "NOETL_RUNTIME_HEARTBEAT_SECS";
 
+/// Lease for an **ephemeral** execution. Shorter than the fleet TTL because an execution
+/// does not heartbeat: its removal is normally the terminal-event deregister, and this is
+/// only the backstop for one that crashes without emitting one.
+pub const EXECUTION_TTL_ENV: &str = "NOETL_RUNTIME_EXECUTION_TTL_SECS";
+
 const DEFAULT_TTL_SECS: u64 = 180;
+const DEFAULT_EXECUTION_TTL_SECS: u64 = 300;
 const DEFAULT_HEARTBEAT_SECS: u64 = 60;
 
 /// `true` unless explicitly disabled, and only when the embedded root is in play.
@@ -79,6 +85,39 @@ fn env_secs(key: &str, default: u64) -> u64 {
 /// The lease window, in microseconds — the unit `list_live_at` takes.
 pub fn ttl_micros() -> u64 {
     env_secs(TTL_ENV, DEFAULT_TTL_SECS).saturating_mul(1_000_000)
+}
+
+/// The lease window for `RuntimeKind::Execution`.
+pub fn execution_ttl_micros() -> u64 {
+    env_secs(EXECUTION_TTL_ENV, DEFAULT_EXECUTION_TTL_SECS).saturating_mul(1_000_000)
+}
+
+/// The TTL that applies to a given kind.
+///
+/// ⚠ Per-kind on purpose. A fleet member heartbeats, so a short lease is safe for it. An
+/// execution does **not** heartbeat, so the same short lease would drop a long-running one
+/// out of discovery while it is still running.
+pub fn ttl_for(kind: RuntimeKind) -> u64 {
+    match kind {
+        RuntimeKind::Execution => execution_ttl_micros(),
+        _ => ttl_micros(),
+    }
+}
+
+/// Minimum spacing between mirrored heartbeats, below which a beat is skipped.
+///
+/// ⚠⚠ MEASURED, not guessed. With the real 7-member prod fleet the mirror was appending
+/// **22.9 ops/min** — each member beating about every 18 s — for **6.7 MB/day**, which is
+/// **22x** the ~0.3 MB/day I had estimated from one member at 60 s. The per-record size was
+/// right (203 B measured vs ~200 B estimated); the RATE was wrong on both axes, member
+/// count and interval.
+///
+/// D8 cannot be compacted — it deliberately does not opt into `supersede_key` because
+/// `watch_since` reads history — so the only lever is writing fewer ops. Renewing at
+/// `ttl/3` keeps every member comfortably inside its lease (two missed beats still leave
+/// margin) while cutting the append rate by roughly the same factor the measurement found.
+pub fn heartbeat_floor_micros() -> u64 {
+    (ttl_micros() / 3).max(1_000_000)
 }
 
 /// How often the heartbeat task renews.
@@ -184,8 +223,15 @@ pub fn topology_in(store: &RuntimeStore, now: u64, ttl: u64) -> Result<Topology,
         RuntimeKind::Playbook,
         RuntimeKind::Execution,
     ] {
+        // ⚠ Per-kind TTL. An execution does not heartbeat, so the fleet lease would drop
+        // a long-running one out of discovery while it is still running.
+        let kind_ttl = if matches!(kind, RuntimeKind::Execution) {
+            execution_ttl_micros()
+        } else {
+            ttl
+        };
         let members = store
-            .discover(kind, now, ttl)
+            .discover(kind, now, kind_ttl)
             .map_err(|e| e.to_string())?
             .into_iter()
             .map(|s| Member {
@@ -258,6 +304,52 @@ pub fn upsert_in(
     }
     register_in(store, kind, id, contract, now)?;
     Ok(true)
+}
+
+/// What a throttled upsert did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpsertOutcome {
+    /// No prior registration — a fresh arrival.
+    Registered,
+    /// Renewed, because the recorded lease was older than the floor.
+    Renewed,
+    /// Skipped: already renewed more recently than the floor. Liveness is unaffected,
+    /// because the floor is well inside the lease.
+    Skipped,
+}
+
+/// Register, renew, or skip — the write-rate-aware form of [`upsert_in`].
+///
+/// Reads the recorded `last_seen` and skips a renewal that would be redundant. One lock,
+/// one decision: reading and writing under separate locks would let two concurrent beats
+/// both decide to write.
+///
+/// ⚠ A record with `last_seen_micros == 0` predates the field, so it is renewed rather than
+/// skipped — that is the one case where writing is the conservative choice, because its
+/// liveness is otherwise unknown.
+pub fn upsert_throttled_in(
+    store: &mut RuntimeStore,
+    kind: RuntimeKind,
+    id: &str,
+    contract: &str,
+    now: u64,
+    floor: u64,
+) -> Result<UpsertOutcome, String> {
+    match store.get(id).map_err(|e| e.to_string())? {
+        Some(existing) => {
+            if existing.last_seen_micros != 0
+                && now.saturating_sub(existing.last_seen_micros) < floor
+            {
+                return Ok(UpsertOutcome::Skipped);
+            }
+            heartbeat_in(store, id, now)?;
+            Ok(UpsertOutcome::Renewed)
+        }
+        None => {
+            register_in(store, kind, id, contract, now)?;
+            Ok(UpsertOutcome::Registered)
+        }
+    }
 }
 
 /// Register or renew a fleet member in the process-wide store.
@@ -367,11 +459,101 @@ pub fn mirror_pool_register(kind: &str, name: &str, status: &str) {
 pub fn mirror_pool_heartbeat(kind: &str, name: &str) {
     let Some(rk) = pool_kind(kind) else { return };
     let Some(id) = sanitise_id(name) else { return };
-    if let Err(e) = upsert(rk, &id, &format!("{kind}:heartbeat")) {
-        tracing::warn!(target: "noetl_server::runtime_registry", error = %e, id = %id,
-            "pool heartbeat not mirrored to D8");
-        crate::metrics::record_runtime_registry("mirror_failed");
+    let Some(store) = store() else { return };
+    let contract = format!("{kind}:heartbeat");
+    let outcome = {
+        let mut guard = match store.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        upsert_throttled_in(
+            &mut guard,
+            rk,
+            &id,
+            &contract,
+            now_micros(),
+            heartbeat_floor_micros(),
+        )
+    };
+    match outcome {
+        Ok(UpsertOutcome::Registered) => crate::metrics::record_runtime_registry("registered"),
+        Ok(UpsertOutcome::Renewed) => crate::metrics::record_runtime_registry("heartbeat"),
+        Ok(UpsertOutcome::Skipped) => {
+            crate::metrics::record_runtime_registry("heartbeat_skipped")
+        }
+        Err(e) => {
+            tracing::warn!(target: "noetl_server::runtime_registry", error = %e, id = %id,
+                "pool heartbeat not mirrored to D8");
+            crate::metrics::record_runtime_registry("mirror_failed");
+        }
     }
+}
+
+/// Register a live execution as an **ephemeral** runtime unit (noetl/ai-meta#455 P4).
+///
+/// ⚠ Fail-soft: called from the execute path, which must not fail because a registry write
+/// did.
+pub fn mirror_execution_started(execution_id: i64) {
+    let Some(store) = store() else { return };
+    let id = format!("exec-{execution_id}");
+    let mut guard = match store.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    match register_in(
+        &mut guard,
+        RuntimeKind::Execution,
+        &id,
+        "execution",
+        now_micros(),
+    ) {
+        Ok(()) => crate::metrics::record_runtime_registry("execution_registered"),
+        Err(e) => {
+            tracing::debug!(target: "noetl_server::runtime_registry", error = %e, id = %id,
+                "execution not registered");
+            crate::metrics::record_runtime_registry("mirror_failed");
+        }
+    }
+}
+
+/// Remove a finished execution immediately rather than waiting out its lease.
+///
+/// ⚠ The TTL is still the guarantee. An execution that crashes without emitting a terminal
+/// event is removed by its lease lapsing, so correctness does not depend on this running —
+/// the same reasoning `deregister` carries for the fleet.
+pub fn mirror_execution_finished(execution_id: i64) {
+    let Some(store) = store() else { return };
+    let id = format!("exec-{execution_id}");
+    let mut guard = match store.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    match guard.deregister(&id) {
+        Ok(true) => crate::metrics::record_runtime_registry("execution_finished"),
+        Ok(false) => {}
+        Err(e) => {
+            tracing::debug!(target: "noetl_server::runtime_registry", error = %e, id = %id,
+                "execution not deregistered");
+        }
+    }
+}
+
+/// Is this event type terminal for an execution?
+///
+/// ⚠ Matched on the names the event log actually uses, both spellings. Prod stores
+/// `playbook.completed` and historically `playbook_completed`, and a registry that only
+/// knew one would leave half of all executions to expire by TTL instead of being removed
+/// promptly — a silent half-failure.
+pub fn is_terminal_event(event_type: &str) -> bool {
+    matches!(
+        event_type,
+        "playbook.completed"
+            | "playbook_completed"
+            | "playbook.failed"
+            | "playbook_failed"
+            | "execution.completed"
+            | "execution.failed"
+    )
 }
 
 /// Mirror a clean pool departure.

@@ -494,6 +494,24 @@ pub async fn emit_events(state: &AppState, pool: &DbPool, rows: &[EventRow]) -> 
     // silently-degraded shadow stays visible.
     crate::handlers::ehdb_embedded::shadow_append(rows);
 
+    // noetl/ai-meta#455 P4 — an execution's terminal event removes it from discovery
+    // immediately rather than leaving it to expire.
+    //
+    // ⚠ Placed at the SAME chokepoint as the embedded shadow above, deliberately. That
+    // call site was itself the noetl/ai-meta#326 mistake: it lived on the materializer,
+    // which prod's scheduled traffic never reaches, so it sat armed and unexercised for a
+    // full window reporting the same all-zero series a healthy shadow reports. Every
+    // server-originated event passes through here, on both sides of the CQRS gate.
+    //
+    // ⚠ The TTL remains the guarantee. An execution that crashes without emitting a
+    // terminal event is removed by its lease lapsing, so correctness does not depend on
+    // this firing — the same reasoning the fleet's deregister carries.
+    for row in rows {
+        if crate::runtime_registry::is_terminal_event(&row.event_type) {
+            crate::runtime_registry::mirror_execution_finished(row.execution_id);
+        }
+    }
+
     // All rows in a batch share the same execution + catalog, so one decision
     // covers the batch.
     let __t = std::time::Instant::now();
