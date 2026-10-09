@@ -149,6 +149,29 @@ pub fn open_embedded() -> Option<Arc<std::sync::Mutex<L0Engine<D1EventLog>>>> {
                 return None;
             }
         };
+    // noetl/ai-meta#460 A1 — report what this replica set actually guarantees, BEFORE the
+    // engine is opened and regardless of whether the open succeeds.
+    //
+    // ⚠⚠ `L0Engine::open` makes a replica set of exactly ONE, and ehdb's failure-domain
+    // check is gated on `replicas.len() >= 2`, so at RF=1 it short-circuits and
+    // `replica_domain_violations` stays pinned at 0. On prod that 0 sits next to two copies
+    // on the SAME device (66320), which is why it had to be evaluated here instead: a 0
+    // nobody computed is indistinguishable from a 0 that was checked.
+    let reality = crate::services::replica_reality::evaluate_and_publish(
+        substrate.as_ref(),
+        "replica-0",
+    );
+    if reality.is_single_point_of_failure() {
+        tracing::warn!(target: "noetl_server::ehdb_embedded", dir = %dir,
+            reality = %reality.describe(),
+            "embedded event-log store is a SINGLE POINT OF FAILURE: no replica is in an \
+             off-node failure domain, so losing this node loses the store (#460 A2/A3 is \
+             the work that changes this; this is the instrument, not the fix)");
+    } else {
+        tracing::info!(target: "noetl_server::ehdb_embedded", dir = %dir,
+            reality = %reality.describe(), "embedded replica set survives node loss");
+    }
+
     // ⚠ This is where ehdb-l0's FORMAT_VERSION gate fires: an on-disk layout
     // written by a different build refuses here rather than being misread.
     match L0Engine::<D1EventLog>::open(

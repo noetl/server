@@ -1148,6 +1148,7 @@ async fn main() -> anyhow::Result<()> {
     // registry's only evidence of not running was silence.
     noetl_server::metrics::init_runtime_registry_series();
     noetl_server::metrics::init_ehdb_retention_series();
+    noetl_server::metrics::init_replica_reality_series();
     // noetl/ai-meta#366 — pin the chain-certificate series so a zero reads as a
     // zero rather than as an absent family (see init_chain_cert_series).
     noetl_server::metrics::init_chain_cert_series();

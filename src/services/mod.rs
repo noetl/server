@@ -19,6 +19,7 @@ pub mod object_backend;
 pub mod orch_snapshot;
 pub mod permanent_log_lean;
 pub mod registry;
+pub mod replica_reality;
 pub mod replay;
 pub mod result_store;
 pub mod result_tier_gc;
