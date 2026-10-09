@@ -8,6 +8,24 @@
 
 use noetl_server::services::event_archive as ea;
 
+/// ⚠⚠ These tests mutate **process-global** Prometheus gauges, and `cargo test` runs the
+/// tests in one binary **in parallel**. Without this lock they race: one test seeds the
+/// series while another asserts an exact value, and the result is a failure that depends on
+/// timing — it passed locally and failed in CI, which is the worst version of the bug.
+///
+/// The repo already carries this lesson for `env::set_var` ("cargo test does not serialise
+/// tests"); a shared metric registry is the same hazard wearing different clothes.
+static GAUGE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Take the lock, tolerating a poisoned mutex so one failing test does not cascade into
+/// every other test in the file reporting a lock error instead of its own verdict.
+fn serialised() -> std::sync::MutexGuard<'static, ()> {
+    match GAUGE_LOCK.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
 /// Renders through the SAME function `/metrics` serves, so the test asserts what a scrape
 /// would actually see rather than what a private registry holds.
 fn rendered() -> String {
@@ -18,6 +36,7 @@ fn rendered() -> String {
 /// present and 0. This is the server#315 lesson: a pin inside a config branch is not a pin.
 #[test]
 fn every_retention_series_is_pinned_at_zero_before_anything_runs() {
+    let _g = serialised();
     noetl_server::metrics::init_ehdb_retention_series();
     let text = rendered();
 
@@ -62,6 +81,7 @@ fn every_retention_series_is_pinned_at_zero_before_anything_runs() {
 /// is no longer blocking anything — a representation outliving what it described.
 #[test]
 fn the_blocking_execution_id_is_cleared_when_nothing_blocks() {
+    let _g = serialised();
     noetl_server::metrics::init_ehdb_retention_series();
     let hot = vec![
         ea::HotExecution { execution_id: 4242, min_sequence: 7, max_sequence: 90 },
@@ -103,6 +123,7 @@ fn the_blocking_execution_id_is_cleared_when_nothing_blocks() {
 /// A negative age (clock skew) must not become a negative gauge.
 #[test]
 fn a_negative_age_is_clamped_rather_than_published() {
+    let _g = serialised();
     noetl_server::metrics::init_ehdb_retention_series();
     let hot = vec![ea::HotExecution { execution_id: 5, min_sequence: 1, max_sequence: 2 }];
     ea::export_floor(&ea::retention_floor(&hot, &[]), Some(-9_999));
@@ -116,6 +137,7 @@ fn a_negative_age_is_clamped_rather_than_published() {
 /// The scan publishes both numbers, so a selection never travels without its population.
 #[test]
 fn the_scan_gauges_carry_the_denominator() {
+    let _g = serialised();
     noetl_server::metrics::init_ehdb_retention_series();
     let mut scan = ea::ArchivableScan::default();
     let rows: Vec<(i64, String, Option<chrono::DateTime<chrono::Utc>>)> = (0..7)
@@ -136,6 +158,7 @@ fn the_scan_gauges_carry_the_denominator() {
 /// ⚠ A huge sequence must saturate rather than wrap into a plausible negative.
 #[test]
 fn an_enormous_sequence_saturates_rather_than_wrapping_negative() {
+    let _g = serialised();
     noetl_server::metrics::init_ehdb_retention_series();
     let hot = vec![ea::HotExecution {
         execution_id: 1,

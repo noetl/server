@@ -8,6 +8,24 @@
 use ehdb_l0::failure_domain::{FailureDomain, ReplicaDomain};
 use noetl_server::services::replica_reality as rr;
 
+/// ⚠⚠ These tests mutate **process-global** Prometheus gauges, and `cargo test` runs the
+/// tests in one binary **in parallel**. Without this lock they race: one test seeds the
+/// series while another asserts an exact value, and the result is a failure that depends on
+/// timing — it passed locally and failed in CI, which is the worst version of the bug.
+///
+/// The repo already carries this lesson for `env::set_var` ("cargo test does not serialise
+/// tests"); a shared metric registry is the same hazard wearing different clothes.
+static GAUGE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Take the lock, tolerating a poisoned mutex so one failing test does not cascade into
+/// every other test in the file reporting a lock error instead of its own verdict.
+fn serialised() -> std::sync::MutexGuard<'static, ()> {
+    match GAUGE_LOCK.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
 fn local(dev: u64, root: &str) -> ReplicaDomain {
     ReplicaDomain {
         replica: format!("r-{dev}-{root}"),
@@ -171,6 +189,7 @@ fn the_domain_labels_are_distinct_and_carry_the_device() {
 /// nobody computed.
 #[test]
 fn the_series_are_pinned_pessimistically_before_evaluation() {
+    let _g = serialised();
     noetl_server::metrics::init_replica_reality_series();
     let text = noetl_server::metrics::gather_text().expect("render /metrics");
     for g in [
@@ -212,6 +231,7 @@ fn the_series_are_pinned_pessimistically_before_evaluation() {
 /// successes only hides the case where the slow puts are the ones that fail.
 #[test]
 fn the_put_histogram_separates_outcomes() {
+    let _g = serialised();
     noetl_server::metrics::init_replica_reality_series();
     noetl_server::metrics::observe_object_store_put("gcs", "ok", 0.012);
     noetl_server::metrics::observe_object_store_put("gcs", "failed", 3.5);
