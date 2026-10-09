@@ -410,3 +410,116 @@ fn deregister_is_a_shortcut_and_the_lease_is_still_the_guarantee() {
     );
     let _ = std::fs::remove_dir_all(&root);
 }
+
+// ---------------------------------------------------------------------------
+// The pool mirror: how the fleet becomes discoverable with NO worker change.
+//
+// The worker has posted /api/worker/pool/register and /heartbeat since long before the
+// registry existed. Mirroring those two calls server-side populates discover(Worker)
+// without touching the worker, its ehdb pin, or its deployment.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn pool_kind_maps_what_the_worker_actually_sends() {
+    // The literal string the Rust worker posts, and the server's own default.
+    assert_eq!(reg::pool_kind("worker_pool"), Some(RuntimeKind::Worker));
+    assert_eq!(reg::pool_kind("worker"), Some(RuntimeKind::Worker));
+    assert_eq!(reg::pool_kind("gateway"), Some(RuntimeKind::Gateway));
+    assert_eq!(reg::pool_kind("ehdb"), Some(RuntimeKind::Ehdb));
+    assert_eq!(reg::pool_kind("tier"), Some(RuntimeKind::Ehdb));
+    assert_eq!(reg::pool_kind("server"), Some(RuntimeKind::Server));
+    // ⚠ Unrecognised must be skipped, not defaulted. Misfiling a gateway as a Worker
+    // makes discover(Gateway) wrong in a way nothing reports.
+    for bad in ["", "pool", "node", "worker-pool", "runtime"] {
+        assert_eq!(
+            reg::pool_kind(bad),
+            None,
+            "{bad:?} must not be mirrored under a guessed kind"
+        );
+    }
+}
+
+#[test]
+fn sanitise_id_derives_a_legal_substrate_key_and_refuses_the_rest() {
+    // Real pool names pass through untouched.
+    assert_eq!(
+        reg::sanitise_id("noetl-worker-rust-f7bb67444-gmqf9").as_deref(),
+        Some("noetl-worker-rust-f7bb67444-gmqf9")
+    );
+    assert_eq!(reg::sanitise_id("shard.3").as_deref(), Some("shard.3"));
+    assert_eq!(reg::sanitise_id("pod:2").as_deref(), Some("pod:2"));
+    // A `/` would be a directory traversal in a substrate key.
+    assert_eq!(reg::sanitise_id("a/b").as_deref(), Some("a-b"));
+    assert_eq!(reg::sanitise_id("a b").as_deref(), Some("a-b"));
+    // Refused rather than normalised into something meaningless.
+    assert_eq!(reg::sanitise_id(""), None, "an empty id registers nothing findable");
+    assert_eq!(
+        reg::sanitise_id(".."),
+        None,
+        "a dot-run resolves as a path segment; validate_op refuses it and so must this"
+    );
+    assert_eq!(reg::sanitise_id("..."), None);
+}
+
+#[test]
+fn a_mirrored_worker_pool_registration_is_discoverable_as_a_worker() {
+    let (mut st, root) = store("mirror");
+    let t0 = 1_000 * SEC;
+    let ttl = 180 * SEC;
+
+    // Exactly what the mirror does for the body the worker already posts.
+    let kind = reg::pool_kind("worker_pool").expect("worker_pool must map");
+    let id = reg::sanitise_id("noetl-worker-rust-f7bb67444-gmqf9").expect("legal id");
+    reg::upsert_in(&mut st, kind, &id, "worker_pool:ready", t0).unwrap();
+
+    let found = reg::discover_in(&st, RuntimeKind::Worker, t0, ttl).unwrap();
+    assert_eq!(found.len(), 1, "the pool must be discoverable as a Worker");
+    assert_eq!(found[0].id(), "noetl-worker-rust-f7bb67444-gmqf9");
+    assert_eq!(found[0].contract, "worker_pool:ready");
+
+    // Its heartbeat renews rather than duplicating.
+    assert!(
+        !reg::upsert_in(&mut st, kind, &id, "worker_pool:heartbeat", t0 + 60 * SEC).unwrap(),
+        "a mirrored heartbeat must renew, not re-register"
+    );
+    assert_eq!(
+        reg::discover_in(&st, RuntimeKind::Worker, t0 + 60 * SEC, ttl)
+            .unwrap()
+            .len(),
+        1,
+        "still exactly one worker after a heartbeat"
+    );
+
+    // ⭐ And a killed worker drops out on TTL, because it stops beating. No reaper.
+    assert!(
+        reg::discover_in(&st, RuntimeKind::Worker, t0 + 60 * SEC + ttl + SEC, ttl)
+            .unwrap()
+            .is_empty(),
+        "a worker that stopped heartbeating must expire by lease"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The mirror runs inside a live request handler, so on a server with no embedded engine it
+/// must be a harmless no-op rather than an error or a panic.
+///
+/// ⚠ This is the control that matters most for shipping it: the authoritative registration
+/// has already succeeded by the time the mirror is attempted, so a mirror that could fail
+/// would turn a working endpoint into a broken one on exactly the deployments that do not
+/// run the embedded engine.
+#[test]
+fn the_mirror_is_a_harmless_no_op_when_the_registry_is_off() {
+    // No NOETL_EHDB_EMBEDDED in the test environment, so `store()` is None.
+    assert!(
+        !reg::registry_enabled(),
+        "precondition: the registry must be off here, or this proves nothing"
+    );
+    // Must not panic, must not error.
+    reg::mirror_pool_register("worker_pool", "noetl-worker-x", "ready");
+    reg::mirror_pool_heartbeat("worker_pool", "noetl-worker-x");
+    reg::mirror_pool_deregister("noetl-worker-x");
+    // And the direct paths report unavailability rather than pretending to succeed.
+    assert!(reg::upsert(RuntimeKind::Worker, "x", "c").is_err());
+    assert!(reg::topology().is_none());
+    assert!(reg::watch(0).is_none());
+}

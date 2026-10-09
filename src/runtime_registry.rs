@@ -286,6 +286,103 @@ pub fn deregister(id: &str) -> Result<bool, String> {
     Ok(gone)
 }
 
+/// Map a pool `kind` / `component_type` string onto a `RuntimeKind`.
+///
+/// ⚠ `None` for anything unrecognised, and the caller **skips the mirror** rather than
+/// defaulting. Misfiling a gateway as a `Worker` would make `discover(Gateway)` wrong in a
+/// way nothing reports, which is worse than a member simply not appearing.
+pub fn pool_kind(kind: &str) -> Option<RuntimeKind> {
+    match kind.to_ascii_lowercase().as_str() {
+        "worker_pool" | "worker" => Some(RuntimeKind::Worker),
+        "gateway" => Some(RuntimeKind::Gateway),
+        "ehdb" | "ehdb_tier" | "tier" => Some(RuntimeKind::Ehdb),
+        "server" | "server_pool" => Some(RuntimeKind::Server),
+        _ => None,
+    }
+}
+
+/// Sanitise a pool name into D8's id charset.
+///
+/// ⚠ A pool name is operator-supplied and reaches a substrate key. `validate_op` would
+/// refuse a bad one — correctly — but that refusal would then be logged on every heartbeat
+/// forever. Normalising once here means a legal name is derived rather than a cycle of
+/// rejections, and an empty result is reported as unmirrorable instead of writing `""`.
+pub fn sanitise_id(raw: &str) -> Option<String> {
+    let id: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    // A dot-run would resolve as a path segment; `validate_op` refuses it and so do we.
+    if id.is_empty() || id.split('.').all(|seg| seg.is_empty()) {
+        None
+    } else {
+        Some(id)
+    }
+}
+
+/// Mirror an **already-authoritative** pool registration into D8.
+///
+/// ⚠⚠ Fail-soft, always. This runs after `RuntimeService::register` has already succeeded,
+/// so the caller's registration is a fact before this is attempted. A mirror that can fail
+/// a real registration would be a liability rather than evidence — the same posture
+/// `ehdb_embedded::shadow_append` is written under. Never returns an error; never panics.
+///
+/// ⭐ This is what makes `discover(Worker)` real **without changing the worker at all**.
+/// The worker has posted `/api/worker/pool/register` and `/heartbeat` since long before the
+/// registry existed, so mirroring those two calls populates the fleet with no worker code,
+/// no ehdb pin bump and no worker roll.
+pub fn mirror_pool_register(kind: &str, name: &str, status: &str) {
+    let Some(rk) = pool_kind(kind) else {
+        tracing::debug!(target: "noetl_server::runtime_registry", kind = %kind, name = %name,
+            "pool kind not mirrored to D8 — unrecognised, and misfiling is worse than omitting");
+        return;
+    };
+    let Some(id) = sanitise_id(name) else {
+        tracing::warn!(target: "noetl_server::runtime_registry", name = %name,
+            "pool name cannot be expressed as a D8 id; not mirrored");
+        return;
+    };
+    let contract = format!("{kind}:{status}");
+    match upsert(rk, &id, &contract) {
+        Ok(_) => {}
+        Err(e) => {
+            tracing::warn!(target: "noetl_server::runtime_registry", error = %e, id = %id,
+                "pool registration not mirrored to D8");
+            crate::metrics::record_runtime_registry("mirror_failed");
+        }
+    }
+}
+
+/// Mirror a pool heartbeat into D8, renewing the member's lease.
+///
+/// Falls back to a registration when there is nothing to renew, so a member that was
+/// already beating before the registry existed appears on its next heartbeat rather than
+/// only after a restart.
+pub fn mirror_pool_heartbeat(kind: &str, name: &str) {
+    let Some(rk) = pool_kind(kind) else { return };
+    let Some(id) = sanitise_id(name) else { return };
+    if let Err(e) = upsert(rk, &id, &format!("{kind}:heartbeat")) {
+        tracing::warn!(target: "noetl_server::runtime_registry", error = %e, id = %id,
+            "pool heartbeat not mirrored to D8");
+        crate::metrics::record_runtime_registry("mirror_failed");
+    }
+}
+
+/// Mirror a clean pool departure.
+pub fn mirror_pool_deregister(name: &str) {
+    let Some(id) = sanitise_id(name) else { return };
+    if let Err(e) = deregister(&id) {
+        tracing::warn!(target: "noetl_server::runtime_registry", error = %e, id = %id,
+            "pool deregistration not mirrored to D8");
+    }
+}
+
 /// One live member of the fleet.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct Member {
