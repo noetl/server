@@ -143,6 +143,26 @@ pub fn evaluate_and_publish(substrate: &dyn DurableSubstrate, replica: &str) -> 
     reality
 }
 
+/// Evaluate and publish for a **replica set**, not one replica.
+///
+/// noetl/ai-meta#460 A2. The single-substrate form above was written when the engine was
+/// opened with exactly one replica; once a second (GCS) replica can be configured, reporting
+/// only `replica-0` would leave the gauges saying RF=1 on a store that now has two copies —
+/// the drift this instrument exists to prevent, pointed the other way.
+pub fn evaluate_and_publish_set(replicas: &[(&str, &dyn DurableSubstrate)]) -> ReplicaReality {
+    let domains: Vec<ReplicaDomain> = replicas
+        .iter()
+        .map(|(id, s)| ReplicaDomain {
+            replica: (*id).to_string(),
+            domain: s.failure_domain(),
+            root: None,
+        })
+        .collect();
+    let reality = evaluate(&domains);
+    publish(&reality);
+    reality
+}
+
 /// Publish a reality to the gauges.
 pub fn publish(r: &ReplicaReality) {
     crate::metrics::ehdb_replica_set_size().set(r.replica_set_size as i64);

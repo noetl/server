@@ -15,6 +15,7 @@ pub mod internal;
 pub mod keychain;
 pub mod keychain_refresh;
 pub mod sm_sourced;
+pub mod gcs_substrate;
 pub mod object_backend;
 pub mod orch_snapshot;
 pub mod permanent_log_lean;

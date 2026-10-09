@@ -455,6 +455,145 @@ impl GcsBackend {
         Ok(())
     }
 
+    /// Conditional upload: write only if no object exists at `key`.
+    ///
+    /// `Ok(true)` when newly written, `Ok(false)` when an object was already there. Uses
+    /// GCS's `ifGenerationMatch=0` precondition, so the check and the write are **one
+    /// atomic operation** — an `exists()`-then-`put()` pair would be a race, and the
+    /// substrate contract this backs (`put_if_absent`) is what makes a part's bytes
+    /// immutable once written.
+    ///
+    /// ⚠ 412 Precondition Failed is the "already exists" signal and is NOT an error. Any
+    /// other non-2xx is.
+    pub(crate) async fn put_if_absent(
+        &self,
+        key: &str,
+        media_type: &str,
+        bytes: &[u8],
+    ) -> AppResult<bool> {
+        let started = std::time::Instant::now();
+        let out = self.put_if_absent_inner(key, media_type, bytes).await;
+        crate::metrics::observe_object_store_put(
+            "gcs",
+            match &out {
+                Ok(true) => "ok",
+                // A skipped write is its own outcome: counting it as `ok` would inflate the
+                // put rate with work that never left the process, and counting it as
+                // `failed` would make idempotent re-upload look like breakage.
+                Ok(false) => "already_present",
+                Err(_) => "failed",
+            },
+            started.elapsed().as_secs_f64(),
+        );
+        out
+    }
+
+    async fn put_if_absent_inner(
+        &self,
+        key: &str,
+        media_type: &str,
+        bytes: &[u8],
+    ) -> AppResult<bool> {
+        let url = format!("{}/upload/storage/v1/b/{}/o", self.endpoint, self.bucket);
+        let mut req = self
+            .client
+            .post(&url)
+            .query(&[
+                ("uploadType", "media"),
+                ("name", key),
+                ("ifGenerationMatch", "0"),
+            ])
+            .header(reqwest::header::CONTENT_TYPE, media_type)
+            .body(bytes.to_vec());
+        if let Some(token) = self.auth.bearer_token().await? {
+            req = req.bearer_auth(token);
+        }
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| AppError::Internal(format!("gcs put_if_absent {key}: {e}")))?;
+        if resp.status() == reqwest::StatusCode::PRECONDITION_FAILED {
+            return Ok(false);
+        }
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(AppError::Internal(format!(
+                "gcs put_if_absent {key}: HTTP {} {}",
+                status.as_u16(),
+                body
+            )));
+        }
+        Ok(true)
+    }
+
+    /// Fetch the byte range `[offset, offset+len)` of an object.
+    ///
+    /// ⚠⚠ A range extending past the end of the object is a **HARD ERROR**, not a short
+    /// read. The manifest states every part's length, so an over-read means the caller and
+    /// the store disagree — and returning fewer bytes would let a TRUNCATED object read as
+    /// intact. This is pinned by ehdb's substrate conformance expectations across every
+    /// implementation, and it is the single most important line in this function.
+    ///
+    /// `len == 0` is answered without a request: GCS has no representation for a zero-length
+    /// range, and `bytes=o-(o-1)` would be sent as a malformed header.
+    pub(crate) async fn get_range(&self, key: &str, offset: u64, len: u64) -> AppResult<Vec<u8>> {
+        if len == 0 {
+            return Ok(Vec::new());
+        }
+        let url = format!(
+            "{}/storage/v1/b/{}/o/{}",
+            self.endpoint,
+            self.bucket,
+            percent_encode_segment(key)
+        );
+        let end = offset + len - 1;
+        let mut req = self
+            .client
+            .get(&url)
+            .query(&[("alt", "media")])
+            .header(reqwest::header::RANGE, format!("bytes={offset}-{end}"));
+        if let Some(token) = self.auth.bearer_token().await? {
+            req = req.bearer_auth(token);
+        }
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| AppError::Internal(format!("gcs get_range {key}: {e}")))?;
+        let status = resp.status();
+        if status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
+            return Err(AppError::Internal(format!(
+                "gcs get_range {key}: range {offset}+{len} is not satisfiable (HTTP 416) — \
+                 the store and the manifest disagree about this object's length"
+            )));
+        }
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(AppError::Internal(format!(
+                "gcs get_range {key}: HTTP {} {}",
+                status.as_u16(),
+                body
+            )));
+        }
+        let got = resp
+            .bytes()
+            .await
+            .map_err(|e| AppError::Internal(format!("gcs get_range {key} body: {e}")))?
+            .to_vec();
+        // ⚠ The explicit short-read refusal. A 200 (rather than 206) means the server
+        // ignored the Range header and sent the whole object, which a naive caller would
+        // splice at the wrong offset; a 206 shorter than asked means the object ends early.
+        if got.len() as u64 != len {
+            return Err(AppError::Internal(format!(
+                "gcs get_range {key}: asked {len} bytes at {offset}, got {} (HTTP {}) — \
+                 a short read must not be returned as data",
+                got.len(),
+                status.as_u16()
+            )));
+        }
+        Ok(got)
+    }
+
     /// Download via the GCS JSON API `alt=media`. The object name is a path
     /// segment, so it is percent-encoded (slashes become `%2F`). Returns `None`
     /// on 404 (so the resolver falls back fail-safe), errors on other non-2xx.

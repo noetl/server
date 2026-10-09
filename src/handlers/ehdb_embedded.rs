@@ -28,6 +28,7 @@
 use std::sync::Arc;
 
 use ehdb_l0::dataset::D1EventLog;
+use ehdb_l0::ReplicaTarget;
 use ehdb_l0::engine::{L0Config, L0Engine};
 use ehdb_l0::substrate::{DurableSubstrate, LocalFsSubstrate};
 
@@ -149,6 +150,45 @@ pub fn open_embedded() -> Option<Arc<std::sync::Mutex<L0Engine<D1EventLog>>>> {
                 return None;
             }
         };
+    // noetl/ai-meta#460 A2 — the optional off-box replica.
+    //
+    // ⚠⚠ If the GCS replica is configured but cannot be opened, the engine still opens at
+    // RF=1. Refusing would take the shadow down on a storage problem, which this module's
+    // design forbids outright ("a shadow that could take the server down on a storage
+    // problem would be a liability rather than evidence").
+    //
+    // Degrading is only acceptable because the degradation is MEASURED, not assumed: the A1
+    // evaluation below runs over whatever replica set actually exists, so
+    // `survives_node_loss` reports 0 and `single_point_of_failure` reports 1 whenever the
+    // second replica is missing — including when it was asked for and failed. A silent
+    // fallback with the gauges still reading "redundant" would be the exact representation
+    // drift this instrument was built to catch.
+    let gcs_replica: Option<Arc<dyn DurableSubstrate>> = match replica_gcs_bucket() {
+        None => None,
+        Some(bucket) => {
+            let endpoint = replica_gcs_endpoint();
+            let prefix = std::env::var("NOETL_EHDB_REPLICA_GCS_PREFIX").unwrap_or_default();
+            match crate::services::gcs_substrate::GcsSubstrate::open(&endpoint, &bucket, &prefix)
+            {
+                Ok(s) => {
+                    tracing::info!(target: "noetl_server::ehdb_embedded", bucket = %bucket,
+                        "off-box GCS replica opened: SEALED parts will be replicated off-node \
+                         (the unsealed tail stays RF=1)");
+                    crate::metrics::record_embedded_shadow("gcs_replica_opened");
+                    Some(Arc::new(s) as Arc<dyn DurableSubstrate>)
+                }
+                Err(e) => {
+                    tracing::error!(target: "noetl_server::ehdb_embedded", bucket = %bucket,
+                        error = %e,
+                        "off-box GCS replica was CONFIGURED but could not be opened; the \
+                         engine opens at RF=1 and the replica-reality gauges will say so");
+                    crate::metrics::record_embedded_shadow("gcs_replica_open_failed");
+                    None
+                }
+            }
+        }
+    };
+
     // noetl/ai-meta#460 A1 — report what this replica set actually guarantees, BEFORE the
     // engine is opened and regardless of whether the open succeeds.
     //
@@ -157,10 +197,11 @@ pub fn open_embedded() -> Option<Arc<std::sync::Mutex<L0Engine<D1EventLog>>>> {
     // `replica_domain_violations` stays pinned at 0. On prod that 0 sits next to two copies
     // on the SAME device (66320), which is why it had to be evaluated here instead: a 0
     // nobody computed is indistinguishable from a 0 that was checked.
-    let reality = crate::services::replica_reality::evaluate_and_publish(
-        substrate.as_ref(),
-        "replica-0",
-    );
+    let mut set: Vec<(&str, &dyn DurableSubstrate)> = vec![("replica-0", substrate.as_ref())];
+    if let Some(g) = &gcs_replica {
+        set.push(("replica-1-gcs", g.as_ref()));
+    }
+    let reality = crate::services::replica_reality::evaluate_and_publish_set(&set);
     if reality.is_single_point_of_failure() {
         tracing::warn!(target: "noetl_server::ehdb_embedded", dir = %dir,
             reality = %reality.describe(),
@@ -174,10 +215,22 @@ pub fn open_embedded() -> Option<Arc<std::sync::Mutex<L0Engine<D1EventLog>>>> {
 
     // ⚠ This is where ehdb-l0's FORMAT_VERSION gate fires: an on-disk layout
     // written by a different build refuses here rather than being misread.
-    match L0Engine::<D1EventLog>::open(
-        L0Config::for_dataset("d1_event_log", format!("{dir}/local")),
-        substrate,
-    ) {
+    let config = L0Config::for_dataset("d1_event_log", format!("{dir}/local"));
+    // ⚠ `open` makes a replica set of exactly one; `open_replicated` is the N-way form. Both
+    // funnel through the FORMAT_VERSION gate, and `open_replicated` checks it on EVERY
+    // replica — so a bucket written by a different build refuses here rather than being
+    // misread.
+    let opened = match &gcs_replica {
+        None => L0Engine::<D1EventLog>::open(config, substrate),
+        Some(g) => L0Engine::<D1EventLog>::open_replicated(
+            config,
+            vec![
+                ReplicaTarget::new("replica-0", substrate),
+                ReplicaTarget::new("replica-1-gcs", g.clone()),
+            ],
+        ),
+    };
+    match opened {
         Ok(engine) => {
             tracing::info!(target: "noetl_server::ehdb_embedded", dir = %dir,
                 "embedded EHDB engine open in SHADOW — not serving reads or writes");
@@ -597,6 +650,24 @@ pub fn read_archive_records(
             })
             .collect(),
     )
+}
+
+/// The bucket for the off-box replica, or `None` when A2 is not configured.
+///
+/// ⚠ Absent means RF=1, which is the current prod state and not an error.
+fn replica_gcs_bucket() -> Option<String> {
+    std::env::var("NOETL_EHDB_REPLICA_GCS_BUCKET")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+/// Endpoint for the replica bucket, falling back to the shared object-store endpoint so a
+/// kind run against the emulator needs one variable rather than three.
+fn replica_gcs_endpoint() -> String {
+    std::env::var("NOETL_EHDB_REPLICA_GCS_ENDPOINT")
+        .or_else(|_| std::env::var("NOETL_OBJECT_STORE_GCS_ENDPOINT"))
+        .unwrap_or_else(|_| "https://storage.googleapis.com".to_string())
 }
 
 /// The hot footprint of specific executions, built **from the manifest** rather than by

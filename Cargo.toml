@@ -162,6 +162,13 @@ gcp_auth = "0.12"
 # ⚠ v0.4.1 must not be adopted: its populator could create authority out of a
 # failure. v0.4.2 lacks `populate_from_log` and coverage, so a reader built on it
 # cannot tell a truncated partition from a whole one.
+# ⚠⚠ NOW THREE PINS, AND THEY ALL MOVE TOGETHER. `ehdb-core` carries `EhdbError` /
+# `Result`, which `DurableSubstrate`'s signatures are written in, so the server needs it
+# directly to implement that trait (`services::gcs_substrate`). `ehdb-l0` re-exports many
+# types but not those. Same git source + same tag means cargo unifies it with the copy
+# `ehdb-l0` already depends on; a DIFFERENT tag here would put two `EhdbError` types in the
+# graph and the trait impl would stop satisfying the trait.
+ehdb-core = { git = "https://github.com/noetl/ehdb", tag = "v0.5.0" }
 ehdb-feed = { git = "https://github.com/noetl/ehdb", tag = "v0.5.0" }
 ehdb-l0 = { git = "https://github.com/noetl/ehdb", tag = "v0.5.0" }
 # Value type for the JetStream KV puts in `src/coherence.rs` (multi-replica
