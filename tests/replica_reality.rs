@@ -197,7 +197,11 @@ fn the_series_are_pinned_pessimistically_before_evaluation() {
         "noetl_ehdb_survives_node_loss",
         "noetl_ehdb_replica_domains_distinct",
         "noetl_ehdb_replica_single_point_of_failure",
-        "noetl_object_store_put_seconds",
+        // ⚠ The put HISTOGRAM is deliberately not in this list. It used to be, pinned by
+        // `observe(0.0)` — which is a fabricated sample, not a pin. See
+        // `the_put_pin_does_not_fabricate_a_sample` below. The counter is what carries the
+        // absent-vs-zero signal here.
+        "noetl_object_store_put_total",
     ] {
         assert!(
             text.lines().any(|l| l.starts_with(g)),
@@ -244,4 +248,69 @@ fn the_put_histogram_separates_outcomes() {
     // Buckets must span the range the question needs: ms to seconds.
     assert!(text.contains("le=\"0.001\""), "no 1ms bucket — cannot see a fast local put");
     assert!(text.contains("le=\"8\""), "no 8s bucket — a clipped top answers with its own ceiling");
+}
+
+/// ⚠⚠ A histogram must never be "pinned" by observing into it.
+///
+/// `init_replica_reality_series` used to call `.observe(0.0)` per label. `inc_by(0)` on a
+/// counter is harmless; `observe(0.0)` on a histogram records a 0-second measurement that
+/// was never taken. The damage lands on the one number the metric exists for: #460 is
+/// deciding whether a remote put costs "tens of ms" against a ~4 ms local fsync, and a
+/// planted zero pulls the low quantiles under the real floor — worst when n is small, which
+/// is exactly when the decision gets made.
+///
+/// Measured as a delta rather than asserted by absence: these tests share a process-wide
+/// registry, so another test may legitimately have made the family present already.
+#[test]
+fn the_put_pin_does_not_fabricate_a_sample() {
+    let _g = serialised();
+
+    let count_of = |text: &str| -> u64 {
+        text.lines()
+            .filter(|l| l.starts_with("noetl_object_store_put_seconds_count"))
+            .filter_map(|l| l.rsplit(' ').next())
+            .filter_map(|v| v.parse::<f64>().ok())
+            .sum::<f64>() as u64
+    };
+
+    let before = count_of(&noetl_server::metrics::gather_text().unwrap());
+    noetl_server::metrics::init_replica_reality_series();
+    let after_text = noetl_server::metrics::gather_text().unwrap();
+    assert_eq!(
+        count_of(&after_text),
+        before,
+        "initialising the series added {} histogram observation(s) — a pin must not invent \
+         measurements, because the resulting distribution is then wrong in the direction \
+         that looks fast",
+        count_of(&after_text).saturating_sub(before)
+    );
+
+    // And the counter IS pinned, so "no put has happened" stays readable at zero.
+    assert!(
+        after_text
+            .lines()
+            .any(|l| l.starts_with("noetl_object_store_put_total")),
+        "the attempt counter must be present at zero — it is what makes the histogram's \
+         absence interpretable without fabricating a sample"
+    );
+}
+
+/// Positive control: a real put DOES move both.
+#[test]
+fn a_real_put_moves_the_counter_and_the_histogram() {
+    let _g = serialised();
+    noetl_server::metrics::init_replica_reality_series();
+    let c0 = noetl_server::metrics::object_store_put_total()
+        .with_label_values(&["gcs", "ok"])
+        .get();
+    noetl_server::metrics::observe_object_store_put("gcs", "ok", 0.042);
+    let c1 = noetl_server::metrics::object_store_put_total()
+        .with_label_values(&["gcs", "ok"])
+        .get();
+    assert_eq!(c1, c0 + 1, "the attempt counter must track real puts");
+    let text = noetl_server::metrics::gather_text().unwrap();
+    assert!(
+        text.contains("noetl_object_store_put_seconds_count"),
+        "a real observation must make the histogram present"
+    );
 }

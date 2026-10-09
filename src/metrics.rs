@@ -3846,7 +3846,30 @@ pub fn object_store_put_seconds() -> &'static prometheus::HistogramVec {
     })
 }
 
+/// Put attempts by backend and outcome.
+///
+/// A counter, pinned at 0 — which a counter can be, truthfully. It answers "did any put
+/// happen?" so the histogram never has to be fabricated to answer it.
+pub fn object_store_put_total() -> &'static prometheus::IntCounterVec {
+    static M: std::sync::OnceLock<prometheus::IntCounterVec> = std::sync::OnceLock::new();
+    M.get_or_init(|| {
+        let m = prometheus::IntCounterVec::new(
+            prometheus::Opts::new(
+                "noetl_object_store_put_total",
+                "Object-store put attempts by backend and outcome.",
+            ),
+            &["backend", "outcome"],
+        )
+        .expect("valid metric");
+        registry().register(Box::new(m.clone())).ok();
+        m
+    })
+}
+
 pub fn observe_object_store_put(backend: &str, outcome: &str, seconds: f64) {
+    object_store_put_total()
+        .with_label_values(&[backend, outcome])
+        .inc();
     object_store_put_seconds()
         .with_label_values(&[backend, outcome])
         .observe(seconds);
@@ -3866,13 +3889,27 @@ pub fn init_replica_reality_series() {
     ehdb_survives_node_loss().set(0);
     ehdb_replica_domains_distinct().set(0);
     ehdb_replica_single_point_of_failure().set(1);
+    // ⚠⚠ Do NOT pin the histogram by observing.
+    //
+    // This read `.observe(0.0)` for each label, which is not a pin — it is a FABRICATED
+    // SAMPLE. `inc_by(0)` on a counter is harmless; `observe(0.0)` on a histogram adds a
+    // real 0-second measurement that was never taken. Two consequences, both on the number
+    // this metric exists to produce:
+    //
+    //   - `_count` starts at 1 per label, so "has this ever fired?" cannot be read off it —
+    //     the absent-vs-zero question the pin was meant to answer becomes unanswerable.
+    //   - the distribution is biased toward zero, worst exactly when n is small. #460 is
+    //     deciding whether a remote put costs "tens of ms" against a ~4 ms local fsync, and
+    //     a planted 0 s sample pulls the low quantiles under the real floor.
+    //
+    // A histogram family is pruned until it fires, which is correct and is what
+    // `noetl_server_build_info` exists to disambiguate: the running version either has this
+    // metric or it does not. The attempt COUNTER below is what makes absence readable at
+    // zero, because a counter can be pinned without inventing data.
     for outcome in ["ok", "failed"] {
-        object_store_put_seconds()
-            .with_label_values(&["gcs", outcome])
-            .observe(0.0);
-        object_store_put_seconds()
-            .with_label_values(&["postgres", outcome])
-            .observe(0.0);
+        for backend in ["gcs", "postgres"] {
+            object_store_put_total().with_label_values(&[backend, outcome]).inc_by(0);
+        }
     }
 }
 
