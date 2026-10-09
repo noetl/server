@@ -3850,6 +3850,78 @@ pub fn object_store_put_seconds() -> &'static prometheus::HistogramVec {
 ///
 /// A counter, pinned at 0 — which a counter can be, truthfully. It answers "did any put
 /// happen?" so the histogram never has to be fabricated to answer it.
+/// ⭐⭐ The age of the OLDEST UNSEALED record, in seconds — the size of the RF=1 window.
+///
+/// noetl/ai-meta#460 B2. A2 replicates **sealed** parts off-box; records appended since the
+/// last seal exist only in the local writer, so losing the node loses exactly them. This
+/// gauge is how large that exposure currently is, and without it the exposure is invisible:
+/// every other durability signal reads healthy while an idle shard's tail sits unsealed
+/// indefinitely.
+///
+/// ⚠ `PartWriter::should_seal` is only consulted on append, so the shard the age trigger
+/// protects is by definition the one taking no appends. That is why this is a gauge driven
+/// by a timer rather than something updated on the write path — the write path is not
+/// running on the shard that matters.
+///
+/// Pinned at 0 at startup. 0 means "nothing unsealed", a real and readable state.
+pub fn ehdb_oldest_unsealed_age_seconds() -> &'static prometheus::IntGauge {
+    static M: std::sync::OnceLock<prometheus::IntGauge> = std::sync::OnceLock::new();
+    M.get_or_init(|| {
+        let m = prometheus::IntGauge::new(
+            "noetl_ehdb_oldest_unsealed_age_seconds",
+            "Age of the oldest un-sealed record across shards; the RF=1 exposure window.",
+        )
+        .expect("valid metric");
+        registry().register(Box::new(m.clone())).ok();
+        m
+    })
+}
+
+/// Parts the manifest currently references.
+///
+/// ⚠ The counterweight to B2. Age-based sealing makes parts SMALLER and more NUMEROUS, and
+/// manifest cost grows with part count — the shape that filled the cmdbus PVC when snapshot
+/// size tracked part count while snapshot count tracked write count. Shipping the trigger
+/// without this gauge would trade an invisible durability risk for an invisible capacity one.
+pub fn ehdb_manifest_parts() -> &'static prometheus::IntGauge {
+    static M: std::sync::OnceLock<prometheus::IntGauge> = std::sync::OnceLock::new();
+    M.get_or_init(|| {
+        let m = prometheus::IntGauge::new(
+            "noetl_ehdb_manifest_parts",
+            "Live parts referenced by the embedded engine's manifest.",
+        )
+        .expect("valid metric");
+        registry().register(Box::new(m.clone())).ok();
+        m
+    })
+}
+
+/// Parts sealed by the age trigger specifically.
+///
+/// Distinct from total seals: a seal caused by record/byte limits is ordinary operation,
+/// whereas a seal caused by AGE is the trigger doing the job A2 needs it for. If this stays
+/// at 0 while `oldest_unsealed_age_seconds` climbs, the trigger is configured and inert —
+/// the exact failure its own doc comment in ehdb warns about.
+pub fn ehdb_age_sealed_total() -> &'static prometheus::IntCounter {
+    static M: std::sync::OnceLock<prometheus::IntCounter> = std::sync::OnceLock::new();
+    M.get_or_init(|| {
+        let m = prometheus::IntCounter::new(
+            "noetl_ehdb_age_sealed_total",
+            "Parts sealed because they aged out (noetl/ai-meta#460 B2).",
+        )
+        .expect("valid metric");
+        registry().register(Box::new(m.clone())).ok();
+        m
+    })
+}
+
+/// Pin the B2 series at 0 so absence means "this build has no age trigger", not "fine".
+pub fn init_age_seal_series() {
+    ehdb_oldest_unsealed_age_seconds().set(0);
+    ehdb_manifest_parts().set(0);
+    ehdb_age_sealed_total().inc_by(0);
+}
+
 pub fn object_store_put_total() -> &'static prometheus::IntCounterVec {
     static M: std::sync::OnceLock<prometheus::IntCounterVec> = std::sync::OnceLock::new();
     M.get_or_init(|| {

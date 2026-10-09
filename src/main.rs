@@ -1458,6 +1458,12 @@ async fn main() -> anyhow::Result<()> {
     // A no-op unless the bucket AND the flag are both set, so this line changes nothing
     // until an operator asks for it.
     noetl_server::services::event_archive::spawn_archive_pass(execution_service.clone());
+    // noetl/ai-meta#460 B2 — the OTHER half of the age-seal trigger. Without this spawn the
+    // configured `seal_max_age` never fires on an idle shard, which is the only shard it
+    // exists for.
+    if let Some(engine) = noetl_server::handlers::ehdb_embedded::engine_handle() {
+        noetl_server::handlers::ehdb_embedded::spawn_age_seal_task(engine);
+    }
     // Same TTL the orphan / nonconvergence sweeps enforce, so the pool report
     // and dispatch can never disagree about which workers are alive.
     let runtime_service = RuntimeService::new(
