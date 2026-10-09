@@ -1445,6 +1445,19 @@ async fn main() -> anyhow::Result<()> {
     // (noetl/ai-meta#103 2d-3) — honouring NOETL_EVENT_INGEST_PUBLISH_ONLY.
     let execution_service =
         ExecutionService::new(state.pools.clone(), state.snowflake.clone(), state.clone());
+
+    // noetl/ai-meta#459 — the archive pass.
+    //
+    // ⚠⚠ THIS SPAWN IS THE PIECE THAT WAS MISSING. P1-P6 shipped the config, the archive,
+    // the verify, the floor, the prune and the retrieval API, and nothing called any of
+    // them: `archive_execution_indexed`, `verify_archived`, `archive_state`, `export_floor`
+    // and `export_scan` all had ZERO callers outside their own module. So
+    // `NOETL_EHDB_ARCHIVE_ENABLED=true` would have archived nothing while every flag and
+    // metric read exactly as a working deployment does.
+    //
+    // A no-op unless the bucket AND the flag are both set, so this line changes nothing
+    // until an operator asks for it.
+    noetl_server::services::event_archive::spawn_archive_pass(execution_service.clone());
     // Same TTL the orphan / nonconvergence sweeps enforce, so the pool report
     // and dispatch can never disagree about which workers are alive.
     let runtime_service = RuntimeService::new(

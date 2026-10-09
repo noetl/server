@@ -33,7 +33,7 @@ fn ts(h: i64) -> chrono::DateTime<chrono::Utc> {
 fn arec(seq: u64, id: i64) -> ea::ArchiveRecord {
     ea::ArchiveRecord {
         global_sequence: seq,
-        event_id: id,
+        event_id: Some(format!("ev-{id}")),
         event_type: "step.completed".into(),
         body: serde_json::json!({"seq": seq}),
     }

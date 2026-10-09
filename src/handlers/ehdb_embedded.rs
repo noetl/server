@@ -546,6 +546,59 @@ pub fn comparator_controls() -> Vec<(&'static str, bool, String)> {
     out
 }
 
+/// Read one execution's records out of the embedded engine **as archive records**.
+///
+/// noetl/ai-meta#459 — the archive's source is the store that will be pruned, so the
+/// archive is a faithful copy of exactly the bytes at risk. Reading from Postgres instead
+/// would archive a *different* representation and the prune would be unverifiable against
+/// it.
+///
+/// `None` when the engine is not open. `Some(vec![])` means the engine IS open and holds
+/// nothing for this execution — **out of coverage, not an error**: the engine only holds
+/// what was appended since it opened, so an execution older than the volume has no records
+/// here and must not be archived as an empty one.
+pub fn read_archive_records(
+    execution_id: &str,
+) -> Option<Vec<crate::services::event_archive::ArchiveRecord>> {
+    let engine = engine()?;
+    let guard = match engine.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let recs = guard.read_execution_after(execution_id, 0).ok()?;
+    Some(
+        recs.iter()
+            .map(|r| {
+                // ⚠ The event type and id live in the PAYLOAD for shadow-written records:
+                // `shadow_append` uses `EventRecord::new(..)`, which leaves the `event_id`
+                // column `None`. Preferring the column when a producer did set it mirrors
+                // what `read_embedded` does for the comparator.
+                let v: Option<serde_json::Value> = serde_json::from_str(&r.payload).ok();
+                let event_type = v
+                    .as_ref()
+                    .and_then(|v| v.get("event_type").and_then(|e| e.as_str()))
+                    .unwrap_or("")
+                    .to_string();
+                let from_payload = v
+                    .as_ref()
+                    .and_then(|v| v.get("event_id"))
+                    .map(|e| match e.as_str() {
+                        Some(s) => s.to_string(),
+                        None => e.to_string(),
+                    });
+                crate::services::event_archive::ArchiveRecord {
+                    global_sequence: r.global_sequence,
+                    event_id: r.event_id.clone().or(from_payload),
+                    event_type,
+                    // The payload verbatim: the archive stores what the store holds, not a
+                    // re-serialisation that could drift from it.
+                    body: v.unwrap_or(serde_json::Value::String(r.payload.clone())),
+                }
+            })
+            .collect(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
