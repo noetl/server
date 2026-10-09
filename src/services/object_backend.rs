@@ -294,12 +294,26 @@ impl ObjectBackend {
         media_type: &str,
         bytes: &[u8],
     ) -> AppResult<()> {
-        match self {
+        // noetl/ai-meta#460 B1 — timed, because a design decision was taken on an
+        // UNMEASURED estimate of this exact number: #460 provisionally rejected
+        // synchronous per-record remote append on the grounds that a GCS put costs "tens
+        // of ms" against a ~4 ms local fsync. This path already runs in prod, so the
+        // figure was available for the cost of an instrument rather than a guess.
+        let started = std::time::Instant::now();
+        let out = match self {
             ObjectBackend::Postgres => {
                 object_store::put(pool, key, digest, media_type, bytes).await
             }
             ObjectBackend::Gcs(g) => g.put(key, media_type, bytes).await,
-        }
+        };
+        // ⚠ Failures are timed too, under their own label. A latency distribution over
+        // successes only hides the case where the slow puts are the ones that fail.
+        crate::metrics::observe_object_store_put(
+            self.label(),
+            if out.is_ok() { "ok" } else { "failed" },
+            started.elapsed().as_secs_f64(),
+        );
+        out
     }
 
     /// Fetch the object at `key`, or `None` (caller → HTTP 404).

@@ -3744,6 +3744,138 @@ pub fn init_chain_populate_series() {
     }
 }
 
+/// How many replicas the embedded engine was opened with.
+///
+/// ⚠⚠ Exists because `ehdb_l0_replica_domain_violations` reads **0 on prod while both
+/// copies sit on one device** — the engine's check is gated on `replicas.len() >= 2`, so at
+/// RF=1 it short-circuits and the healthy path pins the counter. That 0 is an unevaluated
+/// pin, indistinguishable from "checked and fine". These four gauges are always computed,
+/// so a 0 here is a verdict (noetl/ai-meta#460 A1).
+pub fn ehdb_replica_set_size() -> &'static prometheus::IntGauge {
+    static M: std::sync::OnceLock<prometheus::IntGauge> = std::sync::OnceLock::new();
+    M.get_or_init(|| {
+        let m = prometheus::IntGauge::new(
+            "noetl_ehdb_replica_set_size",
+            "Replicas the embedded EHDB engine was opened with (1 = RF=1 by construction)",
+        )
+        .expect("valid metric");
+        registry().register(Box::new(m.clone())).ok();
+        m
+    })
+}
+
+/// ⭐ 1 when the replica set can survive losing the writer's node, 0 when it cannot.
+///
+/// Requires at least one `FailureDomain::Remote`. On prod this is **0**, and no production
+/// code path can currently make it 1: `FailureDomain::Remote` is constructed in ehdb's
+/// tests only. That is the honest state, and this is the gauge that says so.
+pub fn ehdb_survives_node_loss() -> &'static prometheus::IntGauge {
+    static M: std::sync::OnceLock<prometheus::IntGauge> = std::sync::OnceLock::new();
+    M.get_or_init(|| {
+        let m = prometheus::IntGauge::new(
+            "noetl_ehdb_survives_node_loss",
+            "1 if the replica set has an off-node domain and can survive node loss, else 0",
+        )
+        .expect("valid metric");
+        registry().register(Box::new(m.clone())).ok();
+        m
+    })
+}
+
+/// Whether the replicas resolve to distinct failure domains.
+///
+/// ⚠ **Vacuously 1 at RF=1** — one replica cannot collide with itself. Published next to
+/// `replica_set_size` precisely so it is never read alone: "distinct domains" on a set of
+/// one is the reassuring half of the reading this work exists to correct.
+pub fn ehdb_replica_domains_distinct() -> &'static prometheus::IntGauge {
+    static M: std::sync::OnceLock<prometheus::IntGauge> = std::sync::OnceLock::new();
+    M.get_or_init(|| {
+        let m = prometheus::IntGauge::new(
+            "noetl_ehdb_replica_domains_distinct",
+            "1 if replica failure domains are distinct (VACUOUS at replica_set_size=1)",
+        )
+        .expect("valid metric");
+        registry().register(Box::new(m.clone())).ok();
+        m
+    })
+}
+
+/// ⭐ **The one to alert on.** 1 when the event-log store is a single point of failure.
+///
+/// Deliberately not "RF < 2": two replicas on one device also cannot survive node loss, and
+/// the lesson of this whole metric family is that a count is not a guarantee.
+pub fn ehdb_replica_single_point_of_failure() -> &'static prometheus::IntGauge {
+    static M: std::sync::OnceLock<prometheus::IntGauge> = std::sync::OnceLock::new();
+    M.get_or_init(|| {
+        let m = prometheus::IntGauge::new(
+            "noetl_ehdb_replica_single_point_of_failure",
+            "1 if the event-log replica set cannot survive losing the node (alert on this)",
+        )
+        .expect("valid metric");
+        registry().register(Box::new(m.clone())).ok();
+        m
+    })
+}
+
+/// Object-store `put` latency, by backend and outcome.
+///
+/// ⚠⚠ Exists because a design decision was taken on an **unmeasured** number: #460 §3.3
+/// provisionally rejected synchronous per-record remote append on the grounds that a GCS
+/// `put` costs "tens of ms" against a ~4 ms local `fsync` — an estimate, from no
+/// measurement. The server already writes to GCS in prod (21,569 objects on the result
+/// tier), so the number was available for the cost of an instrument rather than a guess.
+///
+/// ⭐ Buckets span 1 ms to ~8 s, because the question is an order of magnitude and a
+/// histogram clipped at the top would answer it with its own ceiling.
+pub fn object_store_put_seconds() -> &'static prometheus::HistogramVec {
+    static M: std::sync::OnceLock<prometheus::HistogramVec> = std::sync::OnceLock::new();
+    M.get_or_init(|| {
+        let m = prometheus::HistogramVec::new(
+            prometheus::HistogramOpts::new(
+                "noetl_object_store_put_seconds",
+                "Object-store put latency (noetl/ai-meta#460 B1)",
+            )
+            .buckets(vec![
+                0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0,
+            ]),
+            &["backend", "outcome"],
+        )
+        .expect("valid metric");
+        registry().register(Box::new(m.clone())).ok();
+        m
+    })
+}
+
+pub fn observe_object_store_put(backend: &str, outcome: &str, seconds: f64) {
+    object_store_put_seconds()
+        .with_label_values(&[backend, outcome])
+        .observe(seconds);
+}
+
+/// Pin the A1/B1 series **unconditionally**.
+///
+/// ⚠⚠ Not inside any config branch. These exist to make an unevaluated green
+/// distinguishable from a checked one, so a deployment where they are absent would
+/// reproduce the exact defect they were added for.
+pub fn init_replica_reality_series() {
+    // ⚠ Seeded to the pessimistic value, not 0. Until something evaluates the replica set,
+    // "we do not know" must not read as "safe": `survives_node_loss=0` and
+    // `single_point_of_failure=1` are the honest pre-evaluation state, and
+    // `evaluate_and_publish` overwrites them with the measured answer at open.
+    ehdb_replica_set_size().set(0);
+    ehdb_survives_node_loss().set(0);
+    ehdb_replica_domains_distinct().set(0);
+    ehdb_replica_single_point_of_failure().set(1);
+    for outcome in ["ok", "failed"] {
+        object_store_put_seconds()
+            .with_label_values(&["gcs", outcome])
+            .observe(0.0);
+        object_store_put_seconds()
+            .with_label_values(&["postgres", outcome])
+            .observe(0.0);
+    }
+}
+
 /// ⚠⚠ The age of the oldest execution that is **not** archivable, in seconds.
 ///
 /// This is the single most important number in the retention tier, and it exists because
