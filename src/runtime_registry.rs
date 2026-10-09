@@ -538,41 +538,88 @@ pub fn mirror_execution_finished(execution_id: i64) {
     }
 }
 
-/// When the EHDB tier was last recorded as seen, as micros. Checked **before** the registry
-/// mutex.
+/// How many distinct tier addresses the throttle tracks.
 ///
-/// ⚠⚠ This exists so the hot path stays hot. The hook below runs on every successful event
+/// The address set comes from the shard map, so in practice it is small and fixed (prod
+/// runs one shard per bus, i.e. two addresses). The cap is defensive: an unbounded table
+/// fed a rotating address would grow on the publish path.
+const MAX_TIER_ADDRS: usize = 64;
+
+/// Is `addr` due for a registration refresh — recording the decision when it is?
+///
+/// Pure and testable on purpose. The throttle is exactly where the two-call-site defect
+/// lives, and a decision buried inside a `static` cannot be asserted against.
+///
+/// ⚠⚠ Keyed by ADDRESS. A single shared slot was adequate while there was one call site;
+/// with the command bus and the events feed both reporting, whichever address claimed a
+/// global slot would throttle the other out for a full floor interval, leaving a live
+/// tier unregistered while every counter read healthy. One cap serving two addresses is
+/// the same defect as one cap serving two directions (noetl/worker#314).
+pub fn tier_seen_due(seen: &mut Vec<(String, u64)>, addr: &str, now: u64, floor: u64) -> bool {
+    if let Some(slot) = seen.iter_mut().find(|(a, _)| a == addr) {
+        if now.saturating_sub(slot.1) < floor {
+            return false;
+        }
+        slot.1 = now;
+        return true;
+    }
+    if seen.len() >= MAX_TIER_ADDRS {
+        // Evict the least-recently-seen rather than refusing. Refusing would make a
+        // genuinely new tier permanently invisible — the precise failure this registry
+        // exists to prevent.
+        if let Some(oldest) = seen.iter_mut().min_by_key(|(_, t)| *t) {
+            *oldest = (addr.to_string(), now);
+            return true;
+        }
+    }
+    seen.push((addr.to_string(), now));
+    true
+}
+
+/// When each EHDB tier address was last recorded as seen, as micros. Checked **before**
+/// the registry mutex.
+///
+/// ⚠ This exists so the hot path stays hot. The hooks below run on every successful
 /// publish, and the registry is behind a `Mutex` that every append and every scrape also
-/// take. Doing a throttled `get` under that lock on each publish would put the event write
-/// path behind the registry — an observability surface slowing the thing it observes, which
-/// is the same class of mistake as a scrape that stalls appends. An atomic load costs
-/// nothing and the lock is taken at most once per floor interval.
-static EHDB_LAST_SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// take. Doing a throttled `get` under that lock on each publish would put the write path
+/// behind the registry — an observability surface slowing the thing it observes, which is
+/// the same class of mistake as a scrape that stalls appends. This is a separate, tiny,
+/// essentially uncontended lock taken with `try_lock`; the registry lock is taken at most
+/// once per floor interval per address.
+static EHDB_LAST_SEEN: OnceLock<Mutex<Vec<(String, u64)>>> = OnceLock::new();
 
 /// Record that the EHDB tier at `addr` answered — i.e. register it as a **live** `Ehdb`
 /// member (noetl/ai-meta#455 P2, the `Ehdb` kind).
 ///
-/// ⚠⚠ Called on a SUCCESSFUL publish, deliberately — never from configuration. Registering
-/// a writer because an env var names it would claim liveness for an address that might be
-/// down, which is precisely the representation-drift failure this registry exists to avoid:
-/// *a copy is only true while something forces it to agree.* A successful round-trip is
-/// that forcing function.
+/// ⚠⚠ Called on a publish that LANDED, deliberately — never from configuration, and never
+/// from a deferred one. Registering a writer because an env var names it would claim
+/// liveness for an address that might be down, which is precisely the representation-drift
+/// failure this registry exists to avoid: *a copy is only true while something forces it to
+/// agree.* A completed round-trip is that forcing function; a publish whose on-path budget
+/// merely elapsed is not.
 ///
-/// Fail-soft and non-blocking; the event write path must not slow or fail for this.
+/// ⚠⚠ Hooked on BOTH buses. v3.130.0 hooked only the events publish and measured
+/// `ehdb_registered` = 0 on prod, because `should_publish` skips system executions and
+/// prod's only regular traffic (the hourly cleanup, the 3-minutely watchdog) is exactly
+/// that — `noetl_event_ingest_publish_skipped_total{reason="system_execution"}` = 22 while
+/// `noetl_event_ingest_total` was absent entirely. The command bus is the path that
+/// traffic does take (`noetl_command_publish_total{pool="system"}` = 4). Gating a hook
+/// correctly says nothing about whether anything reaches it (noetl/ai-meta#326).
+///
+/// Fail-soft and non-blocking; the write path must not slow or fail for this.
 pub fn mirror_ehdb_tier_seen(addr: &str) {
-    use std::sync::atomic::Ordering;
     let now = now_micros();
     let floor = heartbeat_floor_micros();
-    let last = EHDB_LAST_SEEN.load(Ordering::Relaxed);
-    if last != 0 && now.saturating_sub(last) < floor {
-        return;
-    }
-    // Claim the slot before doing the work, so concurrent publishes do not all write.
-    if EHDB_LAST_SEEN
-        .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
-        .is_err()
+    // Throttle under a lock that is NOT the registry's, with `try_lock` so a publish never
+    // waits. A lost refresh costs at most one floor interval of staleness.
     {
-        return;
+        let throttle = EHDB_LAST_SEEN.get_or_init(|| Mutex::new(Vec::new()));
+        let Ok(mut seen) = throttle.try_lock() else {
+            return;
+        };
+        if !tier_seen_due(&mut seen, addr, now, floor) {
+            return;
+        }
     }
     let Some(store) = store() else { return };
     let Some(id) = sanitise_id(addr) else { return };

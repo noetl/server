@@ -1935,6 +1935,18 @@ async fn publish_command_notification(
                     );
                 }
                 Ok(crate::command_bus::PublishOutcome::Landed(seq)) => {
+                    // noetl/ai-meta#455 P2 — the writer acked, so the tier is live.
+                    //
+                    // ⚠⚠ This arm, not `Deferred`, and not the events publish. `Deferred`
+                    // means the on-path budget elapsed and a background task is still
+                    // retrying — the writer may be down, so registering on it would claim
+                    // liveness from a timeout. And the events publish is skipped for system
+                    // executions, which is ALL of prod's regular traffic, so the hook placed
+                    // there in v3.130.0 measured `ehdb_registered` = 0 (noetl/ai-meta#326:
+                    // gating a hook correctly says nothing about what reaches it).
+                    if let Some(addr) = publisher.addr_for_execution(execution_id) {
+                        crate::runtime_registry::mirror_ehdb_tier_seen(addr);
+                    }
                     // The publish metric used to live only in the NATS arm, so
                     // removing that arm dropped it entirely — a dispatch-rate
                     // signal that would have gone quiet without anything
