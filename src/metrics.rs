@@ -3744,6 +3744,174 @@ pub fn init_chain_populate_series() {
     }
 }
 
+/// ⚠⚠ The age of the oldest execution that is **not** archivable, in seconds.
+///
+/// This is the single most important number in the retention tier, and it exists because
+/// of a hazard the design names explicitly (noetl/ai-meta#459 §8.1): the prune floor is
+/// pinned by the oldest non-archivable execution, so **one stuck execution blocks all
+/// reclamation while every other counter reads healthy**. Archiving keeps succeeding,
+/// verification keeps passing, and zero bytes come back.
+///
+/// 0 means "nothing is blocking" — a real, readable state, which is why this is pinned
+/// unconditionally at startup rather than left absent until something blocks.
+pub fn ehdb_retention_oldest_non_archivable_age_seconds() -> &'static prometheus::IntGauge {
+    static M: std::sync::OnceLock<prometheus::IntGauge> = std::sync::OnceLock::new();
+    M.get_or_init(|| {
+        let m = prometheus::IntGauge::new(
+            "noetl_ehdb_retention_oldest_non_archivable_age_seconds",
+            "Age of the oldest execution that is not archivable; this pins the retention \
+             floor and blocks ALL reclamation while it climbs (0 = nothing blocking)",
+        )
+        .expect("valid metric");
+        registry().register(Box::new(m.clone())).ok();
+        m
+    })
+}
+
+/// The execution id pinning the floor, or 0 when nothing is.
+///
+/// ⚠ A gauge carrying an id is unusual, and deliberate: the age above says *that* something
+/// is stuck, and an operator's next question is always *which one*. Without it the answer
+/// needs a code path nobody has written at 3am.
+pub fn ehdb_retention_floor_blocked_by_execution() -> &'static prometheus::IntGauge {
+    static M: std::sync::OnceLock<prometheus::IntGauge> = std::sync::OnceLock::new();
+    M.get_or_init(|| {
+        let m = prometheus::IntGauge::new(
+            "noetl_ehdb_retention_floor_blocked_by_execution",
+            "Execution id currently pinning the retention floor (0 = none)",
+        )
+        .expect("valid metric");
+        registry().register(Box::new(m.clone())).ok();
+        m
+    })
+}
+
+/// The sequence below which parts are droppable.
+pub fn ehdb_retention_floor_sequence() -> &'static prometheus::IntGauge {
+    static M: std::sync::OnceLock<prometheus::IntGauge> = std::sync::OnceLock::new();
+    M.get_or_init(|| {
+        let m = prometheus::IntGauge::new(
+            "noetl_ehdb_retention_floor_sequence",
+            "Retention floor: the lowest global_sequence that must be kept hot",
+        )
+        .expect("valid metric");
+        registry().register(Box::new(m.clone())).ok();
+        m
+    })
+}
+
+/// How many executions the last archivable scan examined, and how many it selected.
+///
+/// ⭐ Both, because a selection count without its population is consistent with having
+/// examined one page — and `GET /api/executions` caps at 100 while the real population is
+/// 6,467.
+pub fn ehdb_archive_scan_examined() -> &'static prometheus::IntGauge {
+    static M: std::sync::OnceLock<prometheus::IntGauge> = std::sync::OnceLock::new();
+    M.get_or_init(|| {
+        let m = prometheus::IntGauge::new(
+            "noetl_ehdb_archive_scan_examined",
+            "Executions examined by the last archivable-set scan (the denominator)",
+        )
+        .expect("valid metric");
+        registry().register(Box::new(m.clone())).ok();
+        m
+    })
+}
+
+pub fn ehdb_archive_scan_archivable() -> &'static prometheus::IntGauge {
+    static M: std::sync::OnceLock<prometheus::IntGauge> = std::sync::OnceLock::new();
+    M.get_or_init(|| {
+        let m = prometheus::IntGauge::new(
+            "noetl_ehdb_archive_scan_archivable",
+            "Executions the last scan selected as archivable",
+        )
+        .expect("valid metric");
+        registry().register(Box::new(m.clone())).ok();
+        m
+    })
+}
+
+/// Bytes reclaimed from the hot volume by pruning, cumulative.
+///
+/// ⚠⚠ The alert that matters pairs this with the archive counter: **archiving succeeding
+/// while this stays 0** is the pinned-floor failure, and it is invisible in either series
+/// alone.
+pub fn ehdb_prune_bytes_reclaimed_total() -> &'static prometheus::IntCounter {
+    static M: std::sync::OnceLock<prometheus::IntCounter> = std::sync::OnceLock::new();
+    M.get_or_init(|| {
+        let m = prometheus::IntCounter::new(
+            "noetl_ehdb_prune_bytes_reclaimed_total",
+            "Bytes reclaimed from the hot EHDB volume by retention pruning",
+        )
+        .expect("valid metric");
+        registry().register(Box::new(m.clone())).ok();
+        m
+    })
+}
+
+/// Archive / prune pass outcomes.
+pub fn ehdb_archive_total() -> &'static prometheus::IntCounterVec {
+    static M: std::sync::OnceLock<prometheus::IntCounterVec> = std::sync::OnceLock::new();
+    M.get_or_init(|| {
+        let m = prometheus::IntCounterVec::new(
+            prometheus::Opts::new(
+                "noetl_ehdb_archive_total",
+                "Event-log archival and prune outcomes (noetl/ai-meta#459)",
+            ),
+            &["outcome"],
+        )
+        .expect("valid metric");
+        registry().register(Box::new(m.clone())).ok();
+        m
+    })
+}
+
+/// The closed label set for [`ehdb_archive_total`].
+///
+/// ⚠ `prune_refused_not_durable` and `prune_refused_unindexed` are separate values, because
+/// they are different failures with different fixes — and both must be readable as 0 rather
+/// than absent, since "a prune was never refused" and "this build has no such reason" are
+/// not the same claim.
+pub const EHDB_ARCHIVE_OUTCOMES: [&str; 10] = [
+    "archived",
+    "archive_failed",
+    "already_archived",
+    "verified_durable",
+    "verify_failed",
+    "indexed",
+    "index_failed",
+    "pruned",
+    "prune_refused_not_durable",
+    "prune_refused_unindexed",
+];
+
+/// Pin every retention series at 0 **unconditionally**.
+///
+/// ⚠⚠ Unconditional, and not inside a `if archive_enabled` branch. A pin placed inside a
+/// config branch is not a pin: it leaves the series absent on exactly the configuration
+/// whose value someone would be reading — the server#315 mistake, where publish-skip
+/// reasons were pinned inside `if event_bus_mode.publishes_ehdb()`. With archiving off,
+/// every one of these must read 0, which is a fact; absent is not.
+pub fn init_ehdb_retention_series() {
+    for o in EHDB_ARCHIVE_OUTCOMES {
+        ehdb_archive_total().with_label_values(&[o]).inc_by(0);
+    }
+    ehdb_retention_oldest_non_archivable_age_seconds().set(0);
+    ehdb_retention_floor_blocked_by_execution().set(0);
+    ehdb_retention_floor_sequence().set(0);
+    ehdb_archive_scan_examined().set(0);
+    ehdb_archive_scan_archivable().set(0);
+    ehdb_prune_bytes_reclaimed_total().inc_by(0);
+}
+
+pub fn record_ehdb_archive(outcome: &str) {
+    debug_assert!(
+        EHDB_ARCHIVE_OUTCOMES.contains(&outcome),
+        "unpinned archive outcome {outcome:?}: it would be absent until it first fires"
+    );
+    ehdb_archive_total().with_label_values(&[outcome]).inc();
+}
+
 /// Runtime-registry lifecycle outcomes (noetl/ai-meta#455 P1-P4).
 ///
 /// ⚠ Labels are a closed set pinned at 0 in [`init_runtime_registry_series`], so
