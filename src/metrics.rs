@@ -3877,6 +3877,68 @@ pub fn ehdb_oldest_unsealed_age_seconds() -> &'static prometheus::IntGauge {
     })
 }
 
+/// ⭐⭐ Age of the oldest record that is ACKED BUT NOT YET DURABLE, in seconds.
+///
+/// noetl/ai-meta#460. This is the **whole** durability window, and it is strictly larger
+/// than `ehdb_oldest_unsealed_age_seconds`:
+///
+/// - the unsealed gauge measures records not yet written into a part;
+/// - this one also counts parts that ARE sealed but whose upload has not completed.
+///
+/// ⚠ Shipping only the unsealed gauge (as B2 first did) understates the exposure, and
+/// understates it in the reassuring direction. Replication is asynchronous — a sealed part
+/// has a real window in which the only copy is local — so "sealed" is not "durable", and a
+/// gauge that stops at sealing reports the system safer than it is.
+///
+/// `ehdb-l0` has computed this all along in `UnreplicatedTracker`; `unreplicated_snapshot()`
+/// had **zero callers** in the server, so the number existed and nothing published it.
+pub fn ehdb_unreplicated_oldest_age_seconds() -> &'static prometheus::IntGauge {
+    static M: std::sync::OnceLock<prometheus::IntGauge> = std::sync::OnceLock::new();
+    M.get_or_init(|| {
+        let m = prometheus::IntGauge::new(
+            "noetl_ehdb_unreplicated_oldest_age_seconds",
+            "Age of the oldest acked-but-not-durable record; the full async durability window.",
+        )
+        .expect("valid metric");
+        registry().register(Box::new(m.clone())).ok();
+        m
+    })
+}
+
+/// How many acked records are not yet durable on the substrate.
+///
+/// The companion to the age above: age says how long the window is, this says how much is
+/// in it. An age with no count cannot distinguish one stuck record from a backlog.
+pub fn ehdb_unreplicated_records() -> &'static prometheus::IntGauge {
+    static M: std::sync::OnceLock<prometheus::IntGauge> = std::sync::OnceLock::new();
+    M.get_or_init(|| {
+        let m = prometheus::IntGauge::new(
+            "noetl_ehdb_unreplicated_records",
+            "Acked records not yet durable on the substrate (noetl/ai-meta#460).",
+        )
+        .expect("valid metric");
+        registry().register(Box::new(m.clone())).ok();
+        m
+    })
+}
+
+/// Shards reporting a non-empty durability window.
+///
+/// ⚠ A max-over-shards age hides WHICH shard is stuck and how many are. One shard at 7h and
+/// eleven at 0 reads identically to all twelve at 7h.
+pub fn ehdb_unreplicated_shards() -> &'static prometheus::IntGauge {
+    static M: std::sync::OnceLock<prometheus::IntGauge> = std::sync::OnceLock::new();
+    M.get_or_init(|| {
+        let m = prometheus::IntGauge::new(
+            "noetl_ehdb_unreplicated_shards",
+            "Shards with at least one acked-but-not-durable record.",
+        )
+        .expect("valid metric");
+        registry().register(Box::new(m.clone())).ok();
+        m
+    })
+}
+
 /// Parts the manifest currently references.
 ///
 /// ⚠ The counterweight to B2. Age-based sealing makes parts SMALLER and more NUMEROUS, and
@@ -3920,6 +3982,9 @@ pub fn init_age_seal_series() {
     ehdb_oldest_unsealed_age_seconds().set(0);
     ehdb_manifest_parts().set(0);
     ehdb_age_sealed_total().inc_by(0);
+    ehdb_unreplicated_oldest_age_seconds().set(0);
+    ehdb_unreplicated_records().set(0);
+    ehdb_unreplicated_shards().set(0);
 }
 
 pub fn object_store_put_total() -> &'static prometheus::IntCounterVec {
