@@ -184,13 +184,32 @@ async fn the_pass_is_bounded_by_max_per_pass() {
 /// ⚠⚠ Pruning is refused LOUDLY, not silently. An operator who sets the flag and sees
 /// nothing happen must be told why — a flag that appears to work while doing nothing is the
 /// defect this whole program keeps finding.
+///
+/// ⚠⚠ This test PINNED THE STALE TEXT until 2026-10-10. It asserted
+/// `note.contains("NOT implemented")` and `note.contains("nothing is deleted")` — claims
+/// that stopped being true when server#516 wired the floor to `apply_retention`, so the
+/// test actively held the contradiction in place and would have failed any correction. The
+/// same shape as the `NoFootprint` assertion that pinned the all-archived defect.
+///
+/// The intent was right and is kept: the refusal must be LOUD and must name its reason.
+/// Only the specific strings were wrong.
 #[test]
 fn the_prune_refusal_names_the_reason() {
     let note = ea::prune_readiness_note();
-    assert!(note.contains("NOT implemented"), "{note}");
-    assert!(note.contains("nothing is deleted"), "{note}");
-    assert!(note.contains("minimum-sequence footprint"), "the reason must be concrete: {note}");
+    // The reason an operator needs: arming the flag reclaims NOTHING until the backlog is
+    // drained, because the floor refuses. Without that sentence, zero reclaimed bytes reads
+    // as a broken feature.
+    assert!(note.contains("floor"), "the refusal must name the floor: {note}");
+    assert!(
+        note.to_lowercase().contains("refuse") || note.to_lowercase().contains("until"),
+        "it must say arming reclaims nothing until the backlog drains: {note}"
+    );
     assert!(note.contains("459"), "it must cite where to follow up: {note}");
+    // And it must not resurrect the stale claims.
+    assert!(
+        !note.contains("NOT implemented") && !note.contains("nothing is deleted"),
+        "the note contradicts the code again: {note}"
+    );
 }
 
 /// The record shape is faithful: `event_id: None` is the real value for shadow-written
