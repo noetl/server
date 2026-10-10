@@ -245,10 +245,45 @@ pub fn open_embedded() -> Option<Arc<std::sync::Mutex<L0Engine<D1EventLog>>>> {
         ),
     };
     match opened {
-        Ok(engine) => {
+        Ok(mut engine) => {
             tracing::info!(target: "noetl_server::ehdb_embedded", dir = %dir,
                 "embedded EHDB engine open in SHADOW — not serving reads or writes");
             crate::metrics::record_embedded_shadow("opened");
+            // ⚠⚠ Attaching a replica replicates nothing that ALREADY exists.
+            //
+            // Uploads are enqueued on seal and nowhere else, so arming the
+            // off-box replica above covers parts sealed from now on and leaves
+            // every part of existing history at its old replica count forever.
+            // Measured on prod 2026-10-10, from the remote's own manifest: 40
+            // parts listed, **39 with replica_count 1** and one — the part
+            // sealed after the attach — with 2. Meanwhile every aggregate gauge
+            // read healthy (`survives_node_loss 1`), because those describe the
+            // replica *set*, not the parts.
+            //
+            // ⚠ Worse than an empty remote: the bucket holds a manifest naming
+            // all 40 parts and the bytes of one, so it looks like a complete
+            // store while 39 parts resolve only to `replica-0`. The backfill is
+            // what makes the remote an actually recoverable copy
+            // (noetl/ehdb#400).
+            //
+            // Cheap to call here: it only ENQUEUES onto the existing background
+            // uploader, so startup is not blocked by the copy.
+            if gcs_replica.is_some() && replica_backfill_enabled() {
+                match engine.backfill_under_replicated() {
+                    Ok(0) => tracing::info!(target: "noetl_server::ehdb_embedded",
+                        "replica backfill: nothing under-replicated"),
+                    Ok(n) => tracing::warn!(target: "noetl_server::ehdb_embedded", parts = n,
+                        "replica backfill: enqueued pre-existing parts for off-box copy \
+                         — watch ehdb_l0_backfill_uploads and parts_under_replicated"),
+                    Err(e) => tracing::error!(target: "noetl_server::ehdb_embedded", error = %e,
+                        "replica backfill failed to enqueue"),
+                }
+            } else if gcs_replica.is_some() {
+                tracing::warn!(target: "noetl_server::ehdb_embedded",
+                    "off-box replica armed but backfill is OFF: parts sealed before now stay \
+                     single-copy and the remote is NOT a recoverable copy on its own \
+                     (set NOETL_EHDB_REPLICA_BACKFILL=true)");
+            }
             Some(Arc::new(std::sync::Mutex::new(engine)))
         }
         Err(e) => {
@@ -773,6 +808,17 @@ pub fn spawn_age_seal_task(engine: std::sync::Arc<std::sync::Mutex<L0Engine<D1Ev
 /// The bucket for the off-box replica, or `None` when A2 is not configured.
 ///
 /// ⚠ Absent means RF=1, which is the current prod state and not an error.
+/// Whether to enqueue a one-shot backfill of already-sealed, under-replicated
+/// parts at engine open. Default **off** — it copies existing history to the
+/// off-box replica, which is real egress and real object writes, so it is opted
+/// into deliberately rather than happening on the first restart after a bucket
+/// is configured.
+fn replica_backfill_enabled() -> bool {
+    std::env::var("NOETL_EHDB_REPLICA_BACKFILL")
+        .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+        .unwrap_or(false)
+}
+
 fn replica_gcs_bucket() -> Option<String> {
     std::env::var("NOETL_EHDB_REPLICA_GCS_BUCKET")
         .ok()
