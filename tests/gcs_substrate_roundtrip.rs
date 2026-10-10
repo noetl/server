@@ -192,3 +192,171 @@ fn put_if_absent_is_atomic_and_get_range_refuses_an_over_read() {
     assert!(!s.exists(key).unwrap());
     s.delete(key).expect("deleting an absent key is not an error");
 }
+
+/// ⭐⭐ **The prod scenario, end to end.** This is the exact operation performed on
+/// `noetl-server-rust-embedded-0`: a store that has been running local-only accumulates
+/// history, then an off-box GCS replica is attached.
+///
+/// Before the backfill the remote is in the state measured on prod — it holds the durable
+/// manifest naming **every** part and the bytes of only the ones sealed since the attach.
+/// That is why a cold-load from it must be attempted *before* as well as after: the "after"
+/// result alone is consistent with a remote that was complete all along.
+#[test]
+#[ignore = "needs fake-gcs-server on 127.0.0.1:4443"]
+fn a_backfill_makes_an_attached_replica_recoverable_and_it_was_not_before() {
+    let prefix = format!("bf-{}", std::process::id());
+    let local_objects = unique_dir("bf-objects");
+    let origin_root = unique_dir("bf-origin");
+
+    let local: Arc<dyn DurableSubstrate> =
+        Arc::new(LocalFsSubstrate::new(&local_objects).unwrap());
+
+    // --- Phase 1: history, written with NO off-box replica (prod before the attach) ---
+    let mut origin = L0EventLogEngine::open_replicated(
+        cfg(&origin_root),
+        vec![ReplicaTarget::new("replica-0", local.clone())],
+    )
+    .unwrap();
+    let mut expected: Vec<String> = Vec::new();
+    for i in 0..24u64 {
+        origin
+            .append("1001", &format!("t{i}"), format!("history-{i}"))
+            .unwrap();
+        expected.push(format!("history-{i}"));
+    }
+    origin.flush_and_wait_uploads().unwrap();
+    assert_eq!(origin.manifest_snapshot().parts.len(), 3, "24/8 = 3 parts");
+    drop(origin);
+
+    // --- Phase 2: attach the GCS replica, and seal ONE more part ---
+    let remote = gcs("ehdb-backfill", &prefix);
+    let mut attached = L0EventLogEngine::open_replicated(
+        cfg(&origin_root),
+        vec![
+            ReplicaTarget::new("replica-0", local.clone()),
+            ReplicaTarget::new("replica-1-gcs", remote.clone()),
+        ],
+    )
+    .unwrap();
+    for i in 24..32u64 {
+        attached
+            .append("1001", &format!("t{i}"), format!("history-{i}"))
+            .unwrap();
+        expected.push(format!("history-{i}"));
+    }
+    attached.flush_and_wait_uploads().unwrap();
+    attached.refresh_state_gauges();
+
+    // The prod shape, reproduced: the manifest names 4 parts, exactly one of which the
+    // remote actually holds.
+    let m = attached.manifest_snapshot();
+    assert_eq!(m.parts.len(), 4);
+    let two_way = m.parts.iter().filter(|p| p.replica_count() == 2).count();
+    let one_way = m.parts.iter().filter(|p| p.replica_count() == 1).count();
+    assert_eq!(
+        (one_way, two_way),
+        (3, 1),
+        "3 pre-existing parts single-copy, 1 replicated — the prod 39:1 shape in miniature"
+    );
+    let remote_parts = remote.list_prefix("parts/d1_event_log/").unwrap();
+    assert_eq!(
+        remote_parts.len(),
+        1,
+        "the remote physically holds one part while its manifest names four"
+    );
+
+    // ⚠ The negative control, and the reason it is not optional: a cold-load from the
+    // remote alone must FAIL to reproduce history at this point. Without this, the
+    // post-backfill success is consistent with the remote having been complete all along.
+    let pre_root = unique_dir("bf-cold-pre");
+    let pre = L0EventLogEngine::cold_load_replicated(
+        cfg(&pre_root),
+        vec![ReplicaTarget::new("replica-1-gcs", remote.clone())],
+    );
+    // ⚠ Two outcomes to tell apart, because they are different claims and only one is
+    // true: does the OPEN fail, or does the open succeed and the REPLAY fail? Collapsing
+    // them with `unwrap_or_default()` reports "recovered 0 records", which reads as "the
+    // remote is an empty log" — a claim this does not establish.
+    let (pre_opened, pre_replay_err, pre_recovered): (bool, Option<String>, Vec<String>) =
+        match pre {
+            Err(e) => (false, Some(e.to_string()), Vec::new()),
+            Ok(ref engine) => match engine.replay_all() {
+                Ok(rs) => (
+                    true,
+                    None,
+                    rs.into_iter().map(|r| r.payload).collect::<Vec<String>>(),
+                ),
+                Err(e) => (true, Some(e.to_string()), Vec::new()),
+            },
+        };
+    eprintln!(
+        "PRE-BACKFILL  opened={pre_opened}  replay_err={:?}  recovered={} of {}",
+        pre_replay_err,
+        pre_recovered.len(),
+        expected.len()
+    );
+    // The measured prod shape: the manifest loads fine (it is complete), and the replay
+    // fails on the parts whose only replica is not in this set. ⚠ The dangerous reading
+    // would be an open that succeeds AND a replay that quietly returns a short log — a
+    // silent partial recovery. Pin that it does not happen.
+    assert!(
+        pre_opened,
+        "the remote's manifest is complete, so the open is expected to SUCCEED — that is \
+         exactly why the bucket reads as a usable store"
+    );
+    assert!(
+        pre_replay_err.is_some(),
+        "the replay must FAIL rather than return a short log: a silent partial recovery \
+         is the outcome there would be no way to notice"
+    );
+    assert_ne!(
+        pre_recovered, expected,
+        "BEFORE the backfill the remote must NOT reproduce history"
+    );
+
+    // --- Phase 3: the backfill ---
+    let enqueued = attached.backfill_under_replicated().unwrap();
+    assert_eq!(enqueued, 3, "the three pre-existing parts");
+    attached.flush_and_wait_uploads().unwrap();
+    attached.refresh_state_gauges();
+
+    let m = attached.manifest_snapshot();
+    for p in &m.parts {
+        assert_eq!(p.replica_count(), 2, "part {} two-way", p.part_id);
+        assert!(
+            p.replicas.iter().any(|r| r.replica == "replica-1-gcs"),
+            "part {} names the remote",
+            p.part_id
+        );
+    }
+    assert_eq!(attached.metrics().snapshot().parts_under_replicated, 0);
+    assert_eq!(attached.metrics().snapshot().backfill_uploads, 3);
+
+    // Counted from the bucket, not from the manifest the backfill just wrote.
+    let remote_parts = remote.list_prefix("parts/d1_event_log/").unwrap();
+    assert_eq!(
+        remote_parts.len(),
+        4,
+        "every part is physically in the bucket"
+    );
+    drop(attached);
+
+    // --- Phase 4: ⭐ cold-load from the remote ALONE, with the local store gone ---
+    std::fs::remove_dir_all(&local_objects).unwrap();
+    let cold_root = unique_dir("bf-cold-post");
+    let revived = L0EventLogEngine::cold_load_replicated(
+        cfg(&cold_root),
+        vec![ReplicaTarget::new("replica-1-gcs", remote.clone())],
+    )
+    .expect("the remote alone can serve a cold load after the backfill");
+    let got: Vec<String> = revived
+        .replay_all()
+        .unwrap()
+        .into_iter()
+        .map(|r| r.payload)
+        .collect();
+    assert_eq!(
+        got, expected,
+        "all 32 records — including the 24 written before the replica existed"
+    );
+}
