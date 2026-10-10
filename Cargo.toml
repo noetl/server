@@ -173,6 +173,17 @@ gcp_auth = "0.12"
 # types but not those. Same git source + same tag means cargo unifies it with the copy
 # `ehdb-l0` already depends on; a DIFFERENT tag here would put two `EhdbError` types in the
 # graph and the trait impl would stop satisfying the trait.
+# ⚠⚠⚠ A BUMP HERE NEEDS A `fix:` (or `feat:`) COMMIT SUBJECT TO REACH A CLUSTER.
+#
+# semantic-release computes the version from the commit type, and `chore:` releases
+# NOTHING — silently. The v0.5.0 -> v0.5.2 bump was merged as `chore:` (be5dcce2, PR #526),
+# the run went green, no tag appeared, and the change sat on main correct and undeployable
+# with nothing anywhere saying why. That is the trap `agents/rules/release-versioning.md`
+# records, walked into by the person who wrote the rule down.
+#
+# A dependency pin that exists to change the running binary is a `fix:`. Check the tag after
+# the merge rather than assuming it moved:
+#     gh run watch --repo noetl/server && git fetch origin --tags && git tag --sort=-v:refname | head -1
 ehdb-core = { git = "https://github.com/noetl/ehdb", tag = "v0.5.2" }
 ehdb-feed = { git = "https://github.com/noetl/ehdb", tag = "v0.5.2" }
 ehdb-l0 = { git = "https://github.com/noetl/ehdb", tag = "v0.5.2" }
