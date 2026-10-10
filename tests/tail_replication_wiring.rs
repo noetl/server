@@ -158,3 +158,100 @@ fn the_driver_does_not_hold_the_engine_lock_across_the_remote_put() {
         "the lock boundary must be stated where someone editing this will see it"
     );
 }
+
+/// ⚠⚠ **D2 cleanup defaults ON, which is the opposite of every other flag in
+/// this module, and that asymmetry is deliberate.**
+///
+/// Omitting cleanup does not leave the system as it was — it leaves tail
+/// objects accumulating in the replica bucket indefinitely. Whereas the
+/// operation itself is safe by construction: a tail object is deleted only
+/// when a **contiguous** run of durable parts already covers its whole
+/// interval, so what goes is a redundant second copy of something already
+/// off-box.
+///
+/// A default-off cleanup would mean "turn on replication" silently also means
+/// "grow a bucket forever", which is the kind of coupling nobody discovers
+/// until the bill or the listing gets strange.
+#[test]
+fn tail_cleanup_defaults_on_and_is_opt_out() {
+    let embedded = include_str!("../src/handlers/ehdb_embedded.rs");
+    let at = embedded
+        .find("fn tail_cleanup_enabled")
+        .expect("the cleanup flag reader exists");
+    let body = &embedded[at..(at + 400).min(embedded.len())];
+    assert!(
+        body.contains("unwrap_or(false)") && body.starts_with("fn tail_cleanup_enabled")
+            || body.contains('!'),
+        "cleanup must default ON (opt-out), not off; body was: {body}"
+    );
+    // The reader must be a negation of an opt-out, not a plain opt-in.
+    assert!(
+        body.contains("!std::env::var"),
+        "⚠ cleanup reads like an opt-IN flag. Default-off means enabling replication \
+         silently also means growing the bucket forever: {body}"
+    );
+    assert!(
+        embedded.contains("NOETL_EHDB_TAIL_CLEANUP"),
+        "the flag must be nameable by an operator"
+    );
+}
+
+/// The cleanup's listing and deletes are I/O, so they must run with the engine
+/// lock released — the same rule the upload follows, for the same measured
+/// reason (p50 77 ms / p99 234 ms, and the live append path takes that lock).
+#[test]
+fn the_cleanup_runs_with_the_engine_lock_released() {
+    let embedded = include_str!("../src/handlers/ehdb_embedded.rs");
+    let start = embedded
+        .find("pub fn spawn_tail_replication_task")
+        .expect("the driver exists");
+    let end = embedded[start..]
+        .find("\npub fn ")
+        .map(|o| o + start)
+        .unwrap_or(embedded.len());
+    let driver = &embedded[start..end];
+    assert!(
+        driver.len() > 1200,
+        "extracted driver is {} bytes — the checks below would be vacuous",
+        driver.len()
+    );
+
+    let wm = driver
+        .find("contiguous_durable_watermarks()")
+        .expect("the watermark is read under the lock");
+    let dropped = driver.find("drop(guard);").expect("the lock is released");
+    let reclaim = driver
+        .find("reclaim_superseded_tail_objects(")
+        .expect("the reclaim is called");
+
+    assert!(
+        wm < dropped,
+        "the watermark must be read BEFORE the lock is dropped (it reads the in-RAM manifest)"
+    );
+    assert!(
+        dropped < reclaim,
+        "⚠ the reclaim performs listing, sizing and deletes — all I/O — so it must run \
+         AFTER the lock is released. Holding the engine across it would put the whole \
+         object-store round trip in front of every append that collides with a tick."
+    );
+}
+
+/// An operator must be able to tell a stalled reclaimer from an idle one.
+#[test]
+fn the_cleanup_reports_failures_and_retention_not_just_deletions() {
+    let embedded = include_str!("../src/handlers/ehdb_embedded.rs");
+    assert!(
+        embedded.contains("reclaim.failed"),
+        "delete failures must be surfaced: a reclaimer failing every delete and one with \
+         nothing to delete both leave the reclaimed count flat"
+    );
+    assert!(
+        embedded.contains("reclaim.unparsed"),
+        "objects whose keys this build does not understand must be surfaced rather than \
+         silently skipped — they are being left in an event-log bucket deliberately"
+    );
+    assert!(
+        embedded.contains("retained = reclaim.retained"),
+        "retention must be logged alongside deletions, so a stalled seal/upload is visible"
+    );
+}
