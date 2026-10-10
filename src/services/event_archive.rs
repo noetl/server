@@ -1341,10 +1341,21 @@ where
 /// the flag and sees nothing happen must be told why — a flag that appears to work while
 /// doing nothing is the defect this whole program keeps finding.
 pub fn prune_readiness_note() -> &'static str {
-    "pruning is NOT implemented in the pass yet: a safe floor needs the per-execution \
-     minimum-sequence footprint of the entire hot store, and there is no cheap source for \
-     it (PartMeta carries a bloom, which cannot enumerate). Archiving continues; nothing \
-     is deleted. See noetl/ai-meta#459."
+    // ⚠⚠ This text was stale for one release and said the OPPOSITE of what the code does.
+    //
+    // It still claimed "pruning is NOT implemented ... nothing is deleted" after
+    // noetl/server#516 wired the floor to `apply_retention`. On prod the two lines were
+    // emitted together: "parts below the proven floor WILL be deleted" immediately followed
+    // by a note saying nothing is deleted. A reader would reasonably have believed the note.
+    //
+    // It is the drift this whole tier is about, produced by me, in the one place an operator
+    // looks when arming a destructive flag. Keep this string in step with the code or delete
+    // it.
+    "pruning IS wired: the pass computes a floor and drops only parts lying entirely below \
+     it. The floor refuses while any archivable execution is neither verified-archived nor \
+     out-of-coverage, so arming this flag reclaims nothing until the archive backlog is \
+     drained — watch noetl_ehdb_retention_floor_sequence leave 0 and \
+     noetl_ehdb_archive_total{outcome=\"pruned\"} move. See noetl/ai-meta#459."
 }
 
 /// Spawn the periodic archive pass.
@@ -1382,7 +1393,17 @@ pub fn spawn_archive_pass(service: crate::services::execution::ExecutionService)
         interval_secs = cfg.interval_secs,
         max_per_pass = cfg.max_per_pass,
         store = %store.describe(),
-        "archive pass starting (archive-only; nothing is deleted)"
+        // ⚠ The message can no longer say "archive-only" unconditionally: an operator
+        // reading "nothing is deleted" on a pod that is in fact pruning has been told the
+        // opposite of the truth. Fields rather than two literals, so the distinction is
+        // queryable and not only readable.
+        prune_armed = cfg.prune_enabled,
+        deletes = if cfg.prune_enabled {
+            "parts below the proven floor"
+        } else {
+            "nothing"
+        },
+        "archive pass starting"
     );
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(cfg.interval_secs));
