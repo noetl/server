@@ -502,3 +502,91 @@ fn the_unsealed_tail_reaches_gcs_and_cold_loads_from_it_alone() {
          with the node's disk gone"
     );
 }
+
+/// ⭐ **D2 against real GCS**: once a durable part covers the tail object, the
+/// object is deleted from the bucket — and the records are still recoverable
+/// from it alone.
+///
+/// The last clause is the one that makes this a durability test rather than a
+/// housekeeping test: a cleanup that freed space and lost an event would pass
+/// an object-count assertion.
+#[test]
+#[ignore = "needs fake-gcs-server on 127.0.0.1:4443"]
+fn a_superseded_tail_object_is_reclaimed_from_gcs_and_nothing_is_lost() {
+    let prefix = format!("d2-{}", std::process::id());
+    let local_objects = unique_dir("d2-objects");
+    let origin_root = unique_dir("d2-origin");
+
+    let local: Arc<dyn DurableSubstrate> =
+        Arc::new(LocalFsSubstrate::new(&local_objects).unwrap());
+    let remote = gcs("ehdb-cleanup", &prefix);
+
+    let mut origin = L0EventLogEngine::open_replicated(
+        cfg(&origin_root).with_tail_replication(true),
+        vec![
+            ReplicaTarget::new("replica-0", local.clone()),
+            ReplicaTarget::new("replica-1-gcs", remote.clone()),
+        ],
+    )
+    .unwrap();
+
+    let mut expected = Vec::new();
+    for i in 0..5u64 {
+        origin
+            .append("1001", &format!("t{i}"), format!("rec-{i}"))
+            .unwrap();
+        expected.push(format!("rec-{i}"));
+    }
+
+    // Replicate while unsealed — the tail object lands in GCS.
+    assert_eq!(origin.replicate_tail().unwrap().records, 5);
+    assert_eq!(
+        remote.list_prefix("tail/").unwrap().len(),
+        1,
+        "the tail object is in GCS"
+    );
+
+    // Seal, so a durable part now covers exactly those records.
+    origin.flush_and_wait_uploads().unwrap();
+    let m = origin.manifest_snapshot();
+    assert_eq!(m.parts.len(), 1);
+    assert!(m.parts[0].is_durable(), "the part must be durable");
+
+    // Reclaim — watermark under the lock, I/O outside it.
+    let wm = origin.contiguous_durable_watermarks();
+    let replicas = origin.replica_handles();
+    let rep = ehdb_l0::engine::reclaim_superseded_tail_objects(
+        &replicas,
+        "d1_event_log",
+        &wm,
+        origin.metrics().as_ref(),
+    );
+    assert_eq!(rep.reclaimed, 2, "one object per replica (local + GCS)");
+    assert_eq!(rep.retained, 0);
+    assert_eq!(rep.failed, 0);
+    assert!(
+        remote.list_prefix("tail/").unwrap().is_empty(),
+        "gone from GCS, counted from the bucket"
+    );
+    drop(origin);
+
+    // ⭐ And the records survive, recovered from GCS alone with the node's
+    // local store deleted.
+    std::fs::remove_dir_all(&local_objects).unwrap();
+    let fresh = unique_dir("d2-cold");
+    let revived = L0EventLogEngine::cold_load_replicated(
+        cfg(&fresh),
+        vec![ReplicaTarget::new("replica-1-gcs", gcs("ehdb-cleanup", &prefix))],
+    )
+    .expect("GCS alone serves the cold load after the reclaim");
+    let got: Vec<String> = revived
+        .replay_all()
+        .unwrap()
+        .into_iter()
+        .map(|r| r.payload)
+        .collect();
+    assert_eq!(
+        got, expected,
+        "the reclaim freed a redundant copy and lost no event"
+    );
+}

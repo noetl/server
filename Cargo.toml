@@ -184,9 +184,9 @@ gcp_auth = "0.12"
 # A dependency pin that exists to change the running binary is a `fix:`. Check the tag after
 # the merge rather than assuming it moved:
 #     gh run watch --repo noetl/server && git fetch origin --tags && git tag --sort=-v:refname | head -1
-ehdb-core = { git = "https://github.com/noetl/ehdb", tag = "v0.8.1" }
-ehdb-feed = { git = "https://github.com/noetl/ehdb", tag = "v0.8.1" }
-ehdb-l0 = { git = "https://github.com/noetl/ehdb", tag = "v0.8.1" }
+ehdb-core = { git = "https://github.com/noetl/ehdb", tag = "v0.9.0" }
+ehdb-feed = { git = "https://github.com/noetl/ehdb", tag = "v0.9.0" }
+ehdb-l0 = { git = "https://github.com/noetl/ehdb", tag = "v0.9.0" }
 # Value type for the JetStream KV puts in `src/coherence.rs` (multi-replica
 # watermark/descriptor coherence, RFC #115 program-scale).  Matches the version
 # async-nats already pulls in transitively.

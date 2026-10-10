@@ -772,11 +772,18 @@ pub fn spawn_tail_replication_task(
 ) {
     let interval = tail_replication_interval();
     let enabled = tail_replication_enabled();
+    let cleanup = tail_cleanup_enabled();
     crate::metrics::init_tail_replication_series();
     if enabled {
         tracing::info!(target: "noetl_server::ehdb_embedded", tick_secs = interval.as_secs(),
+            cleanup,
             "unsealed-tail replication task starting — loss window is now the TICK, not the \
              seal interval");
+        if !cleanup {
+            tracing::warn!(target: "noetl_server::ehdb_embedded",
+                "tail-object cleanup is DISABLED: objects will accumulate in the replica \
+                 bucket indefinitely (NOETL_EHDB_TAIL_CLEANUP=false)");
+        }
     } else {
         tracing::info!(target: "noetl_server::ehdb_embedded",
             "unsealed-tail replication task starting with replication OFF (gauges only); the \
@@ -837,6 +844,38 @@ pub fn spawn_tail_replication_task(
                             guard.commit_tail_batch(b, &mut report);
                         } else {
                             guard.fail_tail_batch(b, &mut report);
+                        }
+                    }
+                    // D2 — the watermark is read HERE, under the lock (no I/O),
+                    // and carried out so the listing and the deletes happen
+                    // with the lock released. Same rule as the upload above.
+                    let watermarks = guard.contiguous_durable_watermarks();
+                    drop(guard);
+                    if cleanup {
+                        let reclaim = ehdb_l0::engine::reclaim_superseded_tail_objects(
+                            &replicas,
+                            DATASET,
+                            &watermarks,
+                            metrics.as_ref(),
+                        );
+                        if reclaim.reclaimed > 0 {
+                            tracing::info!(target: "noetl_server::ehdb_embedded",
+                                reclaimed = reclaim.reclaimed, bytes = reclaim.bytes,
+                                retained = reclaim.retained,
+                                "tail objects reclaimed — a contiguous run of durable parts \
+                                 already covers them");
+                        }
+                        if reclaim.failed > 0 {
+                            tracing::warn!(target: "noetl_server::ehdb_embedded",
+                                failed = reclaim.failed,
+                                "tail-object deletes failed; the objects remain and are \
+                                 retried next tick");
+                        }
+                        if reclaim.unparsed > 0 {
+                            tracing::warn!(target: "noetl_server::ehdb_embedded",
+                                unparsed = reclaim.unparsed,
+                                "objects under the tail prefix whose keys this build does not \
+                                 understand — left in place deliberately");
                         }
                     }
                     Ok(report)
@@ -948,6 +987,25 @@ pub fn spawn_age_seal_task(engine: std::sync::Arc<std::sync::Mutex<L0Engine<D1Ev
 /// off-box replica, which is real egress and real object writes, so it is opted
 /// into deliberately rather than happening on the first restart after a bucket
 /// is configured.
+/// Whether to delete tail objects a durable part already covers (B3 **D2**).
+///
+/// ⚠⚠ Default **TRUE**, which is deliberately the opposite of every other flag
+/// in this module, and the reason is the shape of the two failure modes.
+/// Omitting cleanup does not leave the system as it was — it leaves tail
+/// objects accumulating in the bucket forever, which is the trap. Whereas the
+/// operation itself is safe *by construction*: `reclaim_superseded_tail_objects`
+/// deletes an object only when a **contiguous** run of durable parts already
+/// covers its whole interval, so what it removes is a redundant second copy of
+/// something already off-box.
+///
+/// Set to `false` to keep every tail object — a deliberate choice, e.g. while
+/// auditing what the replicator writes.
+fn tail_cleanup_enabled() -> bool {
+    !std::env::var("NOETL_EHDB_TAIL_CLEANUP")
+        .map(|v| v.eq_ignore_ascii_case("false") || v == "0")
+        .unwrap_or(false)
+}
+
 /// Whether to replicate the **unsealed** tail off-box (B3). Default **off**.
 ///
 /// ⚠ Only meaningful with a replica bucket configured — without one the only
