@@ -360,3 +360,145 @@ fn a_backfill_makes_an_attached_replica_recoverable_and_it_was_not_before() {
         "all 32 records — including the 24 written before the replica existed"
     );
 }
+
+/// Build a store whose records are deliberately left **unsealed**, replicating
+/// the tail iff `tail`. Returns (local_root, prefix, expected_tail_payloads).
+///
+/// The sealed part exists only so a durable manifest does — a cold load needs
+/// one. The records under test are the ones that never sealed.
+fn tail_scenario(
+    bucket: &str,
+    tag: &str,
+    tail: bool,
+) -> (std::path::PathBuf, String, Vec<String>, Vec<String>) {
+    let prefix = format!("{tag}-{}", std::process::id());
+    let local_objects = unique_dir(&format!("{tag}-objects"));
+    let origin_root = unique_dir(&format!("{tag}-origin"));
+
+    let local: Arc<dyn DurableSubstrate> =
+        Arc::new(LocalFsSubstrate::new(&local_objects).unwrap());
+    let remote = gcs(bucket, &prefix);
+
+    let mut c = cfg(&origin_root);
+    if tail {
+        c = c.with_tail_replication(true);
+    }
+    let mut origin = L0EventLogEngine::open_replicated(
+        c,
+        vec![
+            ReplicaTarget::new("replica-0", local.clone()),
+            ReplicaTarget::new("replica-1-gcs", remote.clone()),
+        ],
+    )
+    .unwrap();
+
+    // 8 records seal exactly one part, so a durable manifest exists.
+    let mut sealed = Vec::new();
+    for i in 0..8u64 {
+        origin
+            .append("1001", &format!("s{i}"), format!("sealed-{i}"))
+            .unwrap();
+        sealed.push(format!("sealed-{i}"));
+    }
+    origin.flush_and_wait_uploads().unwrap();
+    assert_eq!(origin.manifest_snapshot().parts.len(), 1);
+
+    // These must NOT seal — they are the subject.
+    let mut tail_payloads = Vec::new();
+    for i in 0..5u64 {
+        origin
+            .append("1001", &format!("u{i}"), format!("unsealed-{i}"))
+            .unwrap();
+        tail_payloads.push(format!("unsealed-{i}"));
+    }
+    assert_eq!(
+        origin.manifest_snapshot().parts.len(),
+        1,
+        "the 5 must still be unsealed, or this proves nothing about the tail"
+    );
+
+    if tail {
+        let rep = origin.replicate_tail().unwrap();
+        assert_eq!(rep.records, 5, "all five unsealed records replicated");
+        assert!(rep.failed_shards.is_empty());
+    }
+    drop(origin);
+
+    // Simulate losing the node's disk entirely.
+    std::fs::remove_dir_all(&local_objects).unwrap();
+    (origin_root, prefix, sealed, tail_payloads)
+}
+
+/// Recover from the GCS replica alone and return the payloads, in order.
+fn recover_from_gcs_alone(bucket: &str, prefix: &str, tag: &str) -> Vec<String> {
+    let fresh = unique_dir(tag);
+    let engine = L0EventLogEngine::cold_load_replicated(
+        cfg(&fresh),
+        vec![ReplicaTarget::new("replica-1-gcs", gcs(bucket, prefix))],
+    )
+    .expect("the GCS replica alone can serve a cold load");
+    engine
+        .replay_all()
+        .unwrap()
+        .into_iter()
+        .map(|r| r.payload)
+        .collect()
+}
+
+/// ⚠⚠ **B3 RED control, against real GCS.** With tail replication off, records
+/// in an unsealed part are gone when the node's disk is lost — even though the
+/// remote holds the sealed part and a complete manifest.
+///
+/// Without this, the GREEN below is unfalsifiable: a cold load that happened to
+/// find the records some other way would look identical.
+#[test]
+#[ignore = "needs fake-gcs-server on 127.0.0.1:4443"]
+fn without_tail_replication_unsealed_records_do_not_reach_gcs() {
+    let (_root, prefix, sealed, tail_payloads) =
+        tail_scenario("ehdb-tail-red", "b3red", false);
+
+    // Nothing under `tail/`, counted from the bucket itself.
+    let objects = gcs("ehdb-tail-red", &prefix)
+        .list_prefix("tail/")
+        .unwrap();
+    assert!(
+        objects.is_empty(),
+        "tail objects exist with the flag OFF: {objects:?}"
+    );
+
+    let got = recover_from_gcs_alone("ehdb-tail-red", &prefix, "b3red-cold");
+    assert_eq!(got, sealed, "only the sealed part comes back");
+    for p in &tail_payloads {
+        assert!(
+            !got.contains(p),
+            "{p} survived with replication OFF — the loss B3 prevents is not real here"
+        );
+    }
+}
+
+/// ⭐⭐ **The B3 acceptance proof: unsealed-tail records cold-load from the GCS
+/// replica alone**, with the node's local store deleted.
+#[test]
+#[ignore = "needs fake-gcs-server on 127.0.0.1:4443"]
+fn the_unsealed_tail_reaches_gcs_and_cold_loads_from_it_alone() {
+    let (_root, prefix, sealed, tail_payloads) = tail_scenario("ehdb-tail", "b3green", true);
+
+    // Byte-level proof from the bucket, not from a gauge: the tail object is
+    // physically there, under `tail/` and NOT under `parts/`.
+    let remote = gcs("ehdb-tail", &prefix);
+    let tails = remote.list_prefix("tail/").unwrap();
+    assert_eq!(tails.len(), 1, "one tail object in GCS: {tails:?}");
+    assert!(tails[0].contains("/shard-0/"), "tail key shape: {tails:?}");
+    let parts = remote.list_prefix("parts/").unwrap();
+    assert_eq!(parts.len(), 1, "the one sealed part, with no tail among it");
+
+    let got = recover_from_gcs_alone("ehdb-tail", &prefix, "b3green-cold");
+
+    let mut expected = sealed.clone();
+    expected.extend(tail_payloads.clone());
+    assert_eq!(
+        got, expected,
+        "all 13 records — the 8 sealed AND the 5 that never sealed, recovered from GCS \
+         with the node's disk gone"
+    );
+}

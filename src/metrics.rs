@@ -3978,6 +3978,59 @@ pub fn ehdb_age_sealed_total() -> &'static prometheus::IntCounter {
 }
 
 /// Pin the B2 series at 0 so absence means "this build has no age trigger", not "fine".
+pub fn ehdb_tail_batches_total() -> &'static prometheus::IntCounter {
+    static M: std::sync::OnceLock<prometheus::IntCounter> = std::sync::OnceLock::new();
+    M.get_or_init(|| {
+        let m = prometheus::IntCounter::new(
+            "noetl_ehdb_tail_batches_total",
+            "Unsealed-tail batches replicated off-box (noetl/ai-meta#460 B3).",
+        )
+        .expect("valid metric");
+        registry().register(Box::new(m.clone())).ok();
+        m
+    })
+}
+
+pub fn ehdb_tail_records_total() -> &'static prometheus::IntCounter {
+    static M: std::sync::OnceLock<prometheus::IntCounter> = std::sync::OnceLock::new();
+    M.get_or_init(|| {
+        let m = prometheus::IntCounter::new(
+            "noetl_ehdb_tail_records_total",
+            "Records carried off-box by tail replication — the loss B3 prevents (noetl/ai-meta#460).",
+        )
+        .expect("valid metric");
+        registry().register(Box::new(m.clone())).ok();
+        m
+    })
+}
+
+pub fn ehdb_tail_failed_total() -> &'static prometheus::IntCounter {
+    static M: std::sync::OnceLock<prometheus::IntCounter> = std::sync::OnceLock::new();
+    M.get_or_init(|| {
+        let m = prometheus::IntCounter::new(
+            "noetl_ehdb_tail_failed_total",
+            "Tail-replication passes or shards where every replica write failed, so the records stayed local-only. Distinct from a flat batch count, which an IDLE replicator also produces.",
+        )
+        .expect("valid metric");
+        registry().register(Box::new(m.clone())).ok();
+        m
+    })
+}
+
+/// Pin the B3 series at 0 so "replication is off" and "this build has no tail
+/// replicator" are distinguishable on a scrape.
+///
+/// ⚠ Unconditional on purpose. `Registry::gather` prunes families with no
+/// children, so a counter that has never been touched is **absent**, and an
+/// absent series reads identically to a healthy zero to every alert. Pinning
+/// inside the `if enabled` branch would leave exactly the configuration whose
+/// zero an operator needs to read with nothing to read.
+pub fn init_tail_replication_series() {
+    ehdb_tail_batches_total().inc_by(0);
+    ehdb_tail_records_total().inc_by(0);
+    ehdb_tail_failed_total().inc_by(0);
+}
+
 pub fn init_age_seal_series() {
     ehdb_oldest_unsealed_age_seconds().set(0);
     ehdb_manifest_parts().set(0);

@@ -1462,6 +1462,7 @@ async fn main() -> anyhow::Result<()> {
     // configured `seal_max_age` never fires on an idle shard, which is the only shard it
     // exists for.
     if let Some(engine) = noetl_server::handlers::ehdb_embedded::engine_handle() {
+        noetl_server::handlers::ehdb_embedded::spawn_tail_replication_task(engine.clone());
         noetl_server::handlers::ehdb_embedded::spawn_age_seal_task(engine);
     }
     // Same TTL the orphan / nonconvergence sweeps enforce, so the pool report
