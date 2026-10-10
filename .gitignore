@@ -19,3 +19,10 @@ target
 #  and can be added to the global gitignore or merged into this file.  For a more nuclear
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
+
+# ⚠ `vendor/` was 19,670 tracked files (572 MB) that NOTHING consumed: no
+# `.cargo/config.toml` redirect, no `--offline` build. It had drifted to 57 of 344 crates
+# disagreeing with Cargo.lock, and held a pre-ehdb#398 engine — so adding `--offline` later
+# would have looked like infrastructure work and silently compiled the old code.
+# Removed in noetl/ai-meta#463. Ignored so it cannot come back untracked and unnoticed.
+vendor/
