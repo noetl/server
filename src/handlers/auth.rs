@@ -329,6 +329,8 @@ struct TokenClaims {
     sub: String,
     email: Option<String>,
     name: Option<String>,
+    /// The token's `email_verified`. Only a JSON `true` counts.
+    email_verified: bool,
 }
 
 /// Decode + validate the Auth0 ID token claims exactly as the `auth0_login`
@@ -386,10 +388,13 @@ fn decode_and_validate_token(token: &str, auth0_domain: &str) -> Result<TokenCla
         .map(str::to_string)
         .or_else(|| email.clone());
 
+    let email_verified = claims.get("email_verified").and_then(|v| v.as_bool()) == Some(true);
+
     Ok(TokenClaims {
         sub: sub.to_string(),
         email,
         name,
+        email_verified,
     })
 }
 
@@ -457,6 +462,10 @@ async fn login_create_session(
 
     // Identical CTE to auth0_login.create_user_session: upsert the Auth0 user,
     // copy same-email roles, create a fresh session, resolve the role names.
+    // ⚠ Roles follow an email only when the token says the caller owns that
+    // address (`email_verified`), and never for a blank email: an account
+    // anyone can create with an unverified address must not inherit the roles
+    // granted to it.
     // Parameterised binds replace the playbook's jsonb-escaped literals.
     #[allow(clippy::type_complexity)] // one-off sqlx query-row tuple
     let row: Option<(String, i32, Option<String>, String, Option<String>, serde_json::Value)> =
@@ -481,7 +490,9 @@ async fn login_create_session(
                AND same_email.user_id <> u.user_id
               JOIN auth.user_roles ur
                 ON ur.user_id = same_email.user_id
-              WHERE ur.expires_at IS NULL OR ur.expires_at > NOW()
+              WHERE $6::bool
+                AND u.email <> ''
+                AND (ur.expires_at IS NULL OR ur.expires_at > NOW())
               ON CONFLICT (user_id, role_id) DO NOTHING
               RETURNING role_id
             ),
@@ -525,6 +536,7 @@ async fn login_create_session(
         .bind(claims.name.clone().unwrap_or_default())
         .bind(&req.auth0_token)
         .bind(&req.client_ip)
+        .bind(claims.email_verified)
         .fetch_optional(&pool)
         .await?;
 
@@ -788,6 +800,50 @@ mod tests {
         assert_eq!(c.sub, "auth0|abc");
         assert_eq!(c.email.as_deref(), Some("a@b.com"));
         assert_eq!(c.name.as_deref(), Some("Ann"));
+    }
+
+    #[test]
+    fn email_verified_is_true_only_for_a_json_true() {
+        for (value, expected) in [
+            (serde_json::json!(true), true),
+            (serde_json::json!(false), false),
+            (serde_json::json!("true"), false),
+            (serde_json::json!(1), false),
+            (serde_json::Value::Null, false),
+        ] {
+            let jwt = make_jwt(&serde_json::json!({
+                "iss": "https://tenant.us.auth0.com/",
+                "exp": future_exp(),
+                "sub": "auth0|abc",
+                "email": "a@b.com",
+                "email_verified": value,
+            }));
+            let c = decode_and_validate_token(&jwt, "tenant.us.auth0.com").expect("valid");
+            assert_eq!(c.email_verified, expected, "email_verified = {value}");
+        }
+        let jwt = make_jwt(&serde_json::json!({
+            "iss": "https://tenant.us.auth0.com/",
+            "exp": future_exp(),
+            "sub": "auth0|abc",
+        }));
+        assert!(!decode_and_validate_token(&jwt, "tenant.us.auth0.com").unwrap().email_verified);
+    }
+
+    /// ⚠ The login CTE copies same-email roles only for a verified, non-blank
+    /// email. Checked in the source because the statement runs only against a
+    /// live auth database.
+    #[test]
+    fn same_email_role_copy_requires_a_verified_email() {
+        let src = include_str!("auth.rs");
+        let code = src.split_once("\n#[cfg(test)]").map(|(a, _)| a).unwrap_or(src);
+        let at = code.find("copied_roles AS (").expect("copied_roles CTE");
+        let cte = &code[at..at + code[at..].find("RETURNING role_id").expect("end of copied_roles")];
+        assert!(cte.contains("WHERE $6::bool"), "role copy is not gated on email_verified:\n{cte}");
+        assert!(cte.contains("u.email <> ''"), "role copy can match a blank email:\n{cte}");
+        assert!(
+            code.contains(".bind(claims.email_verified)"),
+            "$6 must be bound to the token's email_verified"
+        );
     }
 
     #[test]
