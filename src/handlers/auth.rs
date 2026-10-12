@@ -130,6 +130,30 @@ async fn resolve_auth_pool(cred: &CredentialService, credential: &str) -> AppRes
     Ok(pool)
 }
 
+/// The `user` object of a login or session-validate response.
+///
+/// Carries `auth0_id`, the Auth0 subject the session belongs to, so the gateway
+/// can bind user-scoped playbook variables to the authenticated caller instead
+/// of trusting a client-supplied id. Omitted when unknown, never sent blank.
+fn session_user_json(
+    user_id: i32,
+    email: String,
+    display_name: Option<String>,
+    roles: serde_json::Value,
+    auth0_id: Option<&str>,
+) -> serde_json::Value {
+    let mut user = serde_json::json!({
+        "user_id": user_id,
+        "display_name": display_name.unwrap_or_else(|| email.clone()),
+        "email": email,
+        "roles": roles,
+    });
+    if let Some(sub) = auth0_id.map(str::trim).filter(|s| !s.is_empty()) {
+        user["auth0_id"] = serde_json::Value::String(sub.to_string());
+    }
+    user
+}
+
 // ---------------------------------------------------------------------------
 // Session validation — synchronous mirror of `auth0_validate_session`.
 // ---------------------------------------------------------------------------
@@ -219,7 +243,7 @@ async fn validate_session_inner(
     // invalid; else valid).  Parameterised bind replaces the playbook's
     // jsonb-escaped literal — same match semantics, safer quoting.
     #[allow(clippy::type_complexity)] // one-off sqlx query-row tuple
-    let row: Option<(i32, Option<String>, String, Option<String>, bool)> = sqlx::query_as(
+    let row: Option<(i32, Option<String>, String, Option<String>, bool, Option<String>)> = sqlx::query_as(
         r#"
         SELECT
             s.user_id,
@@ -231,7 +255,8 @@ async fn validate_session_inner(
                 WHEN NOT s.is_active THEN false
                 WHEN NOT u.is_active THEN false
                 ELSE true
-            END AS session_valid
+            END AS session_valid,
+            u.auth0_id
         FROM auth.sessions s
         JOIN auth.users u ON s.user_id = u.user_id
         WHERE s.session_token = $1
@@ -241,7 +266,7 @@ async fn validate_session_inner(
     .fetch_optional(&pool)
     .await?;
 
-    let (user_id, expires_at, email, display_name, _session_valid) = match row {
+    let (user_id, expires_at, email, display_name, _session_valid, auth0_id) = match row {
         Some(r) if r.4 => r,
         // No row, or found-but-invalid → the playbook's send_invalid branch.
         _ => return Ok(ValidateSessionResponse::invalid()),
@@ -265,12 +290,7 @@ async fn validate_session_inner(
     .fetch_one(&pool)
     .await?;
 
-    let user = serde_json::json!({
-        "user_id": user_id,
-        "email": email,
-        "display_name": display_name.unwrap_or_else(|| email.clone()),
-        "roles": roles,
-    });
+    let user = session_user_json(user_id, email, display_name, roles, auth0_id.as_deref());
 
     Ok(ValidateSessionResponse {
         status: "ok".into(),
@@ -536,12 +556,7 @@ async fn login_create_session(
         });
     };
 
-    let user = serde_json::json!({
-        "user_id": user_id,
-        "email": email,
-        "display_name": display_name.unwrap_or_else(|| email.clone()),
-        "roles": roles,
-    });
+    let user = session_user_json(user_id, email, display_name, roles, Some(claims.sub.as_str()));
 
     Ok(LoginResponse {
         status: "success".into(),
@@ -755,6 +770,36 @@ async fn check_playbook_access_inner(
         "display_name": display_name.unwrap_or_else(|| email.clone()),
     });
     Ok(CheckAccessResponse::decided(true, Some(user), &req.action))
+}
+
+#[cfg(test)]
+mod session_user_tests {
+    use super::session_user_json;
+    use serde_json::json;
+
+    #[test]
+    fn carries_the_auth0_subject() {
+        let u = session_user_json(7, "a@b.com".into(), Some("Ann".into()), json!(["user"]), Some("auth0|abc"));
+        assert_eq!(u["auth0_id"], "auth0|abc");
+        assert_eq!(u["user_id"], 7);
+        assert_eq!(u["email"], "a@b.com");
+        assert_eq!(u["display_name"], "Ann");
+        assert_eq!(u["roles"], json!(["user"]));
+    }
+
+    #[test]
+    fn omits_an_unknown_or_blank_subject_rather_than_sending_blank() {
+        for missing in [None, Some(""), Some("  ")] {
+            let u = session_user_json(7, "a@b.com".into(), None, json!([]), missing);
+            assert!(u.get("auth0_id").is_none());
+        }
+    }
+
+    #[test]
+    fn display_name_falls_back_to_email() {
+        let u = session_user_json(7, "a@b.com".into(), None, json!([]), None);
+        assert_eq!(u["display_name"], "a@b.com");
+    }
 }
 
 #[cfg(test)]
