@@ -391,6 +391,33 @@ fn verify_with_jwks(token: &str, jwks: &JwkSet, params: &VerifyParams) -> Result
         .map_err(|e| classify_jwt_error(&e))
 }
 
+/// Normalise a tenant domain for comparison: no scheme, no trailing slash,
+/// lowercase. `https://Tenant.us.auth0.com/` and `tenant.us.auth0.com` are equal.
+fn normalize_domain(raw: &str) -> String {
+    let d = raw.trim();
+    let d = d.strip_prefix("https://").or_else(|| d.strip_prefix("http://")).unwrap_or(d);
+    d.trim_end_matches('/').to_ascii_lowercase()
+}
+
+/// The Auth0 tenant a login is checked against: the server's configured
+/// `NOETL_AUTH0_DOMAIN`, never the one named in the request.
+///
+/// The request's `auth0_domain` is accepted only as a consistency hint: absent
+/// or equal to the configured tenant is fine, anything else is refused. With no
+/// tenant configured the login is refused rather than falling back to the
+/// request, so the trust anchor is always server-side configuration.
+pub fn trusted_auth0_domain(configured: Option<&str>, requested: &str) -> Result<String, String> {
+    let configured = configured.map(normalize_domain).unwrap_or_default();
+    if configured.is_empty() {
+        return Err("server has no Auth0 tenant configured (NOETL_AUTH0_DOMAIN)".to_string());
+    }
+    let requested = normalize_domain(requested);
+    if !requested.is_empty() && requested != configured {
+        return Err("auth0_domain does not match the server's configured Auth0 tenant".to_string());
+    }
+    Ok(configured)
+}
+
 /// Verify the Auth0 ID token's signature + standard claims for `auth0_domain`.
 ///
 /// Derives the issuer + JWKS URL from the domain (falling back to
@@ -755,5 +782,44 @@ MmYl3DjpSV0xyivlvyMT+Qwn\n\
         assert_eq!(VerifyMode::Off.label(), "off");
         assert_eq!(VerifyMode::Shadow.label(), "shadow");
         assert_eq!(VerifyMode::Enforce.label(), "enforce");
+    }
+}
+
+#[cfg(test)]
+mod trusted_domain_tests {
+    use super::trusted_auth0_domain;
+
+    const TENANT: &str = "tenant.us.auth0.com";
+
+    #[test]
+    fn uses_the_configured_tenant_when_the_request_names_none() {
+        assert_eq!(trusted_auth0_domain(Some(TENANT), ""), Ok(TENANT.to_string()));
+    }
+
+    #[test]
+    fn accepts_a_request_that_names_the_configured_tenant_in_any_spelling() {
+        for spelled in [TENANT, "https://tenant.us.auth0.com/", " Tenant.US.auth0.com ", "tenant.us.auth0.com/"] {
+            assert_eq!(trusted_auth0_domain(Some(TENANT), spelled), Ok(TENANT.to_string()), "{spelled}");
+        }
+    }
+
+    #[test]
+    fn refuses_a_request_that_names_a_different_tenant() {
+        for other in ["other.us.auth0.com", "https://other.example/", "tenant.us.auth0.com.example"] {
+            assert!(trusted_auth0_domain(Some(TENANT), other).is_err(), "{other}");
+        }
+    }
+
+    #[test]
+    fn never_falls_back_to_the_request_when_nothing_is_configured() {
+        assert!(trusted_auth0_domain(None, TENANT).is_err());
+        assert!(trusted_auth0_domain(Some("  "), TENANT).is_err());
+        assert!(trusted_auth0_domain(None, "").is_err());
+    }
+
+    #[test]
+    fn the_returned_domain_is_always_the_configured_one() {
+        let d = trusted_auth0_domain(Some("https://Tenant.us.auth0.com/"), "tenant.us.auth0.com").unwrap();
+        assert_eq!(d, TENANT);
     }
 }

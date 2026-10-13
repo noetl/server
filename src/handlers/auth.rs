@@ -423,8 +423,22 @@ pub async fn login(
     State(cred): State<CredentialService>,
     Json(req): Json<LoginRequest>,
 ) -> Json<LoginResponse> {
+    // 0. The tenant is the server's configured one; the request may only agree
+    //    with it. Every check below (issuer, JWKS) is derived from this value.
+    let configured_domain = std::env::var("NOETL_AUTH0_DOMAIN").ok();
+    let auth0_domain = match crate::handlers::auth_verify::trusted_auth0_domain(
+        configured_domain.as_deref(),
+        &req.auth0_domain,
+    ) {
+        Ok(d) => d,
+        Err(reason) => {
+            crate::metrics::record_auth_sync("login", "invalid");
+            return Json(LoginResponse::token_error(reason));
+        }
+    };
+
     // 1. Token claims (mirrors the playbook `start` step + its error callback).
-    let claims = match decode_and_validate_token(&req.auth0_token, &req.auth0_domain) {
+    let claims = match decode_and_validate_token(&req.auth0_token, &auth0_domain) {
         Ok(c) => c,
         Err(reason) => {
             crate::metrics::record_auth_sync("login", "invalid");
@@ -442,7 +456,7 @@ pub async fn login(
     let verify_mode = crate::handlers::auth_verify::verify_mode();
     if let Err(reason) = crate::handlers::auth_verify::enforce_for_login(
         &req.auth0_token,
-        &req.auth0_domain,
+        &auth0_domain,
         verify_mode,
     )
     .await
