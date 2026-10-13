@@ -130,6 +130,30 @@ async fn resolve_auth_pool(cred: &CredentialService, credential: &str) -> AppRes
     Ok(pool)
 }
 
+/// The `user` object of a login or session-validate response.
+///
+/// Carries `auth0_id`, the Auth0 subject the session belongs to, so the gateway
+/// can bind user-scoped playbook variables to the authenticated caller instead
+/// of trusting a client-supplied id. Omitted when unknown, never sent blank.
+fn session_user_json(
+    user_id: i32,
+    email: String,
+    display_name: Option<String>,
+    roles: serde_json::Value,
+    auth0_id: Option<&str>,
+) -> serde_json::Value {
+    let mut user = serde_json::json!({
+        "user_id": user_id,
+        "display_name": display_name.unwrap_or_else(|| email.clone()),
+        "email": email,
+        "roles": roles,
+    });
+    if let Some(sub) = auth0_id.map(str::trim).filter(|s| !s.is_empty()) {
+        user["auth0_id"] = serde_json::Value::String(sub.to_string());
+    }
+    user
+}
+
 // ---------------------------------------------------------------------------
 // Session validation — synchronous mirror of `auth0_validate_session`.
 // ---------------------------------------------------------------------------
@@ -219,7 +243,7 @@ async fn validate_session_inner(
     // invalid; else valid).  Parameterised bind replaces the playbook's
     // jsonb-escaped literal — same match semantics, safer quoting.
     #[allow(clippy::type_complexity)] // one-off sqlx query-row tuple
-    let row: Option<(i32, Option<String>, String, Option<String>, bool)> = sqlx::query_as(
+    let row: Option<(i32, Option<String>, String, Option<String>, bool, Option<String>)> = sqlx::query_as(
         r#"
         SELECT
             s.user_id,
@@ -231,7 +255,8 @@ async fn validate_session_inner(
                 WHEN NOT s.is_active THEN false
                 WHEN NOT u.is_active THEN false
                 ELSE true
-            END AS session_valid
+            END AS session_valid,
+            u.auth0_id
         FROM auth.sessions s
         JOIN auth.users u ON s.user_id = u.user_id
         WHERE s.session_token = $1
@@ -241,7 +266,7 @@ async fn validate_session_inner(
     .fetch_optional(&pool)
     .await?;
 
-    let (user_id, expires_at, email, display_name, _session_valid) = match row {
+    let (user_id, expires_at, email, display_name, _session_valid, auth0_id) = match row {
         Some(r) if r.4 => r,
         // No row, or found-but-invalid → the playbook's send_invalid branch.
         _ => return Ok(ValidateSessionResponse::invalid()),
@@ -265,12 +290,7 @@ async fn validate_session_inner(
     .fetch_one(&pool)
     .await?;
 
-    let user = serde_json::json!({
-        "user_id": user_id,
-        "email": email,
-        "display_name": display_name.unwrap_or_else(|| email.clone()),
-        "roles": roles,
-    });
+    let user = session_user_json(user_id, email, display_name, roles, auth0_id.as_deref());
 
     Ok(ValidateSessionResponse {
         status: "ok".into(),
@@ -408,8 +428,22 @@ pub async fn login(
     State(cred): State<CredentialService>,
     Json(req): Json<LoginRequest>,
 ) -> Json<LoginResponse> {
+    // 0. The tenant is the server's configured one; the request may only agree
+    //    with it. Every check below (issuer, JWKS) is derived from this value.
+    let configured_domain = std::env::var("NOETL_AUTH0_DOMAIN").ok();
+    let auth0_domain = match crate::handlers::auth_verify::trusted_auth0_domain(
+        configured_domain.as_deref(),
+        &req.auth0_domain,
+    ) {
+        Ok(d) => d,
+        Err(reason) => {
+            crate::metrics::record_auth_sync("login", "invalid");
+            return Json(LoginResponse::token_error(reason));
+        }
+    };
+
     // 1. Token claims (mirrors the playbook `start` step + its error callback).
-    let claims = match decode_and_validate_token(&req.auth0_token, &req.auth0_domain) {
+    let claims = match decode_and_validate_token(&req.auth0_token, &auth0_domain) {
         Ok(c) => c,
         Err(reason) => {
             crate::metrics::record_auth_sync("login", "invalid");
@@ -427,7 +461,7 @@ pub async fn login(
     let verify_mode = crate::handlers::auth_verify::verify_mode();
     if let Err(reason) = crate::handlers::auth_verify::enforce_for_login(
         &req.auth0_token,
-        &req.auth0_domain,
+        &auth0_domain,
         verify_mode,
     )
     .await
@@ -548,12 +582,7 @@ async fn login_create_session(
         });
     };
 
-    let user = serde_json::json!({
-        "user_id": user_id,
-        "email": email,
-        "display_name": display_name.unwrap_or_else(|| email.clone()),
-        "roles": roles,
-    });
+    let user = session_user_json(user_id, email, display_name, roles, Some(claims.sub.as_str()));
 
     Ok(LoginResponse {
         status: "success".into(),
@@ -767,6 +796,36 @@ async fn check_playbook_access_inner(
         "display_name": display_name.unwrap_or_else(|| email.clone()),
     });
     Ok(CheckAccessResponse::decided(true, Some(user), &req.action))
+}
+
+#[cfg(test)]
+mod session_user_tests {
+    use super::session_user_json;
+    use serde_json::json;
+
+    #[test]
+    fn carries_the_auth0_subject() {
+        let u = session_user_json(7, "a@b.com".into(), Some("Ann".into()), json!(["user"]), Some("auth0|abc"));
+        assert_eq!(u["auth0_id"], "auth0|abc");
+        assert_eq!(u["user_id"], 7);
+        assert_eq!(u["email"], "a@b.com");
+        assert_eq!(u["display_name"], "Ann");
+        assert_eq!(u["roles"], json!(["user"]));
+    }
+
+    #[test]
+    fn omits_an_unknown_or_blank_subject_rather_than_sending_blank() {
+        for missing in [None, Some(""), Some("  ")] {
+            let u = session_user_json(7, "a@b.com".into(), None, json!([]), missing);
+            assert!(u.get("auth0_id").is_none());
+        }
+    }
+
+    #[test]
+    fn display_name_falls_back_to_email() {
+        let u = session_user_json(7, "a@b.com".into(), None, json!([]), None);
+        assert_eq!(u["display_name"], "a@b.com");
+    }
 }
 
 #[cfg(test)]
