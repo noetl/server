@@ -428,6 +428,27 @@ pub enum DivergenceKind {
     /// carry the same thing" — and a comparator that only ever answered the
     /// first is what let a systematically-divergent tier report `match`.
     Content,
+    /// A comparable `event_id` the tier holds MORE THAN ONCE.
+    ///
+    /// Its own kind rather than a `count` divergence, because the two say
+    /// different things and only one of them is data loss. `count` reads as "the
+    /// tier does not hold the right number of events", which is what an operator
+    /// acts on; a duplicate holds every right event and one of them twice. Every
+    /// tier reader folds by `event_id` after sorting, so served state is
+    /// unaffected — but the re-delivery is a real mirror defect, so it is
+    /// reported rather than collapsed silently.
+    ///
+    /// ⚠ The write path that produces it is NOT established — the tier driver
+    /// is documented to deduplicate a re-delivery by `event_id`
+    /// (`ehdb_tier_repair.rs`), so either that dedup does not cover the path
+    /// producing these records or it does not fire. Tracked as
+    /// noetl/ai-meta#472. Do not read this kind as a known-cause condition.
+    ///
+    /// Before this existed, a duplicate fired `count` with no `missing_event`
+    /// and no `extra_event` beside it, which is exactly the signature that paged
+    /// prod on 2026-10-15: `authoritative(mirror-expected)=35 ehdb=38`, read as
+    /// three surplus events when it was three repeated ids.
+    DuplicateEvent,
     /// A tier record that cannot be matched at all: its payload does not parse,
     /// or it carries no `event_id`.
     ///
@@ -444,6 +465,7 @@ impl DivergenceKind {
         match self {
             Self::MissingExecution => "missing_execution",
             Self::Count => "count",
+            Self::DuplicateEvent => "duplicate_event",
             Self::MissingEvent => "missing_event",
             Self::ExtraEvent => "extra_event",
             Self::Order => "order",
@@ -455,9 +477,10 @@ impl DivergenceKind {
 }
 
 /// Every [`DivergenceKind`] label value, for pinning and for the control suite.
-pub const DIVERGENCE_KINDS: [DivergenceKind; 8] = [
+pub const DIVERGENCE_KINDS: [DivergenceKind; 9] = [
     DivergenceKind::MissingExecution,
     DivergenceKind::Count,
+    DivergenceKind::DuplicateEvent,
     DivergenceKind::MissingEvent,
     DivergenceKind::ExtraEvent,
     DivergenceKind::Order,
@@ -568,6 +591,18 @@ pub struct CrossStoreReport {
     pub pending_tier: usize,
     /// Tier records that parsed and carried an `event_id`.
     pub identified: usize,
+    /// Tier records whose `event_id` another comparable record already carried.
+    ///
+    /// Reported rather than silently collapsed. `ehdb_count` counts DISTINCT
+    /// comparable ids, so a duplicate no longer inflates it into a `count`
+    /// divergence — but a mirror re-delivering the same event is still a fact
+    /// worth seeing, and dropping it from the count without saying so would
+    /// trade a false alarm for silence. Non-zero means the tier read held the
+    /// same `event_id` more than once (noetl/ai-meta#472); zero on a healthy read, and
+    /// `skip_serializing_if` keeps it off the wire there so a clean report is
+    /// byte-identical to what it was before this existed.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub tier_duplicate_ids: usize,
     /// Shared `event_id`s whose identifying fields agreed.
     pub matched: usize,
     /// Tier records that arrived **after** an event with a higher `event_id`
@@ -858,7 +893,29 @@ fn compare_inner(
         .count()
         + skewed_ahead;
     parsed.retain(|m| !held_back_ids.contains(&m.event_id));
-    let ehdb_comparable = mirrored.len() - pending_tier;
+    // Count DISTINCT comparable `event_id`s, which is the same denominator
+    // every other check on the tier side uses (`mirrored_ids` below, and the
+    // presence / extra checks through it).
+    //
+    // ⚠ It used to be `mirrored.len() - pending_tier`, and that mixed two
+    // populations with the subtrahend drawn from a third. `mirrored` is the raw
+    // tier read, so it counts records that never reached a comparison at all —
+    // a payload that is not JSON, or one carrying no `event_id` — while
+    // `pending_tier` is counted off `parsed`. A repeated `event_id` was counted
+    // twice on one side of `expected.len() != ehdb_comparable` and once on the
+    // other, so a tier read holding a duplicate reported a `count` divergence
+    // against a tier that was not missing anything and had nothing extra:
+    // every set-based check agreed while the count check did not.
+    //
+    // That is what paged prod on 2026-10-15 — `ehdb=38` against
+    // `authoritative(mirror-expected)=35`, a +3 that was three repeated ids in
+    // the read rather than three surplus events. The duplicates are reported
+    // below rather than merely dropped, so the condition stays visible instead
+    // of trading a false alarm for silence; the underlying re-delivery is
+    // noetl/ai-meta#472.
+    let mirrored_ids: BTreeSet<i64> = parsed.iter().map(|m| m.event_id).collect();
+    let ehdb_comparable = mirrored_ids.len();
+    let tier_duplicate_ids = parsed.len() - mirrored_ids.len();
 
     // The two authoritative views. `expected` scopes the count / missing checks
     // to events the tier should hold; `auth_by_id` covers the whole log so a
@@ -868,7 +925,28 @@ fn compare_inner(
         authoritative.iter().filter(|e| e.mirror_expected).collect();
     let auth_by_id: BTreeMap<i64, &AuthoritativeEvent> =
         authoritative.iter().map(|e| (e.event_id, e)).collect();
-    let mirrored_ids: BTreeSet<i64> = parsed.iter().map(|m| m.event_id).collect();
+
+    // --- duplicates ----------------------------------------------------------
+    if tier_duplicate_ids > 0 {
+        let mut seen: BTreeSet<i64> = BTreeSet::new();
+        let mut repeated: BTreeSet<i64> = BTreeSet::new();
+        for m in &parsed {
+            if !seen.insert(m.event_id) {
+                repeated.insert(m.event_id);
+            }
+        }
+        let repeated: Vec<i64> = repeated.into_iter().collect();
+        divergences.push(Divergence {
+            kind: DivergenceKind::DuplicateEvent,
+            detail: format!(
+                "the tier holds {tier_duplicate_ids} redundant record(s) for {} \
+                 event_id(s) {}; every one is present and none is surplus, so this \
+                 is a re-delivery rather than a count gap (noetl/ai-meta#472)",
+                repeated.len(),
+                id_list(&repeated)
+            ),
+        });
+    }
 
     // --- presence ------------------------------------------------------------
     if !expected.is_empty() && ehdb_comparable == 0 {
@@ -1080,6 +1158,7 @@ fn compare_inner(
         pending_authoritative,
         pending_tier,
         identified: parsed.len(),
+        tier_duplicate_ids,
         matched,
         arrival_reordered,
         holds: divergences.is_empty(),
@@ -1204,10 +1283,11 @@ pub struct ControlResult {
 }
 
 /// Every control label value, for pinning.
-pub const CONTROL_NAMES: [&str; 12] = [
+pub const CONTROL_NAMES: [&str; 13] = [
     "identical",
     "missing_execution",
     "count",
+    "duplicate_event",
     "missing_event",
     "extra_event",
     "order",
@@ -1303,13 +1383,29 @@ pub fn run_controls() -> Vec<ControlResult> {
             Box::new(|m: &mut Vec<MirroredRecord>| m.clear()),
         ),
         (
-            DivergenceKind::Count,
-            // A duplicate keeps every id present, so `count` fires without
-            // dragging `missing_event` along with it.
+            DivergenceKind::DuplicateEvent,
+            // A duplicate keeps every id present, so neither `missing_event` nor
+            // `extra_event` fires — the whole signature is the redundant record.
+            // This mutation used to be the `count` control, back when a repeated
+            // id inflated `ehdb_count`; it is the duplicate control now, and the
+            // reason the two had to be separated is in `DuplicateEvent`'s docs.
             Box::new(|m: &mut Vec<MirroredRecord>| {
                 let mut dup = m[2].clone();
                 dup.global_sequence = 4;
                 m.push(dup);
+            }),
+        ),
+        (
+            DivergenceKind::Count,
+            // ⚠ `count` can no longer be provoked in ISOLATION, and that is a
+            // property worth stating rather than a gap in the control. Now that
+            // `ehdb_count` counts distinct comparable ids, the count and the id
+            // sets are two views of one fact: a cardinality gap means an id is
+            // absent or surplus, so `missing_event` or `extra_event` always
+            // fires beside it. The control therefore asserts `count` is still
+            // raised, not that it is raised alone.
+            Box::new(|m: &mut Vec<MirroredRecord>| {
+                m.remove(2);
             }),
         ),
         (
@@ -3488,5 +3584,227 @@ mod tests {
             "the guard must be looking at the real comparator body; it found none of the \
              gated recorders, which means the anchor moved and this test is vacuous"
         );
+    }
+
+    // ---- `ehdb_count` counts DISTINCT comparable ids -----------------------
+    //
+    // The prod page of 2026-10-15 14:51Z reported
+    // `authoritative(mirror-expected)=35 ehdb=38`, and the +3 was three
+    // REPEATED `event_id`s in the tier read, not three surplus events: every
+    // set-based check on the same data agreed. The count check was the only one
+    // using a different denominator.
+
+    /// A repeated `event_id` in the tier read is not a count divergence.
+    ///
+    /// The prod shape, scaled down: the tier holds every expected event and
+    /// additionally re-delivered one of them. Nothing is missing and nothing is
+    /// surplus, so no check should fire — but the duplicate is reported, so the
+    /// re-delivery stays visible rather than being quietly collapsed.
+    #[test]
+    fn a_repeated_tier_event_id_is_not_a_count_divergence() {
+        let auth = vec![
+            auth_event(9_001, "playbook.started", "start", "STARTED"),
+            auth_event(9_002, "step.enter", "fetch", "RUNNING"),
+            auth_event(9_003, "step.exit", "fetch", "COMPLETED"),
+        ];
+        let mirrored = vec![
+            mirrored_of(1, &auth[0]),
+            mirrored_of(2, &auth[1]),
+            mirrored_of(3, &auth[2]),
+            // the re-delivery: same `event_id`, later arrival
+            mirrored_of(4, &auth[1]),
+        ];
+
+        let r = compare_cross_store(1, &auth, &mirrored);
+        assert!(
+            !r.kinds().contains("count"),
+            "a repeated event_id is not a cardinality gap: {:?}",
+            r.divergences
+        );
+        assert!(
+            !r.kinds().contains("missing_event") && !r.kinds().contains("extra_event"),
+            "nothing is absent and nothing is surplus: {:?}",
+            r.divergences
+        );
+        assert!(
+            r.kinds().contains("duplicate_event"),
+            "but the re-delivery is still reported, on its own terms: {:?}",
+            r.divergences
+        );
+        assert_eq!(r.ehdb_count, 3, "three DISTINCT comparable ids");
+        assert_eq!(r.identified, 4, "four records parsed");
+        assert_eq!(r.tier_duplicate_ids, 1);
+    }
+
+    /// Three duplicates, the prod ratio exactly: 35 expected, 38 records.
+    #[test]
+    fn the_prod_2026_10_15_count_gap_reads_as_duplicates_now() {
+        let auth: Vec<AuthoritativeEvent> = (0..35)
+            .map(|i| auth_event(10_000 + i, "step.exit", "s", "COMPLETED"))
+            .collect();
+        let mut mirrored: Vec<MirroredRecord> = auth
+            .iter()
+            .enumerate()
+            .map(|(i, e)| mirrored_of(i as u64 + 1, e))
+            .collect();
+        for (n, i) in [3usize, 17, 29].iter().enumerate() {
+            mirrored.push(mirrored_of(100 + n as u64, &auth[*i]));
+        }
+        assert_eq!(mirrored.len(), 38, "the read the comparator saw");
+
+        let r = compare_cross_store(1, &auth, &mirrored);
+        assert_eq!(r.authoritative_expected, 35);
+        assert_eq!(r.ehdb_count, 35, "was 38 before the fix, and paged as `count`");
+        assert_eq!(r.tier_duplicate_ids, 3);
+        assert_eq!(
+            r.kinds().into_iter().collect::<Vec<_>>(),
+            vec!["duplicate_event"],
+            "exactly one kind, and it names what actually happened: {:?}",
+            r.divergences
+        );
+    }
+
+    /// ⭐ The old denominator also MASKED a real deficit.
+    ///
+    /// This is the direction that matters more than the false alarm. The tier
+    /// holds two of three expected events and re-delivered one of them, so the
+    /// raw record count is 3 — exactly `expected.len()` — and the old
+    /// `mirrored.len() - pending_tier` therefore reported no count divergence at
+    /// all on a tier that really was missing an event. Counting distinct ids
+    /// makes both the count gap and the absence visible.
+    #[test]
+    fn duplicates_do_not_mask_a_genuine_deficit() {
+        let auth = vec![
+            auth_event(9_001, "playbook.started", "start", "STARTED"),
+            auth_event(9_002, "step.enter", "fetch", "RUNNING"),
+            auth_event(9_003, "step.exit", "fetch", "COMPLETED"),
+        ];
+        // 9_003 never mirrored; 9_002 arrived twice. Raw count still 3.
+        let mirrored = vec![
+            mirrored_of(1, &auth[0]),
+            mirrored_of(2, &auth[1]),
+            mirrored_of(3, &auth[1]),
+        ];
+        assert_eq!(mirrored.len(), auth.len(), "the masking condition");
+
+        let r = compare_cross_store(1, &auth, &mirrored);
+        assert!(
+            r.kinds().contains("missing_event"),
+            "the absent event must be reported: {:?}",
+            r.divergences
+        );
+        assert!(
+            r.kinds().contains("count"),
+            "and the count gap it was hiding: {:?}",
+            r.divergences
+        );
+        assert_eq!(r.ehdb_count, 2);
+        assert_eq!(r.tier_duplicate_ids, 1);
+        assert_eq!(r.missing_event_ids, vec![9_003]);
+    }
+
+    /// A genuine deficit is untouched by the change.
+    #[test]
+    fn a_genuine_deficit_still_reports_missing_event() {
+        let auth = vec![
+            auth_event(9_001, "playbook.started", "start", "STARTED"),
+            auth_event(9_002, "step.enter", "fetch", "RUNNING"),
+            auth_event(9_003, "step.exit", "fetch", "COMPLETED"),
+        ];
+        let mirrored = vec![mirrored_of(1, &auth[0]), mirrored_of(2, &auth[1])];
+
+        let r = compare_cross_store(1, &auth, &mirrored);
+        assert!(r.kinds().contains("missing_event"), "{:?}", r.divergences);
+        assert!(r.kinds().contains("count"), "{:?}", r.divergences);
+        assert_eq!(r.ehdb_count, 2);
+        assert_eq!(r.tier_duplicate_ids, 0, "no duplicates here");
+        assert_eq!(r.missing_event_ids, vec![9_003]);
+    }
+
+    /// A genuine extra is untouched by the change.
+    ///
+    /// Distinct from a duplicate in exactly the way that matters: an id the
+    /// authoritative log does not hold at all is surplus data, and still reads
+    /// as `extra_event`.
+    #[test]
+    fn a_genuine_extra_still_reports_extra_event() {
+        let auth = vec![
+            auth_event(9_001, "playbook.started", "start", "STARTED"),
+            auth_event(9_002, "step.enter", "fetch", "RUNNING"),
+        ];
+        let surplus = auth_event(9_500, "step.exit", "ghost", "COMPLETED");
+        let mirrored = vec![
+            mirrored_of(1, &auth[0]),
+            mirrored_of(2, &auth[1]),
+            mirrored_of(3, &surplus),
+        ];
+
+        let r = compare_cross_store(1, &auth, &mirrored);
+        assert!(r.kinds().contains("extra_event"), "{:?}", r.divergences);
+        assert_eq!(r.ehdb_count, 3, "three distinct ids, one of them surplus");
+        assert_eq!(r.tier_duplicate_ids, 0);
+    }
+
+    /// A tier record that carries no `event_id` is not comparable, so it does
+    /// not count toward `ehdb_count`.
+    ///
+    /// The old denominator was the RAW read, so an unparseable record inflated
+    /// the comparable count — which could mask a deficit the same way a
+    /// duplicate could. It was never compared against anything.
+    #[test]
+    fn a_record_with_no_event_id_is_not_counted_as_comparable() {
+        let auth = vec![
+            auth_event(9_001, "playbook.started", "start", "STARTED"),
+            auth_event(9_002, "step.enter", "fetch", "RUNNING"),
+        ];
+        let mut mirrored = vec![mirrored_of(1, &auth[0]), mirrored_of(2, &auth[1])];
+        mirrored.push(MirroredRecord {
+            global_sequence: 3,
+            payload: json!({ "execution_id": 1, "event_type": "step.exit" }).to_string(),
+        });
+
+        let r = compare_cross_store(1, &auth, &mirrored);
+        // `unidentified` is deliberately a divergence, not a skip — an
+        // unmatchable record is the thing that makes the tier unverifiable
+        // (ai-meta#258). That check is untouched and still fires.
+        assert!(
+            r.kinds().contains("unidentified"),
+            "an unmatchable record must still be reported: {:?}",
+            r.divergences
+        );
+        // What changes is that it no longer ALSO inflates the comparable count
+        // into a second, misleading `count` divergence about cardinality.
+        assert!(
+            !r.kinds().contains("count"),
+            "and it is reported once, not twice in two vocabularies: {:?}",
+            r.divergences
+        );
+        assert_eq!(r.ehdb_count, 2, "was 3 before the fix");
+        assert_eq!(r.identified, 2);
+        assert_eq!(r.tier_duplicate_ids, 0, "absent is not duplicated");
+    }
+
+    /// The set checks are untouched: a tier holding a different id in place of
+    /// an expected one still reports BOTH sides of the set inequality, and the
+    /// equal cardinality does not hide it.
+    #[test]
+    fn a_set_unequal_tier_of_equal_size_is_untouched() {
+        let auth = vec![
+            auth_event(9_001, "playbook.started", "start", "STARTED"),
+            auth_event(9_002, "step.enter", "fetch", "RUNNING"),
+        ];
+        let wrong = auth_event(9_777, "step.enter", "fetch", "RUNNING");
+        let mirrored = vec![mirrored_of(1, &auth[0]), mirrored_of(2, &wrong)];
+
+        let r = compare_cross_store(1, &auth, &mirrored);
+        assert_eq!(r.ehdb_count, 2, "cardinality agrees");
+        assert!(
+            !r.kinds().contains("count"),
+            "so the count check is silent, correctly: {:?}",
+            r.divergences
+        );
+        assert!(r.kinds().contains("missing_event"), "{:?}", r.divergences);
+        assert!(r.kinds().contains("extra_event"), "{:?}", r.divergences);
+        assert_eq!(r.missing_event_ids, vec![9_002]);
     }
 }
