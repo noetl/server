@@ -435,9 +435,14 @@ pub enum DivergenceKind {
     /// tier does not hold the right number of events", which is what an operator
     /// acts on; a duplicate holds every right event and one of them twice. Every
     /// tier reader folds by `event_id` after sorting, so served state is
-    /// unaffected — but the re-delivery is a real mirror defect (ehdb#335, the
-    /// WAL path double-applying an event), so it is reported rather than
-    /// collapsed silently.
+    /// unaffected — but the re-delivery is a real mirror defect, so it is
+    /// reported rather than collapsed silently.
+    ///
+    /// ⚠ The write path that produces it is NOT established — the tier driver
+    /// is documented to deduplicate a re-delivery by `event_id`
+    /// (`ehdb_tier_repair.rs`), so either that dedup does not cover the path
+    /// producing these records or it does not fire. Tracked as
+    /// noetl/ai-meta#472. Do not read this kind as a known-cause condition.
     ///
     /// Before this existed, a duplicate fired `count` with no `missing_event`
     /// and no `extra_event` beside it, which is exactly the signature that paged
@@ -593,7 +598,7 @@ pub struct CrossStoreReport {
     /// divergence — but a mirror re-delivering the same event is still a fact
     /// worth seeing, and dropping it from the count without saying so would
     /// trade a false alarm for silence. Non-zero means the tier read held the
-    /// same `event_id` more than once (ehdb#335); zero on a healthy read, and
+    /// same `event_id` more than once (noetl/ai-meta#472); zero on a healthy read, and
     /// `skip_serializing_if` keeps it off the wire there so a clean report is
     /// byte-identical to what it was before this existed.
     #[serde(default, skip_serializing_if = "is_zero")]
@@ -907,7 +912,7 @@ fn compare_inner(
     // the read rather than three surplus events. The duplicates are reported
     // below rather than merely dropped, so the condition stays visible instead
     // of trading a false alarm for silence; the underlying re-delivery is
-    // ehdb#335.
+    // noetl/ai-meta#472.
     let mirrored_ids: BTreeSet<i64> = parsed.iter().map(|m| m.event_id).collect();
     let ehdb_comparable = mirrored_ids.len();
     let tier_duplicate_ids = parsed.len() - mirrored_ids.len();
@@ -936,7 +941,7 @@ fn compare_inner(
             detail: format!(
                 "the tier holds {tier_duplicate_ids} redundant record(s) for {} \
                  event_id(s) {}; every one is present and none is surplus, so this \
-                 is a re-delivery rather than a count gap (ehdb#335)",
+                 is a re-delivery rather than a count gap (noetl/ai-meta#472)",
                 repeated.len(),
                 id_list(&repeated)
             ),
