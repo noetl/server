@@ -18,8 +18,8 @@ mod aws_sts;
 mod azure;
 mod azure_oauth;
 pub mod broker;
-pub mod file_env;
 pub mod dynamic;
+pub mod file_env;
 mod gcp;
 mod gcp_iam;
 mod k8s;
@@ -36,7 +36,9 @@ pub use gcp::GcpSecretManager;
 pub use gcp_iam::GcpIamProvider;
 pub use k8s::K8sSecretProvider;
 pub use registry::get_provider;
-pub use resolver::{resolve_keychain_entry, resolve_keychain_entry_with_meta, structured_or_string};
+pub use resolver::{
+    resolve_keychain_entry, resolve_keychain_entry_with_meta, structured_or_string,
+};
 pub use vault::VaultSecretProvider;
 
 use std::sync::{Arc, OnceLock};

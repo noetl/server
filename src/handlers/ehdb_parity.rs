@@ -3654,7 +3654,10 @@ mod tests {
 
         let r = compare_cross_store(1, &auth, &mirrored);
         assert_eq!(r.authoritative_expected, 35);
-        assert_eq!(r.ehdb_count, 35, "was 38 before the fix, and paged as `count`");
+        assert_eq!(
+            r.ehdb_count, 35,
+            "was 38 before the fix, and paged as `count`"
+        );
         assert_eq!(r.tier_duplicate_ids, 3);
         assert_eq!(
             r.kinds().into_iter().collect::<Vec<_>>(),

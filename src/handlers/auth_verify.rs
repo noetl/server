@@ -395,7 +395,10 @@ fn verify_with_jwks(token: &str, jwks: &JwkSet, params: &VerifyParams) -> Result
 /// lowercase. `https://Tenant.us.auth0.com/` and `tenant.us.auth0.com` are equal.
 fn normalize_domain(raw: &str) -> String {
     let d = raw.trim();
-    let d = d.strip_prefix("https://").or_else(|| d.strip_prefix("http://")).unwrap_or(d);
+    let d = d
+        .strip_prefix("https://")
+        .or_else(|| d.strip_prefix("http://"))
+        .unwrap_or(d);
     d.trim_end_matches('/').to_ascii_lowercase()
 }
 
@@ -793,20 +796,39 @@ mod trusted_domain_tests {
 
     #[test]
     fn uses_the_configured_tenant_when_the_request_names_none() {
-        assert_eq!(trusted_auth0_domain(Some(TENANT), ""), Ok(TENANT.to_string()));
+        assert_eq!(
+            trusted_auth0_domain(Some(TENANT), ""),
+            Ok(TENANT.to_string())
+        );
     }
 
     #[test]
     fn accepts_a_request_that_names_the_configured_tenant_in_any_spelling() {
-        for spelled in [TENANT, "https://tenant.us.auth0.com/", " Tenant.US.auth0.com ", "tenant.us.auth0.com/"] {
-            assert_eq!(trusted_auth0_domain(Some(TENANT), spelled), Ok(TENANT.to_string()), "{spelled}");
+        for spelled in [
+            TENANT,
+            "https://tenant.us.auth0.com/",
+            " Tenant.US.auth0.com ",
+            "tenant.us.auth0.com/",
+        ] {
+            assert_eq!(
+                trusted_auth0_domain(Some(TENANT), spelled),
+                Ok(TENANT.to_string()),
+                "{spelled}"
+            );
         }
     }
 
     #[test]
     fn refuses_a_request_that_names_a_different_tenant() {
-        for other in ["other.us.auth0.com", "https://other.example/", "tenant.us.auth0.com.example"] {
-            assert!(trusted_auth0_domain(Some(TENANT), other).is_err(), "{other}");
+        for other in [
+            "other.us.auth0.com",
+            "https://other.example/",
+            "tenant.us.auth0.com.example",
+        ] {
+            assert!(
+                trusted_auth0_domain(Some(TENANT), other).is_err(),
+                "{other}"
+            );
         }
     }
 
@@ -819,7 +841,8 @@ mod trusted_domain_tests {
 
     #[test]
     fn the_returned_domain_is_always_the_configured_one() {
-        let d = trusted_auth0_domain(Some("https://Tenant.us.auth0.com/"), "tenant.us.auth0.com").unwrap();
+        let d = trusted_auth0_domain(Some("https://Tenant.us.auth0.com/"), "tenant.us.auth0.com")
+            .unwrap();
         assert_eq!(d, TENANT);
     }
 }

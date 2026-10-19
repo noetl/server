@@ -976,7 +976,12 @@ impl DriveTombstones {
     /// give-up out of the slot was necessary but insufficient while the *budget*
     /// that triggers it still lived inside.
     pub fn noops(&self, execution_id: i64) -> u32 {
-        self.budgets.lock().unwrap().get(&execution_id).copied().unwrap_or(0)
+        self.budgets
+            .lock()
+            .unwrap()
+            .get(&execution_id)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Store the budget, bounded the same way the tombstones are.

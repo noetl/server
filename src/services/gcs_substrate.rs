@@ -212,10 +212,37 @@ impl DurableSubstrate for GcsSubstrate {
         })
     }
 
+    /// ⚠ A METADATA call, not a download (noetl/ai-meta#479).
+    ///
+    /// This used to be `b.get(&k)` with the bytes thrown away — downloading an
+    /// object to answer a boolean. On a remote replica that is a measured GCS get
+    /// (p50 77 ms, p95 139 ms, p99 234 ms) per existence check.
     fn exists(&self, key: &str) -> EhdbResult<bool> {
         let b = self.backend.clone();
         let k = self.key(key);
-        self.blocking(async move { Ok(b.get(&k).await.map_err(to_ehdb)?.is_some()) })
+        self.blocking(async move { Ok(b.stat(&k).await.map_err(to_ehdb)?.is_some()) })
+    }
+
+    /// ⚠ The whole point of noetl/ai-meta#479 / noetl/ehdb#395.
+    ///
+    /// The trait's default falls back to `get_all().len()`, so without this
+    /// override `reclaim_orphans` DOWNLOADS every orphan to learn its size. The
+    /// metadata document already carries it.
+    ///
+    /// ⚠⚠ A missing object returns `NotFound` rather than 0, matching
+    /// [`get_all`](Self::get_all): an absent object and a zero-length object are
+    /// different facts, and conflating them would let a missing part read as a
+    /// present-but-empty one.
+    fn object_size(&self, key: &str) -> EhdbResult<u64> {
+        let b = self.backend.clone();
+        let k = self.key(key);
+        let shown = k.clone();
+        self.blocking(async move {
+            match b.stat(&k).await.map_err(to_ehdb)? {
+                Some(n) => Ok(n),
+                None => Err(EhdbError::NotFound(shown)),
+            }
+        })
     }
 
     fn list_prefix(&self, prefix: &str) -> EhdbResult<Vec<String>> {

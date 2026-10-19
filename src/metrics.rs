@@ -4103,7 +4103,9 @@ pub fn init_replica_reality_series() {
     // "replication is re-sending work" from "replication is not running".
     for outcome in ["ok", "failed", "already_present"] {
         for backend in ["gcs", "postgres"] {
-            object_store_put_total().with_label_values(&[backend, outcome]).inc_by(0);
+            object_store_put_total()
+                .with_label_values(&[backend, outcome])
+                .inc_by(0);
         }
     }
 }

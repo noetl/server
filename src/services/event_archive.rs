@@ -109,7 +109,9 @@ impl RetentionConfig {
                 .parse()
                 .map_err(|_| format!("{INTERVAL_VAR}={raw:?} is not a number of seconds"))?;
             if v == 0 {
-                return Err(format!("{INTERVAL_VAR}=0 would spin; set a positive interval"));
+                return Err(format!(
+                    "{INTERVAL_VAR}=0 would spin; set a positive interval"
+                ));
             }
             c.interval_secs = v;
         }
@@ -170,7 +172,9 @@ pub enum Archivability {
     /// Not in a terminal state — this is what can pin the floor indefinitely.
     NotTerminal,
     /// Terminal, but still inside the retention window.
-    WithinRetention { age_hours: i64 },
+    WithinRetention {
+        age_hours: i64,
+    },
     /// ⚠⚠ Terminal status with no `completed_at`. Treated as NOT archivable: without a
     /// completion time there is no way to know the window has elapsed, and guessing would
     /// archive-and-prune an execution that may have completed seconds ago.
@@ -267,9 +271,7 @@ pub fn classify_into(
             Archivability::Archivable => scan.archivable.push(*id),
             Archivability::NotTerminal => scan.not_terminal += 1,
             Archivability::WithinRetention { .. } => scan.within_retention += 1,
-            Archivability::TerminalWithoutCompletedAt => {
-                scan.terminal_without_completed_at += 1
-            }
+            Archivability::TerminalWithoutCompletedAt => scan.terminal_without_completed_at += 1,
         }
     }
 }
@@ -503,9 +505,14 @@ pub async fn archive_execution(
         archived_at: now,
         store: store.describe(),
     };
-    let mbytes = serde_json::to_vec_pretty(&manifest).map_err(|e| format!("encode manifest: {e}"))?;
+    let mbytes =
+        serde_json::to_vec_pretty(&manifest).map_err(|e| format!("encode manifest: {e}"))?;
     store
-        .put(&manifest_key(meta.execution_id), "application/json", &mbytes)
+        .put(
+            &manifest_key(meta.execution_id),
+            "application/json",
+            &mbytes,
+        )
         .await?;
     Ok(manifest)
 }
@@ -533,9 +540,9 @@ impl Durability {
             }
             Durability::ManifestMissing => "manifest.json is absent".into(),
             Durability::DataMissing { key } => format!("data object {key} is absent"),
-            Durability::DigestMismatch { expected, actual } => format!(
-                "sha256 mismatch: manifest says {expected}, stored bytes hash to {actual}"
-            ),
+            Durability::DigestMismatch { expected, actual } => {
+                format!("sha256 mismatch: manifest says {expected}, stored bytes hash to {actual}")
+            }
             Durability::CountMismatch { expected, actual } => {
                 format!("record count mismatch: manifest says {expected}, object holds {actual}")
             }
@@ -826,7 +833,10 @@ pub async fn archive_state(
         return Ok(ArchiveState::NotDurable(durability));
     };
     let date = start_date(manifest.started_at);
-    if read_date_reference(store, &date, execution_id).await?.is_none() {
+    if read_date_reference(store, &date, execution_id)
+        .await?
+        .is_none()
+    {
         return Ok(ArchiveState::DurableButUnindexed { date });
     }
     Ok(ArchiveState::SafeToPrune { record_count })
@@ -1537,7 +1547,10 @@ pub async fn collect_candidates(
             "the execution listing hit its page cap; the candidate set is INCOMPLETE and              pruning will refuse this pass"
         );
     }
-    Ok(CandidateSet { candidates: out, complete })
+    Ok(CandidateSet {
+        candidates: out,
+        complete,
+    })
 }
 
 // ===========================================================================
@@ -1583,7 +1596,9 @@ pub enum FloorBasis {
 impl FloorBasis {
     pub fn keep_from_sequence(&self) -> Option<u64> {
         match self {
-            FloorBasis::Computed { keep_from_sequence, .. } => Some(*keep_from_sequence),
+            FloorBasis::Computed {
+                keep_from_sequence, ..
+            } => Some(*keep_from_sequence),
             _ => None,
         }
     }
@@ -1592,7 +1607,10 @@ impl FloorBasis {
     }
     pub fn reason(&self) -> String {
         match self {
-            FloorBasis::Computed { keep_from_sequence, constrained_by } => format!(
+            FloorBasis::Computed {
+                keep_from_sequence,
+                constrained_by,
+            } => format!(
                 "keep_from_sequence={keep_from_sequence}, constrained by {constrained_by} \
                  execution(s) that must stay hot"
             ),
@@ -1600,9 +1618,7 @@ impl FloorBasis {
                 "refusing to advance: {unarchived} archivable execution(s) are not yet \
                  verified-archived, and a part may hold one of them"
             ),
-            FloorBasis::NoFootprint => {
-                "no measurable hot footprint; nothing to prune".to_string()
-            }
+            FloorBasis::NoFootprint => "no measurable hot footprint; nothing to prune".to_string(),
         }
     }
 }

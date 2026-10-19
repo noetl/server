@@ -3,30 +3,30 @@
 //! Services encapsulate business logic and coordinate
 //! between handlers and database queries.
 
+pub mod archive_store;
 pub mod catalog;
 pub mod cell_registry;
 pub mod certified_fold;
 pub mod credential;
 pub mod event;
-pub mod archive_store;
 pub mod event_archive;
 pub mod execution;
+pub mod gcs_substrate;
 pub mod internal;
 pub mod keychain;
 pub mod keychain_refresh;
-pub mod sm_sourced;
-pub mod gcs_substrate;
 pub mod object_backend;
 pub mod orch_snapshot;
 pub mod permanent_log_lean;
 pub mod registry;
-pub mod replica_reality;
 pub mod replay;
+pub mod replica_reality;
 pub mod result_store;
 pub mod result_tier_gc;
 pub mod runtime;
 pub mod secret_audit;
 pub mod secret_material;
+pub mod sm_sourced;
 pub mod ui_schema;
 pub mod wallet_rotate;
 

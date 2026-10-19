@@ -614,7 +614,10 @@ mod tests {
         let now = Utc::now();
         let (live, age) = runtime_liveness(now + chrono::Duration::seconds(5), now, 90);
         assert!(live, "a slightly-ahead worker clock is not a dead worker");
-        assert!(age <= 0, "a future heartbeat has a non-positive age, got {age}");
+        assert!(
+            age <= 0,
+            "a future heartbeat has a non-positive age, got {age}"
+        );
     }
 
     #[test]
