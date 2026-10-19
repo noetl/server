@@ -555,7 +555,10 @@ impl ResultStoreService {
         // the belt to the prefix walk's braces, and it is what the anchoring
         // tests cover. Meaningless for GCS (no suffix search), hence
         // backend-gated rather than unconditional.
-        if matches!(backend, crate::services::object_backend::ObjectBackend::Postgres) {
+        if matches!(
+            backend,
+            crate::services::object_backend::ObjectBackend::Postgres
+        ) {
             let found = crate::db::queries::object_store::get_result_tier_json_by_step(
                 &self.pool,
                 noetl_ref.execution_id,
@@ -563,12 +566,11 @@ impl ResultStoreService {
             )
             .await?;
             if let Some((obj, candidates)) = found {
-                let value: serde_json::Value =
-                    serde_json::from_slice(&obj.bytes).map_err(|e| {
-                        AppError::Internal(format!(
-                            "result_store.resolve_legacy_from_tier: decode JSON tier: {e}"
-                        ))
-                    })?;
+                let value: serde_json::Value = serde_json::from_slice(&obj.bytes).map_err(|e| {
+                    AppError::Internal(format!(
+                        "result_store.resolve_legacy_from_tier: decode JSON tier: {e}"
+                    ))
+                })?;
                 return Ok(Some((value, candidates)));
             }
         }
@@ -625,10 +627,7 @@ impl ResultStoreService {
         // key comes from the same derivation the legacy fallback uses, pinned
         // against nine real object keys (five prod, four kind).
         let backend = object_backend();
-        let tail = format!(
-            "{}/{}/{}.json",
-            coords.frame, coords.row, coords.attempt
-        );
+        let tail = format!("{}/{}/{}.json", coords.frame, coords.row, coords.attempt);
         for prefix in Self::tier_step_prefixes(coords.execution_id, &coords.step) {
             let key = format!("{prefix}{tail}");
             if let Some(obj) = backend.get(&self.pool, &key).await? {
@@ -662,9 +661,8 @@ impl ResultStoreService {
     }
 
     fn decode_tier_json(bytes: &[u8]) -> AppResult<serde_json::Value> {
-        serde_json::from_slice(bytes).map_err(|e| {
-            AppError::Internal(format!("result_store: decode JSON tier: {e}"))
-        })
+        serde_json::from_slice(bytes)
+            .map_err(|e| AppError::Internal(format!("result_store: decode JSON tier: {e}")))
     }
 }
 
@@ -678,7 +676,12 @@ mod tests {
 
     // --- §7 key derivation for the legacy tier fallback (noetl/ai-meta#343) ---
 
-    fn registry(env: &str, region: &str, cell: &str, shard_count: u32) -> crate::services::cell_registry::CellRegistry {
+    fn registry(
+        env: &str,
+        region: &str,
+        cell: &str,
+        shard_count: u32,
+    ) -> crate::services::cell_registry::CellRegistry {
         crate::services::cell_registry::CellRegistry {
             shard_count,
             default_cell: cell.to_string(),
@@ -787,8 +790,15 @@ mod tests {
     fn the_prefix_walk_covers_the_neighbouring_date_partitions() {
         let reg = registry("prod", "usc1", "usc1-a", 256);
         let got = tier_step_prefixes_in(&reg, 358337687603650560, "hotelbeds_dispatch");
-        assert_eq!(got.len(), 3, "expected the snowflake date plus one either side");
-        assert!(got[0].contains("date=2026-09-15"), "the snowflake date must be tried FIRST");
+        assert_eq!(
+            got.len(),
+            3,
+            "expected the snowflake date plus one either side"
+        );
+        assert!(
+            got[0].contains("date=2026-09-15"),
+            "the snowflake date must be tried FIRST"
+        );
         assert!(got[1].contains("date=2026-09-14"));
         assert!(got[2].contains("date=2026-09-16"));
     }
@@ -806,9 +816,12 @@ mod tests {
         // And the cell seed moves env/region/cell — kind and prod share one
         // formula and differ only in this configured part.
         let k = tier_step_prefixes_in(&registry("dev", "local", "local-0", 256), eid, "s");
-        assert!(k[0].starts_with("noetl/env=dev/region=local/cell=local-0/shard=s0004/"), "got {}", k[0]);
+        assert!(
+            k[0].starts_with("noetl/env=dev/region=local/cell=local-0/shard=s0004/"),
+            "got {}",
+            k[0]
+        );
     }
-
 
     // --- mint_ref_only (dual-write retirement, #104 OQ5) ---
 

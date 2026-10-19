@@ -56,7 +56,10 @@ impl Policy {
     }
     /// Whether `/api/postgres/execute` carries the auth gate.
     pub fn gates_execute(self) -> bool {
-        matches!(self, Self::GateAll | Self::GateExecute | Self::ReadonlyExecute)
+        matches!(
+            self,
+            Self::GateAll | Self::GateExecute | Self::ReadonlyExecute
+        )
     }
     /// Whether `/api/db/init` and `/api/db/validate` carry the auth gate.
     ///
@@ -139,9 +142,9 @@ pub fn is_read_only(sql: &str) -> bool {
     // and pretending otherwise would be worse than no restriction, because it
     // would carry the reassurance without the property.
     for w in [
-        "INSERT", "UPDATE", "DELETE", "MERGE", "DROP", "TRUNCATE", "ALTER",
-        "CREATE", "GRANT", "REVOKE", "DO", "COPY", "CALL", "VACUUM", "REINDEX",
-        "REFRESH", "SET", "RESET", "LOCK", "COMMENT", "SECURITY",
+        "INSERT", "UPDATE", "DELETE", "MERGE", "DROP", "TRUNCATE", "ALTER", "CREATE", "GRANT",
+        "REVOKE", "DO", "COPY", "CALL", "VACUUM", "REINDEX", "REFRESH", "SET", "RESET", "LOCK",
+        "COMMENT", "SECURITY",
     ] {
         if word_present(&upper, w) {
             return false;
@@ -217,7 +220,11 @@ mod tests {
     #[test]
     fn only_gate_all_touches_init_and_validate() {
         assert!(Policy::GateAll.gates_init_validate());
-        for p in [Policy::GateExecute, Policy::ReadonlyExecute, Policy::DisableExecute] {
+        for p in [
+            Policy::GateExecute,
+            Policy::ReadonlyExecute,
+            Policy::DisableExecute,
+        ] {
             assert!(
                 !p.gates_init_validate(),
                 "{} must leave db/init and db/validate alone — they are what a local \
@@ -229,7 +236,11 @@ mod tests {
 
     #[test]
     fn every_policy_that_should_gate_execute_does() {
-        for p in [Policy::GateAll, Policy::GateExecute, Policy::ReadonlyExecute] {
+        for p in [
+            Policy::GateAll,
+            Policy::GateExecute,
+            Policy::ReadonlyExecute,
+        ] {
             assert!(p.gates_execute(), "{}", p.as_str());
         }
         assert!(!Policy::Open.gates_execute());
@@ -240,7 +251,10 @@ mod tests {
     fn a_second_statement_is_refused_however_it_starts() {
         assert!(!is_read_only("SELECT 1; DROP TABLE noetl.event"));
         assert!(!is_read_only("SELECT 1;DELETE FROM noetl.outbox"));
-        assert!(is_read_only("SELECT 1;"), "a single trailing semicolon is fine");
+        assert!(
+            is_read_only("SELECT 1;"),
+            "a single trailing semicolon is fine"
+        );
     }
 
     /// ⭐ Isolates the MULTI-STATEMENT guard from the keyword scan.
@@ -283,7 +297,9 @@ mod tests {
     fn a_comment_cannot_hide_a_write() {
         assert!(!is_read_only("/* harmless */ DROP TABLE noetl.event"));
         assert!(!is_read_only("-- ok\nTRUNCATE noetl.outbox"));
-        assert!(is_read_only("/* count them */ SELECT COUNT(*) FROM noetl.outbox"));
+        assert!(is_read_only(
+            "/* count them */ SELECT COUNT(*) FROM noetl.outbox"
+        ));
     }
 
     /// A data-modifying CTE is a write wearing a SELECT's clothes.
@@ -292,9 +308,7 @@ mod tests {
         assert!(!is_read_only(
             "WITH d AS (DELETE FROM noetl.outbox RETURNING *) SELECT * FROM d"
         ));
-        assert!(is_read_only(
-            "WITH c AS (SELECT 1 AS n) SELECT n FROM c"
-        ));
+        assert!(is_read_only("WITH c AS (SELECT 1 AS n) SELECT n FROM c"));
     }
 
     /// ⚠ A column named like a keyword must not be refused.

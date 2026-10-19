@@ -63,6 +63,24 @@ use crate::metrics;
 const GCS_RW_SCOPE: &[&str] = &["https://www.googleapis.com/auth/devstorage.read_write"];
 
 /// The resolved object-store backend (built once at startup from env).
+/// Parse `size` out of a GCS object-metadata document.
+///
+/// ⚠ Separated from the request so it is testable without a network, and because
+/// the string/number ambiguity is exactly the kind of thing that degrades
+/// silently: a wrong assumption here returns `None`, which reads as "unknown
+/// size", which reads as "fall back to downloading" — the behaviour this change
+/// exists to remove, still reporting success.
+pub(crate) fn parse_gcs_size(doc: &serde_json::Value) -> Option<u64> {
+    match doc.get("size")? {
+        // The documented spelling: "a string, not an integer, to preserve 64-bit
+        // precision".
+        serde_json::Value::String(s) => s.trim().parse::<u64>().ok(),
+        // Accepted too: a fake or proxy may serialise it as a number.
+        serde_json::Value::Number(n) => n.as_u64(),
+        _ => None,
+    }
+}
+
 #[derive(Clone)]
 pub enum ObjectBackend {
     /// Bytes in `noetl.object_store` (Phase B default; prod/default behavior).
@@ -325,6 +343,17 @@ impl ObjectBackend {
     /// Phase F). The ordering is best-effort per backend (Postgres → newest
     /// first; GCS → lexicographic, the JSON-API default); the GC sweep does not
     /// depend on order, only on coverage up to `limit`.
+    /// Object size from metadata, without downloading the bytes
+    /// (noetl/ai-meta#479). `None` when the object is absent.
+    pub async fn stat(&self, pool: &DbPool, key: &str) -> AppResult<Option<u64>> {
+        match self {
+            // `octet_length(bytes)` rather than selecting `bytes`: the length is
+            // computed in the database and only the number crosses the wire.
+            ObjectBackend::Postgres => object_store::size(pool, key).await,
+            ObjectBackend::Gcs(g) => g.stat(key).await,
+        }
+    }
+
     pub async fn list(&self, pool: &DbPool, prefix: &str, limit: usize) -> AppResult<Vec<String>> {
         match self {
             ObjectBackend::Postgres => object_store::list_keys(pool, prefix, limit as i64).await,
@@ -592,6 +621,59 @@ impl GcsBackend {
             )));
         }
         Ok(got)
+    }
+
+    /// **Object size from metadata, without downloading the bytes**
+    /// (noetl/ai-meta#479).
+    ///
+    /// The same URL as [`get`](Self::get) with the `alt=media` query OMITTED, which
+    /// is what makes the GCS JSON API return the object's metadata document
+    /// instead of its contents. `None` on 404, for the same fail-safe reason
+    /// `get` returns `None`.
+    ///
+    /// ⚠ Why this exists: `reclaim_orphans` sized every orphan by downloading it,
+    /// and `exists` answered a boolean by downloading the object and throwing the
+    /// bytes away. On a remote replica that is a measured GCS get — p50 **77 ms**,
+    /// p95 139 ms, p99 234 ms — per object, to learn a number the metadata
+    /// document already carries.
+    ///
+    /// ⚠⚠ `size` is a **string** in the GCS JSON API, not a number ("Note: This
+    /// is a string, not an integer, to preserve 64-bit precision"). Parsing it as
+    /// a number silently yields `None` and would make this method degrade to
+    /// "unknown size" forever while still reporting success — so both spellings
+    /// are accepted, with the string first.
+    pub(crate) async fn stat(&self, key: &str) -> AppResult<Option<u64>> {
+        let url = format!(
+            "{}/storage/v1/b/{}/o/{}",
+            self.endpoint,
+            self.bucket,
+            percent_encode_segment(key)
+        );
+        // ⚠ NO `alt=media`. That one query parameter is the whole difference
+        // between a metadata call and a download.
+        let mut req = self.client.get(&url).query(&[("fields", "size")]);
+        if let Some(token) = self.auth.bearer_token().await? {
+            req = req.bearer_auth(token);
+        }
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| AppError::Internal(format!("gcs object stat {key}: {e}")))?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(AppError::Internal(format!(
+                "gcs object stat {key}: {status}: {body}"
+            )));
+        }
+        let doc: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| AppError::Internal(format!("gcs object stat {key}: body: {e}")))?;
+        Ok(parse_gcs_size(&doc))
     }
 
     /// Download via the GCS JSON API `alt=media`. The object name is a path
@@ -911,5 +993,132 @@ mod tests {
         assert!(!enc.contains('/'), "no raw slash: {enc}");
         // unreserved chars (letters, digits, `.`, `-`) pass through verbatim
         assert!(enc.ends_with("1.feather"), "tail unreserved: {enc}");
+    }
+}
+
+#[cfg(test)]
+mod gcs_stat_tests {
+    use super::parse_gcs_size;
+
+    /// ⚠⚠ The documented spelling. The GCS JSON API returns `size` as a STRING
+    /// — "Note: This is a string, not an integer, to preserve 64-bit precision".
+    /// Parsing it as a number yields `None`, which reads as "unknown size",
+    /// which makes the caller fall back to downloading — the exact behaviour
+    /// noetl/ai-meta#479 exists to remove, while still reporting success.
+    #[test]
+    fn a_string_size_is_parsed() {
+        let doc = serde_json::json!({"size": "1048576"});
+        assert_eq!(parse_gcs_size(&doc), Some(1_048_576));
+    }
+
+    /// Accepted too: a fake, emulator or proxy may serialise it as a number.
+    #[test]
+    fn a_numeric_size_is_parsed() {
+        let doc = serde_json::json!({"size": 4096});
+        assert_eq!(parse_gcs_size(&doc), Some(4096));
+    }
+
+    /// 64-bit precision is the stated reason the API uses a string, so a value
+    /// past i32/f64-exact must survive.
+    #[test]
+    fn a_large_size_survives_64_bit() {
+        let big = 9_007_199_254_740_993u64; // 2^53 + 1, not f64-exact
+        let doc = serde_json::json!({"size": big.to_string()});
+        assert_eq!(parse_gcs_size(&doc), Some(big));
+    }
+
+    /// Zero is a real answer, not an absence. An empty object exists.
+    #[test]
+    fn zero_is_a_size_not_an_absence() {
+        assert_eq!(parse_gcs_size(&serde_json::json!({"size": "0"})), Some(0));
+    }
+
+    /// ⚠ Unparseable or missing must be `None` rather than a guess. The caller
+    /// treats `None` as "absent", and the request layer only reaches the parser
+    /// on a 2xx, so a malformed body degrades to NotFound rather than to a
+    /// fabricated length.
+    #[test]
+    fn missing_or_unparseable_is_none() {
+        for doc in [
+            serde_json::json!({}),
+            serde_json::json!({"size": null}),
+            serde_json::json!({"size": ""}),
+            serde_json::json!({"size": "not-a-number"}),
+            serde_json::json!({"size": "-1"}),
+            serde_json::json!({"size": ["1024"]}),
+            serde_json::json!({"size": {"value": 1024}}),
+        ] {
+            assert_eq!(parse_gcs_size(&doc), None, "doc {doc} must not parse");
+        }
+    }
+
+    /// Whitespace tolerance — a proxy may pad the value.
+    #[test]
+    fn surrounding_whitespace_is_tolerated() {
+        assert_eq!(
+            parse_gcs_size(&serde_json::json!({"size": " 2048 "})),
+            Some(2048)
+        );
+    }
+}
+
+#[cfg(test)]
+mod gcs_stat_request_shape {
+    /// ⚠⚠ The one thing noetl/ai-meta#479 is ABOUT: `stat` must not send
+    /// `alt=media`, because that single query parameter is the whole difference
+    /// between a metadata call and a full download.
+    ///
+    /// Pinned at the SOURCE level because the behaviour lives in a `reqwest`
+    /// builder: there is no fake GCS here, so a mutation that puts `alt=media`
+    /// back survived every value-level test. A source guard is weaker than a
+    /// round-trip, and it is what is available — stated rather than dressed up.
+    ///
+    /// ⚠ The extraction is asserted before anything is asserted about it. A
+    /// slicing bug that returned an empty region would make every claim below
+    /// vacuously true, which is the failure mode this repo keeps finding.
+    #[test]
+    fn stat_sends_no_alt_media_but_get_does() {
+        let src = include_str!("object_backend.rs");
+
+        let stat = region(src, "pub(crate) async fn stat(&self, key: &str)");
+        assert!(
+            stat.len() > 400,
+            "extracted only {} bytes for stat() — the slice is broken, and a \
+             broken slice would make the assertions below pass vacuously",
+            stat.len()
+        );
+        assert!(
+            !stat.contains("\"alt\""),
+            "stat() must NOT send alt=media — that turns the metadata call back \
+             into a download, which is the regression #479 removed:\n{stat}"
+        );
+        assert!(
+            stat.contains("storage/v1/b/"),
+            "stat() must still hit the object endpoint:\n{stat}"
+        );
+
+        // The negative control: `get` SHOULD carry it, so this test is checking a
+        // real distinction rather than the absence of a string nobody uses.
+        let get = region(src, "pub(crate) async fn get(&self, key: &str)");
+        assert!(
+            get.len() > 400,
+            "extracted only {} bytes for get()",
+            get.len()
+        );
+        assert!(
+            get.contains("(\"alt\", \"media\")"),
+            "get() must still download — without this the test above proves \
+             nothing about stat():\n{get}"
+        );
+    }
+
+    /// Body of the function starting at `sig`, up to the next top-level `\n    }`.
+    fn region<'a>(src: &'a str, sig: &str) -> &'a str {
+        let start = src
+            .find(sig)
+            .unwrap_or_else(|| panic!("signature not found: {sig}"));
+        let rest = &src[start..];
+        let end = rest.find("\n    }").map(|i| i + 6).unwrap_or(rest.len());
+        &rest[..end]
     }
 }

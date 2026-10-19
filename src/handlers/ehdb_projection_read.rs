@@ -460,7 +460,10 @@ fn parse_candidates(body: &Value) -> Result<Vec<Candidate>, DemoteReason> {
     };
     let mut out = Vec::with_capacity(arr.len());
     for r in arr {
-        let global_sequence = r.get("global_sequence").and_then(|s| s.as_u64()).unwrap_or(0);
+        let global_sequence = r
+            .get("global_sequence")
+            .and_then(|s| s.as_u64())
+            .unwrap_or(0);
         let payload = match r.get("payload").and_then(|p| p.as_str()) {
             Some(s) => match serde_json::from_str::<Value>(s) {
                 Ok(v) => v,
@@ -478,14 +481,8 @@ fn parse_candidates(body: &Value) -> Result<Vec<Candidate>, DemoteReason> {
                 .get("checksum")
                 .and_then(|c| c.as_str())
                 .map(str::to_string),
-            applied_count: payload
-                .get("applied_count")
-                .and_then(read_i64)
-                .unwrap_or(0),
-            snapshot: payload
-                .get("snapshot")
-                .filter(|s| !s.is_null())
-                .cloned(),
+            applied_count: payload.get("applied_count").and_then(read_i64).unwrap_or(0),
+            snapshot: payload.get("snapshot").filter(|s| !s.is_null()).cloned(),
             updated_at: payload
                 .get("updated_at")
                 .and_then(|t| t.as_str())
@@ -580,7 +577,9 @@ pub async fn read(
         Err(reason) => return TierRead::Demote(reason),
     };
 
-    let snapshot = chosen.snapshot.expect("decide rejects a record with no body");
+    let snapshot = chosen
+        .snapshot
+        .expect("decide rejects a record with no body");
     TierRead::Served(ServedSnapshot {
         snapshot,
         version: chosen.version,
@@ -605,7 +604,12 @@ mod tests {
         serde_json::json!({"step": n, "vars": {"a": n}})
     }
 
-    fn candidate(version: i64, seq: u64, body: Option<Value>, checksum: Option<String>) -> Candidate {
+    fn candidate(
+        version: i64,
+        seq: u64,
+        body: Option<Value>,
+        checksum: Option<String>,
+    ) -> Candidate {
         let b = body.clone();
         Candidate {
             global_sequence: seq,
@@ -630,7 +634,6 @@ mod tests {
         assert!(ReadSource::Verify.reads_tier());
         assert!(ReadSource::Tier.reads_tier());
     }
-
 
     /// The WAL mode must not consult Postgres — in either direction.
     ///
@@ -672,7 +675,10 @@ mod tests {
                 _ => ReadSource::Postgres,
             };
             if !bad.trim().eq_ignore_ascii_case("wal") {
-                assert!(!got.is_wal(), "{bad:?} must not enable the WAL control-flow path");
+                assert!(
+                    !got.is_wal(),
+                    "{bad:?} must not enable the WAL control-flow path"
+                );
             }
         }
     }
@@ -734,7 +740,10 @@ mod tests {
     /// answers this for every execution that predates it.
     #[test]
     fn an_empty_tier_is_missing_not_a_fault() {
-        assert_eq!(decide(&[], Some(10), None, 0, chrono::Utc::now()).unwrap_err(), DemoteReason::Missing);
+        assert_eq!(
+            decide(&[], Some(10), None, 0, chrono::Utc::now()).unwrap_err(),
+            DemoteReason::Missing
+        );
         assert!(!DemoteReason::Missing.is_fault());
         assert!(!DemoteReason::Unconfigured.is_fault());
         assert!(!DemoteReason::NoIncumbent.is_fault());
@@ -765,7 +774,9 @@ mod tests {
         let c = candidate(10, 1, Some(snap(10)), None);
         let inc = IncumbentFacts {
             version: 10,
-            checksum: Some("0000000000000000000000000000000000000000000000000000000000000000".into()),
+            checksum: Some(
+                "0000000000000000000000000000000000000000000000000000000000000000".into(),
+            ),
             updated_at: chrono::Utc::now() - chrono::Duration::seconds(3600),
         };
         assert_eq!(
@@ -798,11 +809,21 @@ mod tests {
             candidate(4, 1, Some(snap(4)), None),
             candidate(7, 2, Some(snap(7)), None),
         ];
-        assert_eq!(decide(&recs, Some(10), None, 0, chrono::Utc::now()).unwrap().version, 10);
+        assert_eq!(
+            decide(&recs, Some(10), None, 0, chrono::Utc::now())
+                .unwrap()
+                .version,
+            10
+        );
         // …and reversing the input does not change the answer.
         let mut rev = recs.clone();
         rev.reverse();
-        assert_eq!(decide(&rev, Some(10), None, 0, chrono::Utc::now()).unwrap().version, 10);
+        assert_eq!(
+            decide(&rev, Some(10), None, 0, chrono::Utc::now())
+                .unwrap()
+                .version,
+            10
+        );
     }
 
     /// A typed refusal is `unreadable`, never `missing`.
@@ -813,7 +834,10 @@ mod tests {
     #[test]
     fn a_typed_refusal_is_not_read_as_an_empty_tier() {
         let body = serde_json::json!({"outcome": "unavailable", "records": []});
-        assert_eq!(parse_candidates(&body).unwrap_err(), DemoteReason::Unreadable);
+        assert_eq!(
+            parse_candidates(&body).unwrap_err(),
+            DemoteReason::Unreadable
+        );
         let missing_field = serde_json::json!({"outcome": "ok"});
         assert_eq!(
             parse_candidates(&missing_field).unwrap_err(),
@@ -857,11 +881,17 @@ mod tests {
 
         let fresh = decide(&[c()], Some(10), Some(&mk(5)), 30, now).unwrap_err();
         assert_eq!(fresh, DemoteReason::StaleWithinWindow);
-        assert!(!fresh.is_fault(), "an in-flight mirror must not read as a fault");
+        assert!(
+            !fresh.is_fault(),
+            "an in-flight mirror must not read as a fault"
+        );
 
         let old = decide(&[c()], Some(10), Some(&mk(120)), 30, now).unwrap_err();
         assert_eq!(old, DemoteReason::StaleVersion);
-        assert!(old.is_fault(), "a mirror past its promised window IS a fault");
+        assert!(
+            old.is_fault(),
+            "a mirror past its promised window IS a fault"
+        );
 
         // …and with no window configured, age is irrelevant.
         assert_eq!(

@@ -151,7 +151,6 @@ pub(crate) fn effective_region(kc: &KeychainDef) -> String {
     server_region().to_string()
 }
 
-
 /// Interpret a Secret Manager payload as either noetl's **structured credential
 /// object** or an opaque string (noetl/ai-meta#267).
 ///

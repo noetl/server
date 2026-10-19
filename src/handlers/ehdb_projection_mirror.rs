@@ -464,7 +464,9 @@ mod tests {
             ("handlers/events.rs", include_str!("events.rs")),
             ("handlers/internal.rs", include_str!("internal.rs")),
         ] {
-            let n = code_only(src).matches("INTO noetl.projection_snapshot").count();
+            let n = code_only(src)
+                .matches("INTO noetl.projection_snapshot")
+                .count();
             assert_eq!(
                 n, 0,
                 "{name} writes noetl.projection_snapshot directly ({n} site(s)) — it must \
@@ -478,7 +480,13 @@ mod tests {
         // Asserted on the parse rule rather than the process env, because
         // `cargo test` does not serialise tests and setting the variable here
         // would race every other test in this binary.
-        for raw in [None, Some(""), Some("worker"), Some("srever"), Some("SERVERX")] {
+        for raw in [
+            None,
+            Some(""),
+            Some("worker"),
+            Some("srever"),
+            Some("SERVERX"),
+        ] {
             let armed = matches!(
                 raw.map(|s: &str| s.trim().to_ascii_lowercase()).as_deref(),
                 Some("server")

@@ -3,9 +3,9 @@
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 
 use crate::db::models::{
-    CatalogDeleteRequest, CatalogDeleteResponse, CatalogEntries, CatalogEntriesRequest, CatalogEntry,
-    CatalogEntryRequest,
-    CatalogEntryResponse, CatalogRegisterRequest, CatalogRegisterResponse, DeletedCatalogEntry,
+    CatalogDeleteRequest, CatalogDeleteResponse, CatalogEntries, CatalogEntriesRequest,
+    CatalogEntry, CatalogEntryRequest, CatalogEntryResponse, CatalogRegisterRequest,
+    CatalogRegisterResponse, DeletedCatalogEntry,
 };
 use crate::db::queries::catalog as queries;
 use crate::db::DbPool;
@@ -404,8 +404,6 @@ impl CatalogService {
         })
     }
 
-    
-
     /// Get a specific catalog resource.
     pub async fn get_resource(&self, request: CatalogEntryRequest) -> AppResult<CatalogEntry> {
         // Priority: catalog_id > path + version
@@ -487,7 +485,11 @@ const SUBSCRIPTION_ACTIVATIONS: &[&str] = &["continuous", "scheduled"];
 /// Walks the whole `workflow:` tree rather than only its top level, because
 /// nested constructs (`iterator`, `task_sequence`) carry steps of their own and a
 /// top-level-only scan would report a clean playbook with a broken inner step.
-fn collect_tool_kinds(node: &serde_yaml::Value, step: Option<String>, out: &mut Vec<(String, String)>) {
+fn collect_tool_kinds(
+    node: &serde_yaml::Value,
+    step: Option<String>,
+    out: &mut Vec<(String, String)>,
+) {
     match node {
         serde_yaml::Value::Mapping(map) => {
             let here = map
@@ -985,9 +987,7 @@ mod tool_kind_validation_tests {
     /// validator that rejected everything would pass every negative test below.
     #[test]
     fn a_valid_kind_is_accepted() {
-        let y = yaml(
-            "workflow:\n  - step: a\n    tool:\n      kind: noop\n",
-        );
+        let y = yaml("workflow:\n  - step: a\n    tool:\n      kind: noop\n");
         assert!(validate_tool_kinds(&y).is_ok());
     }
 
@@ -995,12 +995,21 @@ mod tool_kind_validation_tests {
     /// control. Each was ACCEPTED by registration before this change.
     #[test]
     fn the_kinds_found_in_the_live_catalog_are_rejected_with_the_step_named() {
-        for bad in ["agent", "mcp", "provider", "result_fetch", "totally_bogus_kind"] {
+        for bad in [
+            "agent",
+            "mcp",
+            "provider",
+            "result_fetch",
+            "totally_bogus_kind",
+        ] {
             let y = yaml(&format!(
                 "workflow:\n  - step: call_thing\n    tool:\n      kind: {bad}\n"
             ));
             let e = validate_tool_kinds(&y).unwrap_err().to_string();
-            assert!(e.contains(bad), "the offending kind must be quoted back: {e}");
+            assert!(
+                e.contains(bad),
+                "the offending kind must be quoted back: {e}"
+            );
             assert!(
                 e.contains("call_thing"),
                 "the offending STEP must be named, or the author has to hunt: {e}"
@@ -1032,7 +1041,10 @@ mod tool_kind_validation_tests {
                  the walker collected nothing here and registration SUCCEEDED",
             )
             .to_string();
-        assert!(e.contains("totally_bogus_kind"), "the kind must be quoted: {e}");
+        assert!(
+            e.contains("totally_bogus_kind"),
+            "the kind must be quoted: {e}"
+        );
         assert!(
             e.contains("t1"),
             "the offending TOOL must be named — a step with several tools would \
@@ -1053,7 +1065,9 @@ mod tool_kind_validation_tests {
         // above.
         let mut found = Vec::new();
         collect_tool_kinds(
-            good_list.get(serde_yaml::Value::from("workflow")).expect("workflow"),
+            good_list
+                .get(serde_yaml::Value::from("workflow"))
+                .expect("workflow"),
             None,
             &mut found,
         );
@@ -1088,7 +1102,9 @@ mod tool_kind_validation_tests {
         );
         let mut found = Vec::new();
         collect_tool_kinds(
-            mixed.get(serde_yaml::Value::from("workflow")).expect("workflow"),
+            mixed
+                .get(serde_yaml::Value::from("workflow"))
+                .expect("workflow"),
             None,
             &mut found,
         );
@@ -1105,7 +1121,10 @@ mod tool_kind_validation_tests {
             ["http", "noop", "python"].into_iter().collect(),
             "every kind must survive both shapes: {found:?}"
         );
-        assert!(validate_tool_kinds(&mixed).is_ok(), "all three kinds are valid");
+        assert!(
+            validate_tool_kinds(&mixed).is_ok(),
+            "all three kinds are valid"
+        );
     }
 
     /// A nested step must not hide behind a clean top level. The consolidated

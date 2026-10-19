@@ -79,6 +79,34 @@ pub async fn put(
 }
 
 /// Fetch the object at `object_key`, or `None` (caller → HTTP 404).
+/// Object size WITHOUT transferring the bytes (noetl/ai-meta#479).
+///
+/// `octet_length(bytes)` is computed in the database, so only the number crosses
+/// the wire. [`get`] selects `bytes`, which means sizing an object through it
+/// transfers the whole object — on the GCS backend that was a measured 77 ms p50
+/// per object, and on Postgres it is the full payload over the connection.
+///
+/// `None` when the key is absent, matching [`get`] so a caller cannot confuse
+/// "no such object" with "zero bytes".
+pub async fn size(pool: &DbPool, object_key: &str) -> AppResult<Option<u64>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT octet_length(bytes) AS len
+        FROM noetl.object_store
+        WHERE object_key = $1
+        LIMIT 1
+        "#,
+    )
+    .bind(object_key)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .next()
+        .map(|r| r.get::<i32, _>("len").max(0) as u64))
+}
+
 pub async fn get(pool: &DbPool, object_key: &str) -> AppResult<Option<ObjectRow>> {
     let rows = sqlx::query(
         r#"
@@ -290,17 +318,26 @@ mod tests {
         // execution.
         let key_wrong = "noetl/env=p/execution=42/results/map_offers/0/0/1.json";
         let key_right = "noetl/env=p/execution=42/results/map/0/0/1.json";
-        assert!(!like_matches(&p, key_wrong), "must not match a sibling step");
+        assert!(
+            !like_matches(&p, key_wrong),
+            "must not match a sibling step"
+        );
         assert!(like_matches(&p, key_right));
 
         // Scoped to the execution: the same step name in another execution is a
         // different result.
-        assert!(!like_matches(&p, "noetl/env=p/execution=43/results/map/0/0/1.json"));
+        assert!(!like_matches(
+            &p,
+            "noetl/env=p/execution=43/results/map/0/0/1.json"
+        ));
 
         // Scoped to the JSON tier. Feather is decoded by the worker's
         // resolve-by-URN path, which owns the arrow decode the control plane
         // deliberately does not carry.
-        assert!(!like_matches(&p, "noetl/env=p/execution=42/results/map/0/0/1.feather"));
+        assert!(!like_matches(
+            &p,
+            "noetl/env=p/execution=42/results/map/0/0/1.feather"
+        ));
     }
 
     #[test]
@@ -310,12 +347,21 @@ mod tests {
         // `%` would match every result in the execution.
         let p = tier_step_pattern(42, "map_offers");
         assert!(p.contains("map\\_offers"), "`_` must be escaped, got {p}");
-        assert!(!like_matches(&p, "noetl/env=p/execution=42/results/mapXoffers/0/0/1.json"));
-        assert!(like_matches(&p, "noetl/env=p/execution=42/results/map_offers/0/0/1.json"));
+        assert!(!like_matches(
+            &p,
+            "noetl/env=p/execution=42/results/mapXoffers/0/0/1.json"
+        ));
+        assert!(like_matches(
+            &p,
+            "noetl/env=p/execution=42/results/map_offers/0/0/1.json"
+        ));
 
         let wild = tier_step_pattern(42, "%");
         assert!(wild.contains("\\%"), "`%` must be escaped, got {wild}");
-        assert!(!like_matches(&wild, "noetl/env=p/execution=42/results/anything/0/0/1.json"));
+        assert!(!like_matches(
+            &wild,
+            "noetl/env=p/execution=42/results/anything/0/0/1.json"
+        ));
     }
 
     /// A minimal SQL-`LIKE` evaluator for `%`, `_` and `\` escapes — enough to

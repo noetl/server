@@ -243,7 +243,14 @@ async fn validate_session_inner(
     // invalid; else valid).  Parameterised bind replaces the playbook's
     // jsonb-escaped literal — same match semantics, safer quoting.
     #[allow(clippy::type_complexity)] // one-off sqlx query-row tuple
-    let row: Option<(i32, Option<String>, String, Option<String>, bool, Option<String>)> = sqlx::query_as(
+    let row: Option<(
+        i32,
+        Option<String>,
+        String,
+        Option<String>,
+        bool,
+        Option<String>,
+    )> = sqlx::query_as(
         r#"
         SELECT
             s.user_id,
@@ -582,7 +589,13 @@ async fn login_create_session(
         });
     };
 
-    let user = session_user_json(user_id, email, display_name, roles, Some(claims.sub.as_str()));
+    let user = session_user_json(
+        user_id,
+        email,
+        display_name,
+        roles,
+        Some(claims.sub.as_str()),
+    );
 
     Ok(LoginResponse {
         status: "success".into(),
@@ -805,7 +818,13 @@ mod session_user_tests {
 
     #[test]
     fn carries_the_auth0_subject() {
-        let u = session_user_json(7, "a@b.com".into(), Some("Ann".into()), json!(["user"]), Some("auth0|abc"));
+        let u = session_user_json(
+            7,
+            "a@b.com".into(),
+            Some("Ann".into()),
+            json!(["user"]),
+            Some("auth0|abc"),
+        );
         assert_eq!(u["auth0_id"], "auth0|abc");
         assert_eq!(u["user_id"], 7);
         assert_eq!(u["email"], "a@b.com");
@@ -885,7 +904,11 @@ mod tests {
             "exp": future_exp(),
             "sub": "auth0|abc",
         }));
-        assert!(!decode_and_validate_token(&jwt, "tenant.us.auth0.com").unwrap().email_verified);
+        assert!(
+            !decode_and_validate_token(&jwt, "tenant.us.auth0.com")
+                .unwrap()
+                .email_verified
+        );
     }
 
     /// ⚠ The login CTE copies same-email roles only for a verified, non-blank
@@ -894,11 +917,23 @@ mod tests {
     #[test]
     fn same_email_role_copy_requires_a_verified_email() {
         let src = include_str!("auth.rs");
-        let code = src.split_once("\n#[cfg(test)]").map(|(a, _)| a).unwrap_or(src);
+        let code = src
+            .split_once("\n#[cfg(test)]")
+            .map(|(a, _)| a)
+            .unwrap_or(src);
         let at = code.find("copied_roles AS (").expect("copied_roles CTE");
-        let cte = &code[at..at + code[at..].find("RETURNING role_id").expect("end of copied_roles")];
-        assert!(cte.contains("WHERE $6::bool"), "role copy is not gated on email_verified:\n{cte}");
-        assert!(cte.contains("u.email <> ''"), "role copy can match a blank email:\n{cte}");
+        let cte = &code[at..at
+            + code[at..]
+                .find("RETURNING role_id")
+                .expect("end of copied_roles")];
+        assert!(
+            cte.contains("WHERE $6::bool"),
+            "role copy is not gated on email_verified:\n{cte}"
+        );
+        assert!(
+            cte.contains("u.email <> ''"),
+            "role copy can match a blank email:\n{cte}"
+        );
         assert!(
             code.contains(".bind(claims.email_verified)"),
             "$6 must be bound to the token's email_verified"

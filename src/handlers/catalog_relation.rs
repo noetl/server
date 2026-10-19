@@ -103,7 +103,8 @@ impl CatalogRelation {
                         catalog_id: p
                             .get("catalog_id")
                             .and_then(|v| {
-                                v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                                v.as_i64()
+                                    .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
                             })
                             .unwrap_or(0),
                         path: path.to_string(),
@@ -155,7 +156,8 @@ impl CatalogRelation {
     /// every execution does, and an archived entry is retired.
     pub fn get_latest(&self, path: &str) -> Option<&Entry> {
         self.by_key
-            .range((path.to_string(), i32::MIN)..=(path.to_string(), i32::MAX)).rfind(|((p, _), e)| p == path && !e.archived)
+            .range((path.to_string(), i32::MIN)..=(path.to_string(), i32::MAX))
+            .rfind(|((p, _), e)| p == path && !e.archived)
             .map(|(_, e)| e)
     }
 
@@ -235,7 +237,10 @@ mod tests {
         assert_eq!(r.get("a", 2).unwrap().content_sha256, "d2");
         assert_eq!(r.get_by_id(1).unwrap().version, 1);
         assert_eq!(
-            r.list_versions("a").iter().map(|e| e.version).collect::<Vec<_>>(),
+            r.list_versions("a")
+                .iter()
+                .map(|e| e.version)
+                .collect::<Vec<_>>(),
             vec![1, 2, 3],
             "list_versions must be ascending"
         );
@@ -259,7 +264,10 @@ mod tests {
             1,
             "archiving v2 must make v1 the latest, not leave v2 resolving"
         );
-        assert!(r.get("a", 2).is_some(), "the archived entry still EXISTS by key");
+        assert!(
+            r.get("a", 2).is_some(),
+            "the archived entry still EXISTS by key"
+        );
         assert!(r.get("a", 2).unwrap().archived);
     }
 
@@ -272,7 +280,10 @@ mod tests {
             reg("b", 1, "d3", "playbook", 3),
             arch("a", None),
         ]);
-        assert!(r.get_latest("a").is_none(), "every version of `a` is retired");
+        assert!(
+            r.get_latest("a").is_none(),
+            "every version of `a` is retired"
+        );
         assert!(r.get_latest("b").is_some(), "a sibling path is untouched");
     }
 
@@ -318,7 +329,11 @@ mod tests {
             reg("c", 1, "d3", "playbook", 3),
             arch("c", Some(1)),
         ]);
-        let pbs: Vec<_> = r.list_by_kind(Some("playbook")).iter().map(|e| e.path.clone()).collect();
+        let pbs: Vec<_> = r
+            .list_by_kind(Some("playbook"))
+            .iter()
+            .map(|e| e.path.clone())
+            .collect();
         assert_eq!(pbs, vec!["a"], "archived `c` must not be listed");
         assert_eq!(r.list_by_kind(None).len(), 2);
         assert_eq!(r.list_by_kind(Some("agent")).len(), 1);
@@ -378,7 +393,10 @@ mod tests {
             reg("a", 4, "d4", "playbook", 44),
         ]);
         assert_eq!(
-            r.list_versions("a").iter().map(|e| e.version).collect::<Vec<_>>(),
+            r.list_versions("a")
+                .iter()
+                .map(|e| e.version)
+                .collect::<Vec<_>>(),
             vec![3, 4],
             "backfilled versions must be the source's own, not 1..n"
         );
@@ -396,7 +414,11 @@ mod tests {
             reg("a", 1, "d1", "playbook", 1),
         ]);
         assert_eq!(one.get("a", 1), twice.get("a", 1));
-        assert_eq!(one.len(), twice.len(), "a duplicate must not create a second entry");
+        assert_eq!(
+            one.len(),
+            twice.len(),
+            "a duplicate must not create a second entry"
+        );
     }
 
     /// Records wrapped in a tier `payload` string fold identically to inline ones.

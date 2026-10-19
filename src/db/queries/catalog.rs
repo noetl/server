@@ -622,10 +622,7 @@ mod catalog_listing_shape {
             .map(|(_, tail)| tail.to_string())
             .unwrap_or(select_list);
         for col in HEAVY {
-            let bare = select_list
-                .split(',')
-                .map(str::trim)
-                .any(|f| f == col);
+            let bare = select_list.split(',').map(str::trim).any(|f| f == col);
             assert!(
                 !bare,
                 "a listing selects `{col}` verbatim; it must be a typed NULL or a \

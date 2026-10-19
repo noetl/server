@@ -478,9 +478,7 @@ pub fn mirror_pool_heartbeat(kind: &str, name: &str) {
     match outcome {
         Ok(UpsertOutcome::Registered) => crate::metrics::record_runtime_registry("registered"),
         Ok(UpsertOutcome::Renewed) => crate::metrics::record_runtime_registry("heartbeat"),
-        Ok(UpsertOutcome::Skipped) => {
-            crate::metrics::record_runtime_registry("heartbeat_skipped")
-        }
+        Ok(UpsertOutcome::Skipped) => crate::metrics::record_runtime_registry("heartbeat_skipped"),
         Err(e) => {
             tracing::warn!(target: "noetl_server::runtime_registry", error = %e, id = %id,
                 "pool heartbeat not mirrored to D8");
@@ -628,9 +626,7 @@ pub fn mirror_ehdb_tier_seen(addr: &str) {
         return;
     };
     match upsert_throttled_in(&mut guard, RuntimeKind::Ehdb, &id, "ehdb-tier", now, floor) {
-        Ok(UpsertOutcome::Registered) => {
-            crate::metrics::record_runtime_registry("ehdb_registered")
-        }
+        Ok(UpsertOutcome::Registered) => crate::metrics::record_runtime_registry("ehdb_registered"),
         Ok(_) => {}
         Err(e) => {
             tracing::debug!(target: "noetl_server::runtime_registry", error = %e, id = %id,
