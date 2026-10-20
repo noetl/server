@@ -2883,6 +2883,32 @@ pub(crate) fn reconcile_decision(advanced: bool, noops_before: u32, cap: u32) ->
     (n, cap != 0 && n >= cap)
 }
 
+/// Has a no-progress streak lasted long enough, in WALL-CLOCK time, to give up?
+/// (noetl/ai-meta#315.)
+///
+/// [`reconcile_decision`] caps POLLS, which equals the intended time only while
+/// a tick takes `interval`. The poller awaits every drive in series, so a slow
+/// drive stretches every tick — prod measured ~299 s against a designed 8 s,
+/// turning "225 polls ≈ 30 min" into ~18.7 h. This caps the same budget in time:
+/// `cap × interval`, i.e. what the poll cap was sized to mean.
+///
+/// At least [`MIN_POLLS_BEFORE_TIMED_GIVE_UP`] polls are required as well, so a
+/// single pathological tick cannot give up on an execution polled only once.
+/// `cap == 0` still disables the cap entirely.
+pub(crate) fn reconcile_give_up_by_time(
+    cap: u32,
+    noops: u32,
+    quiet_for: std::time::Duration,
+    interval: std::time::Duration,
+) -> bool {
+    cap != 0 && noops >= MIN_POLLS_BEFORE_TIMED_GIVE_UP && quiet_for >= interval.saturating_mul(cap)
+}
+
+pub(crate) const MIN_POLLS_BEFORE_TIMED_GIVE_UP: u32 = 3;
+
+/// The poller's designed tick. The time cap is sized from it.
+pub(crate) const RECONCILE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(8);
+
 /// Does the in-flight guard still hold, or has it expired? — noetl/server#447.
 ///
 /// ⚠⚠ The guard has exactly one clear path — on apply — and before this it had
@@ -2984,7 +3010,6 @@ async fn sample_in_flight_ages(state: &AppState) -> Vec<(i64, std::time::Duratio
 
 pub fn spawn_orchestrator_reconciler(state: AppState) {
     tokio::spawn(async move {
-        const RECONCILE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(8);
         loop {
             tokio::time::sleep(RECONCILE_INTERVAL).await;
 
@@ -3129,7 +3154,13 @@ pub fn spawn_orchestrator_reconciler(state: AppState) {
                         None => {
                             let (n, give_up) = reconcile_decision(advanced, before, cap);
                             state.drive_tombstones.set_noops(execution_id, n);
-                            (n, give_up)
+                            let quiet = state
+                                .drive_tombstones
+                                .quiet_for(execution_id)
+                                .unwrap_or_default();
+                            let by_time =
+                                reconcile_give_up_by_time(cap, n, quiet, RECONCILE_INTERVAL);
+                            (n, give_up || by_time)
                         }
                     }
                 };
@@ -3137,8 +3168,13 @@ pub fn spawn_orchestrator_reconciler(state: AppState) {
                     warn!(
                         execution_id,
                         polls = noops,
+                        quiet_seconds = state
+                            .drive_tombstones
+                            .quiet_for(execution_id)
+                            .map_or(0, |d| d.as_secs()),
                         "reconcile poller: giving up — this execution has not advanced for \
-                         NOETL_RECONCILE_MAX_NOOPS consecutive polls, so re-driving it is \
+                         NOETL_RECONCILE_MAX_NOOPS consecutive polls (or that many polls' \
+                         worth of wall-clock time), so re-driving it is \
                          only costing system-pool capacity. It stays non-terminal; a later \
                          real event resumes it (noetl/ai-meta#315)"
                     );
@@ -5817,7 +5853,10 @@ mod snapshot_gate_tests {
 
 #[cfg(test)]
 mod reconcile_cap_tests {
-    use super::reconcile_decision;
+    use super::{
+        reconcile_decision, reconcile_give_up_by_time, MIN_POLLS_BEFORE_TIMED_GIVE_UP,
+        RECONCILE_INTERVAL,
+    };
     use crate::state::{DriveTombstones, TombstoneReason};
 
     /// ⭐ The property #315 is actually about: a fixed set of stuck executions
@@ -6205,6 +6244,78 @@ mod reconcile_cap_tests {
             "giving up must actually evict, or the entry stays in an unbounded map and \
              is re-driven again on the next tick"
         );
+        assert!(
+            body.contains("reconcile_give_up_by_time(") && body.contains("give_up || by_time"),
+            "the poller does not consult the TIME cap, so a slow tick stretches the \
+             poll cap without bound again (noetl/ai-meta#315: ~299 s ticks made 225 \
+             polls ~18.7 h)"
+        );
+    }
+
+    /// Ticks as prod measured them (~299 s): the poll cap alone would take 225
+    /// polls (~18.7 h); the time cap fires once the streak has lasted
+    /// `cap × 8 s` = 30 min — at poll 8.
+    #[test]
+    fn the_time_cap_fires_when_ticks_are_slow() {
+        use std::time::Duration;
+        const CAP: u32 = 225;
+        let tick = Duration::from_secs(299);
+        let mut noops = 0;
+        let mut fired_at = None;
+        for poll in 1..=CAP {
+            let (n, by_polls) = reconcile_decision(false, noops, CAP);
+            noops = n;
+            let quiet = tick * (n - 1); // the streak began at the first no-op
+            if by_polls || reconcile_give_up_by_time(CAP, n, quiet, RECONCILE_INTERVAL) {
+                fired_at = Some(poll);
+                break;
+            }
+        }
+        assert_eq!(fired_at, Some(8), "1800 s of streak is 7 ticks after the first no-op");
+    }
+
+    /// At the designed 8 s tick the time cap never fires before the poll cap —
+    /// nothing changes for a healthy poller.
+    #[test]
+    fn at_the_designed_tick_the_time_cap_is_not_earlier() {
+        const CAP: u32 = 225;
+        for n in 1..CAP {
+            let quiet = RECONCILE_INTERVAL * (n - 1);
+            assert!(
+                !reconcile_give_up_by_time(CAP, n, quiet, RECONCILE_INTERVAL),
+                "time cap fired at poll {n}, before the poll cap"
+            );
+        }
+    }
+
+    #[test]
+    fn the_time_cap_needs_a_minimum_of_polls_and_respects_cap_zero() {
+        use std::time::Duration;
+        let forever = Duration::from_secs(10 * 24 * 3600);
+        let min = MIN_POLLS_BEFORE_TIMED_GIVE_UP;
+        assert!(!reconcile_give_up_by_time(225, min - 1, forever, RECONCILE_INTERVAL));
+        assert!(reconcile_give_up_by_time(225, min, forever, RECONCILE_INTERVAL));
+        assert!(!reconcile_give_up_by_time(0, 1000, forever, RECONCILE_INTERVAL));
+    }
+
+    /// The streak's start survives increments and is cleared with the budget.
+    #[test]
+    fn the_streak_start_is_kept_across_polls_and_cleared_with_the_budget() {
+        let t = crate::state::DriveTombstones::default();
+        assert_eq!(t.quiet_for(7), None);
+        t.set_noops(7, 1);
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        t.set_noops(7, 2);
+        let q = t.quiet_for(7).unwrap();
+        assert!(
+            q >= std::time::Duration::from_millis(40),
+            "the second poll restarted the streak clock: {q:?}"
+        );
+        t.set_noops(7, 0);
+        assert_eq!(t.quiet_for(7), None, "progress must clear the streak");
+        t.set_noops(7, 1);
+        t.mark(7, crate::state::TombstoneReason::GaveUp);
+        assert_eq!(t.quiet_for(7), None, "a give-up must free the streak");
     }
 }
 
