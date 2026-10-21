@@ -590,3 +590,31 @@ fn a_superseded_tail_object_is_reclaimed_from_gcs_and_nothing_is_lost() {
         "the reclaim freed a redundant copy and lost no event"
     );
 }
+
+/// noetl/ai-meta#479 against a real JSON-API implementation: the metadata reply carries
+/// `size` in a shape `object_size` parses (a decimal string on real GCS), and `exists` agrees
+/// with it. The stub test in `gcs_substrate_metadata.rs` proves no bytes move; this proves
+/// the parse is right for a server that is not one I wrote.
+#[test]
+#[ignore = "needs fake-gcs-server on 127.0.0.1:4443"]
+fn object_size_and_exists_agree_with_what_was_written() {
+    let s = gcs("ehdb-replica", &format!("size-{}", std::process::id()));
+    let body = vec![7u8; 12_345];
+    s.put_overwrite("parts/sized", &body).unwrap();
+    s.put_overwrite("parts/empty", &[]).unwrap();
+    assert_eq!(s.object_size("parts/sized").unwrap(), 12_345);
+    assert_eq!(s.object_size("parts/empty").unwrap(), 0);
+    assert!(s.exists("parts/sized").unwrap());
+    assert!(s.exists("parts/empty").unwrap());
+    assert!(!s.exists("parts/never-written").unwrap());
+    assert!(matches!(
+        s.object_size("parts/never-written"),
+        Err(ehdb_core::EhdbError::NotFound(_))
+    ));
+    s.delete("parts/sized").unwrap();
+    s.delete("parts/empty").unwrap();
+    assert!(
+        !s.exists("parts/sized").unwrap(),
+        "delete then exists must be false"
+    );
+}
