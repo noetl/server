@@ -101,7 +101,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::state::AppState;
 
@@ -2471,12 +2471,97 @@ async fn run_sampler_tick(state: &AppState) {
         }
     };
 
-    for execution_id in candidates {
+    let (admitted, skipped) = unreadable_backoff()
+        .lock()
+        .map(|mut b| b.admit(&candidates))
+        .unwrap_or_else(|_| (candidates.clone(), 0));
+    if skipped > 0 {
+        debug!(
+            target: "noetl_server::ehdb_parity",
+            skipped,
+            "EHDB cross-store parity: executions whose last tier read was unavailable are backing off"
+        );
+    }
+
+    for execution_id in admitted {
         // `None` = follow the env flag. The sampler is the RECORDING path, so a
         // per-request override must never reach it — that separation is what makes
         // the on-demand override safe to measure with.
-        let _ = compare_execution(state, execution_id, ParityRecording::Record, None).await;
+        let result = compare_execution(state, execution_id, ParityRecording::Record, None).await;
+        if let Ok(mut b) = unreadable_backoff().lock() {
+            b.record(
+                execution_id,
+                result.outcome == ParityOutcome::EhdbUnavailable,
+            );
+        }
     }
+}
+
+/// Most ticks an unreadable execution sits out between attempts.
+const UNREADABLE_BACKOFF_MAX_TICKS: u32 = 15;
+
+/// Per-execution backoff for executions whose tier read came back unavailable.
+///
+/// ⚠ The sampler re-picks the same recently-settled executions every tick, so
+/// one execution the tier cannot answer cheaply is re-read every tick for as
+/// long as it stays in the lookback. On 2026-10-20 four executions that a seal
+/// had just moved into a 256 MiB sealed segment were re-read every 2 min for an
+/// hour; each read replayed the segment, outlived the client's 2 s timeout, and
+/// kept its in-flight permit — and a live chat turn's mirror append was shed
+/// behind them (noetl/ai-meta#490). The comparator was the load it was
+/// measuring.
+///
+/// After `k` consecutive unavailable verdicts the execution sits out the next
+/// `2^k - 1` ticks (capped). Any other verdict clears it. Ticks, not wall time,
+/// so the schedule follows the configured interval and tests need no clock.
+///
+/// Only the sampler consults this. The on-demand endpoint always reads — an
+/// operator asking about one execution is not the loop this bounds.
+#[derive(Debug, Default)]
+pub(crate) struct UnreadableBackoff {
+    /// execution_id → (consecutive unavailable verdicts, ticks left to sit out)
+    entries: std::collections::HashMap<i64, (u32, u32)>,
+}
+
+impl UnreadableBackoff {
+    /// Split this tick's candidates into those to compare and a skipped count.
+    ///
+    /// Entries for executions no longer among the candidates are dropped, so the
+    /// map is bounded by the sample size rather than by uptime.
+    pub(crate) fn admit(&mut self, candidates: &[i64]) -> (Vec<i64>, usize) {
+        self.entries.retain(|id, _| candidates.contains(id));
+        let mut admitted = Vec::with_capacity(candidates.len());
+        let mut skipped = 0;
+        for id in candidates {
+            match self.entries.get_mut(id) {
+                Some((_, wait)) if *wait > 0 => {
+                    *wait -= 1;
+                    skipped += 1;
+                }
+                _ => admitted.push(*id),
+            }
+        }
+        (admitted, skipped)
+    }
+
+    /// Record the verdict of a comparison the sampler ran.
+    pub(crate) fn record(&mut self, execution_id: i64, unavailable: bool) {
+        if !unavailable {
+            self.entries.remove(&execution_id);
+            return;
+        }
+        let strikes = self.entries.get(&execution_id).map_or(0, |(k, _)| *k) + 1;
+        let wait = (1u32 << strikes.min(5)) - 1;
+        self.entries.insert(
+            execution_id,
+            (strikes, wait.min(UNREADABLE_BACKOFF_MAX_TICKS)),
+        );
+    }
+}
+
+fn unreadable_backoff() -> &'static std::sync::Mutex<UnreadableBackoff> {
+    static B: std::sync::OnceLock<std::sync::Mutex<UnreadableBackoff>> = std::sync::OnceLock::new();
+    B.get_or_init(Default::default)
 }
 
 /// Pick executions that are **settled**: their newest event is older than
@@ -2520,6 +2605,81 @@ pub(crate) async fn sample_candidates(
 
 #[cfg(test)]
 mod tests {
+
+    /// Run `ticks` sampler ticks over a fixed candidate set where `bad` is
+    /// always unreadable; return how many times `bad` was actually read.
+    fn reads_of(bad: i64, ticks: usize) -> usize {
+        let mut b = super::UnreadableBackoff::default();
+        let candidates = [bad, 2, 3];
+        let mut reads = 0;
+        for _ in 0..ticks {
+            let (admitted, _) = b.admit(&candidates);
+            for id in admitted {
+                if id == bad {
+                    reads += 1;
+                }
+                b.record(id, id == bad);
+            }
+        }
+        reads
+    }
+
+    #[test]
+    fn an_unreadable_execution_is_not_reread_every_tick() {
+        // The 2026-10-20 shape: 30 ticks (one hour at prod's 2 min). Without
+        // the backoff it is read 30 times; with it, at ticks 1, 3, 7, 15 and
+        // then every 16th — far fewer, and never zero.
+        let reads = reads_of(1, 30);
+        assert!(reads < 10, "still re-read nearly every tick: {reads}");
+        assert!(
+            reads >= 4,
+            "backed off so far it stopped measuring: {reads}"
+        );
+    }
+
+    #[test]
+    fn readable_executions_are_never_skipped() {
+        let mut b = super::UnreadableBackoff::default();
+        for _ in 0..5 {
+            let (admitted, skipped) = b.admit(&[2, 3]);
+            assert_eq!(admitted, vec![2, 3]);
+            assert_eq!(skipped, 0);
+            b.record(2, false);
+            b.record(3, false);
+        }
+    }
+
+    #[test]
+    fn one_good_read_clears_the_backoff() {
+        let mut b = super::UnreadableBackoff::default();
+        b.record(7, true);
+        b.record(7, true);
+        b.record(7, false);
+        assert_eq!(b.admit(&[7]), (vec![7], 0));
+    }
+
+    #[test]
+    fn executions_leaving_the_window_are_forgotten() {
+        let mut b = super::UnreadableBackoff::default();
+        for id in 0..100 {
+            b.record(id, true);
+        }
+        let _ = b.admit(&[1, 2]);
+        assert!(
+            b.entries.len() <= 2,
+            "map grew past the sample: {}",
+            b.entries.len()
+        );
+    }
+
+    #[test]
+    fn the_wait_is_capped() {
+        let mut b = super::UnreadableBackoff::default();
+        for _ in 0..40 {
+            b.record(9, true);
+        }
+        assert_eq!(b.entries[&9].1, super::UNREADABLE_BACKOFF_MAX_TICKS);
+    }
 
     /// A snowflake spelled as a number and as a string is the same id.
     ///
