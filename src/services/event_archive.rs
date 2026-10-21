@@ -1418,6 +1418,9 @@ pub fn spawn_archive_pass(service: crate::services::execution::ExecutionService)
         // the set, and the cost is bounded by `max_per_pass` per pass rather than forever.
         let mut known_out_of_coverage: std::collections::HashSet<i64> =
             std::collections::HashSet::new();
+        // The last prune verdict, so a change is logged once at INFO rather than the same
+        // line every interval forever.
+        let mut last_prune_verdict: Option<String> = None;
         loop {
             tick.tick().await;
             let candidates = match collect_candidates(&service).await {
@@ -1469,8 +1472,26 @@ pub fn spawn_archive_pass(service: crate::services::execution::ExecutionService)
                     keep_from_sequence = prep.keep_from_sequence,
                     "retention pruned parts below the proven floor"
                 );
+                last_prune_verdict = None;
             } else {
-                tracing::debug!(summary = %prep.describe(), "prune pass");
+                // ⚠⚠ The refusal reason was `debug!` only, and prod does not emit debug.
+                //
+                // So while prune sat refused for hours, WHY was invisible: the
+                // `prune_refused_*` counters said that it refused, and
+                // `retention_floor_sequence` read 0 — but 0 is also what "never ran" looks
+                // like, so neither answered the operator's question. Diagnosing it needed
+                // the pass's own report, which was being written to a level nobody collects.
+                //
+                // Logged on TRANSITION rather than every pass: at INFO every interval this
+                // would be ~288 identical lines a day and would be filtered out, which is
+                // the same invisibility by a different route.
+                let verdict = prep.describe();
+                if last_prune_verdict.as_deref() != Some(verdict.as_str()) {
+                    tracing::info!(summary = %verdict, "prune pass verdict changed");
+                    last_prune_verdict = Some(verdict);
+                } else {
+                    tracing::debug!(summary = %verdict, "prune pass");
+                }
             }
             tracing::info!(report = %rep.describe(), "archive pass complete");
         }
@@ -1828,6 +1849,17 @@ where
             for _ in 0..dropped {
                 crate::metrics::record_ehdb_archive("pruned");
             }
+            // ⚠⚠ This line was MISSING through the first production prune.
+            //
+            // `noetl_ehdb_prune_bytes_reclaimed_total` was pinned at 0 and never fed, so
+            // after reclaiming **2.30 GiB** on prod the counter still read 0 and the figure
+            // had to be measured externally with `df` and `du`. `pruned` counted the parts;
+            // nothing counted the bytes, which is the number anyone actually wants.
+            //
+            // A metric that exists, is pinned, and is never incremented is indistinguishable
+            // from a system that reclaimed nothing — the exact failure this tier was built to
+            // remove, reproduced by the tier.
+            crate::metrics::ehdb_prune_bytes_reclaimed_total().inc_by(bytes);
         }
         Some(Err(e)) => {
             rep.skipped = Some(format!("retention call failed: {e}"));
