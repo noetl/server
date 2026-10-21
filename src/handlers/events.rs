@@ -2323,6 +2323,44 @@ async fn rebuild_state(
     .await
 }
 
+/// Fold the events loaded after a snapshot onto it.
+///
+/// ⚠⚠ **noetl/ai-meta#335.** A snapshot at `version == 0` is the WAL-sourced
+/// projection (`orch_snapshot::load_latest` has no watermark to give it), so
+/// `event_id > 0` loaded EVERY event — including every event the snapshot was
+/// already folded from. Applying them on top applies each one twice, and
+/// `apply_event`'s dedup for `iterations_dispatched` cannot absorb that: its
+/// command-id set is `#[serde(skip)]` (it must stay out of
+/// `canonical_state_digest`), so it arrives EMPTY on a deserialised snapshot.
+/// The count doubles against a `completed` that does not, and the
+/// sequential-dispatch gate stops issuing iterations.
+///
+/// With every event in hand, folding them from scratch IS the snapshot's state —
+/// the WAL path only serves a snapshot whose re-fold of these same events
+/// matched — without the second application. Same query, same number of
+/// `apply_event` calls; the base is just not reused.
+///
+/// A snapshot with a real watermark (`version > 0`) still folds forward. Its
+/// straggler margin can re-apply a `command.issued` the snapshot already holds,
+/// which is the same blind dedup over a ~30 s window; closing that needs the
+/// dedup set to survive serialisation, which is a digest change and not this.
+fn fold_after_snapshot(
+    snapshot: crate::engine::state::WorkflowState,
+    version: i64,
+    events: &[noetl_orchestrate_core::event::Event],
+) -> crate::engine::state::WorkflowState {
+    if version == 0 {
+        if let Some(ws) = crate::engine::state::WorkflowState::from_events(events) {
+            return ws;
+        }
+    }
+    let mut ws = snapshot;
+    for e in events {
+        ws.apply_event(e);
+    }
+    ws
+}
+
 async fn rebuild_state_uncached(
     pool: &crate::db::DbPool,
     result_store: &crate::services::result_store::ResultStoreService,
@@ -2348,10 +2386,9 @@ async fn rebuild_state_uncached(
                 .await?,
             );
             hydrate_result_references(&mut events_since, result_store, keep_refs).await;
-            let mut ws = snap.state;
-            for e in &events_since {
-                ws.apply_event(&e.into());
-            }
+            let core: Vec<noetl_orchestrate_core::event::Event> =
+                events_since.iter().map(Into::into).collect();
+            let ws = fold_after_snapshot(snap.state, snap.version, &core);
             // The window includes everything after the snapshot, so the highest
             // loaded id is the current head.
             let last_event_id = events_since
@@ -6444,6 +6481,112 @@ mod leaked_guard_visibility {
         assert!(
             c.orchestrate_in_flight_since.is_none(),
             "the clock must be cleared too, or the NEXT drive is born stale"
+        );
+    }
+}
+
+#[cfg(test)]
+mod wal_snapshot_double_apply_tests {
+    //! noetl/ai-meta#335: the WAL snapshot path must not fold every event twice.
+    use super::fold_after_snapshot;
+    use crate::engine::state::WorkflowState;
+    use noetl_orchestrate_core::event::Event;
+    use noetl_orchestrate_core::state::canonical_state_digest;
+
+    fn ev(id: i64, t: &str, cid: Option<&str>, result: Option<serde_json::Value>) -> Event {
+        Event {
+            event_id: id,
+            execution_id: 1,
+            catalog_id: 2,
+            event_type: t.to_string(),
+            node_name: Some("loop_step".to_string()),
+            status: String::new(),
+            context: None,
+            result,
+            meta: cid.map(|c| serde_json::json!({ "command_id": c, "loop": true })),
+            timestamp: chrono::DateTime::from_timestamp(0, 0).unwrap(),
+            parent_execution_id: None,
+            attempt: None,
+        }
+    }
+
+    /// A sequential-loop shape: three iterations issued, one completed.
+    fn events() -> Vec<Event> {
+        vec![
+            ev(
+                10,
+                "step.enter",
+                None,
+                Some(serde_json::json!({ "context": { "iterations_expected": 3 } })),
+            ),
+            ev(11, "command.issued", Some("c1"), None),
+            ev(12, "command.issued", Some("c2"), None),
+            ev(13, "command.issued", Some("c3"), None),
+            ev(14, "command.completed", Some("c1"), None),
+        ]
+    }
+
+    fn dispatched(ws: &WorkflowState) -> i32 {
+        ws.steps["loop_step"].iterations_dispatched
+    }
+
+    /// What `load_latest` hands back on the WAL path: the folded state,
+    /// serialised to the tier and deserialised — so the `#[serde(skip)]` dedup
+    /// set is EMPTY, exactly as in production.
+    fn wal_snapshot(evs: &[Event]) -> WorkflowState {
+        let folded = WorkflowState::from_events(evs).unwrap();
+        serde_json::from_value(serde_json::to_value(&folded).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn a_version_zero_snapshot_is_not_folded_twice() {
+        let evs = events();
+        let truth = WorkflowState::from_events(&evs).unwrap();
+        assert_eq!(
+            dispatched(&truth),
+            3,
+            "fixture must be a real iterator — vacuous otherwise"
+        );
+
+        let rebuilt = fold_after_snapshot(wal_snapshot(&evs), 0, &evs);
+        assert_eq!(
+            dispatched(&rebuilt),
+            3,
+            "every event was applied onto a state already folded from it: \
+             iterations_dispatched doubled, and the sequential gate stalls"
+        );
+        assert_eq!(
+            canonical_state_digest(&rebuilt),
+            canonical_state_digest(&truth),
+            "the rebuilt state must be the single fold, field for field"
+        );
+    }
+
+    /// Positive control: a snapshot with a real watermark still folds FORWARD —
+    /// the fix must not throw away a genuine base.
+    #[test]
+    fn a_watermarked_snapshot_still_folds_forward() {
+        let evs = events();
+        let (head, tail) = evs.split_at(3); // snapshot through event 12
+        let base = wal_snapshot(head);
+        assert_eq!(dispatched(&base), 2);
+        let rebuilt = fold_after_snapshot(base, 12, tail);
+        assert_eq!(dispatched(&rebuilt), 3);
+        assert_eq!(
+            canonical_state_digest(&rebuilt),
+            canonical_state_digest(&WorkflowState::from_events(&evs).unwrap())
+        );
+    }
+
+    /// No events since a version-0 snapshot: the snapshot stands.
+    #[test]
+    fn no_events_leaves_the_snapshot_unchanged() {
+        let evs = events();
+        let snap = wal_snapshot(&evs);
+        let want = canonical_state_digest(&snap);
+        assert_eq!(
+            canonical_state_digest(&fold_after_snapshot(snap, 0, &[])),
+            want
         );
     }
 }
