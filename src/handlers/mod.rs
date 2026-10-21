@@ -3,6 +3,7 @@
 //! This module contains all route handlers organized by domain.
 
 pub mod auth;
+pub mod auth_provider;
 pub mod auth_verify;
 pub mod catalog;
 pub mod catalog_log;
