@@ -33,10 +33,15 @@
 //!
 //! ## Config surface (all optional; safe defaults)
 //!
-//! - `NOETL_AUTH0_DOMAIN` — fallback tenant domain when a login request omits
-//!   `auth0_domain`.  The issuer (`https://<domain>/`) and JWKS URL
-//!   (`https://<domain>/.well-known/jwks.json`) are both derived from it.
-//! - `NOETL_AUTH0_AUDIENCE` — comma-separated allowed audiences.  **Unset ⇒ the
+//! - `NOETL_AUTH0_DOMAIN` — the trusted Auth0 tenant domain(s), comma
+//!   separated (a single value is the original one-tenant form).  A login is
+//!   checked against the tenant its request names, which must be on this
+//!   list; a request that names none uses the first.  The issuer
+//!   (`https://<domain>/`) and JWKS URL (`https://<domain>/.well-known/jwks.json`)
+//!   are both derived from that tenant, and JWKS are cached per URL, so each
+//!   tenant's tokens verify only against that tenant's keys.
+//! - `NOETL_AUTH0_AUDIENCE` — comma-separated allowed audiences (the SPA
+//!   client ids of every trusted tenant; client ids are unique per tenant).  **Unset ⇒ the
 //!   `aud` claim is not enforced** (only signature + iss + exp + nbf).  The Muno
 //!   SPA requests an Auth0 ID token with *no* `audience` param, so the token's
 //!   `aud` is the SPA **client_id** — a deployment secret we deliberately do not
@@ -399,35 +404,60 @@ fn normalize_domain(raw: &str) -> String {
     d.trim_end_matches('/').to_ascii_lowercase()
 }
 
-/// The Auth0 tenant a login is checked against: the server's configured
-/// `NOETL_AUTH0_DOMAIN`, never the one named in the request.
+/// The trusted tenants in `NOETL_AUTH0_DOMAIN`'s value: comma separated,
+/// normalised, empty entries and repeats dropped, order kept (the first is the
+/// default tenant).
+fn trusted_domains(configured: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for d in configured.split(',').map(normalize_domain) {
+        if !d.is_empty() && !out.contains(&d) {
+            out.push(d);
+        }
+    }
+    out
+}
+
+/// The default tenant: the first entry of `NOETL_AUTH0_DOMAIN` (empty if unset).
+fn default_auth0_domain() -> String {
+    std::env::var("NOETL_AUTH0_DOMAIN")
+        .ok()
+        .and_then(|v| trusted_domains(&v).into_iter().next())
+        .unwrap_or_default()
+}
+
+/// The Auth0 tenant a login is checked against: one of the server's configured
+/// `NOETL_AUTH0_DOMAIN` tenants, never one only the request names.
 ///
-/// The request's `auth0_domain` is accepted only as a consistency hint: absent
-/// or equal to the configured tenant is fine, anything else is refused. With no
-/// tenant configured the login is refused rather than falling back to the
-/// request, so the trust anchor is always server-side configuration.
+/// The request's `auth0_domain` selects among the configured tenants: absent
+/// means the first (default) tenant, a configured one (in any spelling) is
+/// used as configured, anything else is refused. With no tenant configured the
+/// login is refused rather than falling back to the request, so the trust
+/// anchor is always server-side configuration.
 pub fn trusted_auth0_domain(configured: Option<&str>, requested: &str) -> Result<String, String> {
-    let configured = configured.map(normalize_domain).unwrap_or_default();
-    if configured.is_empty() {
+    let trusted = trusted_domains(configured.unwrap_or_default());
+    let Some(default) = trusted.first() else {
         return Err("server has no Auth0 tenant configured (NOETL_AUTH0_DOMAIN)".to_string());
-    }
+    };
     let requested = normalize_domain(requested);
-    if !requested.is_empty() && requested != configured {
-        return Err("auth0_domain does not match the server's configured Auth0 tenant".to_string());
+    if requested.is_empty() {
+        return Ok(default.clone());
     }
-    Ok(configured)
+    trusted
+        .into_iter()
+        .find(|d| *d == requested)
+        .ok_or_else(|| "auth0_domain is not one of the server's trusted Auth0 tenants".to_string())
 }
 
 /// Verify the Auth0 ID token's signature + standard claims for `auth0_domain`.
 ///
-/// Derives the issuer + JWKS URL from the domain (falling back to
-/// `NOETL_AUTH0_DOMAIN` when the request omitted it), pulls the JWKS from the
+/// Derives the issuer + JWKS URL from the domain (falling back to the first
+/// `NOETL_AUTH0_DOMAIN` tenant when the request omitted it), pulls the JWKS from the
 /// TTL cache (refreshing on an unknown `kid`), and runs [`verify_with_jwks`].
 /// The caller decides — per [`VerifyMode`] — whether a returned error rejects
 /// the login (`Enforce`) or is merely logged (`Shadow`).
 pub async fn verify_signature(token: &str, auth0_domain: &str) -> Result<(), VerifyError> {
     let domain = if auth0_domain.trim().is_empty() {
-        std::env::var("NOETL_AUTH0_DOMAIN").unwrap_or_default()
+        default_auth0_domain()
     } else {
         auth0_domain.trim().to_string()
     };
@@ -776,6 +806,101 @@ MmYl3DjpSV0xyivlvyMT+Qwn\n\
         ));
     }
 
+    // A second tenant with its own signing key (test-only), for the
+    // multi-tenant checks: each tenant's tokens verify only against that
+    // tenant's issuer and JWKS.
+    const TENANT_B_PRIV_PEM: &str = "-----BEGIN PRIVATE KEY-----\n\
+MIIEvwIBADANBgkqhkiG9w0BAQEFAASCBKkwggSlAgEAAoIBAQCtkylo/PBAOWt8\n\
+Hk5tL5TlIy8vLseNv503S1PBwblKJcYgGgmCJh8KNfTLEkuSMjZntx7qGQ3lFlAk\n\
+TSQeSDeRnkl5oQNe9H8dsJdPUnEEWWLuXvs9BInY84l2v68osWEeoxePra8C3uJV\n\
+whwWmB/TN4ndwF9b2UFLnn2FPxnRdp+4eCGPbu/K3LV5apzUwOEv74d2umtL48ql\n\
+Ziu9wqdagSxMqvok1p3xcMSa7/4cmyRl0e3tV/Zqizb9mlDAMy29+CYdyYjWUhvP\n\
+L++D1I09YrrdEKLdKfEkC5CWazLgS4QxasRC5duMKDOJC/FkBoXZgMRvuho8h4KY\n\
+DFLTJbFbAgMBAAECggEAFCIq86h3Q7PasbR1kLkBXTd2EdPWxiyQ6L4zkm4ioc+n\n\
+ihy1t/jXsTWuAIoi5ZaDygcAg9NGfH6t6sVfPaX50B8bUwuSr7EjjNw+yNl9Y4Ls\n\
+yffkI4vtuL0TAl5coRc7dol2F66OoNdyoH5EsiLmJM1fOq9wQDVUm21gY5QnWKzo\n\
+DKfttAC25QtnL2RJl3SxbjzHfYuHUWm47mpDJpmxTRHpDnKaAaZZptAvEiw5LLMv\n\
+Usez/8A/AHi3kxdoZrGClouUzFB2OLt09VwvCr1hNzIvdk+FEf9MpoAbkkaClP3C\n\
+OIP1TcHrt6M1dJYHJAcU9aq5qX+kFl3RCmJh2lfHFQKBgQDbC7fCF31AJQjqefh2\n\
+g2RxvuHgLPOWDUkUrLaYnUkrRV4z+HFuDKRHBOu9FHKrxe8l+1XJKyBOY8Q32TJ8\n\
+d3O2R1Gr71AQDKyXOUWpjOyKj5fLHquOtOGa/BQio0EmHcQL0UpvU+M0tYaDIgCL\n\
+XvWr5XoU3Qb7dfP98NVEUOwsHQKBgQDK25466Os9mFAsaD8udZCDezGpkTbZkXrW\n\
+BsRj0nr7IjOP/nl7m3LKgYZojQ1U0mtbfgK0LllDHrayJIYnoQtDFYXT9buWh0Jl\n\
+q+gMYYWVFrbCWqcJkM5ptMqNvng70nl8zN8fxjcnUPqz/BWPoV2qvgDh6UgsXR4A\n\
+w+dxq+wp1wKBgQDDNjAv84sWLWtCvCyoQfS0Qi8/ABCdu31TxZB9dj8NJycLHfDI\n\
+6M9G06XbvmtrllzI9rK/M4X5FoR6WUDbGAGxguHQXth1VTZDFzF0JzlvSwU2akDu\n\
+T1l4LAsty1x2QbTD62Nwz8v+33/fQeBGVPyQk1Q3X7unQrmNqKIH3i58KQKBgQCw\n\
+fFtwEx4+S1pNGDEHwX6F9VMinFTk+n2s4NxRoFggTwQfHZ0hXf+DkSaXpUfY6OxA\n\
+ACRoD/7Wt0zpNX+F0MVUitAQtTSL5Idunx3WT64BJG7CLk4us03xhznGEdTW7umF\n\
+G1Rvd2qaiQhkOEel2xT7rCxmXyfMeQLWVZnxOkrPpwKBgQCYqIHaqLAdaeK7W4Y7\n\
+n25KfHzpJlYaTwAPBaFhT/Ox3w0afcQKyDgbznJqxYdtKG5xgykWlIg9MMe7/RYk\n\
+zHtpe6K/N+e6NTsMQkpQAUf2SlDf4Q/Bg33LurgOCX+MAMEhB5LaXLi0NJVpgAwt\n\
+Dldy1Heb7ToI9gII+9ovhFfVtw==\n\
+-----END PRIVATE KEY-----\n";
+    const TENANT_B_JWK_N: &str = "rZMpaPzwQDlrfB5ObS-U5SMvLy7Hjb-dN0tTwcG5SiXGIBoJgiYfCjX0yxJLkjI2Z7ce6hkN5RZQJE0kHkg3kZ5JeaEDXvR_HbCXT1JxBFli7l77PQSJ2POJdr-vKLFhHqMXj62vAt7iVcIcFpgf0zeJ3cBfW9lBS559hT8Z0XafuHghj27vyty1eWqc1MDhL--HdrprS-PKpWYrvcKnWoEsTKr6JNad8XDEmu_-HJskZdHt7Vf2aos2_ZpQwDMtvfgmHcmI1lIbzy_vg9SNPWK63RCi3SnxJAuQlmsy4EuEMWrEQuXbjCgziQvxZAaF2YDEb7oaPIeCmAxS0yWxWw";
+    const TENANT_B_KID: &str = "tenant-b-key-1";
+    const TENANT_B_DOMAIN: &str = "ranch.us.auth0.com";
+
+    fn tenant_b_jwks() -> JwkSet {
+        serde_json::from_value(serde_json::json!({
+            "keys": [{ "kty": "RSA", "use": "sig", "alg": "RS256", "kid": TENANT_B_KID, "n": TENANT_B_JWK_N, "e": "AQAB" }]
+        }))
+        .expect("valid JWKS")
+    }
+
+    fn tenant_b_params() -> VerifyParams {
+        VerifyParams {
+            issuer: format!("https://{TENANT_B_DOMAIN}/"),
+            audiences: vec!["spa-client-id".into(), "ranch-client-id".into()],
+            leeway: 0,
+        }
+    }
+
+    fn sign_b(claims: &serde_json::Value) -> String {
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some(TENANT_B_KID.to_string());
+        let key = EncodingKey::from_rsa_pem(TENANT_B_PRIV_PEM.as_bytes()).expect("valid test key");
+        encode(&header, claims, &key).expect("sign")
+    }
+
+    fn tenant_b_claims() -> serde_json::Value {
+        let mut c = good_claims();
+        c["iss"] = serde_json::json!(format!("https://{TENANT_B_DOMAIN}/"));
+        c["aud"] = serde_json::json!("ranch-client-id");
+        c["sub"] = serde_json::json!("email|ranch-guest");
+        c
+    }
+
+    #[test]
+    fn each_tenant_verifies_with_its_own_jwks() {
+        // Tenant A (the original) and tenant B both verify, each with its own keys.
+        let a = sign(TEST_KID, &good_claims());
+        assert!(verify_with_jwks(&a, &jwks_with(TEST_KID), &params(vec!["spa-client-id", "ranch-client-id"])).is_ok());
+        let b = sign_b(&tenant_b_claims());
+        assert!(verify_with_jwks(&b, &tenant_b_jwks(), &tenant_b_params()).is_ok());
+    }
+
+    #[test]
+    fn a_tenant_token_does_not_verify_against_the_other_tenant() {
+        // Tenant B's token checked as tenant A: wrong keys (kid unknown there).
+        let b = sign_b(&tenant_b_claims());
+        let err = verify_with_jwks(&b, &jwks_with(TEST_KID), &params(vec![])).unwrap_err();
+        assert_eq!(err.outcome, VerifyOutcome::UnknownKid);
+        // Tenant A's token checked as tenant B: wrong keys too.
+        let a = sign(TEST_KID, &good_claims());
+        assert_eq!(verify_with_jwks(&a, &tenant_b_jwks(), &tenant_b_params()).unwrap_err().outcome, VerifyOutcome::UnknownKid);
+        // Tenant A's key forging a tenant-B token under B's kid: bad signature.
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some(TENANT_B_KID.to_string());
+        let key = EncodingKey::from_rsa_pem(TEST_PRIV_PEM.as_bytes()).unwrap();
+        let forged = encode(&header, &tenant_b_claims(), &key).unwrap();
+        assert_eq!(verify_with_jwks(&forged, &tenant_b_jwks(), &tenant_b_params()).unwrap_err().outcome, VerifyOutcome::BadSignature);
+        // Tenant B's genuine token naming tenant A as issuer: B's keys, A's issuer expected -> bad claims.
+        let mut c = tenant_b_claims();
+        c["iss"] = serde_json::json!(format!("https://{TEST_ISSUER_DOMAIN}/"));
+        assert_eq!(verify_with_jwks(&sign_b(&c), &tenant_b_jwks(), &tenant_b_params()).unwrap_err().outcome, VerifyOutcome::BadClaims);
+    }
+
     #[test]
     fn verify_mode_parses_tristate() {
         // Defaults + explicit values (env-independent parse via direct match).
@@ -821,5 +946,35 @@ mod trusted_domain_tests {
     fn the_returned_domain_is_always_the_configured_one() {
         let d = trusted_auth0_domain(Some("https://Tenant.us.auth0.com/"), "tenant.us.auth0.com").unwrap();
         assert_eq!(d, TENANT);
+    }
+
+    const TWO: &str = "tenant.us.auth0.com, https://Ranch.us.auth0.com/";
+
+    #[test]
+    fn each_listed_tenant_is_accepted_as_itself() {
+        assert_eq!(trusted_auth0_domain(Some(TWO), TENANT), Ok(TENANT.to_string()));
+        assert_eq!(trusted_auth0_domain(Some(TWO), "ranch.us.auth0.com"), Ok("ranch.us.auth0.com".to_string()));
+        assert_eq!(trusted_auth0_domain(Some(TWO), "https://RANCH.us.auth0.com"), Ok("ranch.us.auth0.com".to_string()));
+    }
+
+    #[test]
+    fn a_request_naming_no_tenant_gets_the_first_listed() {
+        assert_eq!(trusted_auth0_domain(Some(TWO), ""), Ok(TENANT.to_string()));
+        assert_eq!(trusted_auth0_domain(Some("ranch.us.auth0.com,tenant.us.auth0.com"), " "), Ok("ranch.us.auth0.com".to_string()));
+    }
+
+    #[test]
+    fn an_unlisted_tenant_is_refused_even_with_several_trusted() {
+        for other in ["other.us.auth0.com", "ranch.us.auth0.com.example", "us.auth0.com", "tenant.us.auth0.com,ranch.us.auth0.com"] {
+            assert!(trusted_auth0_domain(Some(TWO), other).is_err(), "{other}");
+        }
+    }
+
+    #[test]
+    fn empty_and_repeated_entries_are_ignored() {
+        assert_eq!(super::trusted_domains(" , tenant.us.auth0.com,,TENANT.us.auth0.com/ , ranch.us.auth0.com,"),
+            vec![TENANT.to_string(), "ranch.us.auth0.com".to_string()]);
+        assert!(trusted_auth0_domain(Some(" , ,"), TENANT).is_err());
+        assert_eq!(trusted_auth0_domain(Some(",tenant.us.auth0.com"), ""), Ok(TENANT.to_string()));
     }
 }
