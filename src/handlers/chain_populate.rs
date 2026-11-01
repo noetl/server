@@ -57,6 +57,105 @@ pub fn populate_dir() -> String {
     std::env::var(POPULATE_DIR_ENV).unwrap_or_else(|_| DEFAULT_POPULATE_DIR.to_string())
 }
 
+/// A [`LocalFsSubstrate`] whose `list_prefix` starts at the prefix's directory.
+///
+/// ⚠ `LocalFsSubstrate::list_prefix` (ehdb v0.13.4) walks the WHOLE root and filters
+/// afterwards. Every chain read lists one execution's keys twice under the rig
+/// lock, so the cost was the size of the store, not of the execution: measured at
+/// 557,185 files, 3.3-3.5 s per walk, against about 90 us scoped. The reconcile
+/// poller does that on a runtime worker for each active execution, every tick,
+/// which froze the server ~6 s of every ~14 s while anything ran (noetl/ai-meta#503).
+///
+/// Lives here because the server pins an older ehdb; drop it once the pin carries
+/// the same fix upstream.
+struct PrefixScopedSubstrate {
+    root: std::path::PathBuf,
+    inner: LocalFsSubstrate,
+}
+
+impl PrefixScopedSubstrate {
+    fn new(root: &std::path::Path) -> ehdb_core::Result<Self> {
+        Ok(Self {
+            root: root.to_path_buf(),
+            inner: LocalFsSubstrate::new(root)?,
+        })
+    }
+
+    fn walk(
+        &self,
+        dir: &std::path::Path,
+        prefix: &str,
+        out: &mut Vec<String>,
+    ) -> ehdb_core::Result<()> {
+        let storage = |e: std::io::Error| ehdb_core::EhdbError::Storage(e.to_string());
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            // Nothing stored under this prefix yet.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(storage(e)),
+        };
+        for entry in entries {
+            let path = entry.map_err(storage)?.path();
+            if path.is_dir() {
+                self.walk(&path, prefix, out)?;
+                continue;
+            }
+            // Half-written temp files, as LocalFsSubstrate skips them.
+            if path.extension().is_some_and(|e| e == "tmp") {
+                continue;
+            }
+            let rel = path
+                .strip_prefix(&self.root)
+                .map_err(|e| ehdb_core::EhdbError::Storage(e.to_string()))?;
+            let key = rel.to_string_lossy().replace('\\', "/");
+            if key.starts_with(prefix) {
+                out.push(key);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl DurableSubstrate for PrefixScopedSubstrate {
+    fn failure_domain(&self) -> ehdb_l0::failure_domain::FailureDomain {
+        self.inner.failure_domain()
+    }
+    fn put_if_absent(&self, key: &str, bytes: &[u8]) -> ehdb_core::Result<bool> {
+        self.inner.put_if_absent(key, bytes)
+    }
+    fn put_overwrite(&self, key: &str, bytes: &[u8]) -> ehdb_core::Result<()> {
+        self.inner.put_overwrite(key, bytes)
+    }
+    fn get_range(&self, key: &str, offset: u64, len: u64) -> ehdb_core::Result<Vec<u8>> {
+        self.inner.get_range(key, offset, len)
+    }
+    fn get_all(&self, key: &str) -> ehdb_core::Result<Vec<u8>> {
+        self.inner.get_all(key)
+    }
+    fn object_size(&self, key: &str) -> ehdb_core::Result<u64> {
+        self.inner.object_size(key)
+    }
+    fn exists(&self, key: &str) -> ehdb_core::Result<bool> {
+        self.inner.exists(key)
+    }
+    fn list_prefix(&self, prefix: &str) -> ehdb_core::Result<Vec<String>> {
+        // Anything but a plain relative prefix keeps the full walk's behaviour.
+        if prefix.starts_with('/') || prefix.split('/').any(|c| c == "..") {
+            return self.inner.list_prefix(prefix);
+        }
+        let start = match prefix.rfind('/') {
+            Some(i) => self.root.join(&prefix[..i]),
+            None => self.root.clone(),
+        };
+        let mut out = Vec::new();
+        self.walk(&start, prefix, &mut out)?;
+        Ok(out)
+    }
+    fn delete(&self, key: &str) -> ehdb_core::Result<()> {
+        self.inner.delete(key)
+    }
+}
+
 /// The store plus the substrate it was opened over.
 ///
 /// [`ChainPopulator`] borrows both, so they have to outlive it — hence one rig
@@ -101,7 +200,7 @@ fn open_chain() -> Option<std::sync::Mutex<ChainRig>> {
         crate::metrics::record_chain_populate("open_failed");
         return None;
     }
-    match LocalFsSubstrate::new(std::path::Path::new(&dir)) {
+    match PrefixScopedSubstrate::new(std::path::Path::new(&dir)) {
         Ok(fs) => {
             let substrate: Arc<dyn DurableSubstrate> = Arc::new(fs);
             tracing::info!(target: "noetl_server::chain_populate", dir = %dir,
@@ -327,34 +426,49 @@ impl crate::chain_advance::ChainSource for LogSourcedChainSource {
         //
         // Holding one lock across both makes the pair atomic: the chain we read is
         // exactly the chain we just populated.
-        let attempt = |evs: &[ehdb_l0::chain_populator::LogEvent]| {
-            let guard = match rig.lock() {
-                Ok(g) => g,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            let populator = guard.populator();
-            let outcome = populator.populate_from_log(&key, evs);
-            match outcome {
-                Ok(o) => {
-                    // Read under the SAME hold, unless the outcome already decides.
-                    let needs_read = !matches!(
-                        o,
-                        ehdb_l0::chain_populator::FromLog::Diverged { .. }
-                            | ehdb_l0::chain_populator::FromLog::StaleLog { .. }
-                    );
-                    let chain = if needs_read {
-                        Some(populator.chain_if_authoritative(&key))
-                    } else {
-                        None
-                    };
-                    (Ok(o), chain)
+        //
+        // ⚠ Off the runtime: this is a std lock around filesystem work, and the server
+        // has two Tokio workers, so holding it inline stalled every request
+        // (noetl/ai-meta#503).
+        let attempt = |evs: Vec<ehdb_l0::chain_populator::LogEvent>| {
+            let key = key.clone();
+            tokio::task::spawn_blocking(move || {
+                let guard = match rig.lock() {
+                    Ok(g) => g,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                let populator = guard.populator();
+                let outcome = populator.populate_from_log(&key, &evs);
+                match outcome {
+                    Ok(o) => {
+                        // Read under the SAME hold, unless the outcome already decides.
+                        let needs_read = !matches!(
+                            o,
+                            ehdb_l0::chain_populator::FromLog::Diverged { .. }
+                                | ehdb_l0::chain_populator::FromLog::StaleLog { .. }
+                        );
+                        let chain = if needs_read {
+                            Some(populator.chain_if_authoritative(&key))
+                        } else {
+                            None
+                        };
+                        (Ok(o), chain)
+                    }
+                    Err(e) => (Err(e), None),
                 }
-                Err(e) => (Err(e), None),
-            }
+            })
         };
 
         let (outcome_or_err, chain_res, terminal) = {
-            let (o, c) = attempt(&events);
+            let (o, c) = match attempt(events).await {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(target: "noetl_server::chain_populate", execution_id, error = %e,
+                        "chain populate task failed");
+                    crate::metrics::record_chain_populate("populate_failed");
+                    return None;
+                }
+            };
             match o {
                 Ok(ehdb_l0::chain_populator::FromLog::StaleLog {
                     stored_len,
@@ -379,7 +493,15 @@ impl crate::chain_advance::ChainSource for LogSourcedChainSource {
                         crate::metrics::record_chain_populate("diverged");
                         return None;
                     }
-                    let (o2, c2) = attempt(&fresh_events);
+                    let (o2, c2) = match attempt(fresh_events).await {
+                        Ok(r) => r,
+                        Err(e) => {
+                            tracing::warn!(target: "noetl_server::chain_populate", execution_id, error = %e,
+                                "chain populate task failed");
+                            crate::metrics::record_chain_populate("populate_failed");
+                            return None;
+                        }
+                    };
                     (o2, c2, fresh_terminal)
                 }
                 other => (other, c, terminal),
@@ -482,8 +604,82 @@ impl crate::chain_advance::ChainSource for LogSourcedChainSource {
 mod tests {
     use super::*;
 
+    fn scoped_root(name: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("chain-scoped-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
 
+    fn sorted(mut v: Vec<String>) -> Vec<String> {
+        v.sort();
+        v
+    }
 
+    /// The same keys as the full walk it replaces, for every prefix shape.
+    #[test]
+    fn scoped_listing_matches_the_full_walk() {
+        let root = scoped_root("same");
+        let s = PrefixScopedSubstrate::new(&root).unwrap();
+        for k in [
+            "chain/1/seq/01",
+            "chain/1/seq/02",
+            "chain/1/ev/a",
+            "chain/1/head",
+            "chain/12/seq/01",
+            "chain/2/seq/01",
+            "top",
+        ] {
+            s.put_overwrite(k, b"x").unwrap();
+        }
+        std::fs::write(root.join("chain/1/seq/03.tmp"), b"x").unwrap();
+        for p in [
+            "chain/1/seq/",
+            "chain/1/",
+            "chain/1",
+            "chain/1/seq/0",
+            "chain/",
+            "t",
+            "",
+            "chain/9/seq/",
+            "nope/",
+        ] {
+            assert_eq!(
+                sorted(s.list_prefix(p).unwrap()),
+                sorted(s.inner.list_prefix(p).unwrap()),
+                "prefix {p:?}"
+            );
+        }
+        assert_eq!(
+            sorted(s.list_prefix("chain/1/seq/").unwrap()),
+            vec!["chain/1/seq/01".to_string(), "chain/1/seq/02".to_string()]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// ⭐ The fix itself: a listing must not visit other executions. A sibling the
+    /// walk cannot read proves it: the full walk errors there, a scoped one never
+    /// goes near it. Without this, a regression to the full walk passes every
+    /// equality test and only shows up as a stalled server (noetl/ai-meta#503).
+    #[cfg(unix)]
+    #[test]
+    fn scoped_listing_does_not_visit_other_executions() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = scoped_root("siblings");
+        let s = PrefixScopedSubstrate::new(&root).unwrap();
+        s.put_overwrite("chain/1/seq/01", b"x").unwrap();
+        s.put_overwrite("chain/2/seq/01", b"x").unwrap();
+        let sibling = root.join("chain/2");
+        std::fs::set_permissions(&sibling, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Running as root ignores the mode, and the control below would say so.
+        let control_fails = s.inner.list_prefix("chain/1/seq/").is_err();
+        let scoped = s.list_prefix("chain/1/seq/");
+        std::fs::set_permissions(&sibling, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if control_fails {
+            assert_eq!(scoped.unwrap(), vec!["chain/1/seq/01".to_string()]);
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     /// The flag is off by default, so the module is inert on arrival.
     #[test]
