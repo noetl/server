@@ -10,9 +10,12 @@ RUN cargo chef prepare --recipe-path recipe.json
 FROM chef AS builder
 COPY --from=planner /app/recipe.json recipe.json
 # Build deps for the recipe so the cook layer caches them.
-RUN cargo chef cook --release --recipe-path recipe.json
+# `--locked` needs the lock in THIS stage: the builder copies only recipe.json,
+# so cargo-chef would otherwise resolve the graph afresh (noetl/ai-meta#494).
+COPY Cargo.lock Cargo.lock
+RUN cargo chef cook --release --locked --recipe-path recipe.json
 COPY . .
-RUN cargo build --release --bin noetl-control-plane
+RUN cargo build --release --locked --bin noetl-control-plane
 
 # Build the built-in system plug-ins to wasm32 (noetl/ai-meta#108 slice 3).
 # The `plugins/orchestrate` crate is excluded from the server workspace, so it is
@@ -37,7 +40,7 @@ FROM chef AS wasmbuilder
 COPY rust-toolchain.toml ./
 RUN rustup target add wasm32-unknown-unknown
 COPY . .
-RUN cargo build --release --target wasm32-unknown-unknown \
+RUN cargo build --release --locked --target wasm32-unknown-unknown \
         --manifest-path plugins/orchestrate/Cargo.toml
 
 FROM alpine:3.22.2 AS runtime
