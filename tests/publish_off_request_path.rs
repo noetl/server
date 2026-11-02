@@ -114,7 +114,7 @@ async fn a_transient_failure_still_lands_the_append_exactly_once() {
     for _ in 0..60 {
         tokio::time::sleep(Duration::from_millis(250)).await;
         let eng = writer.engine();
-        let g = eng.lock().unwrap();
+        let g = eng.read();
         found = g.read_execution_after("4242", 0).map(|v| v.len()).unwrap_or(0);
         drop(g);
         if found > 0 {
