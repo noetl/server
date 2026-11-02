@@ -69,7 +69,7 @@ fn auth_pools() -> &'static Mutex<HashMap<String, PgPool>> {
 }
 
 /// Resolve `credential` to a cached auth-DB pool, building it on first use.
-async fn resolve_auth_pool(cred: &CredentialService, credential: &str) -> AppResult<PgPool> {
+pub(crate) async fn resolve_auth_pool(cred: &CredentialService, credential: &str) -> AppResult<PgPool> {
     if let Some(pool) = auth_pools().lock().await.get(credential).cloned() {
         return Ok(pool);
     }
@@ -135,7 +135,7 @@ async fn resolve_auth_pool(cred: &CredentialService, credential: &str) -> AppRes
 /// Carries `auth0_id`, the Auth0 subject the session belongs to, so the gateway
 /// can bind user-scoped playbook variables to the authenticated caller instead
 /// of trusting a client-supplied id. Omitted when unknown, never sent blank.
-fn session_user_json(
+pub(crate) fn session_user_json(
     user_id: i32,
     email: String,
     display_name: Option<String>,
