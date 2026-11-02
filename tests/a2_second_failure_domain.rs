@@ -35,7 +35,7 @@ fn unique_dir(tag: &str) -> std::path::PathBuf {
 /// algebra cannot tell this apart from real redundancy, then every "RF=2" claim is
 /// meaningless.
 #[test]
-fn two_local_substrates_on_one_device_are_ONE_domain_and_still_a_spof() {
+fn two_local_substrates_on_one_device_are_one_domain_and_still_a_spof() {
     let a = unique_dir("same-dev-a");
     let b = unique_dir("same-dev-b");
     let sa = LocalFsSubstrate::new(&a).unwrap();
