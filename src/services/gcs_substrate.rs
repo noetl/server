@@ -212,10 +212,29 @@ impl DurableSubstrate for GcsSubstrate {
         })
     }
 
+    /// Overrides the trait default, which downloads the whole object to take its length
+    /// (noetl/ai-meta#479). `reclaim_orphans` sizes every orphan immediately before deleting
+    /// it, so the default meant one full download per object about to be thrown away.
+    fn object_size(&self, key: &str) -> EhdbResult<u64> {
+        let b = self.backend.clone();
+        let k = self.key(key);
+        let shown = k.clone();
+        self.blocking(async move {
+            match b.object_size(&k).await.map_err(to_ehdb)? {
+                Some(n) => Ok(n),
+                // `NotFound`, as `get_all` reports it: the default this replaces failed the
+                // same way for an absent key.
+                None => Err(EhdbError::NotFound(shown)),
+            }
+        })
+    }
+
+    /// A metadata request, not a download. This used to call `get` and discard the bytes
+    /// to answer a boolean (noetl/ai-meta#479).
     fn exists(&self, key: &str) -> EhdbResult<bool> {
         let b = self.backend.clone();
         let k = self.key(key);
-        self.blocking(async move { Ok(b.get(&k).await.map_err(to_ehdb)?.is_some()) })
+        self.blocking(async move { Ok(b.object_size(&k).await.map_err(to_ehdb)?.is_some()) })
     }
 
     fn list_prefix(&self, prefix: &str) -> EhdbResult<Vec<String>> {

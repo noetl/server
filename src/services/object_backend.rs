@@ -643,6 +643,60 @@ impl GcsBackend {
         }))
     }
 
+    /// An object's size from its **metadata** (`GET …/o/<key>` without `alt=media`), so no
+    /// object bytes are transferred. `None` on 404.
+    ///
+    /// noetl/ai-meta#479: sizing and existence-checking used to go through [`Self::get`],
+    /// which downloads the whole object (measured GCS get p50 77 ms, p95 139 ms) only to
+    /// read its length or throw it away.
+    ///
+    /// ⚠ The JSON API returns `size` as a decimal STRING (it is a uint64, which JSON numbers
+    /// cannot carry exactly). A number is accepted too, for emulators that send one. A
+    /// metadata reply with no parseable size is an error, never 0: a zero would let an
+    /// unreadable size read as an empty object.
+    pub(crate) async fn object_size(&self, key: &str) -> AppResult<Option<u64>> {
+        let url = format!(
+            "{}/storage/v1/b/{}/o/{}",
+            self.endpoint,
+            self.bucket,
+            percent_encode_segment(key)
+        );
+        let mut req = self.client.get(&url).query(&[("fields", "size")]);
+        if let Some(token) = self.auth.bearer_token().await? {
+            req = req.bearer_auth(token);
+        }
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| AppError::Internal(format!("gcs object metadata {key}: {e}")))?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(AppError::Internal(format!(
+                "gcs object metadata {key}: HTTP {} {}",
+                status.as_u16(),
+                body
+            )));
+        }
+        let meta: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| AppError::Internal(format!("gcs object metadata {key} decode: {e}")))?;
+        let size = match meta.get("size") {
+            Some(serde_json::Value::String(s)) => s.parse::<u64>().ok(),
+            Some(serde_json::Value::Number(n)) => n.as_u64(),
+            _ => None,
+        };
+        size.map(Some).ok_or_else(|| {
+            AppError::Internal(format!(
+                "gcs object metadata {key}: no parseable `size` in {meta}"
+            ))
+        })
+    }
+
     /// List object names under `prefix` via the GCS JSON API
     /// (`GET …/o?prefix=…&maxResults=…`), following `nextPageToken` until `limit`
     /// keys are collected or the listing is exhausted. The `prefix` rides as a
