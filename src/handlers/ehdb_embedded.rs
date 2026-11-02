@@ -230,6 +230,23 @@ pub fn open_embedded() -> Option<Arc<std::sync::Mutex<L0Engine<D1EventLog>>>> {
         tracing::info!(target: "noetl_server::ehdb_embedded", secs = age.as_secs(),
             "age-based seal trigger configured (bounds the unsealed RF=1 tail)");
     }
+    // noetl/ai-meta#460 B3 — off-box replication of the UNSEALED tail.
+    //
+    // B2 above BOUNDS the window in which records exist only on local disk; it cannot
+    // close it, because a part is still local-only until it seals. This replicates the
+    // records inside an active writer, so the loss window becomes the driver's tick
+    // interval rather than the seal interval.
+    //
+    // ⚠⚠ Same both-halves trap as B2, and ehdb's own doc says so: the flag replicates
+    // nothing without something calling `replicate_tail` on a timer. The other half is
+    // `spawn_tail_replication_task`, guarded by `the_tail_replicator_has_both_halves`.
+    if tail_replication_enabled() {
+        config = config.with_tail_replication(true);
+        tracing::info!(target: "noetl_server::ehdb_embedded",
+            tick_secs = tail_replication_interval().as_secs(),
+            "unsealed-tail replication configured — the loss window becomes the tick \
+             interval, NOT zero (no remote ack gates the local append)");
+    }
     // ⚠ `open` makes a replica set of exactly one; `open_replicated` is the N-way form. Both
     // funnel through the FORMAT_VERSION gate, and `open_replicated` checks it on EVERY
     // replica — so a bucket written by a different build refuses here rather than being
@@ -245,10 +262,45 @@ pub fn open_embedded() -> Option<Arc<std::sync::Mutex<L0Engine<D1EventLog>>>> {
         ),
     };
     match opened {
-        Ok(engine) => {
+        Ok(mut engine) => {
             tracing::info!(target: "noetl_server::ehdb_embedded", dir = %dir,
                 "embedded EHDB engine open in SHADOW — not serving reads or writes");
             crate::metrics::record_embedded_shadow("opened");
+            // ⚠⚠ Attaching a replica replicates nothing that ALREADY exists.
+            //
+            // Uploads are enqueued on seal and nowhere else, so arming the
+            // off-box replica above covers parts sealed from now on and leaves
+            // every part of existing history at its old replica count forever.
+            // Measured on prod 2026-10-10, from the remote's own manifest: 40
+            // parts listed, **39 with replica_count 1** and one — the part
+            // sealed after the attach — with 2. Meanwhile every aggregate gauge
+            // read healthy (`survives_node_loss 1`), because those describe the
+            // replica *set*, not the parts.
+            //
+            // ⚠ Worse than an empty remote: the bucket holds a manifest naming
+            // all 40 parts and the bytes of one, so it looks like a complete
+            // store while 39 parts resolve only to `replica-0`. The backfill is
+            // what makes the remote an actually recoverable copy
+            // (noetl/ehdb#400).
+            //
+            // Cheap to call here: it only ENQUEUES onto the existing background
+            // uploader, so startup is not blocked by the copy.
+            if gcs_replica.is_some() && replica_backfill_enabled() {
+                match engine.backfill_under_replicated() {
+                    Ok(0) => tracing::info!(target: "noetl_server::ehdb_embedded",
+                        "replica backfill: nothing under-replicated"),
+                    Ok(n) => tracing::warn!(target: "noetl_server::ehdb_embedded", parts = n,
+                        "replica backfill: enqueued pre-existing parts for off-box copy \
+                         — watch ehdb_l0_backfill_uploads and parts_under_replicated"),
+                    Err(e) => tracing::error!(target: "noetl_server::ehdb_embedded", error = %e,
+                        "replica backfill failed to enqueue"),
+                }
+            } else if gcs_replica.is_some() {
+                tracing::warn!(target: "noetl_server::ehdb_embedded",
+                    "off-box replica armed but backfill is OFF: parts sealed before now stay \
+                     single-copy and the remote is NOT a recoverable copy on its own \
+                     (set NOETL_EHDB_REPLICA_BACKFILL=true)");
+            }
             Some(Arc::new(std::sync::Mutex::new(engine)))
         }
         Err(e) => {
@@ -703,6 +755,163 @@ pub fn seal_max_age() -> Option<std::time::Duration> {
 /// Only the SEALING is gated. `seal_aged_parts` is itself a no-op when `seal_max_age` is
 /// `None`, so it is called unconditionally too and the gate lives in one place rather than
 /// two that can disagree.
+/// **Drive off-box replication of the unsealed tail** (B3, noetl/ai-meta#460).
+///
+/// The other half of `NOETL_EHDB_TAIL_REPLICATION`. `L0Engine::replicate_tail`
+/// is a no-op when the flag is off, so this is spawned unconditionally and the
+/// gauges publish either way — an operator can see the window the tail is
+/// exposed to before deciding to turn replication on.
+///
+/// ⚠⚠ **The tick interval IS the loss window.** A record appended just after a
+/// tick is unreplicated until the next one. So B3 shrinks the window from the
+/// seal interval (B2, 900 s on prod) to this value; it does not reach zero.
+/// Saying "the tail is replicated" without naming the interval overstates it in
+/// exactly the way "no data loss" would.
+pub fn spawn_tail_replication_task(
+    engine: std::sync::Arc<std::sync::Mutex<L0Engine<D1EventLog>>>,
+) {
+    let interval = tail_replication_interval();
+    let enabled = tail_replication_enabled();
+    let cleanup = tail_cleanup_enabled();
+    crate::metrics::init_tail_replication_series();
+    if enabled {
+        tracing::info!(target: "noetl_server::ehdb_embedded", tick_secs = interval.as_secs(),
+            cleanup,
+            "unsealed-tail replication task starting — loss window is now the TICK, not the \
+             seal interval");
+        if !cleanup {
+            tracing::warn!(target: "noetl_server::ehdb_embedded",
+                "tail-object cleanup is DISABLED: objects will accumulate in the replica \
+                 bucket indefinitely (NOETL_EHDB_TAIL_CLEANUP=false)");
+        }
+    } else {
+        tracing::info!(target: "noetl_server::ehdb_embedded",
+            "unsealed-tail replication task starting with replication OFF (gauges only); the \
+             tail stays RF=1 until NOETL_EHDB_TAIL_REPLICATION=true");
+    }
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(interval);
+        loop {
+            tick.tick().await;
+            // ⚠⚠ THREE phases, and the lock boundary is the whole point.
+            //
+            // `L0Engine::replicate_tail` would do all of this in one call — and
+            // therefore perform the remote put while this task holds the engine
+            // lock. That lock is also taken by `shadow_append`, which runs
+            // inside `emit_events` on the LIVE write path, so every append that
+            // collided with a tick would wait out the put: p50 77 ms, p99
+            // 234 ms measured against GCS (noetl/ai-meta#460). A durability
+            // feature would have become a latency regression on the write path.
+            //
+            // ehdb's uploader thread has always avoided exactly this — "the
+            // substrate writes happen OUTSIDE the lock so a slow store never
+            // blocks appends/reads" — and `prepare_tail_batches` /
+            // `upload_tail_batch` / `commit_tail_batch` exist so this can too.
+            // `prepare` and `commit` do no I/O; only the middle phase does, and
+            // it holds nothing.
+            let prepared = {
+                let guard = match engine.lock() {
+                    Ok(g) => g,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                guard
+                    .prepare_tail_batches()
+                    .map(|batches| (batches, guard.replica_handles(), guard.metrics()))
+            };
+            let outcome = match prepared {
+                Err(e) => Err(e),
+                Ok((batches, replicas, metrics)) => {
+                    // --- lock released; the remote puts happen here ---
+                    let results: Vec<(bool, ehdb_l0::engine::TailBatch)> = batches
+                        .into_iter()
+                        .map(|b| {
+                            let ok = ehdb_l0::engine::upload_tail_batch(
+                                &replicas,
+                                &b,
+                                metrics.as_ref(),
+                            );
+                            (ok, b)
+                        })
+                        .collect();
+                    // --- lock re-taken only to move the watermarks ---
+                    let mut guard = match engine.lock() {
+                        Ok(g) => g,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    let mut report = ehdb_l0::engine::TailReplicationReport::default();
+                    for (ok, b) in &results {
+                        if *ok {
+                            guard.commit_tail_batch(b, &mut report);
+                        } else {
+                            guard.fail_tail_batch(b, &mut report);
+                        }
+                    }
+                    // D2 — the watermark is read HERE, under the lock (no I/O),
+                    // and carried out so the listing and the deletes happen
+                    // with the lock released. Same rule as the upload above.
+                    let watermarks = guard.contiguous_durable_watermarks();
+                    drop(guard);
+                    if cleanup {
+                        let reclaim = ehdb_l0::engine::reclaim_superseded_tail_objects(
+                            &replicas,
+                            DATASET,
+                            &watermarks,
+                            metrics.as_ref(),
+                        );
+                        if reclaim.reclaimed > 0 {
+                            tracing::info!(target: "noetl_server::ehdb_embedded",
+                                reclaimed = reclaim.reclaimed, bytes = reclaim.bytes,
+                                retained = reclaim.retained,
+                                "tail objects reclaimed — a contiguous run of durable parts \
+                                 already covers them");
+                        }
+                        if reclaim.failed > 0 {
+                            tracing::warn!(target: "noetl_server::ehdb_embedded",
+                                failed = reclaim.failed,
+                                "tail-object deletes failed; the objects remain and are \
+                                 retried next tick");
+                        }
+                        if reclaim.unparsed > 0 {
+                            tracing::warn!(target: "noetl_server::ehdb_embedded",
+                                unparsed = reclaim.unparsed,
+                                "objects under the tail prefix whose keys this build does not \
+                                 understand — left in place deliberately");
+                        }
+                    }
+                    Ok(report)
+                }
+            };
+            match outcome {
+                Ok(report) => {
+                    if report.batches > 0 {
+                        crate::metrics::ehdb_tail_batches_total().inc_by(report.batches as u64);
+                        crate::metrics::ehdb_tail_records_total().inc_by(report.records as u64);
+                        tracing::debug!(target: "noetl_server::ehdb_embedded",
+                            batches = report.batches, records = report.records,
+                            bytes = report.bytes, "unsealed tail replicated off-box");
+                    }
+                    // ⚠ Reported even though `batches == 0` also means "nothing to
+                    // do": a replicator failing every put and an idle one are
+                    // opposite conditions that both leave the batch count flat.
+                    if !report.failed_shards.is_empty() {
+                        crate::metrics::ehdb_tail_failed_total()
+                            .inc_by(report.failed_shards.len() as u64);
+                        tracing::warn!(target: "noetl_server::ehdb_embedded",
+                            shards = ?report.failed_shards,
+                            "unsealed-tail replication FAILED for these shards — their records \
+                             are still local-only and will be retried next tick");
+                    }
+                }
+                Err(e) => {
+                    crate::metrics::ehdb_tail_failed_total().inc();
+                    tracing::warn!(target: "noetl_server::ehdb_embedded", error = %e,
+                        "unsealed-tail replication pass failed");
+                }
+            }
+        }
+    });
+}
+
 pub fn spawn_age_seal_task(engine: std::sync::Arc<std::sync::Mutex<L0Engine<D1EventLog>>>) {
     let interval = std::env::var("NOETL_EHDB_SEAL_TICK_SECS")
         .ok()
@@ -773,6 +982,62 @@ pub fn spawn_age_seal_task(engine: std::sync::Arc<std::sync::Mutex<L0Engine<D1Ev
 /// The bucket for the off-box replica, or `None` when A2 is not configured.
 ///
 /// ⚠ Absent means RF=1, which is the current prod state and not an error.
+/// Whether to enqueue a one-shot backfill of already-sealed, under-replicated
+/// parts at engine open. Default **off** — it copies existing history to the
+/// off-box replica, which is real egress and real object writes, so it is opted
+/// into deliberately rather than happening on the first restart after a bucket
+/// is configured.
+/// Whether to delete tail objects a durable part already covers (B3 **D2**).
+///
+/// ⚠⚠ Default **TRUE**, which is deliberately the opposite of every other flag
+/// in this module, and the reason is the shape of the two failure modes.
+/// Omitting cleanup does not leave the system as it was — it leaves tail
+/// objects accumulating in the bucket forever, which is the trap. Whereas the
+/// operation itself is safe *by construction*: `reclaim_superseded_tail_objects`
+/// deletes an object only when a **contiguous** run of durable parts already
+/// covers its whole interval, so what it removes is a redundant second copy of
+/// something already off-box.
+///
+/// Set to `false` to keep every tail object — a deliberate choice, e.g. while
+/// auditing what the replicator writes.
+fn tail_cleanup_enabled() -> bool {
+    !std::env::var("NOETL_EHDB_TAIL_CLEANUP")
+        .map(|v| v.eq_ignore_ascii_case("false") || v == "0")
+        .unwrap_or(false)
+}
+
+/// Whether to replicate the **unsealed** tail off-box (B3). Default **off**.
+///
+/// ⚠ Only meaningful with a replica bucket configured — without one the only
+/// "replica" is the local device, and copying the tail to the same disk it is
+/// already on buys nothing.
+fn tail_replication_enabled() -> bool {
+    std::env::var("NOETL_EHDB_TAIL_REPLICATION")
+        .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+        .unwrap_or(false)
+}
+
+/// How often the tail replicator runs. **This value IS the loss window** — a
+/// record appended just after a tick is unreplicated until the next one — so it
+/// is the number to quote when describing what B3 buys, not the seal interval.
+///
+/// Default 15 s. The trade is put volume against that window: every tick with
+/// new records writes one object per active shard.
+fn tail_replication_interval() -> std::time::Duration {
+    let secs = std::env::var("NOETL_EHDB_TAIL_REPLICATION_TICK_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(15);
+    std::time::Duration::from_secs(secs)
+}
+
+fn replica_backfill_enabled() -> bool {
+    std::env::var("NOETL_EHDB_REPLICA_BACKFILL")
+        .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+        .unwrap_or(false)
+}
+
 fn replica_gcs_bucket() -> Option<String> {
     std::env::var("NOETL_EHDB_REPLICA_GCS_BUCKET")
         .ok()

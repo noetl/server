@@ -880,8 +880,10 @@ pub struct DriveTombstones {
         std::collections::HashMap<i64, TombstoneReason>,
         std::collections::VecDeque<i64>,
     )>,
-    /// Consecutive-no-progress budgets, OUTSIDE the evictable orch_cache slot.
-    budgets: std::sync::Mutex<std::collections::HashMap<i64, u32>>,
+    /// Consecutive-no-progress budgets, OUTSIDE the evictable orch_cache slot:
+    /// the count, and when the streak began (noetl/ai-meta#315 — see
+    /// [`Self::quiet_for`]).
+    budgets: std::sync::Mutex<std::collections::HashMap<i64, (u32, std::time::Instant)>>,
     cap: usize,
 }
 
@@ -976,7 +978,23 @@ impl DriveTombstones {
     /// give-up out of the slot was necessary but insufficient while the *budget*
     /// that triggers it still lived inside.
     pub fn noops(&self, execution_id: i64) -> u32 {
-        self.budgets.lock().unwrap().get(&execution_id).copied().unwrap_or(0)
+        self.budgets.lock().unwrap().get(&execution_id).map_or(0, |b| b.0)
+    }
+
+    /// How long this execution's no-progress streak has lasted, in wall-clock
+    /// time. `None` when it has none.
+    ///
+    /// ⚠ noetl/ai-meta#315. The cap counts POLLS, and "225 polls ≈ 30 min"
+    /// holds only while a tick takes 8 s. The poller awaits every drive in
+    /// series, so slow drives stretch the tick: measured on prod 2026-09-24 at
+    /// ~299 s, which made the cap ~18.7 h. The streak's age is what the cap
+    /// meant all along.
+    pub fn quiet_for(&self, execution_id: i64) -> Option<std::time::Duration> {
+        self.budgets
+            .lock()
+            .unwrap()
+            .get(&execution_id)
+            .map(|b| b.1.elapsed())
     }
 
     /// Store the budget, bounded the same way the tombstones are.
@@ -992,7 +1010,12 @@ impl DriveTombstones {
                 g.remove(&k);
             }
         }
-        g.insert(execution_id, n);
+        // The streak's start is kept across increments: it is when the streak
+        // BEGAN that the time cap measures from.
+        let since = g
+            .get(&execution_id)
+            .map_or_else(std::time::Instant::now, |b| b.1);
+        g.insert(execution_id, (n, since));
     }
 
     pub fn budget_len(&self) -> usize {

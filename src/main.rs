@@ -144,6 +144,14 @@ fn build_router(
             "/api/auth/check-playbook-access",
             post(handlers::auth::check_playbook_access),
         )
+        // Gateway auth providers (spec 2026-10-21-gateway-auth-providers): a
+        // provider playbook verified the caller; mint their session. 404
+        // unless NOETL_AUTH_MINT_KEY is set; 403 without the gateway's key.
+        .route(
+            "/api/auth/provider-session",
+            post(handlers::auth_provider::provider_session),
+        )
+        .route("/api/auth/logout", post(handlers::auth_provider::logout))
         .with_state(credential_service.clone());
 
     // Sealed-credential endpoint (Secrets Wallet Phase 5b, noetl/ai-meta#61).
@@ -1462,6 +1470,7 @@ async fn main() -> anyhow::Result<()> {
     // configured `seal_max_age` never fires on an idle shard, which is the only shard it
     // exists for.
     if let Some(engine) = noetl_server::handlers::ehdb_embedded::engine_handle() {
+        noetl_server::handlers::ehdb_embedded::spawn_tail_replication_task(engine.clone());
         noetl_server::handlers::ehdb_embedded::spawn_age_seal_task(engine);
     }
     // Same TTL the orphan / nonconvergence sweeps enforce, so the pool report
