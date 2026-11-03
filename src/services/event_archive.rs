@@ -1200,7 +1200,7 @@ pub struct RetouchState {
     /// is re-confirmed every pass.
     pub counted_suspects: std::collections::HashSet<i64>,
     pub counted_touched: std::collections::HashSet<i64>,
-    /// Suspects an exact read already cleared, with the newest part (by `min_sequence`) that
+    /// Suspects an exact read already cleared, with the newest part (by `max_sequence`) that
     /// read covered. Re-read only when a NEWER part may hold the execution — otherwise a
     /// persistent bloom false positive would be re-read every pass, and with the reads
     /// bounded, the same few would crowd out everything behind them.
@@ -1242,6 +1242,18 @@ pub fn apply_retouch_scan(
     }
 }
 
+/// Whether a sealed part can hold a record of an execution that its archive does not cover,
+/// and if so the value that orders and remembers it (the part's `max_sequence`).
+///
+/// ⚠⚠ The test is the part ENDING above the archived max. A part that starts below it and
+/// ends above it is the normal place for a late record: on kind the engine sealed an
+/// execution's original records and its late one into a single part. Requiring the part to
+/// start above the archived max missed exactly that record.
+pub fn retouch_part_value(part_min: u64, part_max: u64, archived_max: u64) -> Option<u64> {
+    debug_assert!(part_min <= part_max);
+    (part_max > archived_max).then_some(part_max)
+}
+
 /// What [`detect_retouched`] found, with the population it looked at.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct RetouchScan {
@@ -1266,19 +1278,26 @@ pub struct RetouchScan {
 /// # Why two stages
 ///
 /// Blooms give false positives — the same ones that pin the floor (P0b) would flag healthy
-/// executions here. But a bloom has **no false negatives**: if no part starting above the
+/// executions here. But a bloom has **no false negatives**: if no part ending above the
 /// archived `max_sequence` might contain the execution, it is certainly not re-touched. So
 /// the bloom only selects suspects, and an exact read decides.
 ///
-/// ⚠ "Starting above", not "extending above". The first cut compared against the parts'
-/// `max_sequence`, and on kind every archived execution was a suspect (10 of 10): the part
-/// holding an execution's last archived record almost always holds later records of other
-/// executions. The 32 bounded reads then went to the same ids every pass, which on prod's
-/// thousands of archived executions would never reach the rest. A suspect an exact read has
-/// cleared is not read again until a newer part may hold it.
+/// ⚠⚠ Two wrong turns, both found on kind, and the reason the shape is what it is:
+/// 1. Without memory, nearly every archived execution is a suspect on every pass (10 of 10):
+///    the part holding its last archived record usually holds later records of others. The
+///    bounded reads went to the same ids every pass and would never reach the rest on prod.
+/// 2. "Fixing" that by requiring the part to START above the archived max missed a real late
+///    record: the engine sealed the execution's original records and the late one into ONE
+///    part starting below the archived max — the normal outcome when an execution is
+///    archived while its records are still in the unsealed tail.
 ///
-/// `parts_above` maps `(execution, archived_max)` to the newest `min_sequence` of a part that
-/// starts above `archived_max` and may hold the execution (see
+/// So the test is "ends above" (sound), and the cost is bounded by memory instead: a suspect
+/// an exact read cleared is not read again until a NEWER sealed part (parts are immutable)
+/// may hold it. Suspects are read newest part first, because a late event lands in the
+/// newest parts.
+///
+/// `parts_above` maps `(execution, archived_max)` to the newest `max_sequence` of a part that
+/// ends above `archived_max` and may hold the execution (see
 /// `ehdb_embedded::retouch_suspects`); `None` means the engine is not open, so nothing is
 /// concluded. `exact` has the same contract as in [`prune_pass_refined`].
 pub fn detect_retouched<FS, FE>(
@@ -1305,14 +1324,15 @@ where
         out.unreadable = true;
         return out;
     };
-    // A suspect: a part that starts ABOVE the archived max may hold it, and no earlier exact
-    // read already cleared that part.
+    // A suspect: a part ending above the archived max may hold it, and no earlier exact read
+    // already cleared a part that new.
     let mut suspects: Vec<(i64, u64)> = above
         .into_iter()
         .filter(|&(id, part_min)| state.cleared.get(&id).is_none_or(|&c| part_min > c))
         .collect();
-    // Deterministic order, so a bounded pass works through the same list.
-    suspects.sort_unstable();
+    // Newest part first: a late event lands in the newest parts, so with the reads bounded
+    // those are the ones to spend them on. Ties broken by id, so the order is deterministic.
+    suspects.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
     out.suspects = suspects.len();
     out.suspect_ids = suspects.iter().map(|&(id, _)| id).collect();
     for (n, (id, part_min)) in suspects.into_iter().enumerate() {

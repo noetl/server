@@ -201,6 +201,38 @@ fn an_unreadable_engine_confirms_nothing() {
     assert!(scan.unreadable && scan.confirmed.is_empty());
 }
 
+/// ⭐⭐ The shape kind produced: the engine sealed the execution's original records AND the
+/// late one into ONE part, starting below the archived max and ending above it. It must be a
+/// suspect. A part wholly inside the archive's range is not.
+#[test]
+fn a_part_straddling_the_archived_max_is_a_suspect() {
+    // archived max 100; part 50..=200 holds old records and the late one.
+    assert_eq!(ea::retouch_part_value(50, 200, 100), Some(200));
+    // part entirely above.
+    assert_eq!(ea::retouch_part_value(150, 200, 100), Some(200));
+    // part ending at or below the archived max cannot hold anything new.
+    assert_eq!(ea::retouch_part_value(10, 100, 100), None);
+    assert_eq!(ea::retouch_part_value(10, 90, 100), None);
+}
+
+/// Newest part first: with reads bounded, they go where a late event lands.
+#[test]
+fn suspects_are_read_newest_part_first() {
+    let st = state(ea::RetouchMode::On, &[(1, 1, 2), (2, 1, 2), (3, 1, 2)]);
+    let mut order = Vec::new();
+    ea::detect_retouched(
+        &st,
+        &known(&[1, 2, 3]),
+        |_| Some(vec![(1, 10), (2, 30), (3, 20)]),
+        |id| {
+            order.push(id);
+            Some(Some((1, 2)))
+        },
+        32,
+    );
+    assert_eq!(order, vec![2, 3, 1]);
+}
+
 // --- applying a scan --------------------------------------------------------------
 
 /// `shadow` counts and logs, and changes nothing the floor sees.

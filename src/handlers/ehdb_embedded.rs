@@ -1094,14 +1094,19 @@ pub fn exact_extent(execution_id: i64) -> Option<Option<(u64, u64)>> {
 }
 
 /// Re-touch suspects (noetl/ai-meta#506 P3): for each `(execution, archived_max)`, the
-/// newest `min_sequence` among parts that **start above** `archived_max` and whose bloom may
-/// hold the execution. Executions with no such part are omitted — certainly not re-touched.
+/// newest `max_sequence` among parts that **end above** `archived_max` and whose bloom may
+/// hold the execution. Executions with no such part are omitted — certainly not re-touched
+/// (blooms have no false negatives, and every record lives in some part's range).
 ///
-/// ⚠ Not [`hot_footprint`]'s `max_sequence`. That is the max over each *part's* range, and the
-/// part holding an execution's last archived record almost always holds later records of
-/// other executions too, so every archived execution read as a suspect (measured on kind:
-/// 10 of 10) and the bounded exact reads were spent on the same ids every pass. A late record
-/// lands in a part sealed after archival, which starts above the archived max.
+/// ⚠⚠ "Ends above", not "starts above". A version that required the part to START above the
+/// archived max missed a late record on kind: the engine sealed its whole unsealed tail —
+/// the execution's original records AND the late one — into one part starting below the
+/// archived max. That happens whenever an execution is archived while its records are still
+/// in the unsealed tail, so it is the common case, not an edge.
+///
+/// The cost of "ends above" is that nearly every archived execution is a suspect once. The
+/// caller bounds it by remembering, per execution, the newest part an exact read cleared:
+/// sealed parts are immutable, so only a newly sealed part can make it a suspect again.
 pub fn retouch_suspects(extents: &[(i64, u64)]) -> Option<Vec<(i64, u64)>> {
     use std::collections::HashMap;
     let engine = engine()?;
@@ -1119,16 +1124,20 @@ pub fn retouch_suspects(extents: &[(i64, u64)]) -> Option<Vec<(i64, u64)>> {
     let mut out: HashMap<i64, u64> = HashMap::new();
     for part in &manifest.parts {
         for (id, archived_max, key) in &keys {
-            if part.min_sequence <= *archived_max {
+            let Some(value) = crate::services::event_archive::retouch_part_value(
+                part.min_sequence,
+                part.max_sequence,
+                *archived_max,
+            ) else {
                 continue;
-            }
+            };
             let may = match &part.execution_bloom {
                 Some(b) => b.maybe_contains(key),
                 None => true,
             };
             if may {
-                let e = out.entry(*id).or_insert(part.min_sequence);
-                *e = (*e).max(part.min_sequence);
+                let e = out.entry(*id).or_insert(value);
+                *e = (*e).max(value);
             }
         }
     }
