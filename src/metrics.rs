@@ -3744,6 +3744,43 @@ pub fn init_chain_populate_series() {
     }
 }
 
+/// Retention-floor holder confirmations (noetl/ai-meta#506 P0b).
+///
+/// `refined` and `absent` moving means the bloom footprint over-reported and the exact read
+/// corrected it. `unreadable` and `bounded` mean the pass fell back to the bloom floor.
+pub fn ehdb_floor_refinement_total() -> &'static prometheus::IntCounterVec {
+    static M: std::sync::OnceLock<prometheus::IntCounterVec> = std::sync::OnceLock::new();
+    M.get_or_init(|| {
+        let c = prometheus::IntCounterVec::new(
+            prometheus::Opts::new(
+                "noetl_ehdb_floor_refinement_total",
+                "Retention-floor holders checked by exact read, by outcome",
+            ),
+            &["outcome"],
+        )
+        .expect("valid counter vec");
+        registry().register(Box::new(c.clone())).expect("register");
+        c
+    })
+}
+
+pub const FLOOR_REFINEMENT_OUTCOMES: &[&str] = &["refined", "absent", "unreadable", "bounded"];
+
+pub fn record_floor_refinement(r: &crate::services::event_archive::FloorRefinement) {
+    let c = ehdb_floor_refinement_total();
+    c.with_label_values(&["refined"]).inc_by(r.refined as u64);
+    c.with_label_values(&["absent"]).inc_by(r.absent as u64);
+    c.with_label_values(&["unreadable"]).inc_by(u64::from(r.unreadable));
+    c.with_label_values(&["bounded"]).inc_by(u64::from(r.bounded));
+}
+
+/// Pinned unconditionally, so "never refined" reads 0 rather than absent.
+pub fn init_floor_refinement_series() {
+    for o in FLOOR_REFINEMENT_OUTCOMES {
+        ehdb_floor_refinement_total().with_label_values(&[o]).inc_by(0);
+    }
+}
+
 /// Chain-store retention sweeper verdicts per partition (noetl/ai-meta#506).
 pub fn chain_retention_total() -> &'static prometheus::IntCounterVec {
     static M: std::sync::OnceLock<prometheus::IntCounterVec> = std::sync::OnceLock::new();

@@ -1073,6 +1073,26 @@ fn replica_gcs_endpoint() -> String {
 ///
 /// `None` when the engine is not open — the caller must refuse to prune, not treat an absent
 /// footprint as "nothing constrains".
+/// The EXACT sequence extent of one execution's records: `(min, max)` over every record the
+/// engine holds for it, sealed parts and the unsealed buffer alike.
+///
+/// noetl/ai-meta#506 P0b. [`hot_footprint`] answers from blooms and over-reports; this is
+/// the confirmation the floor uses for its holder. `None` = cannot read (engine closed or the
+/// read failed); `Some(None)` = the engine holds nothing for this execution.
+pub fn exact_extent(execution_id: i64) -> Option<Option<(u64, u64)>> {
+    let engine = engine()?;
+    let guard = match engine.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let recs = guard
+        .read_execution_after(&execution_id.to_string(), 0)
+        .ok()?;
+    let min = recs.iter().map(|r| r.global_sequence).min();
+    let max = recs.iter().map(|r| r.global_sequence).max();
+    Some(min.zip(max))
+}
+
 pub fn hot_footprint(
     ids: &[i64],
 ) -> Option<Vec<crate::services::event_archive::HotExecution>> {
