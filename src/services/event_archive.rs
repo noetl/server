@@ -1364,6 +1364,174 @@ where
     out
 }
 
+// ===========================================================================
+// noetl/ai-meta#506 RFC question 5 — the archived set survives a restart.
+// ===========================================================================
+
+/// `off` (default) | `shadow` | `on`.
+pub const KNOWN_PERSIST_ENV: &str = "NOETL_EHDB_ARCHIVE_KNOWN_PERSIST";
+/// Where the snapshot lives. Defaults to `<NOETL_EHDB_EMBEDDED_DIR>/archive-known.json`.
+pub const KNOWN_PATH_ENV: &str = "NOETL_EHDB_ARCHIVE_KNOWN_PATH";
+/// Snapshot format version. Bumped for any change a reader of the old format would misread.
+pub const KNOWN_SNAPSHOT_VERSION: u32 = 1;
+
+/// # Why
+///
+/// `known_archived` is in memory. After every restart the pass re-verifies the whole archived
+/// backlog from GCS before it trusts any of it: on prod 2026-11-03 that was ~10k candidates
+/// at ~4 verifications/s, about 40 minutes, during which the prune refuses and re-touch
+/// detection waits. Frequent rolls multiply it.
+///
+/// # Modes
+///
+/// - `shadow` writes the snapshot after every pass and, after a restart, only MEASURES it:
+///   `noetl_ehdb_archive_persisted_known{state}` shows how many snapshot claims the
+///   re-verification has confirmed. Nothing is trusted.
+/// - `on` also loads it at start, so the floor and detection use it at once.
+///
+/// ⚠⚠ `on` trusts a "verified durable" claim made by an earlier process, and the prune
+/// deletes engine parts on the strength of it. Only arm it after `shadow` has shown the
+/// snapshot fully confirmed across restarts (`unconfirmed` back to 0).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum KnownPersistMode {
+    #[default]
+    Off,
+    Shadow,
+    On,
+}
+
+impl KnownPersistMode {
+    pub fn from_env() -> Self {
+        Self::parse(&std::env::var(KNOWN_PERSIST_ENV).unwrap_or_default())
+    }
+    /// Unrecognised values read as `Off`: a typo must never make the floor trust a file.
+    pub fn parse(v: &str) -> Self {
+        match v.trim().to_ascii_lowercase().as_str() {
+            "shadow" => Self::Shadow,
+            "on" | "true" | "1" | "yes" => Self::On,
+            _ => Self::Off,
+        }
+    }
+}
+
+/// The snapshot path: [`KNOWN_PATH_ENV`], else beside the embedded engine, else none.
+pub fn known_state_path() -> Option<std::path::PathBuf> {
+    if let Ok(p) = std::env::var(KNOWN_PATH_ENV) {
+        if !p.trim().is_empty() {
+            return Some(p.trim().into());
+        }
+    }
+    let dir = std::env::var("NOETL_EHDB_EMBEDDED_DIR").ok()?;
+    let dir = dir.trim();
+    (!dir.is_empty()).then(|| std::path::Path::new(dir).join("archive-known.json"))
+}
+
+/// One archived execution in the snapshot. `extent` is absent when it was not recorded —
+/// it is only tracked while re-touch detection is on — and is then NOT invented on load: a
+/// made-up `(0, 0)` would make every part read as past the archive.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct KnownArchived {
+    pub id: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extent: Option<(u64, u64)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct KnownSnapshot {
+    pub version: u32,
+    /// The archive bucket the claims are about. A snapshot for another bucket is refused:
+    /// "archived" means "archived THERE".
+    pub bucket: String,
+    pub written_at: DateTime<Utc>,
+    pub archived: Vec<KnownArchived>,
+    pub out_of_coverage: Vec<i64>,
+}
+
+impl KnownSnapshot {
+    /// Build from the pass state, sorted so the file is deterministic.
+    pub fn capture(
+        bucket: &str,
+        known_archived: &std::collections::HashSet<i64>,
+        known_out_of_coverage: &std::collections::HashSet<i64>,
+        retouch: &RetouchState,
+        now: DateTime<Utc>,
+    ) -> Self {
+        let mut archived: Vec<KnownArchived> = known_archived
+            .iter()
+            .map(|id| KnownArchived {
+                id: *id,
+                extent: retouch.extents.get(id).copied(),
+            })
+            .collect();
+        archived.sort_unstable_by_key(|k| k.id);
+        let mut out_of_coverage: Vec<i64> = known_out_of_coverage.iter().copied().collect();
+        out_of_coverage.sort_unstable();
+        Self {
+            version: KNOWN_SNAPSHOT_VERSION,
+            bucket: bucket.to_string(),
+            written_at: now,
+            archived,
+            out_of_coverage,
+        }
+    }
+
+    /// Parse and check a snapshot. Any doubt is an error, and an error means "start empty",
+    /// which is exactly the behaviour before this existed.
+    pub fn decode(bytes: &[u8], bucket: &str) -> Result<Self, String> {
+        let snap: Self = serde_json::from_slice(bytes).map_err(|e| format!("decode: {e}"))?;
+        if snap.version != KNOWN_SNAPSHOT_VERSION {
+            return Err(format!(
+                "version {} (this build reads {KNOWN_SNAPSHOT_VERSION})",
+                snap.version
+            ));
+        }
+        if snap.bucket != bucket {
+            return Err(format!(
+                "bucket mismatch: snapshot is for {:?}, this pass archives to {bucket:?}",
+                snap.bucket
+            ));
+        }
+        Ok(snap)
+    }
+
+    /// `on`: put the snapshot's claims into the pass state.
+    pub fn apply(
+        &self,
+        known_archived: &mut std::collections::HashSet<i64>,
+        known_out_of_coverage: &mut std::collections::HashSet<i64>,
+        retouch: &mut RetouchState,
+    ) {
+        for k in &self.archived {
+            known_archived.insert(k.id);
+            if let Some(e) = k.extent {
+                retouch.extents.insert(k.id, e);
+            }
+        }
+        known_out_of_coverage.extend(self.out_of_coverage.iter().copied());
+    }
+
+    /// `shadow`: how many of this snapshot's archived claims the live state has re-verified.
+    /// Returns `(confirmed, unconfirmed)`.
+    pub fn confirmation(&self, known_archived: &std::collections::HashSet<i64>) -> (usize, usize) {
+        let confirmed = self
+            .archived
+            .iter()
+            .filter(|k| known_archived.contains(&k.id))
+            .count();
+        (confirmed, self.archived.len() - confirmed)
+    }
+}
+
+/// Write the snapshot atomically: a temp file in the same directory, then rename, so a
+/// crash mid-write leaves the previous snapshot rather than a torn one.
+pub fn write_known_snapshot(path: &std::path::Path, snap: &KnownSnapshot) -> Result<(), String> {
+    let bytes = serde_json::to_vec(snap).map_err(|e| format!("encode: {e}"))?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, &bytes).map_err(|e| format!("write {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, path).map_err(|e| format!("rename to {}: {e}", path.display()))?;
+    Ok(())
+}
+
 /// What one pass did, with the population it looked at.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct PassReport {
@@ -1751,6 +1919,79 @@ pub fn spawn_archive_pass(service: crate::services::execution::ExecutionService)
             ..Default::default()
         };
         tracing::info!(mode = ?retouch.mode, "archive re-touch detection ({RETOUCH_ENV})");
+
+        // noetl/ai-meta#506 Q5: the archived set across restarts. Off by default.
+        let persist = KnownPersistMode::from_env();
+        let persist_path = match persist {
+            KnownPersistMode::Off => None,
+            _ => known_state_path(),
+        };
+        let bucket_name = cfg.bucket.clone().unwrap_or_default();
+        let mut loaded_snapshot: Option<KnownSnapshot> = None;
+        if let Some(path) = &persist_path {
+            let read = {
+                let path = path.clone();
+                tokio::task::spawn_blocking(move || std::fs::read(path)).await
+            };
+            match read {
+                Ok(Ok(bytes)) => match KnownSnapshot::decode(&bytes, &bucket_name) {
+                    Ok(snap) => {
+                        crate::metrics::ehdb_archive_known_persist_total()
+                            .with_label_values(&["loaded"])
+                            .inc();
+                        tracing::info!(
+                            mode = ?persist,
+                            archived = snap.archived.len(),
+                            out_of_coverage = snap.out_of_coverage.len(),
+                            written_at = %snap.written_at,
+                            trusted = persist == KnownPersistMode::On,
+                            "archived-set snapshot loaded ({KNOWN_PERSIST_ENV})"
+                        );
+                        if persist == KnownPersistMode::On {
+                            snap.apply(
+                                &mut known_archived,
+                                &mut known_out_of_coverage,
+                                &mut retouch,
+                            );
+                        }
+                        loaded_snapshot = Some(snap);
+                    }
+                    Err(e) => {
+                        let outcome = if e.starts_with("bucket mismatch") {
+                            "bucket_mismatch"
+                        } else {
+                            "load_failed"
+                        };
+                        crate::metrics::ehdb_archive_known_persist_total()
+                            .with_label_values(&[outcome])
+                            .inc();
+                        tracing::warn!(error = %e, path = %path.display(),
+                            "archived-set snapshot not used; starting empty");
+                    }
+                },
+                Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                    tracing::info!(path = %path.display(), "no archived-set snapshot yet");
+                }
+                Ok(Err(e)) => {
+                    crate::metrics::ehdb_archive_known_persist_total()
+                        .with_label_values(&["load_failed"])
+                        .inc();
+                    tracing::warn!(error = %e, path = %path.display(),
+                        "archived-set snapshot unreadable; starting empty");
+                }
+                Err(e) => {
+                    crate::metrics::ehdb_archive_known_persist_total()
+                        .with_label_values(&["load_failed"])
+                        .inc();
+                    tracing::warn!(error = %e, "archived-set snapshot read task failed");
+                }
+            }
+        } else if persist != KnownPersistMode::Off {
+            tracing::warn!(
+                "{KNOWN_PERSIST_ENV} is set but neither {KNOWN_PATH_ENV} nor \
+                 NOETL_EHDB_EMBEDDED_DIR names a place for the snapshot; it is off"
+            );
+        }
         loop {
             tick.tick().await;
             let candidates = match collect_candidates(&service).await {
@@ -1863,6 +2104,48 @@ pub fn spawn_archive_pass(service: crate::services::execution::ExecutionService)
                 }
             }
             tracing::info!(report = %rep.describe(), "archive pass complete");
+
+            // noetl/ai-meta#506 Q5. Written after the pass, so it holds only what this
+            // process verified (or loaded and is trusting under `on`). Off the runtime: a
+            // blocking write on one of the two Tokio workers is the #503 stall's shape.
+            if let Some(path) = &persist_path {
+                let snap = KnownSnapshot::capture(
+                    &bucket_name,
+                    &known_archived,
+                    &known_out_of_coverage,
+                    &retouch,
+                    Utc::now(),
+                );
+                let path = path.clone();
+                let written =
+                    tokio::task::spawn_blocking(move || write_known_snapshot(&path, &snap)).await;
+                match written {
+                    Ok(Ok(())) => crate::metrics::ehdb_archive_known_persist_total()
+                        .with_label_values(&["written"])
+                        .inc(),
+                    Ok(Err(e)) => {
+                        crate::metrics::ehdb_archive_known_persist_total()
+                            .with_label_values(&["write_failed"])
+                            .inc();
+                        tracing::warn!(error = %e, "archived-set snapshot write failed");
+                    }
+                    Err(e) => {
+                        crate::metrics::ehdb_archive_known_persist_total()
+                            .with_label_values(&["write_failed"])
+                            .inc();
+                        tracing::warn!(error = %e, "archived-set snapshot write task failed");
+                    }
+                }
+                if let Some(loaded) = &loaded_snapshot {
+                    let (confirmed, unconfirmed) = loaded.confirmation(&known_archived);
+                    crate::metrics::ehdb_archive_persisted_known()
+                        .with_label_values(&["confirmed"])
+                        .set(confirmed as i64);
+                    crate::metrics::ehdb_archive_persisted_known()
+                        .with_label_values(&["unconfirmed"])
+                        .set(unconfirmed as i64);
+                }
+            }
         }
     });
 }
