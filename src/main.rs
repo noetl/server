@@ -1153,6 +1153,7 @@ async fn main() -> anyhow::Result<()> {
     noetl_server::metrics::init_chain_populate_series();
     // noetl/ai-meta#506 — pinned even when the sweeper is off, so `hours` reads 0.
     noetl_server::metrics::init_chain_retention_series();
+    noetl_server::metrics::init_floor_refinement_series();
     // noetl/ai-meta#455 — pinned so "the server never registered itself" reads as
     // `registered` staying 0 rather than as an absent series. Before this, the
     // registry's only evidence of not running was silence.

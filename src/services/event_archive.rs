@@ -1457,12 +1457,26 @@ pub fn spawn_archive_pass(service: crate::services::execution::ExecutionService)
                 .union(&known_out_of_coverage)
                 .copied()
                 .collect();
-            let prep = prune_pass(
+            // noetl/ai-meta#506 P0b: confirm the floor holder with an exact read, so a
+            // bloom false positive on an old part cannot pin the floor there.
+            //
+            // ⚠ Default OFF (`NOETL_EHDB_FLOOR_EXACT`). On, the floor moves to where hot data
+            // really starts, so the next pass drops every verified-archived part below it —
+            // on prod a backlog of days. Arming that is an operator decision.
+            let exact_on = floor_exact_enabled();
+            let prep = prune_pass_refined(
                 &cfg,
                 &candidates,
                 Utc::now(),
                 &satisfied,
                 crate::handlers::ehdb_embedded::hot_footprint,
+                |id: i64| {
+                    if exact_on {
+                        crate::handlers::ehdb_embedded::exact_extent(id)
+                    } else {
+                        None
+                    }
+                },
                 crate::handlers::ehdb_embedded::prune_below,
             );
             if prep.parts_dropped > 0 {
@@ -1762,11 +1776,138 @@ pub fn prune_pass<FP, PR>(
     set: &CandidateSet,
     now: DateTime<Utc>,
     verified_archived: &std::collections::HashSet<i64>,
+    footprint: FP,
+    prune: PR,
+) -> PruneReport
+where
+    FP: FnMut(&[i64]) -> Option<Vec<HotExecution>>,
+    PR: FnMut(u64) -> Option<Result<(usize, u64), String>>,
+{
+    prune_pass_refined(cfg, set, now, verified_archived, footprint, |_| None, prune)
+}
+
+/// Confirm the floor holder by exact read (noetl/ai-meta#506 P0b). Default OFF.
+pub const FLOOR_EXACT_ENV: &str = "NOETL_EHDB_FLOOR_EXACT";
+
+/// Whether [`FLOOR_EXACT_ENV`] is on (`1`/`true`/`yes`/`on`).
+pub fn floor_exact_enabled() -> bool {
+    matches!(
+        std::env::var(FLOOR_EXACT_ENV)
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+/// Most exact reads one prune pass spends confirming the floor holder.
+pub const MAX_FLOOR_REFINEMENTS: usize = 32;
+
+/// What [`refine_floor_holders`] did.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct FloorRefinement {
+    /// Holders whose bloom extent was replaced by the exact one.
+    pub refined: usize,
+    /// Holders the engine turned out to hold no records for (dropped from the footprint).
+    pub absent: usize,
+    /// The exact read was unavailable, so the bloom extent was kept (conservative).
+    pub unreadable: bool,
+    /// [`MAX_FLOOR_REFINEMENTS`] was reached before the holder was exact.
+    pub bounded: bool,
+}
+
+/// ⭐ Replace the floor holder's **bloom** extent with its **exact** one, repeatedly, until the
+/// lowest constraining entry is exact (noetl/ai-meta#506 P0b).
+///
+/// # Why
+///
+/// The footprint counts an execution as present in every part whose bloom says *maybe*, and
+/// the floor is the minimum over every constraining execution of every such part — on prod
+/// about 495 hot ids × 402 parts, ~200k bloom tests. A single false positive on an OLD part
+/// pins the floor there. Measured 2026-11-03: the floor sat on a part whose only records
+/// belong to a cold `system/scheduled_cleanup` run of Oct 27; a hot execution from Nov 1
+/// matched its 128-bit bloom by chance. When that execution aged out, the next floor was
+/// again a false positive. The floor only ever advanced from one false positive to the next.
+///
+/// # Why this is safe
+///
+/// A bloom has no false negatives, so an execution's exact extent always lies **inside** its
+/// bloom extent: refinement can only raise `min_sequence` to where the execution's records
+/// really start, never above them. Every failure keeps the bloom extent — the lower floor.
+///
+/// `exact(id)` returns `None` when it cannot read (keep the bloom extent and stop),
+/// `Some(None)` when the engine holds no records for `id`, and `Some(Some((min, max)))`.
+pub fn refine_floor_holders<FE>(
+    footprint: &mut Vec<HotExecution>,
+    verified_archived: &std::collections::HashSet<i64>,
+    mut exact: FE,
+    max_reads: usize,
+) -> FloorRefinement
+where
+    FE: FnMut(i64) -> Option<Option<(u64, u64)>>,
+{
+    let mut out = FloorRefinement::default();
+    let mut exact_ids: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    let mut reads = 0usize;
+    loop {
+        // The current holder: the lowest-starting execution that constrains.
+        let Some(idx) = footprint
+            .iter()
+            .enumerate()
+            .filter(|(_, h)| !verified_archived.contains(&h.execution_id))
+            .min_by_key(|(_, h)| h.min_sequence)
+            .map(|(i, _)| i)
+        else {
+            return out;
+        };
+        let id = footprint[idx].execution_id;
+        if exact_ids.contains(&id) {
+            // The lowest entry is already exact: the floor is real.
+            return out;
+        }
+        if reads >= max_reads {
+            out.bounded = true;
+            return out;
+        }
+        reads += 1;
+        match exact(id) {
+            None => {
+                out.unreadable = true;
+                return out;
+            }
+            Some(None) => {
+                footprint.swap_remove(idx);
+                out.absent += 1;
+            }
+            Some(Some((min, _max))) => {
+                // The exact first record is where the execution's data starts, so it is the
+                // bound to keep from — whether it raises the bloom estimate (the normal case)
+                // or, were the two ever to disagree, lowers it (which is only more
+                // conservative). `max_sequence` is left alone: it feeds only the
+                // all-archived branch, and a record still in the unsealed buffer can sit
+                // above every part's max.
+                footprint[idx].min_sequence = min;
+                exact_ids.insert(id);
+                out.refined += 1;
+            }
+        }
+    }
+}
+
+/// [`prune_pass`] with the floor holder confirmed by an exact read before the floor is used.
+pub fn prune_pass_refined<FP, FE, PR>(
+    cfg: &RetentionConfig,
+    set: &CandidateSet,
+    now: DateTime<Utc>,
+    verified_archived: &std::collections::HashSet<i64>,
     mut footprint: FP,
+    exact: FE,
     mut prune: PR,
 ) -> PruneReport
 where
     FP: FnMut(&[i64]) -> Option<Vec<HotExecution>>,
+    FE: FnMut(i64) -> Option<Option<(u64, u64)>>,
     PR: FnMut(u64) -> Option<Result<(usize, u64), String>>,
 {
     let mut rep = PruneReport::default();
@@ -1819,11 +1960,14 @@ where
         return rep;
     }
 
-    let Some(fp) = footprint(&all_ids) else {
+    let Some(mut fp) = footprint(&all_ids) else {
         // ⚠ Absent footprint is NOT "nothing constrains". Refuse.
         rep.skipped = Some("the embedded engine is not open; the footprint is unknown".into());
         return rep;
     };
+
+    let refinement = refine_floor_holders(&mut fp, verified_archived, exact, MAX_FLOOR_REFINEMENTS);
+    crate::metrics::record_floor_refinement(&refinement);
 
     let basis = compute_prune_floor(&scan, verified_archived, &fp);
     rep.basis = Some(basis.reason());
