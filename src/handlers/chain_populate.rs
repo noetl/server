@@ -220,6 +220,20 @@ fn open_chain() -> Option<std::sync::Mutex<ChainRig>> {
     }
 }
 
+/// Run `f` while holding the chain-store lock, or `None` when the populator is off.
+///
+/// ⚠ For the retention sweeper (noetl/ai-meta#506). `populate_from_log` and the
+/// guarded read run under this lock, so a partition deleted while holding it can
+/// never be half-written or half-read. Blocking: call from `spawn_blocking`.
+pub(crate) fn with_chain_lock<R>(f: impl FnOnce() -> R) -> Option<R> {
+    let rig = rig()?;
+    let _guard = match rig.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    Some(f())
+}
+
 /// Drive `populate_from_log` directly against the process store.
 ///
 /// ⚠ Exposed for the divergence POSITIVE CONTROL only. The burst test proves that

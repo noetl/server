@@ -3744,6 +3744,77 @@ pub fn init_chain_populate_series() {
     }
 }
 
+/// Chain-store retention sweeper verdicts per partition (noetl/ai-meta#506).
+pub fn chain_retention_total() -> &'static prometheus::IntCounterVec {
+    static M: std::sync::OnceLock<prometheus::IntCounterVec> = std::sync::OnceLock::new();
+    M.get_or_init(|| {
+        let c = prometheus::IntCounterVec::new(
+            prometheus::Opts::new(
+                "noetl_chain_retention_total",
+                "Chain-store partitions examined by the retention sweeper, by verdict",
+            ),
+            &["outcome"],
+        )
+        .expect("valid counter vec");
+        registry().register(Box::new(c.clone())).expect("register");
+        c
+    })
+}
+
+pub fn record_chain_retention(outcome: &str, n: u64) {
+    chain_retention_total()
+        .with_label_values(&[outcome])
+        .inc_by(n);
+}
+
+/// The configured window in hours; **0 = sweeper off**. Always published, so "off"
+/// is a value rather than an absent series.
+pub fn chain_retention_hours() -> &'static prometheus::IntGauge {
+    static M: std::sync::OnceLock<prometheus::IntGauge> = std::sync::OnceLock::new();
+    M.get_or_init(|| {
+        let g = prometheus::IntGauge::new(
+            "noetl_chain_retention_hours",
+            "Chain-store retention window in hours; 0 means the sweeper is off",
+        )
+        .expect("valid gauge");
+        registry().register(Box::new(g.clone())).expect("register");
+        g
+    })
+}
+
+pub fn set_chain_retention_hours(h: i64) {
+    chain_retention_hours().set(h);
+}
+
+/// Unix time of the last completed sweep; 0 = never. Without it a dead sweeper and a
+/// sweeper with nothing to delete both read as flat counters.
+pub fn chain_retention_swept_at() -> &'static prometheus::IntGauge {
+    static M: std::sync::OnceLock<prometheus::IntGauge> = std::sync::OnceLock::new();
+    M.get_or_init(|| {
+        let g = prometheus::IntGauge::new(
+            "noetl_chain_retention_swept_at_seconds",
+            "Unix time of the last completed chain retention sweep; 0 means never",
+        )
+        .expect("valid gauge");
+        registry().register(Box::new(g.clone())).expect("register");
+        g
+    })
+}
+
+pub fn set_chain_retention_swept_at(t: i64) {
+    chain_retention_swept_at().set(t);
+}
+
+/// Pin every retention verdict at 0, unconditionally — including when the sweeper is
+/// off, so a scrape tells "off" (`hours` 0) from "not this binary" (absent).
+pub fn init_chain_retention_series() {
+    for o in crate::handlers::chain_retention::RETENTION_OUTCOMES {
+        chain_retention_total().with_label_values(&[o]).inc_by(0);
+    }
+    chain_retention_hours().set(0);
+    chain_retention_swept_at().set(0);
+}
+
 /// How many replicas the embedded engine was opened with.
 ///
 /// ⚠⚠ Exists because `ehdb_l0_replica_domain_violations` reads **0 on prod while both

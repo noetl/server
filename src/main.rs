@@ -1151,6 +1151,8 @@ async fn main() -> anyhow::Result<()> {
     // noetl/ai-meta#332 step 5 — pinned so an unrun shadow reads 0, not absent.
     noetl_server::metrics::init_embedded_shadow_series();
     noetl_server::metrics::init_chain_populate_series();
+    // noetl/ai-meta#506 — pinned even when the sweeper is off, so `hours` reads 0.
+    noetl_server::metrics::init_chain_retention_series();
     // noetl/ai-meta#455 — pinned so "the server never registered itself" reads as
     // `registered` staying 0 rather than as an absent series. Before this, the
     // registry's only evidence of not running was silence.
@@ -1309,6 +1311,9 @@ async fn main() -> anyhow::Result<()> {
     // ⚠ Without this the gauge only moves when someone calls the gated endpoint, so
     // on a running cluster it sits at 0 — indistinguishable from healthy.
     handlers::chain_populate::spawn_root_invariant_sampler(state.clone());
+    // noetl/ai-meta#506 — delete chain partitions nothing will read again. Default
+    // OFF (`NOETL_CHAIN_RETENTION_HOURS`); the store refills ~17k inodes/day without it.
+    handlers::chain_retention::spawn_chain_retention_sweeper(state.clone());
     // noetl/ai-meta#317 — sample the shared pool so exhaustion is visible.
     // Cheap: two atomic reads off the sqlx handle every 15s, no query.
     {
