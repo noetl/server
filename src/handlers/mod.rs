@@ -14,6 +14,7 @@ pub mod catalog_read;
 pub mod catalog_relation;
 pub mod catalog_snapshot;
 pub mod chain_populate;
+pub mod chain_retention;
 pub mod cells;
 pub mod container_callback;
 pub mod credentials;
