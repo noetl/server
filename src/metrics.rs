@@ -4344,7 +4344,7 @@ pub fn ehdb_archive_total() -> &'static prometheus::IntCounterVec {
 /// they are different failures with different fixes — and both must be readable as 0 rather
 /// than absent, since "a prune was never refused" and "this build has no such reason" are
 /// not the same claim.
-pub const EHDB_ARCHIVE_OUTCOMES: [&str; 11] = [
+pub const EHDB_ARCHIVE_OUTCOMES: [&str; 15] = [
     "archived",
     "archive_failed",
     "already_archived",
@@ -4365,6 +4365,16 @@ pub const EHDB_ARCHIVE_OUTCOMES: [&str; 11] = [
     // Every published gauge read healthy. A count that can block the system belongs on
     // /metrics, not only in a log line.
     "out_of_coverage",
+    // noetl/ai-meta#506 P3 — an archived execution that received a late event. `suspect`
+    // is the bloom saying "maybe"; `re_touched` is an exact read confirming it. Non-zero
+    // `re_touched` means the settle window or a hold class is wrong.
+    "re_touch_suspect",
+    "re_touched",
+    // The re-archive that brings the cold copy back to complete, and the case it cannot:
+    // the hot store no longer holds the execution's first records, so a rewrite would drop
+    // them from the archive. That execution stays pinned under the floor instead.
+    "re_archived",
+    "re_touch_incomplete",
 ];
 
 /// Pin every retention series at 0 **unconditionally**.

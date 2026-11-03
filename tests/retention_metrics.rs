@@ -79,7 +79,9 @@ fn every_retention_series_is_pinned_at_zero_before_anything_runs() {
     // number that mattered — `out_of_coverage=100` equalled `max_per_pass`, so the budget was
     // spent re-deciding unarchivable executions and `archived` sat at 0 with every published
     // gauge reading healthy.
-    assert_eq!(noetl_server::metrics::EHDB_ARCHIVE_OUTCOMES.len(), 11);
+    // 15 since 2026-11-03 (noetl/ai-meta#506 P3): `re_touch_suspect`, `re_touched`,
+    // `re_archived`, `re_touch_incomplete` — a late event on an archived execution.
+    assert_eq!(noetl_server::metrics::EHDB_ARCHIVE_OUTCOMES.len(), 15);
 }
 
 /// ⚠⚠ When the block clears, the id must be RESET. A stale id would name an execution that
