@@ -1093,6 +1093,48 @@ pub fn exact_extent(execution_id: i64) -> Option<Option<(u64, u64)>> {
     Some(min.zip(max))
 }
 
+/// Re-touch suspects (noetl/ai-meta#506 P3): for each `(execution, archived_max)`, the
+/// newest `min_sequence` among parts that **start above** `archived_max` and whose bloom may
+/// hold the execution. Executions with no such part are omitted — certainly not re-touched.
+///
+/// ⚠ Not [`hot_footprint`]'s `max_sequence`. That is the max over each *part's* range, and the
+/// part holding an execution's last archived record almost always holds later records of
+/// other executions too, so every archived execution read as a suspect (measured on kind:
+/// 10 of 10) and the bounded exact reads were spent on the same ids every pass. A late record
+/// lands in a part sealed after archival, which starts above the archived max.
+pub fn retouch_suspects(extents: &[(i64, u64)]) -> Option<Vec<(i64, u64)>> {
+    use std::collections::HashMap;
+    let engine = engine()?;
+    let manifest = {
+        let guard = match engine.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.manifest_snapshot()
+    };
+    let keys: Vec<(i64, u64, String)> = extents
+        .iter()
+        .map(|&(id, max)| (id, max, id.to_string()))
+        .collect();
+    let mut out: HashMap<i64, u64> = HashMap::new();
+    for part in &manifest.parts {
+        for (id, archived_max, key) in &keys {
+            if part.min_sequence <= *archived_max {
+                continue;
+            }
+            let may = match &part.execution_bloom {
+                Some(b) => b.maybe_contains(key),
+                None => true,
+            };
+            if may {
+                let e = out.entry(*id).or_insert(part.min_sequence);
+                *e = (*e).max(part.min_sequence);
+            }
+        }
+    }
+    Some(out.into_iter().collect())
+}
+
 pub fn hot_footprint(
     ids: &[i64],
 ) -> Option<Vec<crate::services::event_archive::HotExecution>> {

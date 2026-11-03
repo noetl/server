@@ -75,16 +75,16 @@ fn known(ids: &[i64]) -> HashSet<i64> {
 
 // --- detection ------------------------------------------------------------------
 
-/// No part above the archived extent might hold it: certainly not re-touched, and no exact
-/// read is spent. (Blooms have no false negatives.)
+/// No part starting above the archived extent might hold it: certainly not re-touched, and
+/// no exact read is spent. (Blooms have no false negatives.)
 #[test]
-fn a_bloom_that_rules_it_out_costs_no_exact_read() {
+fn no_part_above_the_archive_costs_no_exact_read() {
     let st = state(ea::RetouchMode::On, &[(1, 10, 20)]);
     let mut reads = 0;
     let scan = ea::detect_retouched(
         &st,
         &known(&[1]),
-        |_| Some(vec![hot(1, 10, 20)]),
+        |_| Some(vec![]),
         |_| {
             reads += 1;
             Some(Some((10, 20)))
@@ -95,24 +95,69 @@ fn a_bloom_that_rules_it_out_costs_no_exact_read() {
     assert!(scan.confirmed.is_empty());
 }
 
-/// ⭐ The bloom says "maybe" (a false positive on a newer part), the exact read says no.
-/// Acting on the bloom would flag healthy executions every pass — the same false positives
-/// that pin the floor (P0b).
+/// The suspect test is asked about the ARCHIVED max, per execution.
 #[test]
-fn a_bloom_false_positive_is_a_suspect_not_a_re_touch() {
-    let st = state(ea::RetouchMode::On, &[(1, 10, 20)]);
+fn suspects_are_asked_about_the_archived_max() {
+    let st = state(ea::RetouchMode::On, &[(1, 10, 20), (2, 30, 40)]);
+    let mut asked = Vec::new();
+    ea::detect_retouched(
+        &st,
+        &known(&[1, 2]),
+        |ext| {
+            asked = ext.to_vec();
+            Some(vec![])
+        },
+        |_| None,
+        32,
+    );
+    asked.sort_unstable();
+    assert_eq!(asked, vec![(1, 20), (2, 40)]);
+}
+
+/// ⭐ A bloom false positive on a newer part: a suspect, cleared by the exact read, and
+/// remembered — so it does not consume a read every pass.
+#[test]
+fn a_bloom_false_positive_is_cleared_and_remembered() {
+    let mut st = state(ea::RetouchMode::On, &[(1, 10, 20)]);
+    let mut k = known(&[1]);
     let scan = ea::detect_retouched(
         &st,
-        &known(&[1]),
-        |_| Some(vec![hot(1, 10, 900)]),
+        &k,
+        |_| Some(vec![(1, 900)]),
         |_| Some(Some((10, 20))),
         32,
     );
     assert_eq!(scan.suspects, 1);
     assert!(
         scan.confirmed.is_empty(),
-        "an exact read at the archived extent must clear a bloom suspect"
+        "an exact read at the archived extent must clear it"
     );
+    assert_eq!(scan.cleared, vec![(1, 900)]);
+    ea::apply_retouch_scan(&scan, &mut st, &mut k);
+
+    // Same newest part next pass: not a suspect, no read.
+    let mut reads = 0;
+    let again = ea::detect_retouched(
+        &st,
+        &k,
+        |_| Some(vec![(1, 900)]),
+        |_| {
+            reads += 1;
+            Some(Some((10, 20)))
+        },
+        32,
+    );
+    assert_eq!((again.suspects, reads), (0, 0));
+
+    // A NEWER part may hold it: a suspect again.
+    let newer = ea::detect_retouched(
+        &st,
+        &k,
+        |_| Some(vec![(1, 950)]),
+        |_| Some(Some((10, 20))),
+        32,
+    );
+    assert_eq!(newer.suspects, 1);
 }
 
 #[test]
@@ -121,7 +166,7 @@ fn a_real_late_record_is_confirmed() {
     let scan = ea::detect_retouched(
         &st,
         &known(&[1, 2]),
-        |_| Some(vec![hot(1, 10, 900), hot(2, 30, 40)]),
+        |_| Some(vec![(1, 900)]),
         |id| Some(Some(if id == 1 { (10, 25) } else { (30, 40) })),
         32,
     );
@@ -137,7 +182,7 @@ fn exact_reads_are_bounded_per_pass() {
     let scan = ea::detect_retouched(
         &st,
         &known(&ids),
-        |ids| Some(ids.iter().map(|&i| hot(i, 1, 99)).collect()),
+        |ext| Some(ext.iter().map(|&(i, _)| (i, 99)).collect()),
         |_| {
             reads += 1;
             Some(Some((1, 99)))
@@ -228,7 +273,7 @@ async fn a_re_touched_execution_is_archived_again_with_the_late_record() {
     let scan = ea::detect_retouched(
         &st,
         &k,
-        |_| Some(vec![hot(7, 1, 10)]),
+        |_| Some(vec![(7, 10)]),
         |_| Some(Some((1, 10))),
         32,
     );

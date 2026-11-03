@@ -1200,6 +1200,11 @@ pub struct RetouchState {
     /// is re-confirmed every pass.
     pub counted_suspects: std::collections::HashSet<i64>,
     pub counted_touched: std::collections::HashSet<i64>,
+    /// Suspects an exact read already cleared, with the newest part (by `min_sequence`) that
+    /// read covered. Re-read only when a NEWER part may hold the execution — otherwise a
+    /// persistent bloom false positive would be re-read every pass, and with the reads
+    /// bounded, the same few would crowd out everything behind them.
+    pub cleared: std::collections::HashMap<i64, u64>,
 }
 
 /// Apply one [`RetouchScan`] to the pass state (noetl/ai-meta#506 P3).
@@ -1216,6 +1221,9 @@ pub fn apply_retouch_scan(
         if state.counted_suspects.insert(*id) {
             crate::metrics::record_ehdb_archive("re_touch_suspect");
         }
+    }
+    for &(id, part_min) in &scan.cleared {
+        state.cleared.insert(id, part_min);
     }
     for id in &scan.confirmed {
         if state.counted_touched.insert(*id) {
@@ -1243,6 +1251,8 @@ pub struct RetouchScan {
     pub suspects: usize,
     /// Their ids, sorted.
     pub suspect_ids: Vec<i64>,
+    /// Suspects the exact read cleared, with the newest part it covered.
+    pub cleared: Vec<(i64, u64)>,
     /// Confirmed by an exact read: the hot store holds a record past the archived extent.
     pub confirmed: Vec<i64>,
     /// [`MAX_RETOUCH_READS`] was reached; the rest wait for the next pass.
@@ -1255,53 +1265,57 @@ pub struct RetouchScan {
 ///
 /// # Why two stages
 ///
-/// The bloom footprint over-estimates an execution's extent — the same false positives that
-/// pin the floor (P0b) would flag healthy executions here. But a bloom has **no false
-/// negatives**: if no part above the archived `max_sequence` might contain the execution, it
-/// is certainly not re-touched. So the bloom only selects suspects, and an exact read decides.
+/// Blooms give false positives — the same ones that pin the floor (P0b) would flag healthy
+/// executions here. But a bloom has **no false negatives**: if no part starting above the
+/// archived `max_sequence` might contain the execution, it is certainly not re-touched. So
+/// the bloom only selects suspects, and an exact read decides.
 ///
-/// `footprint` and `exact` have the same contracts as in [`prune_pass_refined`]; `None` from
-/// `footprint` means the engine is not open, so nothing is concluded.
-pub fn detect_retouched<FP, FE>(
+/// ⚠ "Starting above", not "extending above". The first cut compared against the parts'
+/// `max_sequence`, and on kind every archived execution was a suspect (10 of 10): the part
+/// holding an execution's last archived record almost always holds later records of other
+/// executions. The 32 bounded reads then went to the same ids every pass, which on prod's
+/// thousands of archived executions would never reach the rest. A suspect an exact read has
+/// cleared is not read again until a newer part may hold it.
+///
+/// `parts_above` maps `(execution, archived_max)` to the newest `min_sequence` of a part that
+/// starts above `archived_max` and may hold the execution (see
+/// `ehdb_embedded::retouch_suspects`); `None` means the engine is not open, so nothing is
+/// concluded. `exact` has the same contract as in [`prune_pass_refined`].
+pub fn detect_retouched<FS, FE>(
     state: &RetouchState,
     known_archived: &std::collections::HashSet<i64>,
-    mut footprint: FP,
+    mut parts_above: FS,
     mut exact: FE,
     max_reads: usize,
 ) -> RetouchScan
 where
-    FP: FnMut(&[i64]) -> Option<Vec<HotExecution>>,
+    FS: FnMut(&[(i64, u64)]) -> Option<Vec<(i64, u64)>>,
     FE: FnMut(i64) -> Option<Option<(u64, u64)>>,
 {
     let mut out = RetouchScan::default();
-    let ids: Vec<i64> = known_archived
+    let extents: Vec<(i64, u64)> = known_archived
         .iter()
-        .copied()
-        .filter(|id| state.extents.contains_key(id))
+        .filter_map(|id| state.extents.get(id).map(|&(_, max)| (*id, max)))
         .collect();
-    out.examined = ids.len();
-    if ids.is_empty() {
+    out.examined = extents.len();
+    if extents.is_empty() {
         return out;
     }
-    let Some(fp) = footprint(&ids) else {
+    let Some(above) = parts_above(&extents) else {
         out.unreadable = true;
         return out;
     };
-    let mut suspects: Vec<i64> = fp
-        .iter()
-        .filter(|h| {
-            state
-                .extents
-                .get(&h.execution_id)
-                .is_some_and(|&(_, archived_max)| h.max_sequence > archived_max)
-        })
-        .map(|h| h.execution_id)
+    // A suspect: a part that starts ABOVE the archived max may hold it, and no earlier exact
+    // read already cleared that part.
+    let mut suspects: Vec<(i64, u64)> = above
+        .into_iter()
+        .filter(|&(id, part_min)| state.cleared.get(&id).is_none_or(|&c| part_min > c))
         .collect();
     // Deterministic order, so a bounded pass works through the same list.
     suspects.sort_unstable();
     out.suspects = suspects.len();
-    out.suspect_ids = suspects.clone();
-    for (n, id) in suspects.into_iter().enumerate() {
+    out.suspect_ids = suspects.iter().map(|&(id, _)| id).collect();
+    for (n, (id, part_min)) in suspects.into_iter().enumerate() {
         if n >= max_reads {
             out.bounded = true;
             break;
@@ -1312,7 +1326,7 @@ where
                 break;
             }
             // Nothing left in the hot store: pruned whole, nothing late to protect.
-            Some(None) => {}
+            Some(None) => out.cleared.push((id, part_min)),
             Some(Some((_, hot_max))) => {
                 if state
                     .extents
@@ -1320,6 +1334,9 @@ where
                     .is_some_and(|&(_, archived_max)| hot_max > archived_max)
                 {
                     out.confirmed.push(id);
+                } else {
+                    // A bloom false positive on a newer part.
+                    out.cleared.push((id, part_min));
                 }
             }
         }
@@ -1478,6 +1495,7 @@ where
                     let max = records.iter().map(|r| r.global_sequence).max().unwrap_or(0);
                     retouch.extents.insert(*id, (hot_min.unwrap_or(0), max));
                     retouch.pending.remove(id);
+                    retouch.cleared.remove(id);
                     known_archived.insert(*id);
                     rep.re_archived += 1;
                     crate::metrics::record_ehdb_archive("re_archived");
@@ -1740,7 +1758,7 @@ pub fn spawn_archive_pass(service: crate::services::execution::ExecutionService)
                 let scan = detect_retouched(
                     &retouch,
                     &known_archived,
-                    crate::handlers::ehdb_embedded::hot_footprint,
+                    crate::handlers::ehdb_embedded::retouch_suspects,
                     crate::handlers::ehdb_embedded::exact_extent,
                     MAX_RETOUCH_READS,
                 );
