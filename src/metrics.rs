@@ -4384,6 +4384,48 @@ pub const EHDB_ARCHIVE_OUTCOMES: [&str; 15] = [
 /// whose value someone would be reading — the server#315 mistake, where publish-skip
 /// reasons were pinned inside `if event_bus_mode.publishes_ehdb()`. With archiving off,
 /// every one of these must read 0, which is a fact; absent is not.
+/// The persisted archived set (noetl/ai-meta#506 RFC question 5): what happened to the
+/// snapshot that lets a restart skip re-verifying the whole archived backlog.
+pub const EHDB_ARCHIVE_KNOWN_PERSIST_OUTCOMES: [&str; 5] =
+    ["loaded", "load_failed", "bucket_mismatch", "written", "write_failed"];
+
+pub fn ehdb_archive_known_persist_total() -> &'static prometheus::IntCounterVec {
+    static M: std::sync::OnceLock<prometheus::IntCounterVec> = std::sync::OnceLock::new();
+    M.get_or_init(|| {
+        let m = prometheus::IntCounterVec::new(
+            prometheus::Opts::new(
+                "noetl_ehdb_archive_known_persist_total",
+                "Persisted archived-set snapshot outcomes (noetl/ai-meta#506 Q5)",
+            ),
+            &["outcome"],
+        )
+        .expect("valid metric");
+        registry().register(Box::new(m.clone())).ok();
+        m
+    })
+}
+
+/// In `shadow`, how many executions the snapshot loaded at start claims are archived, split
+/// by whether this process has since re-verified them (`confirmed`) or not yet
+/// (`unconfirmed`). Once the post-restart re-verification has finished, a `unconfirmed`
+/// that stays above 0 is a snapshot entry the archive no longer backs — the case that must
+/// read 0 before `on` is safe.
+pub fn ehdb_archive_persisted_known() -> &'static prometheus::IntGaugeVec {
+    static M: std::sync::OnceLock<prometheus::IntGaugeVec> = std::sync::OnceLock::new();
+    M.get_or_init(|| {
+        let m = prometheus::IntGaugeVec::new(
+            prometheus::Opts::new(
+                "noetl_ehdb_archive_persisted_known",
+                "Executions the loaded snapshot claims archived, by re-verification state (noetl/ai-meta#506 Q5)",
+            ),
+            &["state"],
+        )
+        .expect("valid metric");
+        registry().register(Box::new(m.clone())).ok();
+        m
+    })
+}
+
 pub fn init_ehdb_retention_series() {
     for o in EHDB_ARCHIVE_OUTCOMES {
         ehdb_archive_total().with_label_values(&[o]).inc_by(0);
@@ -4394,6 +4436,12 @@ pub fn init_ehdb_retention_series() {
     ehdb_archive_scan_examined().set(0);
     ehdb_archive_scan_archivable().set(0);
     ehdb_prune_bytes_reclaimed_total().inc_by(0);
+    for o in EHDB_ARCHIVE_KNOWN_PERSIST_OUTCOMES {
+        ehdb_archive_known_persist_total().with_label_values(&[o]).inc_by(0);
+    }
+    for st in ["confirmed", "unconfirmed"] {
+        ehdb_archive_persisted_known().with_label_values(&[st]).set(0);
+    }
 }
 
 pub fn record_ehdb_archive(outcome: &str) {
