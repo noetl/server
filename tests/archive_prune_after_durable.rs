@@ -142,7 +142,7 @@ async fn an_indexed_durable_archive_is_safe_to_prune() {
     let recs: Vec<_> = (0..10).map(|i| arec(100 + i, 1 + i as i64)).collect();
     ea::archive_execution_indexed(&store, &meta(5), &recs, Utc::now()).await.unwrap();
     match ea::archive_state(&store, 5).await.unwrap() {
-        ea::ArchiveState::SafeToPrune { record_count } => assert_eq!(record_count, 10),
+        ea::ArchiveState::SafeToPrune { record_count, .. } => assert_eq!(record_count, 10),
         other => panic!("expected SafeToPrune, got {other:?}"),
     }
 }

@@ -783,7 +783,15 @@ pub async fn archive_execution_indexed(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ArchiveState {
     /// Verified durable AND indexed. The only state a prune may advance past.
-    SafeToPrune { record_count: u64 },
+    ///
+    /// Carries the archived sequence extent from the manifest, so a later pass can tell
+    /// whether the hot store has since received records the archive does not hold
+    /// (noetl/ai-meta#506 P3).
+    SafeToPrune {
+        record_count: u64,
+        min_sequence: u64,
+        max_sequence: u64,
+    },
     /// Not archived at all.
     NotArchived,
     /// Archived but the data failed verification.
@@ -798,7 +806,7 @@ impl ArchiveState {
     }
     pub fn reason(&self) -> String {
         match self {
-            ArchiveState::SafeToPrune { record_count } => {
+            ArchiveState::SafeToPrune { record_count, .. } => {
                 format!("safe to prune ({record_count} records verified and indexed)")
             }
             ArchiveState::NotArchived => "not archived".into(),
@@ -829,7 +837,11 @@ pub async fn archive_state(
     if read_date_reference(store, &date, execution_id).await?.is_none() {
         return Ok(ArchiveState::DurableButUnindexed { date });
     }
-    Ok(ArchiveState::SafeToPrune { record_count })
+    Ok(ArchiveState::SafeToPrune {
+        record_count,
+        min_sequence: manifest.min_sequence,
+        max_sequence: manifest.max_sequence,
+    })
 }
 
 /// One execution's footprint in the hot log, for the floor computation.
@@ -1130,6 +1142,228 @@ pub struct ArchiveCandidate {
     pub started_at: DateTime<Utc>,
 }
 
+// ===========================================================================
+// noetl/ai-meta#506 P3 — an archived execution that is touched again.
+// ===========================================================================
+
+/// Whether the pass looks for, and repairs, archived executions that received a late event.
+pub const RETOUCH_ENV: &str = "NOETL_EHDB_ARCHIVE_RETOUCH";
+
+/// [`RETOUCH_ENV`]: `off` (default), `shadow` (detect and count only), `on` (also stop
+/// treating the execution as archived, and re-archive it).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RetouchMode {
+    #[default]
+    Off,
+    Shadow,
+    On,
+}
+
+impl RetouchMode {
+    /// Unrecognised values read as `Off`: a typo must never change what the floor allows.
+    pub fn from_env() -> Self {
+        Self::parse(&std::env::var(RETOUCH_ENV).unwrap_or_default())
+    }
+    pub fn parse(v: &str) -> Self {
+        match v.trim().to_ascii_lowercase().as_str() {
+            "shadow" => Self::Shadow,
+            "on" | "true" | "1" | "yes" => Self::On,
+            _ => Self::Off,
+        }
+    }
+}
+
+/// Most exact reads one pass spends confirming re-touch suspects. Each takes the engine
+/// lock, so the cost is bounded the same way [`MAX_FLOOR_REFINEMENTS`] bounds floor reads.
+pub const MAX_RETOUCH_READS: usize = 32;
+
+/// What the archive pass remembers about archived executions across passes.
+///
+/// # The defect this exists for
+///
+/// Before P3 an execution in `known_archived` was never looked at again. A late event — a
+/// #504 straggler, a callback after terminal — lands in `noetl.event` (nothing is lost at the
+/// source of truth) and in a NEW engine part, while the execution still counts as satisfied
+/// for the prune floor. Once the floor passes that part, the late record is dropped from the
+/// hot store with no copy in the archive, and nothing reports it.
+#[derive(Debug, Default)]
+pub struct RetouchState {
+    /// What [`RETOUCH_ENV`] asked for. `Off` leaves the pass exactly as it was before P3.
+    pub mode: RetouchMode,
+    /// The archived `(min_sequence, max_sequence)` per execution, from its manifest.
+    pub extents: std::collections::HashMap<i64, (u64, u64)>,
+    /// Confirmed re-touched executions awaiting a complete re-archive. Never in
+    /// `known_archived`, so they constrain the floor until the archive covers them again.
+    pub pending: std::collections::HashSet<i64>,
+    /// Executions already counted as suspect / re-touched, so the counters count
+    /// executions rather than passes: in `shadow` a confirmed execution stays archived and
+    /// is re-confirmed every pass.
+    pub counted_suspects: std::collections::HashSet<i64>,
+    pub counted_touched: std::collections::HashSet<i64>,
+    /// Suspects an exact read already cleared, with the newest part (by `max_sequence`) that
+    /// read covered. Re-read only when a NEWER part may hold the execution — otherwise a
+    /// persistent bloom false positive would be re-read every pass, and with the reads
+    /// bounded, the same few would crowd out everything behind them.
+    pub cleared: std::collections::HashMap<i64, u64>,
+}
+
+/// Apply one [`RetouchScan`] to the pass state (noetl/ai-meta#506 P3).
+///
+/// `shadow` counts and logs; `on` also takes each confirmed execution out of
+/// `known_archived` — so it constrains the prune floor again — and queues it for the
+/// re-archive that [`archive_pass`] performs.
+pub fn apply_retouch_scan(
+    scan: &RetouchScan,
+    state: &mut RetouchState,
+    known_archived: &mut std::collections::HashSet<i64>,
+) {
+    for id in &scan.suspect_ids {
+        if state.counted_suspects.insert(*id) {
+            crate::metrics::record_ehdb_archive("re_touch_suspect");
+        }
+    }
+    for &(id, part_min) in &scan.cleared {
+        state.cleared.insert(id, part_min);
+    }
+    for id in &scan.confirmed {
+        if state.counted_touched.insert(*id) {
+            crate::metrics::record_ehdb_archive("re_touched");
+            tracing::warn!(
+                execution_id = id,
+                mode = ?state.mode,
+                "archived execution received records after it was archived \
+                 (noetl/ai-meta#506 P3): the settle window or a hold class is wrong"
+            );
+        }
+        if state.mode == RetouchMode::On {
+            known_archived.remove(id);
+            state.pending.insert(*id);
+        }
+    }
+}
+
+/// Whether a sealed part can hold a record of an execution that its archive does not cover,
+/// and if so the value that orders and remembers it (the part's `max_sequence`).
+///
+/// ⚠⚠ The test is the part ENDING above the archived max. A part that starts below it and
+/// ends above it is the normal place for a late record: on kind the engine sealed an
+/// execution's original records and its late one into a single part. Requiring the part to
+/// start above the archived max missed exactly that record.
+pub fn retouch_part_value(part_min: u64, part_max: u64, archived_max: u64) -> Option<u64> {
+    debug_assert!(part_min <= part_max);
+    (part_max > archived_max).then_some(part_max)
+}
+
+/// What [`detect_retouched`] found, with the population it looked at.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct RetouchScan {
+    /// Archived executions with a known extent that the scan considered.
+    pub examined: usize,
+    /// The bloom puts the execution in a part above its archived extent: maybe re-touched.
+    pub suspects: usize,
+    /// Their ids, sorted.
+    pub suspect_ids: Vec<i64>,
+    /// Suspects the exact read cleared, with the newest part it covered.
+    pub cleared: Vec<(i64, u64)>,
+    /// Confirmed by an exact read: the hot store holds a record past the archived extent.
+    pub confirmed: Vec<i64>,
+    /// [`MAX_RETOUCH_READS`] was reached; the rest wait for the next pass.
+    pub bounded: bool,
+    /// The engine could not be read; the scan stopped without a verdict.
+    pub unreadable: bool,
+}
+
+/// ⭐ Find archived executions the hot store now holds records for past their archive.
+///
+/// # Why two stages
+///
+/// Blooms give false positives — the same ones that pin the floor (P0b) would flag healthy
+/// executions here. But a bloom has **no false negatives**: if no part ending above the
+/// archived `max_sequence` might contain the execution, it is certainly not re-touched. So
+/// the bloom only selects suspects, and an exact read decides.
+///
+/// ⚠⚠ Two wrong turns, both found on kind, and the reason the shape is what it is:
+/// 1. Without memory, nearly every archived execution is a suspect on every pass (10 of 10):
+///    the part holding its last archived record usually holds later records of others. The
+///    bounded reads went to the same ids every pass and would never reach the rest on prod.
+/// 2. "Fixing" that by requiring the part to START above the archived max missed a real late
+///    record: the engine sealed the execution's original records and the late one into ONE
+///    part starting below the archived max — the normal outcome when an execution is
+///    archived while its records are still in the unsealed tail.
+///
+/// So the test is "ends above" (sound), and the cost is bounded by memory instead: a suspect
+/// an exact read cleared is not read again until a NEWER sealed part (parts are immutable)
+/// may hold it. Suspects are read newest part first, because a late event lands in the
+/// newest parts.
+///
+/// `parts_above` maps `(execution, archived_max)` to the newest `max_sequence` of a part that
+/// ends above `archived_max` and may hold the execution (see
+/// `ehdb_embedded::retouch_suspects`); `None` means the engine is not open, so nothing is
+/// concluded. `exact` has the same contract as in [`prune_pass_refined`].
+pub fn detect_retouched<FS, FE>(
+    state: &RetouchState,
+    known_archived: &std::collections::HashSet<i64>,
+    mut parts_above: FS,
+    mut exact: FE,
+    max_reads: usize,
+) -> RetouchScan
+where
+    FS: FnMut(&[(i64, u64)]) -> Option<Vec<(i64, u64)>>,
+    FE: FnMut(i64) -> Option<Option<(u64, u64)>>,
+{
+    let mut out = RetouchScan::default();
+    let extents: Vec<(i64, u64)> = known_archived
+        .iter()
+        .filter_map(|id| state.extents.get(id).map(|&(_, max)| (*id, max)))
+        .collect();
+    out.examined = extents.len();
+    if extents.is_empty() {
+        return out;
+    }
+    let Some(above) = parts_above(&extents) else {
+        out.unreadable = true;
+        return out;
+    };
+    // A suspect: a part ending above the archived max may hold it, and no earlier exact read
+    // already cleared a part that new.
+    let mut suspects: Vec<(i64, u64)> = above
+        .into_iter()
+        .filter(|&(id, part_min)| state.cleared.get(&id).is_none_or(|&c| part_min > c))
+        .collect();
+    // Newest part first: a late event lands in the newest parts, so with the reads bounded
+    // those are the ones to spend them on. Ties broken by id, so the order is deterministic.
+    suspects.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    out.suspects = suspects.len();
+    out.suspect_ids = suspects.iter().map(|&(id, _)| id).collect();
+    for (n, (id, part_min)) in suspects.into_iter().enumerate() {
+        if n >= max_reads {
+            out.bounded = true;
+            break;
+        }
+        match exact(id) {
+            None => {
+                out.unreadable = true;
+                break;
+            }
+            // Nothing left in the hot store: pruned whole, nothing late to protect.
+            Some(None) => out.cleared.push((id, part_min)),
+            Some(Some((_, hot_max))) => {
+                if state
+                    .extents
+                    .get(&id)
+                    .is_some_and(|&(_, archived_max)| hot_max > archived_max)
+                {
+                    out.confirmed.push(id);
+                } else {
+                    // A bloom false positive on a newer part.
+                    out.cleared.push((id, part_min));
+                }
+            }
+        }
+    }
+    out
+}
+
 /// What one pass did, with the population it looked at.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct PassReport {
@@ -1141,6 +1375,11 @@ pub struct PassReport {
     pub failed: usize,
     pub verified: usize,
     pub verify_failed: usize,
+    /// Re-touched executions archived again, complete (noetl/ai-meta#506 P3).
+    pub re_archived: usize,
+    /// Re-touched executions whose first records are no longer hot, so a rewrite would
+    /// drop them from the archive. Kept pending, and so kept under the floor.
+    pub re_touch_incomplete: usize,
     /// Set when the pass did not run, with the reason.
     pub skipped: Option<String>,
 }
@@ -1152,7 +1391,7 @@ impl PassReport {
         }
         format!(
             "examined={} archivable={} archived={} already={} out_of_coverage={} \
-             verified={} verify_failed={} failed={}",
+             verified={} verify_failed={} failed={} re_archived={} re_touch_incomplete={}",
             self.examined,
             self.archivable,
             self.archived,
@@ -1160,7 +1399,9 @@ impl PassReport {
             self.out_of_coverage,
             self.verified,
             self.verify_failed,
-            self.failed
+            self.failed,
+            self.re_archived,
+            self.re_touch_incomplete
         )
     }
 }
@@ -1177,6 +1418,8 @@ impl PassReport {
 /// for that yet — see [`prune_readiness_note`]. Archive-only is the correct first
 /// increment: it is additive, and the prune cannot be safe before the archive is verified
 /// anyway.
+// Eight inputs since P3 added `retouch`; each is a distinct piece of cross-pass state.
+#[allow(clippy::too_many_arguments)]
 pub async fn archive_pass<F>(
     store: &dyn ArchiveStore,
     cfg: &RetentionConfig,
@@ -1184,6 +1427,7 @@ pub async fn archive_pass<F>(
     now: DateTime<Utc>,
     known_archived: &mut std::collections::HashSet<i64>,
     known_out_of_coverage: &mut std::collections::HashSet<i64>,
+    retouch: &mut RetouchState,
     mut read_records: F,
 ) -> PassReport
 where
@@ -1221,6 +1465,74 @@ where
         if budget == 0 {
             break;
         }
+        // noetl/ai-meta#506 P3: a confirmed re-touch. Checked BEFORE the archive read-back
+        // below, which would find the old manifest still verifying and put the execution
+        // straight back into `known_archived` — satisfied for the floor again while the
+        // hot store holds a record the archive does not.
+        if retouch.pending.contains(id) {
+            budget -= 1;
+            let Some(records) = read_records(*id) else {
+                rep.skipped = Some("the embedded engine is not open".into());
+                return rep;
+            };
+            let archived_min = retouch.extents.get(id).map(|&(min, _)| min);
+            let hot_min = records.iter().map(|r| r.global_sequence).min();
+            // ⚠⚠ Complete only if the hot store still starts where the archive starts. A
+            // rewrite from a hot store whose oldest parts are already pruned would replace
+            // the archive with the late records alone — the cold copy would LOSE the
+            // execution's history, and it is the only copy besides Postgres.
+            let complete = matches!((hot_min, archived_min), (Some(h), Some(a)) if h <= a);
+            if !complete {
+                rep.re_touch_incomplete += 1;
+                crate::metrics::record_ehdb_archive("re_touch_incomplete");
+                tracing::warn!(
+                    execution_id = id,
+                    hot_min = ?hot_min,
+                    archived_min = ?archived_min,
+                    "re-touched execution cannot be re-archived complete: its first records \
+                     are no longer hot. It stays under the floor (noetl/ai-meta#506 P3)"
+                );
+                continue;
+            }
+            let c = candidates
+                .iter()
+                .find(|c| c.execution_id == *id)
+                .expect("the candidate the scan selected is in the input");
+            let meta = ExecutionMeta {
+                execution_id: c.execution_id,
+                status: c.status.clone(),
+                started_at: c.started_at,
+                completed_at: c.completed_at,
+            };
+            if let Err(e) = archive_execution_indexed(store, &meta, &records, now).await {
+                tracing::warn!(execution_id = id, error = %e, "re-archive failed");
+                rep.failed += 1;
+                crate::metrics::record_ehdb_archive("archive_failed");
+                continue;
+            }
+            match verify_archived(store, *id).await {
+                Ok(d) if d.is_durable() => {
+                    let max = records.iter().map(|r| r.global_sequence).max().unwrap_or(0);
+                    retouch.extents.insert(*id, (hot_min.unwrap_or(0), max));
+                    retouch.pending.remove(id);
+                    retouch.cleared.remove(id);
+                    known_archived.insert(*id);
+                    rep.re_archived += 1;
+                    crate::metrics::record_ehdb_archive("re_archived");
+                    tracing::info!(
+                        execution_id = id,
+                        records = records.len(),
+                        max_sequence = max,
+                        "re-touched execution archived again, complete"
+                    );
+                }
+                _ => {
+                    rep.verify_failed += 1;
+                    crate::metrics::record_ehdb_archive("verify_failed");
+                }
+            }
+            continue;
+        }
         // Skipped for free: no GET, no budget. This is what lets a pass reach past the
         // first max_per_pass of a 6,230-long list.
         if known_archived.contains(id) {
@@ -1245,7 +1557,14 @@ where
         // Not known: read the archive BACK to find out, which is also the idempotency
         // check — no separate bookkeeping store that could drift from the truth.
         match archive_state(store, *id).await {
-            Ok(ArchiveState::SafeToPrune { .. }) => {
+            Ok(ArchiveState::SafeToPrune {
+                min_sequence,
+                max_sequence,
+                ..
+            }) => {
+                if retouch.mode != RetouchMode::Off {
+                    retouch.extents.insert(*id, (min_sequence, max_sequence));
+                }
                 known_archived.insert(*id);
                 rep.already_archived += 1;
                 crate::metrics::record_ehdb_archive("already_archived");
@@ -1316,6 +1635,11 @@ where
                 // write. A set populated on write would let a later pass skip an execution
                 // whose archive never landed.
                 known_archived.insert(*id);
+                if retouch.mode != RetouchMode::Off {
+                    let min = records.iter().map(|r| r.global_sequence).min().unwrap_or(0);
+                    let max = records.iter().map(|r| r.global_sequence).max().unwrap_or(0);
+                    retouch.extents.insert(*id, (min, max));
+                }
                 rep.verified += 1;
                 crate::metrics::record_ehdb_archive("verified_durable");
             }
@@ -1421,6 +1745,12 @@ pub fn spawn_archive_pass(service: crate::services::execution::ExecutionService)
         // The last prune verdict, so a change is logged once at INFO rather than the same
         // line every interval forever.
         let mut last_prune_verdict: Option<String> = None;
+        // noetl/ai-meta#506 P3. Off by default: the pass then behaves exactly as before.
+        let mut retouch = RetouchState {
+            mode: RetouchMode::from_env(),
+            ..Default::default()
+        };
+        tracing::info!(mode = ?retouch.mode, "archive re-touch detection ({RETOUCH_ENV})");
         loop {
             tick.tick().await;
             let candidates = match collect_candidates(&service).await {
@@ -1437,9 +1767,34 @@ pub fn spawn_archive_pass(service: crate::services::execution::ExecutionService)
                 Utc::now(),
                 &mut known_archived,
                 &mut known_out_of_coverage,
+                &mut retouch,
                 |id: i64| crate::handlers::ehdb_embedded::read_archive_records(&id.to_string()),
             )
             .await;
+
+            // noetl/ai-meta#506 P3: before the floor is computed, so a confirmed re-touch
+            // (in `on`) is already out of the satisfied set this very pass.
+            if retouch.mode != RetouchMode::Off {
+                let scan = detect_retouched(
+                    &retouch,
+                    &known_archived,
+                    crate::handlers::ehdb_embedded::retouch_suspects,
+                    crate::handlers::ehdb_embedded::exact_extent,
+                    MAX_RETOUCH_READS,
+                );
+                apply_retouch_scan(&scan, &mut retouch, &mut known_archived);
+                if scan.suspects > 0 || scan.unreadable || !retouch.pending.is_empty() {
+                    tracing::info!(
+                        examined = scan.examined,
+                        suspects = scan.suspects,
+                        confirmed = scan.confirmed.len(),
+                        pending = retouch.pending.len(),
+                        bounded = scan.bounded,
+                        unreadable = scan.unreadable,
+                        "archive re-touch scan"
+                    );
+                }
+            }
 
             // ⚠ The prune step runs on the SAME known_archived set the archive pass just
             // updated — the executions this process has verified durable AND indexed. It is
