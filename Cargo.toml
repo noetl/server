@@ -173,6 +173,11 @@ gcp_auth = "0.12"
 # types but not those. Same git source + same tag means cargo unifies it with the copy
 # `ehdb-l0` already depends on; a DIFFERENT tag here would put two `EhdbError` types in the
 # graph and the trait impl would stop satisfying the trait.
+# v0.14.12 (2026-11-04) = v0.14.10 + ehdb#436 (journal repair lazy; not linked here) +
+# ehdb#437: an active part that starts at or below the highest sealed key is never
+# resumed as the live part. Prod's embedded d1_event_log has an EMPTY live part beside a
+# non-empty part from 2026-11-03 below the sealed range; v0.14.10 would have resumed the
+# stale one and sealed a part overlapping a day of parts (noetl/ai-meta#516 pre-flight).
 # v0.14.10 = the noetl/ehdb#426 design-review hardening (ehdb #427-#435), on top of
 # v0.14.2's feed/engine-lock fixes. What changes for this server's embedded store:
 #   - restart no longer loses acked records: the active part is the one with the newest
@@ -200,9 +205,9 @@ gcp_auth = "0.12"
 # A dependency pin that exists to change the running binary is a `fix:`. Check the tag after
 # the merge rather than assuming it moved:
 #     gh run watch --repo noetl/server && git fetch origin --tags && git tag --sort=-v:refname | head -1
-ehdb-core = { git = "https://github.com/noetl/ehdb", tag = "v0.14.10" }
-ehdb-feed = { git = "https://github.com/noetl/ehdb", tag = "v0.14.10" }
-ehdb-l0 = { git = "https://github.com/noetl/ehdb", tag = "v0.14.10" }
+ehdb-core = { git = "https://github.com/noetl/ehdb", tag = "v0.14.12" }
+ehdb-feed = { git = "https://github.com/noetl/ehdb", tag = "v0.14.12" }
+ehdb-l0 = { git = "https://github.com/noetl/ehdb", tag = "v0.14.12" }
 # Value type for the JetStream KV puts in `src/coherence.rs` (multi-replica
 # watermark/descriptor coherence, RFC #115 program-scale).  Matches the version
 # async-nats already pulls in transitively.
