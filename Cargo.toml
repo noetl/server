@@ -179,8 +179,12 @@ gcp_auth = "0.12"
 # the reader the new `scheme`/`b64` filter fields; with `EHDB_BLOOM_SCHEME` unset the
 # writer produces legacy filters byte-for-byte (golden-tested), so nothing this server
 # writes changes. ⚠⚠ Do NOT set `EHDB_BLOOM_SCHEME=2` on any writer until EVERY reader of
-# that store (server, worker pools, the cmdbus writer) runs v0.15.0+: an older `Bloom` has
-# `deny_unknown_fields` and would refuse the manifest.
+# that store (server, worker pools, the cmdbus writer) runs v0.15.0+, and do not take any
+# reader below v0.15.0 while a scheme-2 part exists in a store it opens. An older reader
+# does NOT refuse such a manifest: it fails to decode LATEST, falls back to the newest
+# versioned manifest it can decode, logs nothing, and re-adopts only the sealed parts on
+# LOCAL disk (kind, 2026-11-04: LATEST v105 was republished as a different v105). A part
+# held only in the substrate would silently leave the manifest.
 # v0.14.12 (2026-11-04) = v0.14.10 + ehdb#436 (journal repair lazy; not linked here) +
 # ehdb#437: an active part that starts at or below the highest sealed key is never
 # resumed as the live part. Prod's embedded d1_event_log has an EMPTY live part beside a
