@@ -173,6 +173,22 @@ gcp_auth = "0.12"
 # types but not those. Same git source + same tag means cargo unifies it with the copy
 # `ehdb-l0` already depends on; a DIFFERENT tag here would put two `EhdbError` types in the
 # graph and the trait impl would stop satisfying the trait.
+# v0.14.10 = the noetl/ehdb#426 design-review hardening (ehdb #427-#435), on top of
+# v0.14.2's feed/engine-lock fixes. What changes for this server's embedded store:
+#   - restart no longer loses acked records: the active part is the one with the newest
+#     record (not `part-000000`), sealed-but-unuploaded parts are re-registered and
+#     re-uploaded on open, and `reclaim_orphans` — which `apply_retention` calls — only
+#     deletes parts the manifest provably covers. Before, every retention pass after a
+#     restart could delete a sealed part whose upload had not landed.
+#   - ⚠ bit-rot in ANY `*.active` file now fails the open (it used to be read only for
+#     `part-000000`). A torn tail is not bit-rot and is handled as before.
+#   - `LATEST` only moves forward; the open loads the newest readable manifest across
+#     replicas; a failed append is rolled back; a seal failure after a durable append is
+#     counted in the new `ehdb_l0_seal_failed` series instead of failing the append.
+#   - the epoch fence ledger is atomic and fsynced, and re-checked under the engine lock.
+# FORMAT_VERSION is still 1 (unchanged since v0.3.0). Kind-validated 2026-11-04 in
+# embedded mode: same green set as v3.147.0, 202 active-part records recovered across a
+# server restart, `seal_failed` 0.
 # ⚠⚠⚠ A BUMP HERE NEEDS A `fix:` (or `feat:`) COMMIT SUBJECT TO REACH A CLUSTER.
 #
 # semantic-release computes the version from the commit type, and `chore:` releases
@@ -184,9 +200,9 @@ gcp_auth = "0.12"
 # A dependency pin that exists to change the running binary is a `fix:`. Check the tag after
 # the merge rather than assuming it moved:
 #     gh run watch --repo noetl/server && git fetch origin --tags && git tag --sort=-v:refname | head -1
-ehdb-core = { git = "https://github.com/noetl/ehdb", tag = "v0.13.4" }
-ehdb-feed = { git = "https://github.com/noetl/ehdb", tag = "v0.13.4" }
-ehdb-l0 = { git = "https://github.com/noetl/ehdb", tag = "v0.13.4" }
+ehdb-core = { git = "https://github.com/noetl/ehdb", tag = "v0.14.10" }
+ehdb-feed = { git = "https://github.com/noetl/ehdb", tag = "v0.14.10" }
+ehdb-l0 = { git = "https://github.com/noetl/ehdb", tag = "v0.14.10" }
 # Value type for the JetStream KV puts in `src/coherence.rs` (multi-replica
 # watermark/descriptor coherence, RFC #115 program-scale).  Matches the version
 # async-nats already pulls in transitively.
