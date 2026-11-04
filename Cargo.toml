@@ -173,6 +173,14 @@ gcp_auth = "0.12"
 # types but not those. Same git source + same tag means cargo unifies it with the copy
 # `ehdb-l0` already depends on; a DIFFERENT tag here would put two `EhdbError` types in the
 # graph and the trait impl would stop satisfying the trait.
+# v0.15.0 (2026-11-04) = v0.14.12 + ehdb#438, RELEASE A of the bloom fix (noetl/ai-meta#517).
+# Legacy bloom probes `(h1 + i*h2) mod m` collapse for about 1 key in 2^j (the prod key
+# that pinned the retention floor had all 9 probes on ONE bit). This release only teaches
+# the reader the new `scheme`/`b64` filter fields; with `EHDB_BLOOM_SCHEME` unset the
+# writer produces legacy filters byte-for-byte (golden-tested), so nothing this server
+# writes changes. ⚠⚠ Do NOT set `EHDB_BLOOM_SCHEME=2` on any writer until EVERY reader of
+# that store (server, worker pools, the cmdbus writer) runs v0.15.0+: an older `Bloom` has
+# `deny_unknown_fields` and would refuse the manifest.
 # v0.14.12 (2026-11-04) = v0.14.10 + ehdb#436 (journal repair lazy; not linked here) +
 # ehdb#437: an active part that starts at or below the highest sealed key is never
 # resumed as the live part. Prod's embedded d1_event_log has an EMPTY live part beside a
@@ -205,9 +213,9 @@ gcp_auth = "0.12"
 # A dependency pin that exists to change the running binary is a `fix:`. Check the tag after
 # the merge rather than assuming it moved:
 #     gh run watch --repo noetl/server && git fetch origin --tags && git tag --sort=-v:refname | head -1
-ehdb-core = { git = "https://github.com/noetl/ehdb", tag = "v0.14.12" }
-ehdb-feed = { git = "https://github.com/noetl/ehdb", tag = "v0.14.12" }
-ehdb-l0 = { git = "https://github.com/noetl/ehdb", tag = "v0.14.12" }
+ehdb-core = { git = "https://github.com/noetl/ehdb", tag = "v0.15.0" }
+ehdb-feed = { git = "https://github.com/noetl/ehdb", tag = "v0.15.0" }
+ehdb-l0 = { git = "https://github.com/noetl/ehdb", tag = "v0.15.0" }
 # Value type for the JetStream KV puts in `src/coherence.rs` (multi-replica
 # watermark/descriptor coherence, RFC #115 program-scale).  Matches the version
 # async-nats already pulls in transitively.
