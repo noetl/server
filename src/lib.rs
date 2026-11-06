@@ -53,6 +53,7 @@ pub mod command_bus;
 pub mod config;
 pub mod crypto;
 pub mod db;
+pub mod ehgraph_embedded;
 pub mod engine;
 pub mod error;
 pub mod event_bus;

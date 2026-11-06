@@ -220,6 +220,23 @@ gcp_auth = "0.12"
 ehdb-core = { git = "https://github.com/noetl/ehdb", tag = "v0.15.0" }
 ehdb-feed = { git = "https://github.com/noetl/ehdb", tag = "v0.15.0" }
 ehdb-l0 = { git = "https://github.com/noetl/ehdb", tag = "v0.15.0" }
+# ehgraph, the topology graph engine, EMBEDDED for the `noetl-cluster` domain
+# (noetl/ehgraph E2/E4, `src/ehgraph_embedded.rs`). Default OFF: inert unless
+# NOETL_EHGRAPH_EMBEDDED=true.
+#
+# ⚠ A REV pin, not a tag, for now. ehgraph has no release tags yet, and cutting
+# one is a release decision for the owner. Move this to a tag (the same policy as
+# the EHDB pins above) when ehgraph cuts v0.1.0.
+#
+# ⚠⚠ ROLLBACK SAFETY. An embedded instance rolls back WITH this server. ehgraph at
+# this rev writes on-disk format 1 and refuses a newer format or an unknown field
+# (E9), so rolling this server back past an ehgraph format bump makes the graph
+# REFUSE to open (the /ehgraph/noetl-cluster routes answer 503). It does not
+# silently misread the data. Roll forward, or restore an older backup.
+#
+# ehgraph does not link EHDB (its E8), so this pin cannot put a second ehdb-l0 in
+# the graph. It does bring arrow 53 (arrow-array/-ipc/-schema) for snapshots.
+ehgraph = { git = "https://github.com/noetl/ehgraph", rev = "98a30792c38e9f5446a8307f95c0489212ffe305" }
 # Value type for the JetStream KV puts in `src/coherence.rs` (multi-replica
 # watermark/descriptor coherence, RFC #115 program-scale).  Matches the version
 # async-nats already pulls in transitively.
