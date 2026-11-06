@@ -54,6 +54,7 @@ fn build_router(
     replay_service: ReplayService,
     result_store_service: ResultStoreService,
     wallet_cipher: noetl_server::crypto::EnvelopeCipher,
+    ehgraph_routes: Option<Router>,
 ) -> Router {
     // CORS configuration - allow all origins for development
     let cors = CorsLayer::new()
@@ -1020,6 +1021,14 @@ fn build_router(
         )));
     }
 
+    // Embedded ehgraph `noetl-cluster` (noetl/ehgraph E2/E4). `None` unless
+    // NOETL_EHGRAPH_EMBEDDED=true. Its routes carry ehgraph's own per-namespace
+    // bearer grants, so they are not behind the internal-token gate. A refused
+    // open mounts a 503 router here that says why.
+    if let Some(ehgraph_routes) = ehgraph_routes {
+        app = app.nest(noetl_server::ehgraph_embedded::MOUNT, ehgraph_routes);
+    }
+
     app.layer(TraceLayer::new_for_http()).layer(cors)
 }
 
@@ -1517,6 +1526,14 @@ async fn main() -> anyhow::Result<()> {
     noetl_server::runtime_registry::self_register();
     noetl_server::runtime_registry::spawn_heartbeat();
 
+    // Embedded ehgraph `noetl-cluster` (noetl/ehgraph E2/E4). Inert unless
+    // NOETL_EHGRAPH_EMBEDDED=true. Opened before the listener binds so the graph is
+    // reachable from the first request. A refusal (no single-writer declaration, a
+    // multi-replica config, a newer on-disk format) is logged at ERROR and served as
+    // 503 under its mount. It never takes the control plane down.
+    let ehgraph = noetl_server::ehgraph_embedded::Embedded::start(&app_config).await;
+    let ehgraph_routes = ehgraph.router();
+
     let app = build_router(
         state,
         db_pool,
@@ -1528,6 +1545,7 @@ async fn main() -> anyhow::Result<()> {
         replay_service,
         result_store_service,
         wallet_cipher_for_router,
+        ehgraph_routes,
     );
 
     // Bind to address
@@ -1573,6 +1591,9 @@ async fn main() -> anyhow::Result<()> {
     // A snapshot still queued at exit never reaches the tier, and the
     // comparator reports it as a divergence for as long as the row lives.
     noetl_server::handlers::ehdb_projection_mirror_queue::flush().await;
+    // Drain in-flight graph calls and release the data-directory lock, so a
+    // restart or a restore never finds the directory still held.
+    ehgraph.shutdown().await;
 
     tracing::info!("Server shutdown complete");
 
