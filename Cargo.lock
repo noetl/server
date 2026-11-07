@@ -1706,6 +1706,9 @@ version = "3.112.3"
 dependencies = [
  "aes-gcm",
  "anyhow",
+ "arrow-array",
+ "arrow-ipc",
+ "arrow-schema",
  "async-trait",
  "axum",
  "axum-server",

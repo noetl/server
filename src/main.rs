@@ -315,9 +315,12 @@ fn build_router(
         .route("/api/execute", post(handlers::execute))
         .route("/api/execute/batch", post(handlers::execute_batch))
         .route("/api/events", post(handlers::handle_event))
+        // JSON (worker batch) → handlers::events::handle_batch_events, unchanged;
+        // application/vnd.apache.arrow.file (`noetl push`, § H.11.5) → the EHDB
+        // event-log import, off unless NOETL_EVENTS_ARROW_INGEST=enabled.
         .route(
             "/api/events/batch",
-            post(handlers::events::handle_batch_events),
+            post(handlers::events_arrow::batch_dispatch),
         )
         .route("/api/commands/{event_id}", get(handlers::get_command))
         .route(
