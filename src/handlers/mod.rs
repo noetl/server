@@ -40,6 +40,7 @@ pub mod ehdb_projection_read;
 pub mod ehdb_projection_serve;
 pub mod event_write;
 pub mod events;
+pub mod events_arrow;
 pub mod execute;
 pub mod executions;
 pub mod health;

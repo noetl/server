@@ -249,6 +249,12 @@ ehgraph = { git = "https://github.com/noetl/ehgraph", rev = "760f5724dd01786e173
 # watermark/descriptor coherence, RFC #115 program-scale).  Matches the version
 # async-nats already pulls in transitively.
 bytes = "1"
+# `noetl push` Feather ingest (`src/handlers/events_arrow.rs`, blueprint § H.11.5).
+# The arrow 53 line ehgraph already brings (arrow-array/-ipc/-schema 53.4), so
+# this adds no new arrow version to the graph.
+arrow-array = "53"
+arrow-ipc = "53"
+arrow-schema = "53"
 
 # Build-fix pin (NOT used directly).  time 0.3.48 (2026-06-12) collides with
 # async-nats 0.38.0's blanket `From<Kind> for Error<Kind>` under rustc 1.91+
