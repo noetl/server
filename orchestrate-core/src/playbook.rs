@@ -80,6 +80,124 @@ pub enum ToolKind {
     /// `wasm-plugin` dispatcher routes `tool_kind: "wasm"` to the host (load
     /// from the catalog → run → flush capability intents).
     Wasm,
+    /// MCP (Model Context Protocol) JSON-RPC call — `tools/call`, `tools/list` or a
+    /// passthrough method against an MCP server. The worker already executes it through
+    /// noetl-tools' `McpTool` (registered in `create_default_registry` since tools 2.16);
+    /// endpoint/method/tool/arguments ride the flattened `extra` map unchanged.
+    ///
+    /// ⚠ **Flag-gated, OFF by default** — see [`ToolKindGates`] and
+    /// [`ToolKind::gate_env`]. With `NOETL_TOOL_KIND_MCP` unset, `mcp` is rejected at
+    /// registration and at execute exactly as before (noetl/ai-meta#256).
+    Mcp,
+    /// AI agent loop (noetl-tools `kind: agent`, `framework: claude | claude-code`).
+    ///
+    /// ⚠ **Flag-gated, OFF by default** (`NOETL_TOOL_KIND_AGENT`). Do NOT enable it until
+    /// the worker registers noetl-tools' `AgentTool`: the worker is held at noetl-tools
+    /// `=4.0.1` (noetl/ai-meta#330), which has no agent tool, and `AgentTool` is not in
+    /// `create_default_registry` in any release. Enabling this first recreates the #256
+    /// defect — a kind that registers but can never execute. See
+    /// `ai-meta/docs/rfc/interop-topology-and-ai-mcp-playbooks.md` Phase 6.
+    Agent,
+}
+
+/// Environment flag that enables `tool.kind: mcp` on this server. Strict `== "true"`.
+pub const TOOL_KIND_MCP_ENV: &str = "NOETL_TOOL_KIND_MCP";
+/// Environment flag that enables `tool.kind: agent` on this server. Strict `== "true"`.
+pub const TOOL_KIND_AGENT_ENV: &str = "NOETL_TOOL_KIND_AGENT";
+
+/// Which flag-gated tool kinds this server accepts in an authored playbook.
+///
+/// Gated kinds are part of the full vocabulary (`ToolKind` derives `Deserialize` for
+/// every variant, so a command or event that names one still decodes), but the
+/// **authoring** surfaces — [`ToolKind::parse`] (the registration validator's oracle) and
+/// [`ToolSpec::kind`] (what `parse_playbook` deserialises at execute) — refuse a gated
+/// kind whose flag is off. Off is therefore byte-for-byte today's behaviour: registration
+/// names the kind as unknown, and execute fails the `ToolDefinition` parse.
+///
+/// Read once per process ([`ToolKindGates::current`]); flipping a flag needs a restart,
+/// which is how every other arming flag on this server behaves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ToolKindGates {
+    pub mcp: bool,
+    pub agent: bool,
+}
+
+impl ToolKindGates {
+    /// Every gate closed — the default.
+    pub const OFF: ToolKindGates = ToolKindGates {
+        mcp: false,
+        agent: false,
+    };
+    /// Every gate open — for tests and for enumerating the full vocabulary.
+    pub const ALL_ON: ToolKindGates = ToolKindGates {
+        mcp: true,
+        agent: true,
+    };
+
+    /// Build from a lookup function, so tests never touch the process environment.
+    pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Self {
+        let on = |key: &str| get(key).as_deref() == Some("true");
+        ToolKindGates {
+            mcp: on(TOOL_KIND_MCP_ENV),
+            agent: on(TOOL_KIND_AGENT_ENV),
+        }
+    }
+
+    /// Read the gates from the process environment.
+    pub fn from_env() -> Self {
+        Self::from_lookup(|k| std::env::var(k).ok())
+    }
+
+    /// The process-wide gates, read from the environment on first use.
+    pub fn current() -> ToolKindGates {
+        static GATES: std::sync::OnceLock<ToolKindGates> = std::sync::OnceLock::new();
+        *GATES.get_or_init(ToolKindGates::from_env)
+    }
+
+    /// Is `kind` accepted under these gates? Ungated kinds always are.
+    pub fn allows(&self, kind: &ToolKind) -> bool {
+        match kind {
+            ToolKind::Mcp => self.mcp,
+            ToolKind::Agent => self.agent,
+            _ => true,
+        }
+    }
+}
+
+/// `deserialize_with` for an authored `tool.kind`: the full vocabulary, minus gated kinds
+/// whose flag is off (see [`ToolKindGates`]).
+fn deserialize_gated_kind<'de, D>(deserializer: D) -> Result<ToolKind, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let kind = ToolKind::deserialize(deserializer)?;
+    check_gate(kind, effective_gates()).map_err(serde::de::Error::custom)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only per-thread override of the process gates, so the deserialisation path
+    /// can be exercised with a gate open without touching the process environment.
+    static TEST_GATES: std::cell::Cell<Option<ToolKindGates>> = const { std::cell::Cell::new(None) };
+}
+
+fn effective_gates() -> ToolKindGates {
+    #[cfg(test)]
+    if let Some(g) = TEST_GATES.with(|c| c.get()) {
+        return g;
+    }
+    ToolKindGates::current()
+}
+
+/// The gate decision, separated from the environment so it is testable.
+fn check_gate(kind: ToolKind, gates: ToolKindGates) -> Result<ToolKind, String> {
+    if gates.allows(&kind) {
+        return Ok(kind);
+    }
+    Err(format!(
+        "tool kind '{kind}' is disabled on this server (set {}=true to enable it)",
+        kind.gate_env().unwrap_or("?")
+    ))
 }
 
 impl ToolKind {
@@ -90,7 +208,7 @@ impl ToolKind {
     /// through serde and asserts the count — a variant added without extending
     /// this array fails that test rather than silently becoming a kind the
     /// registration validator rejects.
-    pub const ALL: [ToolKind; 25] = [
+    pub const ALL: [ToolKind; 27] = [
         ToolKind::Http,
         ToolKind::Postgres,
         ToolKind::Duckdb,
@@ -116,17 +234,51 @@ impl ToolKind {
         ToolKind::Rhai,
         ToolKind::Subscription,
         ToolKind::Wasm,
+        ToolKind::Mcp,
+        ToolKind::Agent,
     ];
 
     /// Parse a wire value, using serde as the oracle rather than a second copy
     /// of the name list — two lists are two chances to disagree.
+    ///
+    /// Respects the process-wide [`ToolKindGates`]: a gated kind whose flag is off does
+    /// not parse, exactly as before it existed.
     pub fn parse(value: &str) -> Option<Self> {
+        Self::parse_with(value, ToolKindGates::current())
+    }
+
+    /// [`ToolKind::parse`] under explicit gates.
+    pub fn parse_with(value: &str, gates: ToolKindGates) -> Option<Self> {
+        Self::parse_ungated(value).filter(|k| gates.allows(k))
+    }
+
+    /// The full vocabulary, ignoring gates — "is this a kind at all?", used to tell an
+    /// author that a kind exists but is switched off rather than that it is unknown.
+    pub fn parse_ungated(value: &str) -> Option<Self> {
         serde_json::from_value::<ToolKind>(serde_json::Value::String(value.to_string())).ok()
     }
 
-    /// The valid set, sorted, for an error message.
+    /// The env flag that gates this kind, if it is gated.
+    pub fn gate_env(&self) -> Option<&'static str> {
+        match self {
+            ToolKind::Mcp => Some(TOOL_KIND_MCP_ENV),
+            ToolKind::Agent => Some(TOOL_KIND_AGENT_ENV),
+            _ => None,
+        }
+    }
+
+    /// The valid set, sorted, for an error message. Gated-off kinds are not advertised.
     pub fn valid_set() -> String {
-        let mut v: Vec<String> = Self::ALL.iter().map(|k| k.to_string()).collect();
+        Self::valid_set_with(ToolKindGates::current())
+    }
+
+    /// [`ToolKind::valid_set`] under explicit gates.
+    pub fn valid_set_with(gates: ToolKindGates) -> String {
+        let mut v: Vec<String> = Self::ALL
+            .iter()
+            .filter(|k| gates.allows(k))
+            .map(|k| k.to_string())
+            .collect();
         v.sort();
         v.join(", ")
     }
@@ -160,6 +312,8 @@ impl std::fmt::Display for ToolKind {
             ToolKind::Rhai => "rhai",
             ToolKind::Subscription => "subscription",
             ToolKind::Wasm => "wasm",
+            ToolKind::Mcp => "mcp",
+            ToolKind::Agent => "agent",
         };
         write!(f, "{}", s)
     }
@@ -223,7 +377,9 @@ pub struct EvalElse {
 /// All execution-specific fields live under tool.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolSpec {
-    /// Tool type.
+    /// Tool type. Authored, so flag-gated kinds are refused while their flag is off
+    /// ([`ToolKindGates`]).
+    #[serde(deserialize_with = "deserialize_gated_kind")]
     pub kind: ToolKind,
 
     /// Tool-level flow control (canonical format).
@@ -1770,38 +1926,56 @@ mod tool_kind_tests {
     /// `ALL` must actually contain every variant. There is no reflection, so the
     /// guard is: each entry round-trips through serde, the count matches, and the
     /// names are distinct. A new variant that is not added here makes the count
-    /// assertion fail.
+    /// assertion fail. Round-trips under ALL_ON: `ALL` is the full vocabulary,
+    /// gated kinds included.
     #[test]
     fn every_variant_is_in_all() {
-        assert_eq!(ToolKind::ALL.len(), 25);
+        assert_eq!(ToolKind::ALL.len(), 27);
         let mut names: Vec<String> = ToolKind::ALL.iter().map(|k| k.to_string()).collect();
         names.sort();
         names.dedup();
-        assert_eq!(names.len(), 25, "ALL contains a duplicate");
+        assert_eq!(names.len(), 27, "ALL contains a duplicate");
         for k in ToolKind::ALL {
             let name = k.to_string();
             assert_eq!(
-                ToolKind::parse(&name),
-                Some(k),
+                ToolKind::parse_with(&name, ToolKindGates::ALL_ON),
+                Some(k.clone()),
                 "{name} does not round-trip through serde"
+            );
+            // Display and the derived Serialize must agree, or the worker would be
+            // sent a kind string the registration validator never saw.
+            assert_eq!(
+                serde_json::to_value(&k).unwrap(),
+                serde_json::Value::String(name.clone()),
+                "{name}: Display and Serialize disagree"
             );
         }
     }
 
-    /// The kinds noetl/ai-meta#256 found in the live catalog must be rejected.
-    /// These are not hypothetical: all four were registered and are permanently
-    /// unexecutable.
+    /// The kinds noetl/ai-meta#256 found in the live catalog must be rejected while
+    /// their gates are closed. `provider` and `result_fetch` are not kinds at all;
+    /// `agent` and `mcp` are gated kinds whose flags are off by default.
     #[test]
     fn the_kinds_found_in_the_live_catalog_are_rejected() {
         for bad in ["agent", "mcp", "provider", "result_fetch"] {
-            assert!(ToolKind::parse(bad).is_none(), "{bad} must not parse");
+            assert!(
+                ToolKind::parse_with(bad, ToolKindGates::OFF).is_none(),
+                "{bad} must not parse with every gate off"
+            );
         }
-        // Negative control from the issue's own probe table.
-        assert!(ToolKind::parse("totally_bogus_kind").is_none());
+        for not_a_kind in ["provider", "result_fetch", "totally_bogus_kind"] {
+            assert!(
+                ToolKind::parse_with(not_a_kind, ToolKindGates::ALL_ON).is_none(),
+                "{not_a_kind} is not a kind even with every gate open"
+            );
+        }
         // Positive control: the check is capable of accepting something.
-        assert_eq!(ToolKind::parse("noop"), Some(ToolKind::Noop));
         assert_eq!(
-            ToolKind::parse("task_sequence"),
+            ToolKind::parse_with("noop", ToolKindGates::OFF),
+            Some(ToolKind::Noop)
+        );
+        assert_eq!(
+            ToolKind::parse_with("task_sequence", ToolKindGates::OFF),
             Some(ToolKind::TaskSequence)
         );
     }
@@ -1814,15 +1988,217 @@ mod tool_kind_tests {
         assert!(ToolKind::parse("HTTP").is_none());
         assert!(ToolKind::parse(" http").is_none());
         assert_eq!(ToolKind::parse("http"), Some(ToolKind::Http));
+        assert!(ToolKind::parse_with("MCP", ToolKindGates::ALL_ON).is_none());
+        assert!(ToolKind::parse_with("Agent", ToolKindGates::ALL_ON).is_none());
     }
 
     #[test]
-    fn the_valid_set_names_real_kinds() {
-        let s = ToolKind::valid_set();
-        assert!(s.contains("noop") && s.contains("task_sequence") && s.contains("wasm"));
+    fn the_valid_set_names_real_kinds_and_hides_closed_gates() {
+        let off = ToolKind::valid_set_with(ToolKindGates::OFF);
+        assert!(off.contains("noop") && off.contains("task_sequence") && off.contains("wasm"));
         assert!(
-            !s.contains("agent"),
-            "the invalid kinds must not be advertised"
+            !off.split(", ").any(|k| k == "agent" || k == "mcp"),
+            "gated-off kinds must not be advertised: {off}"
+        );
+        let on = ToolKind::valid_set_with(ToolKindGates::ALL_ON);
+        assert!(on.split(", ").any(|k| k == "mcp"), "{on}");
+        assert!(on.split(", ").any(|k| k == "agent"), "{on}");
+    }
+
+    /// The two gates are independent: opening `mcp` must not open `agent`. This is
+    /// load-bearing — `agent` has no executor in the worker yet, `mcp` does.
+    #[test]
+    fn the_gates_are_independent() {
+        let mcp_only = ToolKindGates {
+            mcp: true,
+            agent: false,
+        };
+        assert_eq!(ToolKind::parse_with("mcp", mcp_only), Some(ToolKind::Mcp));
+        assert!(ToolKind::parse_with("agent", mcp_only).is_none());
+        let agent_only = ToolKindGates {
+            mcp: false,
+            agent: true,
+        };
+        assert_eq!(
+            ToolKind::parse_with("agent", agent_only),
+            Some(ToolKind::Agent)
+        );
+        assert!(ToolKind::parse_with("mcp", agent_only).is_none());
+    }
+
+    /// Strict `== "true"`: an arming flag is not armed by `1`, `yes`, `TRUE` or a
+    /// stray space, and an unrelated variable never opens a gate.
+    #[test]
+    fn gates_read_strict_true_only() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |k: &str| {
+                pairs
+                    .iter()
+                    .find(|(key, _)| *key == k)
+                    .map(|(_, v)| v.to_string())
+            }
+        };
+        assert_eq!(ToolKindGates::from_lookup(env(&[])), ToolKindGates::OFF);
+        assert_eq!(
+            ToolKindGates::from_lookup(env(&[("NOETL_TOOL_KIND_MCP", "true")])),
+            ToolKindGates {
+                mcp: true,
+                agent: false
+            }
+        );
+        assert_eq!(
+            ToolKindGates::from_lookup(env(&[("NOETL_TOOL_KIND_AGENT", "true")])),
+            ToolKindGates {
+                mcp: false,
+                agent: true
+            }
+        );
+        for not_true in ["1", "yes", "TRUE", "True", " true", "true ", "on", ""] {
+            let pairs: &'static [(&'static str, &'static str)] = Box::leak(Box::new([
+                ("NOETL_TOOL_KIND_MCP", not_true),
+                ("NOETL_TOOL_KIND_AGENT", not_true),
+            ]));
+            assert_eq!(
+                ToolKindGates::from_lookup(env(pairs)),
+                ToolKindGates::OFF,
+                "{not_true:?} must not arm a gate"
+            );
+        }
+    }
+
+    /// The gate decision names the flag, so an author who hits it at execute is told
+    /// how to turn it on rather than only that it failed.
+    #[test]
+    fn a_closed_gate_names_its_flag() {
+        let e = check_gate(ToolKind::Mcp, ToolKindGates::OFF).unwrap_err();
+        assert!(
+            e.contains("mcp") && e.contains("NOETL_TOOL_KIND_MCP"),
+            "{e}"
+        );
+        let e = check_gate(ToolKind::Agent, ToolKindGates::OFF).unwrap_err();
+        assert!(
+            e.contains("agent") && e.contains("NOETL_TOOL_KIND_AGENT"),
+            "{e}"
+        );
+        assert_eq!(
+            check_gate(ToolKind::Http, ToolKindGates::OFF),
+            Ok(ToolKind::Http)
+        );
+        assert_eq!(
+            check_gate(ToolKind::Mcp, ToolKindGates::ALL_ON),
+            Ok(ToolKind::Mcp)
+        );
+    }
+
+    /// The execute-time path: with the process gates closed (the default — CI never
+    /// sets the flags), an authored `kind: mcp` / `kind: agent` step must still FAIL the
+    /// playbook parse, exactly as before this change. This is the property that keeps
+    /// the old `kind: mcp` / `kind: agent` catalog rows #256 found from silently
+    /// becoming executable when this server ships.
+    #[test]
+    fn with_gates_closed_an_authored_gated_kind_fails_the_playbook_parse() {
+        if ToolKindGates::current() != ToolKindGates::OFF {
+            eprintln!("skipping: NOETL_TOOL_KIND_* is set in this test environment");
+            return;
+        }
+        for kind in ["mcp", "agent"] {
+            let yaml = format!(
+                "apiVersion: noetl.io/v2\nkind: Playbook\nmetadata: {{ name: p, path: p }}\n\
+                 workflow:\n  - step: start\n    tool:\n      kind: {kind}\n"
+            );
+            assert!(
+                serde_yaml::from_str::<Playbook>(&yaml).is_err(),
+                "kind: {kind} must not deserialize while its gate is closed"
+            );
+            let spec = serde_json::json!({ "kind": kind });
+            assert!(
+                serde_json::from_value::<ToolSpec>(spec).is_err(),
+                "ToolSpec kind: {kind} must not deserialize while its gate is closed"
+            );
+        }
+        // Positive control on the same path.
+        let ok = serde_json::from_value::<ToolSpec>(serde_json::json!({ "kind": "noop" }));
+        assert!(ok.is_ok(), "{ok:?}");
+    }
+
+    /// Commands and events are NOT gated: `ToolCall.kind` decodes the full vocabulary,
+    /// so a command issued while a gate was open can still be read back after it is
+    /// closed. The gate is an authoring gate only.
+    #[test]
+    fn tool_call_decodes_gated_kinds_regardless_of_gates() {
+        let call: ToolCall =
+            serde_json::from_value(serde_json::json!({ "kind": "mcp", "config": {} })).unwrap();
+        assert_eq!(call.kind, ToolKind::Mcp);
+        let call: ToolCall =
+            serde_json::from_value(serde_json::json!({ "kind": "agent" })).unwrap();
+        assert_eq!(call.kind, ToolKind::Agent);
+    }
+
+    /// Run `f` with this thread's gates overridden.
+    fn with_gates<T>(g: ToolKindGates, f: impl FnOnce() -> T) -> T {
+        TEST_GATES.with(|c| c.set(Some(g)));
+        let out = f();
+        TEST_GATES.with(|c| c.set(None));
+        out
+    }
+
+    /// With the `mcp` gate open, the MCP step shape used by the live ops agent
+    /// (`ops/automation/agents/kubernetes/runtime.yaml`, step `call_mcp`) parses, and
+    /// every MCP field reaches `extra` unchanged — that is what the worker's `McpTool`
+    /// reads. `agent` stays rejected: the gates are independent on this path too.
+    #[test]
+    fn an_open_mcp_gate_accepts_the_live_mcp_step_shape() {
+        let yaml = "apiVersion: noetl.io/v2\nkind: Playbook\n\
+                    metadata: { name: kubernetes_runtime_agent, path: automation/agents/kubernetes/runtime }\n\
+                    workflow:\n\
+                    \x20 - step: call_mcp\n\
+                    \x20   tool:\n\
+                    \x20     kind: mcp\n\
+                    \x20     server: kubernetes\n\
+                    \x20     endpoint: http://kubernetes-mcp-server.mcp.svc.cluster.local:8080/mcp\n\
+                    \x20     method: tools/call\n\
+                    \x20     tool: pods_list\n\
+                    \x20     arguments: {}\n";
+        let mcp_only = ToolKindGates {
+            mcp: true,
+            agent: false,
+        };
+        let pb = with_gates(mcp_only, || serde_yaml::from_str::<Playbook>(yaml));
+        let pb = pb.expect("kind: mcp must parse with its gate open");
+        let ToolDefinition::Single(spec) = &pb.workflow[0].tool else {
+            panic!("expected the mapping form");
+        };
+        assert_eq!(spec.kind, ToolKind::Mcp);
+        // What the worker receives is the re-serialised spec: `method` rides ToolSpec's
+        // own field (shared with `http`), the rest ride the flattened `extra`. Either
+        // way every MCP field must arrive with its value intact.
+        let wire = serde_json::to_value(spec).unwrap();
+        assert_eq!(
+            wire["kind"], "mcp",
+            "the string the worker registry dispatches on"
+        );
+        assert_eq!(wire["method"], "tools/call");
+        assert_eq!(wire["tool"], "pods_list");
+        assert_eq!(wire["server"], "kubernetes");
+        assert_eq!(
+            wire["endpoint"],
+            "http://kubernetes-mcp-server.mcp.svc.cluster.local:8080/mcp"
+        );
+        assert_eq!(wire["arguments"], serde_json::json!({}));
+
+        let agent = with_gates(mcp_only, || {
+            serde_json::from_value::<ToolSpec>(serde_json::json!({ "kind": "agent" }))
+        });
+        assert!(agent.is_err(), "opening mcp must not open agent");
+
+        let both = with_gates(ToolKindGates::ALL_ON, || {
+            serde_json::from_value::<ToolSpec>(serde_json::json!({
+                "kind": "agent", "framework": "claude", "model": "claude-sonnet-5-5", "prompt": "hi"
+            }))
+        });
+        assert_eq!(
+            both.expect("agent parses with its gate open").kind,
+            ToolKind::Agent
         );
     }
 }
