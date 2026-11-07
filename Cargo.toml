@@ -173,6 +173,13 @@ gcp_auth = "0.12"
 # types but not those. Same git source + same tag means cargo unifies it with the copy
 # `ehdb-l0` already depends on; a DIFFERENT tag here would put two `EhdbError` types in the
 # graph and the trait impl would stop satisfying the trait.
+# v0.15.1 (2026-11-07) = v0.15.0 + ehdb#440 (closes ehdb#439): a manifest copy that is
+# well-formed JSON but does not decode (an unknown bloom scheme, an unknown field) now
+# REFUSES the open instead of silently falling back to an older snapshot. Torn/garbage
+# bytes still take the fallback. This is the build that makes a scheme-2 store safe to
+# roll back onto: the rollback target for Release B must be v0.15.1+, never v0.14.x.
+# All prod manifests (server d1 + d8, cmdbus, eventbus, eventkv) were decoded with
+# v0.15.1 before this bump, so the stricter open cannot refuse today's stores.
 # v0.15.0 (2026-11-04) = v0.14.12 + ehdb#438, RELEASE A of the bloom fix (noetl/ai-meta#517).
 # Legacy bloom probes `(h1 + i*h2) mod m` collapse for about 1 key in 2^j (the prod key
 # that pinned the retention floor had all 9 probes on ONE bit). This release only teaches
@@ -217,9 +224,9 @@ gcp_auth = "0.12"
 # A dependency pin that exists to change the running binary is a `fix:`. Check the tag after
 # the merge rather than assuming it moved:
 #     gh run watch --repo noetl/server && git fetch origin --tags && git tag --sort=-v:refname | head -1
-ehdb-core = { git = "https://github.com/noetl/ehdb", tag = "v0.15.0" }
-ehdb-feed = { git = "https://github.com/noetl/ehdb", tag = "v0.15.0" }
-ehdb-l0 = { git = "https://github.com/noetl/ehdb", tag = "v0.15.0" }
+ehdb-core = { git = "https://github.com/noetl/ehdb", tag = "v0.15.1" }
+ehdb-feed = { git = "https://github.com/noetl/ehdb", tag = "v0.15.1" }
+ehdb-l0 = { git = "https://github.com/noetl/ehdb", tag = "v0.15.1" }
 # ehgraph, the topology graph engine, EMBEDDED for the `noetl-cluster` domain
 # (noetl/ehgraph E2/E4, `src/ehgraph_embedded.rs`). Default OFF: inert unless
 # NOETL_EHGRAPH_EMBEDDED=true.
