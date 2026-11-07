@@ -37,6 +37,31 @@
 //! [`MOUNT`] answers `503` with the reason, so a `kind: Mcp` caller sees why
 //! rather than a 404. The ehgraph open itself fails fast: no partial instance is
 //! ever left running.
+//!
+//! # Memory budgets come from the pod's limit (ehgraph C11)
+//!
+//! The graph shares this server's memory, so a `[budgets]` value the config leaves
+//! unset is derived from the container's cgroup memory limit, or from
+//! `[budgets] host_memory_bytes` when that is set:
+//!
+//! - the resident graph gets 10% of the limit;
+//! - sessions get 10% in total, and a quarter of that per session;
+//! - each derived value is at least 16 MiB.
+//!
+//! The open **refuses**, so the mount answers 503, when the graph and session budgets
+//! together exceed half the limit. With no limit detected (a bare process, a pod
+//! without `resources.limits.memory`), ehgraph's fixed defaults apply and the graph is
+//! capped at 256 MiB. A write that would grow the graph past its budget is refused with
+//! `MEMORY_BUDGET_EXCEEDED`, and nothing is logged. Check the derived numbers against
+//! the server's real memory use before arming. `graph.instance.info` reports them.
+//!
+//! # Backups (ehgraph C19)
+//!
+//! `backup_prefix` is a directory or `gs://bucket/prefix`. A GCS target authenticates
+//! as the pod's Workload Identity. ehgraph opens the target once, and both
+//! `backup_interval_s` and `EhGraph::backup_now` ship through it. Change-log
+//! compaction (`[store] compaction`) stays off: it writes on-disk format 2, and a
+//! server built before this pin cannot open format 2.
 
 use std::sync::OnceLock;
 use std::time::Duration;
