@@ -268,3 +268,135 @@ fn main_starts_mounts_and_shuts_down_the_graph() {
         "start before serving, shut down after"
     );
 }
+
+// ── ehgraph 760f572: budgets from the host's memory limit (C11), backup handle (C19) ──
+
+const MIB: u64 = 1 << 20;
+
+async fn instance_budgets(graph: &ehgraph::EhGraph) -> Value {
+    let info = graph
+        .client(TOKEN)
+        .unwrap()
+        .call_async("graph.instance.info", json!({}))
+        .await;
+    assert!(info.ok, "{info:?}");
+    info.data.unwrap()["budgets"].clone()
+}
+
+/// Unset budgets come out of the host's limit. noetl-server sets none, so in a pod
+/// they come from the container's cgroup limit; `host_memory_bytes` stands in for it
+/// here so the test does not depend on the machine it runs on.
+#[tokio::test]
+#[serial]
+async fn embedded_budgets_are_derived_from_the_host_memory_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let extra = format!("[budgets]\nhost_memory_bytes = {}", 1600 * MIB);
+    let graph = open_with(&toml(dir.path(), EMBEDDED_DOMAIN, &extra), &single())
+        .await
+        .unwrap();
+    let budgets = instance_budgets(&graph).await;
+    assert_eq!(
+        budgets["resident_graph_bytes"],
+        160 * MIB,
+        "graph: 10% of the host"
+    );
+    assert_eq!(
+        budgets["global_bytes"],
+        160 * MIB,
+        "sessions: 10% of the host"
+    );
+    // (Each derived budget has a 16 MiB floor, so a small host would not show the ratios.)
+    assert_eq!(
+        budgets["per_session_bytes"],
+        40 * MIB,
+        "a quarter of the sessions"
+    );
+    assert!(graph.shutdown(Duration::from_secs(5)).await.lock_released);
+}
+
+/// Explicit budgets that would take more than half the host refuse the open, so the
+/// graph answers 503 instead of letting the server be OOM-killed.
+#[tokio::test]
+#[serial]
+async fn embedded_budgets_over_half_the_host_refuse_to_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let extra = format!(
+        "[budgets]\nhost_memory_bytes = {}\nglobal_bytes = {}\nresident_graph_bytes = {}",
+        100 * MIB,
+        30 * MIB,
+        30 * MIB
+    );
+    let err = open_with(&toml(dir.path(), EMBEDDED_DOMAIN, &extra), &single())
+        .await
+        .err()
+        .expect("budgets over half the host must refuse");
+    assert!(err.contains("at most half"), "{err}");
+}
+
+/// A write that would grow the resident graph past its budget is refused before
+/// anything is logged, in-process just as over HTTP.
+#[tokio::test]
+#[serial]
+async fn a_write_past_the_resident_graph_budget_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let extra = format!(
+        "[budgets]\nhost_memory_bytes = {}\nresident_graph_bytes = 4096",
+        400 * MIB
+    );
+    let graph = open_with(&toml(dir.path(), EMBEDDED_DOMAIN, &extra), &single())
+        .await
+        .unwrap();
+    let client = graph.client(TOKEN).unwrap();
+    let nodes: Vec<Value> = (0..64)
+        .map(|i| json!({"id": format!("svc:{i}"), "type": "Service", "properties": {"pad": "x".repeat(256)}}))
+        .collect();
+    let wrote = client
+        .call_async(
+            "graph.upsert",
+            json!({"namespace": "cluster", "execution_id": "budget", "source": "noetl-server", "nodes": nodes}),
+        )
+        .await;
+    assert!(!wrote.ok, "{wrote:?}");
+    let code = wrote.error.unwrap().code.to_string();
+    assert_eq!(code, "MEMORY_BUDGET_EXCEEDED");
+    let read = client
+        .call_async("graph.node", json!({"namespace": "cluster", "id": "svc:0"}))
+        .await;
+    assert!(!read.ok, "nothing was logged: {read:?}");
+    assert!(graph.shutdown(Duration::from_secs(5)).await.lock_released);
+}
+
+/// `backup_prefix` (a directory here, `gs://…` in a pod) is now opened as a backup
+/// target behind a handle; `backup_now` ships through it.
+#[tokio::test]
+#[serial]
+async fn backup_now_ships_through_the_configured_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let graph = open_with(&toml(dir.path(), EMBEDDED_DOMAIN, ""), &single())
+        .await
+        .unwrap();
+    let wrote = graph
+        .client(TOKEN)
+        .unwrap()
+        .call_async(
+            "graph.upsert",
+            json!({"namespace": "cluster", "execution_id": "backup", "source": "noetl-server",
+                   "nodes": [{"id": "svc:server", "type": "Service"}]}),
+        )
+        .await;
+    assert!(wrote.ok, "{wrote:?}");
+    let g = graph.clone();
+    let checkpoint = tokio::task::spawn_blocking(move || g.backup_now())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        checkpoint.namespaces.contains_key("cluster"),
+        "{checkpoint:?}"
+    );
+    assert!(std::fs::read_dir(dir.path().join("backup"))
+        .unwrap()
+        .next()
+        .is_some());
+    assert!(graph.shutdown(Duration::from_secs(5)).await.lock_released);
+}

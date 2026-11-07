@@ -229,14 +229,15 @@ ehdb-l0 = { git = "https://github.com/noetl/ehdb", tag = "v0.15.0" }
 # the EHDB pins above) when ehgraph cuts v0.1.0.
 #
 # ⚠⚠ ROLLBACK SAFETY. An embedded instance rolls back WITH this server. ehgraph at
-# this rev writes on-disk format 1 and refuses a newer format or an unknown field
+# this rev writes on-disk format 1 (format 2 only once compaction, off by default,
+# has run on a namespace) and refuses a newer format or an unknown field
 # (E9), so rolling this server back past an ehgraph format bump makes the graph
 # REFUSE to open (the /ehgraph/noetl-cluster routes answer 503). It does not
 # silently misread the data. Roll forward, or restore an older backup.
 #
 # ehgraph does not link EHDB (its E8), so this pin cannot put a second ehdb-l0 in
 # the graph. It does bring arrow 53 (arrow-array/-ipc/-schema) for snapshots.
-ehgraph = { git = "https://github.com/noetl/ehgraph", rev = "98a30792c38e9f5446a8307f95c0489212ffe305" }
+ehgraph = { git = "https://github.com/noetl/ehgraph", rev = "760f5724dd01786e173f880fbffc190a61654ddd" }
 # Value type for the JetStream KV puts in `src/coherence.rs` (multi-replica
 # watermark/descriptor coherence, RFC #115 program-scale).  Matches the version
 # async-nats already pulls in transitively.
