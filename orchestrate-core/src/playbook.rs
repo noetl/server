@@ -16,6 +16,7 @@ use std::collections::HashMap;
 /// server's `secrets::residency` module re-exports this enum and holds the
 /// region-check *logic* (which needs server-only deps); the enum itself is pure
 /// data.
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Residency {
@@ -43,6 +44,7 @@ impl Residency {
 }
 
 /// Supported tool kinds.
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolKind {
@@ -325,6 +327,7 @@ impl std::fmt::Display for ToolKind {
 
 /// Eval condition for per-task flow control.
 /// Evaluated after each tool execution.
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EvalCondition {
     /// Jinja2 expression to evaluate.
@@ -358,6 +361,7 @@ pub struct EvalCondition {
 }
 
 /// Else clause for eval conditions.
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EvalElse {
     /// Action to take.
@@ -375,11 +379,13 @@ pub struct EvalElse {
 
 /// Tool specification with tool.kind pattern.
 /// All execution-specific fields live under tool.
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolSpec {
     /// Tool type. Authored, so flag-gated kinds are refused while their flag is off
     /// ([`ToolKindGates`]).
     #[serde(deserialize_with = "deserialize_gated_kind")]
+    #[cfg_attr(feature = "json-schema", schemars(with = "ToolKind"))]
     pub kind: ToolKind,
 
     /// Tool-level flow control (canonical format).
@@ -493,6 +499,7 @@ pub struct ToolSpec {
 }
 
 /// Eval entry - can be a condition or an else clause.
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum EvalEntry {
@@ -508,6 +515,7 @@ pub enum EvalEntry {
 
 /// Pipeline task - a labeled tool in a task sequence.
 /// Format: { label: { kind: ..., args: ..., eval: ... } }
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PipelineTask {
     /// Task label (used as context key in forward-only data flow).
@@ -518,6 +526,7 @@ pub struct PipelineTask {
 }
 
 /// Tool definition - can be single tool or pipeline.
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ToolDefinition {
@@ -566,6 +575,7 @@ pub enum ToolDefinition {
 /// `Nested`.  The serializer round-trips through the nested form
 /// so the wire shape downstream (worker's `task_sequence` consumer)
 /// stays unchanged.
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 pub enum PipelineItem {
@@ -615,6 +625,7 @@ impl serde::Serialize for PipelineItem {
 // ============================================================================
 
 /// Loop execution mode.
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum LoopMode {
@@ -637,6 +648,7 @@ pub enum LoopMode {
 /// context).  The lease/heartbeat/byte fields are accepted for playbook
 /// compatibility with the Python engine; stale-reclaim is handled by the
 /// playbook's own claim SQL (its `reclaim_stale` CTE), so they are advisory.
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct FrameSpec {
     /// Max rows claimed per frame (the claim SQL's `LIMIT {{ __frame_max_rows }}`).
@@ -661,6 +673,7 @@ pub struct FrameSpec {
 /// The claim block of a `mode: cursor` loop — a SQL tool that atomically
 /// leases a frame of work rows and returns them (its `RETURNING` columns
 /// become the per-row `iter.<iterator>` object).
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CursorClaim {
     /// Tool kind running the claim (default `postgres`).
@@ -678,6 +691,7 @@ fn default_cursor_kind() -> String {
 }
 
 /// Loop runtime specification (canonical format).
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoopSpec {
     /// Execution mode: sequential, parallel, or cursor.
@@ -694,6 +708,7 @@ pub struct LoopSpec {
 }
 
 /// Step-level loop configuration (canonical format).
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Loop {
     /// Jinja expression for collection to iterate over.  Required for
@@ -729,6 +744,7 @@ impl Loop {
 
 /// Arc specification for v10 next router format.
 /// Canonical format: next.arcs[].when for conditional routing (Petri-net arcs).
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NextArc {
     /// Target step name.
@@ -753,6 +769,7 @@ pub struct NextArc {
 }
 
 /// Next router spec for v10 format.
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NextRouterSpec {
     /// Routing mode: exclusive (first match) or inclusive (all matches).
@@ -761,6 +778,7 @@ pub struct NextRouterSpec {
 }
 
 /// Canonical v10 next router format with spec and arcs.
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NextRouter {
     /// Router specification (mode: exclusive/inclusive).
@@ -773,6 +791,7 @@ pub struct NextRouter {
 }
 
 /// Legacy target for transition (deprecated, use NextArc).
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CanonicalNextTarget {
     /// Target step name.
@@ -797,6 +816,7 @@ pub struct CanonicalNextTarget {
 /// defeating the unknown-step validation in `validate_next_refs`). The
 /// sequence-shaped variants are therefore declared before the struct `Router`,
 /// which is reached only for the canonical map form `{ spec, arcs }`.
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum NextSpec {
@@ -821,6 +841,7 @@ pub enum NextSpec {
 // ============================================================================
 
 /// Step-level behavior configuration.
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct StepSpec {
     /// Next evaluation mode: exclusive (first match) or inclusive (all matches).
@@ -850,6 +871,7 @@ pub struct StepSpec {
 /// - loop: optional loop wrapper with spec.mode
 /// - tool: ordered pipeline (list of labeled tasks) OR single tool shorthand
 /// - next: outgoing arcs with optional when conditions for routing
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Step {
     /// Step name (unique identifier).
@@ -901,6 +923,7 @@ pub struct Step {
 // ============================================================================
 
 /// Reusable task definition in workbook.
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkbookTask {
     /// Task name.
@@ -915,6 +938,7 @@ pub struct WorkbookTask {
 }
 
 /// Keychain entry for credential/token definitions.
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KeychainDef {
     /// Keychain entry name.
@@ -998,6 +1022,7 @@ pub struct KeychainDef {
 // ============================================================================
 
 /// Playbook metadata.
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Metadata {
     /// Playbook name (required).
@@ -1025,6 +1050,7 @@ pub struct Metadata {
 // ============================================================================
 
 /// Complete workflow definition (v2 canonical format).
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Playbook {
     /// API version (noetl.io/v2).

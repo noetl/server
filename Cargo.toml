@@ -27,7 +27,10 @@ exclude = ["plugins/orchestrate"]
 # specified when publishing").  The release workflow publishes
 # noetl-orchestrate-core first; mirrors noetl-tools/noetl-directives
 # (noetl/ai-meta#92).
-noetl-orchestrate-core = { version = "0.1.0", path = "orchestrate-core" }
+# `json-schema`: the DSL knowledge base (ai-meta RFC `dsl-knowledge-base.md`) —
+# `GET /api/dsl/schema` serves the schema derived from these types.  The wasm32
+# orchestrate plug-in does not enable it.
+noetl-orchestrate-core = { version = "0.1.0", path = "orchestrate-core", features = ["json-schema"] }
 # Async runtime
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time", "sync"] }
 

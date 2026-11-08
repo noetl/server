@@ -163,18 +163,22 @@ fn validate_no_case_blocks(yaml_content: &str) -> AppResult<()> {
 /// Validate a parsed playbook.
 pub fn validate_playbook(playbook: &Playbook) -> AppResult<()> {
     // Check API version
-    if playbook.api_version != "noetl.io/v2" {
+    // One source for the grammar version: the DSL knowledge base serves the
+    // same constant (`GET /api/dsl/version`), so the two cannot disagree.
+    if playbook.api_version != noetl_orchestrate_core::dsl::API_VERSION {
         return Err(AppError::Validation(format!(
-            "Unsupported API version: {}. Expected noetl.io/v2",
-            playbook.api_version
+            "Unsupported API version: {}. Expected {}",
+            playbook.api_version,
+            noetl_orchestrate_core::dsl::API_VERSION
         )));
     }
 
     // Check kind
-    if playbook.kind != "Playbook" {
+    if playbook.kind != noetl_orchestrate_core::dsl::PLAYBOOK_KIND {
         return Err(AppError::Validation(format!(
-            "Invalid kind: {}. Expected Playbook",
-            playbook.kind
+            "Invalid kind: {}. Expected {}",
+            playbook.kind,
+            noetl_orchestrate_core::dsl::PLAYBOOK_KIND
         )));
     }
 
