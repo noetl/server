@@ -577,7 +577,20 @@ fn validate_tool_kinds(yaml: &serde_yaml::Value) -> AppResult<()> {
     let mut bad: Vec<String> = found
         .iter()
         .filter(|(_, k)| noetl_orchestrate_core::playbook::ToolKind::parse(k).is_none())
-        .map(|(step, k)| format!("step '{step}' has kind '{k}'"))
+        .map(|(step, k)| {
+            // A flag-gated kind (`mcp`, `agent`) whose flag is off is still rejected —
+            // exactly as before it existed — but the author is told it is switched off
+            // rather than unknown, and which flag switches it on.
+            match noetl_orchestrate_core::playbook::ToolKind::parse_ungated(k)
+                .and_then(|kind| kind.gate_env())
+            {
+                Some(env) => format!(
+                    "step '{step}' has kind '{k}' (recognised but disabled on this server; \
+                     {env}=true enables it)"
+                ),
+                None => format!("step '{step}' has kind '{k}'"),
+            }
+        })
         .collect();
     if bad.is_empty() {
         return Ok(());
@@ -1150,6 +1163,51 @@ mod tool_kind_validation_tests {
         );
         let e = validate_tool_kinds(&y).unwrap_err().to_string();
         assert!(e.contains("one") && e.contains("two"), "{e}");
+    }
+
+    /// With the gates closed (the default), a gated kind is still REJECTED at
+    /// registration — the #256 property is unchanged — but the message names the flag
+    /// instead of implying the kind does not exist, and a truly unknown kind gets no
+    /// such hint.
+    #[test]
+    fn a_gated_off_kind_is_rejected_and_names_its_flag() {
+        use noetl_orchestrate_core::playbook::{ToolKindGates, TOOL_KIND_MCP_ENV};
+        if ToolKindGates::current() != ToolKindGates::OFF {
+            eprintln!("skipping: NOETL_TOOL_KIND_* is set in this test environment");
+            return;
+        }
+        let y = yaml(
+            "workflow:\n\
+             \x20 - step: call_mcp\n\
+             \x20   tool:\n\
+             \x20     kind: mcp\n\
+             \x20 - step: bogus\n\
+             \x20   tool:\n\
+             \x20     kind: totally_bogus_kind\n",
+        );
+        let e = validate_tool_kinds(&y).unwrap_err().to_string();
+        assert!(
+            e.contains("call_mcp") && e.contains(TOOL_KIND_MCP_ENV),
+            "{e}"
+        );
+        assert!(e.contains("recognised but disabled"), "{e}");
+        let bogus_clause = e
+            .split("; ")
+            .find(|c| c.contains("totally_bogus_kind"))
+            .expect("the bogus step is reported");
+        assert!(
+            !bogus_clause.contains("NOETL_TOOL_KIND"),
+            "an unknown kind must not be told a flag will fix it: {bogus_clause}"
+        );
+        let valid = e
+            .split("Valid kinds: ")
+            .nth(1)
+            .and_then(|rest| rest.split(". ").next())
+            .expect("the valid set is offered");
+        assert!(
+            !valid.split(", ").any(|k| k == "mcp" || k == "agent"),
+            "a gated-off kind must not appear in the advertised valid set: {valid}"
+        );
     }
 }
 
