@@ -1,0 +1,957 @@
+{
+  "$defs": {
+    "CanonicalNextTarget": {
+      "description": "Legacy target for transition (deprecated, use NextArc).",
+      "properties": {
+        "args": {
+          "additionalProperties": true,
+          "default": null,
+          "description": "Arguments to pass to target step.",
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "step": {
+          "description": "Target step name.",
+          "type": "string"
+        },
+        "when": {
+          "default": null,
+          "description": "Transition guard expression (Jinja2).",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "step"
+      ],
+      "type": "object"
+    },
+    "CursorClaim": {
+      "description": "The claim block of a `mode: cursor` loop — a SQL tool that atomically\nleases a frame of work rows and returns them (its `RETURNING` columns\nbecome the per-row `iter.<iterator>` object).",
+      "properties": {
+        "auth": {
+          "default": null,
+          "description": "Credential alias for the claim tool.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "claim": {
+          "description": "The claim SQL (atomic lease, e.g. `... FOR UPDATE SKIP LOCKED ... RETURNING ...`).",
+          "type": "string"
+        },
+        "kind": {
+          "default": "postgres",
+          "description": "Tool kind running the claim (default `postgres`).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "claim"
+      ],
+      "type": "object"
+    },
+    "EvalCondition": {
+      "description": "Eval condition for per-task flow control.\nEvaluated after each tool execution.",
+      "properties": {
+        "attempts": {
+          "default": null,
+          "description": "Retry attempts (for do: retry).",
+          "format": "int32",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "backoff": {
+          "default": null,
+          "description": "Retry backoff strategy: linear or exponential.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "delay": {
+          "default": null,
+          "description": "Retry delay in seconds.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "do": {
+          "description": "Action to take: continue, retry, break, jump, fail",
+          "type": "string"
+        },
+        "expr": {
+          "default": null,
+          "description": "Jinja2 expression to evaluate.\nAccess outcome object: outcome.status, outcome.error, outcome.result",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "set_vars": {
+          "additionalProperties": true,
+          "default": null,
+          "description": "Variables to set (step-scoped).",
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "target": {
+          "default": null,
+          "description": "Target step (for do: jump).",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "do"
+      ],
+      "type": "object"
+    },
+    "EvalElse": {
+      "description": "Else clause for eval conditions.",
+      "properties": {
+        "do": {
+          "description": "Action to take.",
+          "type": "string"
+        },
+        "set_vars": {
+          "additionalProperties": true,
+          "default": null,
+          "description": "Variables to set.",
+          "type": [
+            "object",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "do"
+      ],
+      "type": "object"
+    },
+    "EvalEntry": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/EvalCondition",
+          "description": "Conditional eval with expr."
+        },
+        {
+          "description": "Else clause (no condition).",
+          "properties": {
+            "else": {
+              "$ref": "#/$defs/EvalElse"
+            }
+          },
+          "required": [
+            "else"
+          ],
+          "type": "object"
+        }
+      ],
+      "description": "Eval entry - can be a condition or an else clause."
+    },
+    "FrameSpec": {
+      "description": "Frame sizing / leasing policy for a `mode: cursor` loop.\n\nOnly `max_rows` is load-bearing in the orchestrator-driven port (it caps\neach claim and is injected as `__frame_max_rows` into the claim render\ncontext).  The lease/heartbeat/byte fields are accepted for playbook\ncompatibility with the Python engine; stale-reclaim is handled by the\nplaybook's own claim SQL (its `reclaim_stale` CTE), so they are advisory.",
+      "properties": {
+        "heartbeat_seconds": {
+          "default": null,
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "lease_seconds": {
+          "default": null,
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "max_bytes": {
+          "default": null,
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "max_rows": {
+          "default": null,
+          "description": "Max rows claimed per frame (the claim SQL's `LIMIT {{ __frame_max_rows }}`).",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "max_seconds": {
+          "default": null,
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "process": {
+          "default": null,
+          "description": "`row` (default) binds `iter.<name>` to one row; `frame` is reserved.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "row_concurrency": {
+          "default": null,
+          "description": "Rows of one frame to dispatch concurrently (1 = sequential within frame).",
+          "format": "int32",
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "KeychainDef": {
+      "additionalProperties": true,
+      "description": "Keychain entry for credential/token definitions.",
+      "properties": {
+        "allowed_regions": {
+          "default": [],
+          "description": "Secrets Wallet Phase 6c — extra regions (besides the entry's own\n`region`) from which resolution is allowed when `residency` is\n`strict` or `advisory`.  Empty by default.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "auth": {
+          "default": null,
+          "description": "Credential alias used to authenticate to `provider` (e.g. a service\naccount). On a provider that authenticates by ambient identity (GCP\nWorkload Identity), this is unused.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "auto_renew": {
+          "default": false,
+          "description": "Auto-renew flag.",
+          "type": "boolean"
+        },
+        "credential": {
+          "default": null,
+          "description": "Credential reference.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "map": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": null,
+          "description": "Output-key → secret-reference map. Each value is a secret-path template\n(rendered against the workload at resolution time); the resolved entry\nis the object `{ <key>: <secret-value>, ... }` — the \"auth object as a\nmap\" shape. Absent for single-value entries.",
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "name": {
+          "description": "Keychain entry name.",
+          "type": "string"
+        },
+        "no_broker_fallback": {
+          "default": false,
+          "description": "Secrets Wallet Phase 6e — opt-out for the cross-region broker\nfallback.  When `true`, a strict-mode residency denial bubbles up\nas `ResidencyViolation` even if a broker is configured for the\nentry's region — used for credentials whose policy says \"this\ndata physically cannot leave its home region, full stop.\"\nDefault `false` (broker fallback honoured when registered).",
+          "type": "boolean"
+        },
+        "provider": {
+          "default": null,
+          "description": "Secret-source backend that resolves this entry: `gcp` (Google Secret\nManager), `aws`, `azure`, `vault`, `k8s`. When set, the server-side\nkeychain resolver fetches the value(s) from this provider on a cache\nmiss (Secrets Wallet Phase 3b). `None` means the entry is supplied by\nother means (pre-registered credential, minted token).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "region": {
+          "default": null,
+          "description": "Secrets Wallet Phase 6a — home region of this secret (e.g.\n`us-east-1`, `europe-west4`).  When set, the resolver passes it to the\nchosen [`crate::secrets::SecretProvider`]: AWS uses it as the regional\nendpoint host; Azure / Vault use it for vault / cluster routing; GCP\nuses it as part of the resource id.  `None` falls back to the server's\n`NOETL_SERVER_REGION` env.  Per `agents/rules/safety.md`, the region is\na routing hint, not a secret — public-safe.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "residency": {
+          "$ref": "#/$defs/Residency",
+          "default": "none",
+          "description": "Secrets Wallet Phase 6c — residency policy.  Controls whether a\nserver in a different region than this entry's `region` is allowed\nto resolve it.  See [`crate::secrets::residency::Residency`]."
+        },
+        "scope": {
+          "default": null,
+          "description": "Scope type.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "token_type": {
+          "default": null,
+          "description": "Token type.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    },
+    "Loop": {
+      "description": "Step-level loop configuration (canonical format).",
+      "properties": {
+        "cursor": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CursorClaim"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Claim block for `mode: cursor` loops."
+        },
+        "in": {
+          "default": null,
+          "description": "Jinja expression for collection to iterate over.  Required for\n`sequential` / `parallel`; absent for `cursor` (which claims work).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "iterator": {
+          "description": "Variable name for each item.",
+          "type": "string"
+        },
+        "spec": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LoopSpec"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Loop spec with mode (canonical format)."
+        }
+      },
+      "required": [
+        "iterator"
+      ],
+      "type": "object"
+    },
+    "LoopMode": {
+      "description": "Loop execution mode.",
+      "oneOf": [
+        {
+          "enum": [
+            "sequential",
+            "parallel"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "cursor",
+          "description": "Claim-based work-distribution loop (noetl/ai-meta#100).  Instead of a\nfixed `in:` collection, the orchestrator repeatedly runs the\n`loop.cursor.claim` SQL to lease a frame of work rows, fans out the\nstep body per claimed row, then re-claims — until the claim returns\nzero rows (drained).  Honors the Rust execution model: the claim runs\nas a normal postgres tool command on a worker; no long-lived worker.",
+          "type": "string"
+        }
+      ]
+    },
+    "LoopSpec": {
+      "description": "Loop runtime specification (canonical format).",
+      "properties": {
+        "frame": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FrameSpec"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Frame sizing/leasing policy (cursor mode only)."
+        },
+        "max_in_flight": {
+          "default": null,
+          "description": "Maximum concurrent iterations in parallel mode / frames in cursor mode.",
+          "format": "int32",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "mode": {
+          "$ref": "#/$defs/LoopMode",
+          "default": "sequential",
+          "description": "Execution mode: sequential, parallel, or cursor."
+        }
+      },
+      "type": "object"
+    },
+    "Metadata": {
+      "additionalProperties": true,
+      "description": "Playbook metadata.",
+      "properties": {
+        "description": {
+          "default": null,
+          "description": "Description.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "labels": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": null,
+          "description": "Labels for filtering.",
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "name": {
+          "description": "Playbook name (required).",
+          "type": "string"
+        },
+        "path": {
+          "default": null,
+          "description": "Resource path.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    },
+    "NextArc": {
+      "description": "Arc specification for v10 next router format.\nCanonical format: next.arcs[].when for conditional routing (Petri-net arcs).",
+      "properties": {
+        "set": {
+          "additionalProperties": true,
+          "default": null,
+          "description": "Arc-level variable mutations to apply to execution context before\ndispatching the downstream step.  Mirrors Python's `set:` on arcs.\nScope-prefixed keys (`ctx.x`, `iter.x`, `step.x`) are stripped to\nthe bare key; bare keys and unknown-scope dotted keys are written\nas-is.  Values are Jinja2 templates rendered against the producing\nstep's completion context before being applied.\n\nYAML key: `set:`.  The legacy `args:` key is rejected by the Python\nreference parser and is NOT supported here.",
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "step": {
+          "description": "Target step name.",
+          "type": "string"
+        },
+        "when": {
+          "default": null,
+          "description": "Transition guard expression (Jinja2).\nEvaluated by server after step completion.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "step"
+      ],
+      "type": "object"
+    },
+    "NextRouter": {
+      "description": "Canonical v10 next router format with spec and arcs.",
+      "properties": {
+        "arcs": {
+          "default": [],
+          "description": "List of arcs (outgoing transitions).",
+          "items": {
+            "$ref": "#/$defs/NextArc"
+          },
+          "type": "array"
+        },
+        "spec": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NextRouterSpec"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Router specification (mode: exclusive/inclusive)."
+        }
+      },
+      "type": "object"
+    },
+    "NextRouterSpec": {
+      "description": "Next router spec for v10 format.",
+      "properties": {
+        "mode": {
+          "default": null,
+          "description": "Routing mode: exclusive (first match) or inclusive (all matches).",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "NextSpec": {
+      "anyOf": [
+        {
+          "description": "List of step targets with optional `when` (legacy canonical): a\nsequence of `{ step, when?, args? }` maps.",
+          "items": {
+            "$ref": "#/$defs/CanonicalNextTarget"
+          },
+          "type": "array"
+        },
+        {
+          "description": "List of bare step names.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        {
+          "description": "Single step name.",
+          "type": "string"
+        },
+        {
+          "$ref": "#/$defs/NextRouter",
+          "description": "Canonical v10 router format: `{ spec: { mode: ... }, arcs: [...] }` — a\nmap. Declared last so a sequence never deserializes into it positionally\n(see the type-level note above)."
+        }
+      ],
+      "description": "Next step specification - supports multiple formats for compatibility.\n\n**Variant order is load-bearing.** `#[serde(untagged)]` tries variants top\nto bottom, and serde deserializes a YAML *sequence* into a struct\npositionally — so if `Router` (a struct) came first it would greedily eat\nthe list form `next: [{step: x}]` into a `NextRouter` with `spec` taken from\nelement 0 and `arcs` defaulting to `[]`, silently dropping every target (and\ndefeating the unknown-step validation in `validate_next_refs`). The\nsequence-shaped variants are therefore declared before the struct `Router`,\nwhich is reached only for the canonical map form `{ spec, arcs }`."
+    },
+    "PipelineItem": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ToolSpec",
+          "description": "Flat shape: `{ name: \"label\", kind: \"python\", code: \"...\", ... }`.\nThe pipeline-item label lives in the `name` field; the rest of\nthe fields are an inline `ToolSpec`.  Stored via `ToolSpec.extra`\n(the `#[serde(flatten)] HashMap` catch-all), so no schema change\nis needed on ToolSpec itself."
+        },
+        {
+          "additionalProperties": {
+            "$ref": "#/$defs/ToolSpec"
+          },
+          "description": "Nested shape: `{ \"label\": { kind: \"python\", code: \"...\", ... } }`.\nSingle-key map — the key is the label, the value is the spec.",
+          "type": "object"
+        }
+      ],
+      "description": "One item in a pipeline.  Untagged so serde tries each variant\nin declaration order and picks the first that decodes.\n\n`Flat` is tried first because the v10 dominant form has a\ntop-level `kind:` field (a required field on `ToolSpec`); the\nnested label-as-key form has no `kind:` at the top level\n(the key IS the label), so it cleanly falls through to\n`Nested`.  The serializer round-trips through the nested form\nso the wire shape downstream (worker's `task_sequence` consumer)\nstays unchanged."
+    },
+    "Residency": {
+      "description": "Residency policy for a [`KeychainDef`] — part of the playbook model, so it\nlives in the core with the rest of the types (noetl/ai-meta#108).  The\nserver's `secrets::residency` module re-exports this enum and holds the\nregion-check *logic* (which needs server-only deps); the enum itself is pure\ndata.",
+      "oneOf": [
+        {
+          "const": "none",
+          "description": "No check; resolution proceeds regardless of server region.\nBack-compat default for entries without an explicit policy.",
+          "type": "string"
+        },
+        {
+          "const": "advisory",
+          "description": "Check but proceed on mismatch — observability without enforcement.\nUsed during the migration window before flipping to `strict`.",
+          "type": "string"
+        },
+        {
+          "const": "strict",
+          "description": "Fail-closed on mismatch; resolution short-circuits before any provider\ncall (the server maps this to an `AppError::ResidencyViolation`).",
+          "type": "string"
+        }
+      ]
+    },
+    "Step": {
+      "description": "Workflow step with canonical format control flow.\n\nCanonical step structure:\n- step: name (unique identifier)\n- desc: description\n- spec: step behavior (next_mode, timeout, on_error)\n- when: transition enable guard (evaluated by server on input token)\n- loop: optional loop wrapper with spec.mode\n- tool: ordered pipeline (list of labeled tasks) OR single tool shorthand\n- next: outgoing arcs with optional when conditions for routing",
+      "properties": {
+        "args": {
+          "additionalProperties": true,
+          "default": null,
+          "description": "Input arguments for this step.",
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "desc": {
+          "default": null,
+          "description": "Step description.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "loop": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Loop"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Loop configuration with spec.mode."
+        },
+        "next": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NextSpec"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Next step(s) with optional when conditions for routing."
+        },
+        "set": {
+          "additionalProperties": true,
+          "default": null,
+          "description": "Step-level `set:` mutations — template expressions rendered\nagainst the producing step's completion context, then applied\nvia scope-prefix stripping (`ctx.x` → `x`) exactly like\narc-level `set:`.  Mirrors Python's step-level `set:` in\n`noetl/core/dsl/engine/executor/transitions.py`.",
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "spec": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/StepSpec"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Step behavior configuration."
+        },
+        "step": {
+          "description": "Step name (unique identifier).",
+          "type": "string"
+        },
+        "tool": {
+          "$ref": "#/$defs/ToolDefinition",
+          "description": "Tool configuration - single tool or pipeline."
+        },
+        "vars": {
+          "additionalProperties": true,
+          "default": null,
+          "description": "Variables to extract from step result.",
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "when": {
+          "default": null,
+          "description": "Transition enable guard (canonical format).\nJinja2 expression evaluated by server before step runs.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "step",
+        "tool"
+      ],
+      "type": "object"
+    },
+    "StepSpec": {
+      "description": "Step-level behavior configuration.",
+      "properties": {
+        "next_mode": {
+          "default": null,
+          "description": "Next evaluation mode: exclusive (first match) or inclusive (all matches).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "on_error": {
+          "default": null,
+          "description": "Error handling: fail, continue, or retry.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "timeout": {
+          "default": null,
+          "description": "Step timeout (e.g., \"30s\", \"5m\").",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "ToolDefinition": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ToolSpec",
+          "description": "Single tool (shorthand)."
+        },
+        {
+          "description": "Pipeline - list of labeled tasks.\n\nTwo YAML shapes are accepted on input, both map to the same\ninternal representation (label-as-key) before serialization\nfor the worker's `task_sequence` consumer:\n\n**Flat / name-as-field** (the dominant v10 form in e2e\nfixtures: ~5 fixtures with this shape under\n`repos/e2e/fixtures/playbooks/`):\n```yaml\ntool:\n- name: init_action\n  kind: python\n  input: { ... }\n  code: ...\n```\n\n**Nested / label-as-key** (the existing Rust internal\nshape, also used in some hand-written fixtures):\n```yaml\ntool:\n- init_action:\n    kind: python\n    input: { ... }\n    code: ...\n```\n\nSee `noetl/ai-meta#57` for the e2e finding that surfaced\nthe flat form being rejected by the strict Rust decoder.",
+          "items": {
+            "$ref": "#/$defs/PipelineItem"
+          },
+          "type": "array"
+        }
+      ],
+      "description": "Tool definition - can be single tool or pipeline."
+    },
+    "ToolKind": {
+      "description": "Supported tool kinds.",
+      "oneOf": [
+        {
+          "enum": [
+            "http",
+            "postgres",
+            "duckdb",
+            "ducklake",
+            "python",
+            "workbook",
+            "playbook",
+            "playbooks",
+            "secrets",
+            "iterator",
+            "container",
+            "script",
+            "snowflake",
+            "transfer",
+            "snowflake_transfer",
+            "gcs",
+            "gateway",
+            "nats",
+            "shell",
+            "artifact",
+            "noop",
+            "task_sequence",
+            "rhai"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "subscription",
+          "description": "Bounded-drain message subscription poll (NATS / Pub/Sub / Kafka).\nnoetl/ai-meta#90 Phase 1 — dispatched generically by the worker\nthrough the noetl-tools registry; the server only needs to accept\nthe kind so playbook validation passes.",
+          "type": "string"
+        },
+        {
+          "const": "wasm",
+          "description": "Compiled WASM system plug-in (noetl/ai-meta#105). The step's tool\ncarries `plugin: { path, version }` (+ optional `input`); the server\nonly accepts the kind so playbook validation passes, and the worker's\n`wasm-plugin` dispatcher routes `tool_kind: \"wasm\"` to the host (load\nfrom the catalog → run → flush capability intents).",
+          "type": "string"
+        }
+      ]
+    },
+    "ToolSpec": {
+      "additionalProperties": true,
+      "description": "Tool specification with tool.kind pattern.\nAll execution-specific fields live under tool.",
+      "properties": {
+        "args": {
+          "description": "Default arguments / inputs passed to the tool runtime.\n\nThe canonical NoETL v10 playbook YAML writes this as\n`input:` at the step's `tool:` block.  The Rust internal\nname stays `args` because that's what the noetl-tools\nregistry's `ToolConfig` consumes (PythonTool, ShellTool,\netc. expose this to user code as `args` / `globals()` /\nshell env).  The serde alias means both forms decode into\nthe same field; `input:` is the form playbooks should\nwrite, `args:` stays accepted for back-compat with\nexisting fixtures.\n\nWithout the alias, `input:` is silently dropped by serde,\nthe worker's Python wrapper's `globals().update(args)`\ngets an empty dict, and any user code referencing the\nworkload by name (e.g. `print(f\"hello {message}\")`) raises\n`NameError`.  See noetl/ai-meta#56 for the e2e finding."
+        },
+        "auth": {
+          "description": "Authentication configuration."
+        },
+        "code": {
+          "description": "Python code (for python tool).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "command": {
+          "description": "Command for the tool runtime.\n\nTwo shapes share this key and the type must accept both, so\nit is `serde_json::Value` (same treatment as `args` above):\n\n- **Scalar string** — shell / db tools (`command: \"echo hi\"`,\n  `command: \"SELECT 1\"`).  The db tools accept it via a\n  `#[serde(alias = \"command\")]` on their `query` field.\n- **Array of strings** — the `container` tool kind, K8s-Job\n  style (`command: [\"/bin/sh\", \"-c\"]`), which the worker's\n  `ContainerConfig.command: Option<Vec<String>>` consumes.\n\nBefore noetl/ai-meta#81 this was `Option<String>`, which made\nthe `container` tool impossible to execute: an array failed\nthe `ToolSpec` deserialise server-side (\"data did not match\nany variant of untagged enum ToolDefinition\"), and a scalar\ncleared the server only to be rejected by the worker\n(\"expected a sequence\").  Carrying the raw `Value` lets the\narray pass through to the worker unchanged while scalars stay\nJSON strings for the shell / db consumers."
+        },
+        "connection": {
+          "description": "Connection string or credential reference.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "eval": {
+          "description": "Tool-level flow control (canonical format).\nEvaluated after tool execution.",
+          "items": {
+            "$ref": "#/$defs/EvalEntry"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "headers": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "HTTP headers.",
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "kind": {
+          "$ref": "#/$defs/ToolKind",
+          "description": "Tool type. Authored, so flag-gated kinds are refused while their flag is off\n([`ToolKindGates`])."
+        },
+        "libs": {
+          "description": "Libraries/dependencies."
+        },
+        "method": {
+          "description": "HTTP method (for http tool).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "output_select": {
+          "description": "Output selection strategy (for result externalization)."
+        },
+        "params": {
+          "description": "Tool params. A raw `Value`, for the same reason `command` above is one.\n\n⚠ This was `Option<HashMap<String, Value>>`, i.e. map-only, and a SEQUENCE of\npositional SQL parameters therefore failed the untagged `ToolDefinition` enum\noutright — `data did not match any variant of untagged enum ToolDefinition`,\na 400 at `POST /api/execute` with no execution and no clue which field was at\nfault. Measured 2026-10-07: that rejected **all 53 registered `adiona/v1/*`\nplaybooks**, which bind `$1` positionally.\n\nThe dispatcher has always wanted an array here. `noetl-tools`'\n`tools/postgres.rs` declares `pub params: Vec<serde_json::Value>` and binds it\npositionally; its own tests use `\"params\": [42]`, and `duckdb.rs` uses\n`[1, \"hello\"]`. Only `http.rs` uses a map. So the map-only type contradicted\nthe dispatcher for every SQL tool kind while matching it for exactly one.\n\nCarrying the raw `Value` lets both forms pass through unchanged. The server has\nno other reader of this field — it deserialises and re-serialises it for the\nworker — so widening it changes nothing else."
+        },
+        "query": {
+          "description": "Query/SQL (for database tools).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "url": {
+          "description": "URL (for http tool).",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "type": "object"
+    },
+    "WorkbookTask": {
+      "description": "Reusable task definition in workbook.",
+      "properties": {
+        "name": {
+          "description": "Task name.",
+          "type": "string"
+        },
+        "sink": {
+          "default": null,
+          "description": "Optional sink configuration."
+        },
+        "tool": {
+          "$ref": "#/$defs/ToolSpec",
+          "description": "Tool configuration."
+        }
+      },
+      "required": [
+        "name",
+        "tool"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "https://noetl.ai/schema/v2/playbook.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "NoETL playbook grammar (noetl.io/v2), generated from the Rust authoring types in noetl-orchestrate-core 0.1.0. Permissive like the parser (unknown keys are not rejected); `tool.kind` is closed to the kinds this server accepts. Semantic rules (a `start` step, unique step names, existing `next` targets) are enforced by the server's validator, not by this schema.",
+  "properties": {
+    "apiVersion": {
+      "description": "API version (noetl.io/v2).",
+      "type": "string"
+    },
+    "keychain": {
+      "default": null,
+      "description": "Keychain definitions for credentials and tokens.",
+      "items": {
+        "$ref": "#/$defs/KeychainDef"
+      },
+      "type": [
+        "array",
+        "null"
+      ]
+    },
+    "kind": {
+      "description": "Resource kind (Playbook).",
+      "type": "string"
+    },
+    "metadata": {
+      "$ref": "#/$defs/Metadata",
+      "description": "Metadata (name, path, labels)."
+    },
+    "vars": {
+      "additionalProperties": true,
+      "default": null,
+      "description": "Top-level variables (canonical format).",
+      "type": [
+        "object",
+        "null"
+      ]
+    },
+    "workbook": {
+      "default": null,
+      "description": "Reusable tasks.",
+      "items": {
+        "$ref": "#/$defs/WorkbookTask"
+      },
+      "type": [
+        "array",
+        "null"
+      ]
+    },
+    "workflow": {
+      "description": "Workflow steps.",
+      "items": {
+        "$ref": "#/$defs/Step"
+      },
+      "type": "array"
+    },
+    "workload": {
+      "default": null,
+      "description": "Global workflow variables."
+    }
+  },
+  "required": [
+    "apiVersion",
+    "kind",
+    "metadata",
+    "workflow"
+  ],
+  "title": "NoETL Playbook",
+  "type": "object"
+}

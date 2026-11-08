@@ -1,0 +1,173 @@
+{
+  "api_version": "noetl.io/v2",
+  "document_kind": "Playbook",
+  "enabled_tool_kinds": [
+    "artifact",
+    "container",
+    "duckdb",
+    "ducklake",
+    "gateway",
+    "gcs",
+    "http",
+    "iterator",
+    "nats",
+    "noop",
+    "playbook",
+    "playbooks",
+    "postgres",
+    "python",
+    "rhai",
+    "script",
+    "secrets",
+    "shell",
+    "snowflake",
+    "snowflake_transfer",
+    "subscription",
+    "task_sequence",
+    "transfer",
+    "wasm",
+    "workbook"
+  ],
+  "executable": "not_reported",
+  "executable_note": "Kinds the parser accepts. Which kinds a live worker can execute is reported by workers (RFC dsl-knowledge-base Phase 3) and is not known to this process.",
+  "orchestrate_core_version": "0.1.0",
+  "tool_kinds": [
+    {
+      "enabled": false,
+      "gate_env": "NOETL_TOOL_KIND_AGENT",
+      "gated": true,
+      "name": "agent"
+    },
+    {
+      "enabled": true,
+      "gated": false,
+      "name": "artifact"
+    },
+    {
+      "enabled": true,
+      "gated": false,
+      "name": "container"
+    },
+    {
+      "enabled": true,
+      "gated": false,
+      "name": "duckdb"
+    },
+    {
+      "enabled": true,
+      "gated": false,
+      "name": "ducklake"
+    },
+    {
+      "enabled": true,
+      "gated": false,
+      "name": "gateway"
+    },
+    {
+      "enabled": true,
+      "gated": false,
+      "name": "gcs"
+    },
+    {
+      "enabled": true,
+      "gated": false,
+      "name": "http"
+    },
+    {
+      "enabled": true,
+      "gated": false,
+      "name": "iterator"
+    },
+    {
+      "enabled": false,
+      "gate_env": "NOETL_TOOL_KIND_MCP",
+      "gated": true,
+      "name": "mcp"
+    },
+    {
+      "enabled": true,
+      "gated": false,
+      "name": "nats"
+    },
+    {
+      "enabled": true,
+      "gated": false,
+      "name": "noop"
+    },
+    {
+      "enabled": true,
+      "gated": false,
+      "name": "playbook"
+    },
+    {
+      "enabled": true,
+      "gated": false,
+      "name": "playbooks"
+    },
+    {
+      "enabled": true,
+      "gated": false,
+      "name": "postgres"
+    },
+    {
+      "enabled": true,
+      "gated": false,
+      "name": "python"
+    },
+    {
+      "enabled": true,
+      "gated": false,
+      "name": "rhai"
+    },
+    {
+      "enabled": true,
+      "gated": false,
+      "name": "script"
+    },
+    {
+      "enabled": true,
+      "gated": false,
+      "name": "secrets"
+    },
+    {
+      "enabled": true,
+      "gated": false,
+      "name": "shell"
+    },
+    {
+      "enabled": true,
+      "gated": false,
+      "name": "snowflake"
+    },
+    {
+      "enabled": true,
+      "gated": false,
+      "name": "snowflake_transfer"
+    },
+    {
+      "enabled": true,
+      "gated": false,
+      "name": "subscription"
+    },
+    {
+      "enabled": true,
+      "gated": false,
+      "name": "task_sequence"
+    },
+    {
+      "enabled": true,
+      "gated": false,
+      "name": "transfer"
+    },
+    {
+      "enabled": true,
+      "gated": false,
+      "name": "wasm"
+    },
+    {
+      "enabled": true,
+      "gated": false,
+      "name": "workbook"
+    }
+  ]
+}

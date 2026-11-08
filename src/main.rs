@@ -1028,6 +1028,16 @@ fn build_router(
     // NOETL_EHGRAPH_EMBEDDED=true. Its routes carry ehgraph's own per-namespace
     // bearer grants, so they are not behind the internal-token gate. A refused
     // open mounts a 503 router here that says why.
+    // DSL knowledge base (ai-meta RFC `dsl-knowledge-base.md`, Phase 1) — the
+    // playbook schema + tool-kind manifest this process accepts, read-only and
+    // stateless. Mounted only under NOETL_DSL_KB=true, so a default deployment
+    // carries no new route. Listed in `tests/auth_gate_wiring.rs`
+    // PUBLIC_BY_DESIGN: it reflects compiled grammar, no data, no credentials.
+    if handlers::dsl::dsl_kb_enabled() {
+        let dsl_routes = handlers::dsl::routes();
+        app = app.merge(dsl_routes);
+    }
+
     if let Some(ehgraph_routes) = ehgraph_routes {
         app = app.nest(noetl_server::ehgraph_embedded::MOUNT, ehgraph_routes);
     }

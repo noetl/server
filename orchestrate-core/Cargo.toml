@@ -22,8 +22,21 @@ tracing = "0.1"
 sha2 = "0.10"
 hex = "0.4"
 
+# DSL knowledge base (ai-meta RFC `dsl-knowledge-base.md`): derive the playbook
+# JSON Schema from the authoring types below.  OPTIONAL so the wasm32
+# `system/orchestrate` plug-in (which never emits a schema) carries none of it;
+# the server enables it.  schemars 1.x emits draft 2020-12.
+schemars = { version = "1", optional = true }
+
+[features]
+json-schema = ["dep:schemars"]
+
 [dev-dependencies]
 serde_yaml = "0.9"
 # Phase 0 determinism probe (ai-meta#265): the digest under test.
 sha2 = "0.10"
 hex = "0.4"
+
+[[example]]
+name = "emit_dsl"
+required-features = ["json-schema"]

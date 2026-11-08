@@ -17,6 +17,7 @@
 
 pub mod chain_cert;
 pub mod commands;
+pub mod dsl;
 pub mod error;
 pub mod evaluator;
 pub mod event;
