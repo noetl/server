@@ -59,65 +59,22 @@ impl CatalogService {
         // Decode content if base64 encoded
         let content = self.decode_content(&request.content)?;
 
-        // Parse YAML to extract metadata
-        let yaml: serde_yaml::Value = serde_yaml::from_str(&content)
-            .map_err(|e| AppError::Validation(format!("Invalid YAML: {}", e)))?;
-
-        // Extract metadata
+        // Every pre-insert check lives in `registration_identity` +
+        // `registration_checks`, shared with the DSL validator
+        // (`POST /api/dsl/validate`, ai-meta RFC dsl-knowledge-base Phase 2), so
+        // "validate says it registers" and "it registers" cannot disagree: they are
+        // the same function, not two copies of it.
+        let (yaml, path, kind) = registration_identity(&content, &request.resource_type)?;
+        registration_checks(&yaml, &kind)?;
+        // `registration_identity` already proved `metadata` exists.
         let metadata = yaml
             .get("metadata")
             .ok_or_else(|| AppError::Validation("Missing 'metadata' section".to_string()))?;
 
-        let path = metadata
-            .get("path")
-            .and_then(|v| v.as_str())
-            .or_else(|| metadata.get("name").and_then(|v| v.as_str()))
-            .ok_or_else(|| {
-                AppError::Validation("Missing 'path' or 'name' in metadata".to_string())
-            })?
-            .to_string();
-
-        let kind = yaml
-            .get("kind")
-            .and_then(|v| v.as_str())
-            .unwrap_or(&request.resource_type)
-            .to_lowercase();
-
-        // A `kind: Subscription` entry is a first-class catalog type
-        // (noetl/ai-meta#90 Phase 2) — it is never dispatched as a step
-        // DAG, so it is validated against the source/mode/dispatch schema
-        // instead of a `workflow:` block.  Reject a malformed spec at
-        // registration so the continuous runtime never activates a broken
-        // subscription.
-        if kind == "subscription" {
-            validate_subscription_spec(&yaml)?;
-        }
-
-        // noetl/ai-meta#256 — reject an unknown tool kind HERE, not at execute.
-        //
-        // Registration used to accept literal nonsense: a probe registering
-        // `totally_bogus_kind` was ACCEPTED and then failed at invocation with
-        // "data did not match any variant of untagged enum ToolDefinition". So
-        // registration success carried no information about whether a playbook
-        // could ever run, and six live paths had been unexecutable since the day
-        // they were written, with nothing saying so until somebody invoked them.
-        //
-        // The failure now lands on the author at registration instead of on a
-        // user at invocation.
-        validate_tool_kinds(&yaml)?;
-
-        // noetl/ai-meta#455 P5 — a catalog entry names a secret by REFERENCE; the material
-        // lives in the keychain. Refuse inline material here because registration is the
-        // last point at which the answer can still be "no": the catalog is EHDB-backed and
-        // `noetl.event` is append-only, immutable and never purged, so a credential pasted
-        // into a playbook cannot be removed afterwards — and it travels into
-        // `command.issued` when the step dispatches.
-        let secret_scan = crate::services::secret_material::scan(&yaml);
-        if !secret_scan.findings.is_empty() {
-            return Err(AppError::Validation(
-                crate::services::secret_material::describe(&secret_scan),
-            ));
-        }
+        // Phase 2 shadow: what WOULD the full parser say? Never rejects, never
+        // fails the request; counts outcomes. Off unless
+        // NOETL_CATALOG_PARSE_ON_REGISTER=shadow.
+        parse_on_register(&path, &kind, &content);
 
         // Get next version
         let version = queries::get_next_version(&self.pool, &path).await?;
@@ -471,6 +428,142 @@ impl CatalogService {
     }
 }
 
+/// Parse a registration body and extract `(yaml, path, kind)` — the first half of
+/// [`CatalogService::register`], verbatim, shared with the DSL validator.
+pub(crate) fn registration_identity(
+    content: &str,
+    default_kind: &str,
+) -> AppResult<(serde_yaml::Value, String, String)> {
+    // Parse YAML to extract metadata
+    let yaml: serde_yaml::Value = serde_yaml::from_str(content)
+        .map_err(|e| AppError::Validation(format!("Invalid YAML: {}", e)))?;
+
+    // Extract metadata
+    let metadata = yaml
+        .get("metadata")
+        .ok_or_else(|| AppError::Validation("Missing 'metadata' section".to_string()))?;
+
+    let path = metadata
+        .get("path")
+        .and_then(|v| v.as_str())
+        .or_else(|| metadata.get("name").and_then(|v| v.as_str()))
+        .ok_or_else(|| AppError::Validation("Missing 'path' or 'name' in metadata".to_string()))?
+        .to_string();
+
+    let kind = yaml
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .unwrap_or(default_kind)
+        .to_lowercase();
+    Ok((yaml, path, kind))
+}
+
+/// The registration-time checks, in registration order, first failure wins —
+/// exactly what [`CatalogService::register`] enforces before it inserts.
+pub(crate) fn registration_checks(yaml: &serde_yaml::Value, kind: &str) -> AppResult<()> {
+    // A `kind: Subscription` entry is a first-class catalog type
+    // (noetl/ai-meta#90 Phase 2) — it is never dispatched as a step
+    // DAG, so it is validated against the source/mode/dispatch schema
+    // instead of a `workflow:` block.  Reject a malformed spec at
+    // registration so the continuous runtime never activates a broken
+    // subscription.
+    if kind == "subscription" {
+        validate_subscription_spec(yaml)?;
+    }
+
+    // noetl/ai-meta#256 — reject an unknown tool kind HERE, not at execute.
+    //
+    // Registration used to accept literal nonsense: a probe registering
+    // `totally_bogus_kind` was ACCEPTED and then failed at invocation with
+    // "data did not match any variant of untagged enum ToolDefinition". So
+    // registration success carried no information about whether a playbook
+    // could ever run, and six live paths had been unexecutable since the day
+    // they were written, with nothing saying so until somebody invoked them.
+    //
+    // The failure now lands on the author at registration instead of on a
+    // user at invocation.
+    validate_tool_kinds(yaml)?;
+
+    // noetl/ai-meta#455 P5 — a catalog entry names a secret by REFERENCE; the material
+    // lives in the keychain. Refuse inline material here because registration is the
+    // last point at which the answer can still be "no": the catalog is EHDB-backed and
+    // `noetl.event` is append-only, immutable and never purged, so a credential pasted
+    // into a playbook cannot be removed afterwards — and it travels into
+    // `command.issued` when the step dispatches.
+    let secret_scan = crate::services::secret_material::scan(yaml);
+    if !secret_scan.findings.is_empty() {
+        return Err(AppError::Validation(
+            crate::services::secret_material::describe(&secret_scan),
+        ));
+    }
+    Ok(())
+}
+
+/// `NOETL_CATALOG_PARSE_ON_REGISTER` (ai-meta RFC dsl-knowledge-base Phase 2).
+pub const PARSE_ON_REGISTER_ENV: &str = "NOETL_CATALOG_PARSE_ON_REGISTER";
+
+/// How registration treats the full playbook parser.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParseOnRegister {
+    /// Today's behaviour: registration never runs `parse_playbook`.
+    Off,
+    /// Run it, count what it would reject, reject nothing.
+    Shadow,
+}
+
+impl ParseOnRegister {
+    /// Strict: exactly `shadow` arms it; anything else (including a future
+    /// `enforce`, which is deliberately NOT implemented here) is `Off`.
+    pub fn from_value(v: Option<&str>) -> Self {
+        match v {
+            Some("shadow") => ParseOnRegister::Shadow,
+            _ => ParseOnRegister::Off,
+        }
+    }
+    pub fn current() -> Self {
+        static M: std::sync::OnceLock<ParseOnRegister> = std::sync::OnceLock::new();
+        *M.get_or_init(|| Self::from_value(std::env::var(PARSE_ON_REGISTER_ENV).ok().as_deref()))
+    }
+}
+
+/// The parser's verdict on a registration, as a stable rule id: `None` when it
+/// accepts. `parse` = the document does not deserialise into the grammar;
+/// `rule` = it deserialises but breaks a semantic rule (start step, unique
+/// names, next targets, eval/loop checks).
+pub(crate) fn parse_verdict(kind: &str, content: &str) -> Option<(&'static str, String)> {
+    if kind != "playbook" {
+        return None;
+    }
+    match crate::playbook::parser::parse_playbook(content) {
+        Ok(_) => None,
+        Err(AppError::Parse(m)) => Some(("playbook_parse", m)),
+        Err(e) => Some(("playbook_rule", e.to_string())),
+    }
+}
+
+/// Shadow-mode hook. Returns nothing and cannot fail the registration.
+fn parse_on_register(path: &str, kind: &str, content: &str) {
+    if ParseOnRegister::current() != ParseOnRegister::Shadow || kind != "playbook" {
+        return;
+    }
+    match parse_verdict(kind, content) {
+        None => crate::metrics::catalog_register_parse_total()
+            .with_label_values(&["accepted", "none"])
+            .inc(),
+        Some((rule, msg)) => {
+            crate::metrics::catalog_register_parse_total()
+                .with_label_values(&["would_reject", rule])
+                .inc();
+            tracing::warn!(
+                path,
+                rule,
+                error = %msg,
+                "catalog register: parse_playbook would reject this playbook (shadow; registered anyway)"
+            );
+        }
+    }
+}
+
 /// Source backends a `kind: Subscription` may declare.
 const SUBSCRIPTION_SOURCES: &[&str] = &["pubsub", "nats", "kafka", "webhook"];
 /// Activation modes for a pull subscription.
@@ -605,7 +698,32 @@ fn validate_tool_kinds(yaml: &serde_yaml::Value) -> AppResult<()> {
     )))
 }
 
-fn validate_subscription_spec(yaml: &serde_yaml::Value) -> AppResult<()> {
+/// Every offending `tool.kind`, one entry per (step, kind), for the DSL validator.
+/// Same walk ([`collect_tool_kinds`]) and same oracle ([`ToolKind::parse`]) as
+/// [`validate_tool_kinds`]; this only keeps the items apart instead of joining them
+/// into one message. `gate_env` is set when the kind exists but its flag is off.
+pub(crate) fn tool_kind_offenders(
+    yaml: &serde_yaml::Value,
+) -> Vec<(String, String, Option<&'static str>)> {
+    let Some(workflow) = yaml.get("workflow") else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    collect_tool_kinds(workflow, None, &mut found);
+    let mut out: Vec<(String, String, Option<&'static str>)> = found
+        .into_iter()
+        .filter(|(_, k)| noetl_orchestrate_core::playbook::ToolKind::parse(k).is_none())
+        .map(|(step, k)| {
+            let gate = noetl_orchestrate_core::playbook::ToolKind::parse_ungated(&k)
+                .and_then(|kind| kind.gate_env());
+            (step, k, gate)
+        })
+        .collect();
+    out.dedup();
+    out
+}
+
+pub(crate) fn validate_subscription_spec(yaml: &serde_yaml::Value) -> AppResult<()> {
     let spec = yaml
         .get("spec")
         .ok_or_else(|| AppError::Validation("kind: Subscription requires a 'spec' block".into()))?;

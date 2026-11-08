@@ -93,6 +93,30 @@ pub fn events_ingested_total() -> &'static IntCounterVec {
     })
 }
 
+/// Counter: the full playbook parser's verdict on catalog registrations, recorded
+/// only under `NOETL_CATALOG_PARSE_ON_REGISTER=shadow` (ai-meta RFC
+/// dsl-knowledge-base Phase 2). `outcome` = accepted | would_reject; `rule` =
+/// none | playbook_parse | playbook_rule. The `accepted` series is the
+/// denominator: a would-reject count with no denominator cannot say whether it is
+/// most of the catalog or none of it.
+pub fn catalog_register_parse_total() -> &'static IntCounterVec {
+    static M: OnceLock<IntCounterVec> = OnceLock::new();
+    M.get_or_init(|| {
+        let counter = IntCounterVec::new(
+            Opts::new(
+                "noetl_catalog_register_parse_total",
+                "Catalog registrations by what parse_playbook would say (shadow mode only; never rejects).",
+            ),
+            &["outcome", "rule"],
+        )
+        .expect("static counter spec must be valid");
+        registry()
+            .register(Box::new(counter.clone()))
+            .expect("counter registration must succeed");
+        counter
+    })
+}
+
 /// Counter: rows purged by `POST /api/internal/cleanup/purge`, bucketed by
 /// the `noetl.*` table they were purged from.  Lets retention runs be
 /// observed without per-delete log lines (noetl/ai-meta#96).

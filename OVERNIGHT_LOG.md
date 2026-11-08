@@ -1,0 +1,2 @@
+- 2026-11-07 DSL-KB P1: #562 merged (chore; no release fired). /api/dsl/{version,schema,tools} behind NOETL_DSL_KB (off).
+- 2026-11-07 DSL-KB P2: POST /api/dsl/validate (dry-run register + parse_playbook, rule-tagged) + NOETL_CATALOG_PARSE_ON_REGISTER=shadow counter (off; never rejects).
