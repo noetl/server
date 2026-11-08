@@ -381,16 +381,37 @@ mod wiring {
     /// IS the guarantee.
     #[test]
     fn the_scan_precedes_the_write() {
+        // The scan lives in `registration_checks` (shared with POST /api/dsl/validate,
+        // so the validator cannot disagree with registration). The guarantee is now a
+        // two-link chain, and BOTH links are asserted: the scan is inside
+        // `registration_checks`, and `register` calls `registration_checks` before the
+        // version/write step begins.
+        let checks_at = SRC
+            .find("pub(crate) fn registration_checks(")
+            .expect("registration_checks exists");
+        let checks_end = checks_at
+            + SRC[checks_at..]
+                .find("\n}\n")
+                .expect("registration_checks has a body");
         let scan_at = SRC
             .find("secret_material::scan(")
             .expect("the scan call exists");
+        assert!(
+            (checks_at..checks_end).contains(&scan_at),
+            "the scan must be inside registration_checks, the function register calls"
+        );
+        let register_at = SRC.find("pub async fn register(").expect("register exists");
+        let call_at = register_at
+            + SRC[register_at..]
+                .find("registration_checks(&yaml")
+                .expect("register calls registration_checks");
         let write_at = SRC
             .find("queries::get_next_version(")
             .expect("the version/write step exists");
         assert!(
-            scan_at < write_at,
-            "the scan runs after the write begins: material would be persisted and only \
-             then refused, and noetl.event never forgets it"
+            call_at < write_at,
+            "register runs registration_checks after the write begins: material would be \
+             persisted and only then refused, and noetl.event never forgets it"
         );
     }
 
