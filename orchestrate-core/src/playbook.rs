@@ -151,9 +151,31 @@ impl ToolKindGates {
     }
 
     /// The process-wide gates, read from the environment on first use.
+    ///
+    /// ⚠ **Inside the off-server orchestrate drive (`wasm32`) every gate is open.**
+    /// The plug-in has no process environment: `std::env::var` always fails there, so
+    /// reading the flags would close every gate and the drive would refuse to decode
+    /// the very `kind: mcp` step the server just admitted (`data did not match any
+    /// variant of untagged enum ToolDefinition`, found by the RFC Phase 2 kind e2e).
+    /// The gate is enforced where a playbook is *admitted*: registration
+    /// (`ToolKind::parse`) and the server's own execute-time `parse_playbook`, both
+    /// native. The drive only ever receives a playbook that passed the latter, so
+    /// opening the gates there admits nothing new.
     pub fn current() -> ToolKindGates {
         static GATES: std::sync::OnceLock<ToolKindGates> = std::sync::OnceLock::new();
-        *GATES.get_or_init(ToolKindGates::from_env)
+        *GATES.get_or_init(|| {
+            ToolKindGates::for_target(cfg!(target_arch = "wasm32"), ToolKindGates::from_env)
+        })
+    }
+
+    /// The gates for a build target: all open in the drive sandbox, else `read()`.
+    /// Split out of [`ToolKindGates::current`] so the sandbox arm is testable natively.
+    pub fn for_target(drive_sandbox: bool, read: impl FnOnce() -> ToolKindGates) -> ToolKindGates {
+        if drive_sandbox {
+            ToolKindGates::ALL_ON
+        } else {
+            read()
+        }
     }
 
     /// Is `kind` accepted under these gates? Ungated kinds always are.
@@ -2054,6 +2076,26 @@ mod tool_kind_tests {
 
     /// Strict `== "true"`: an arming flag is not armed by `1`, `yes`, `TRUE` or a
     /// stray space, and an unrelated variable never opens a gate.
+    #[test]
+    fn the_offserver_drive_sandbox_has_every_gate_open_and_native_reads_the_env() {
+        // The wasm drive cannot read the environment, and only ever decodes a playbook the
+        // server's gated execute-parse already admitted. Closing its gates broke the
+        // Phase 2 kind e2e ("did not match any variant of untagged enum ToolDefinition").
+        assert_eq!(
+            ToolKindGates::for_target(true, || ToolKindGates::OFF),
+            ToolKindGates::ALL_ON
+        );
+        assert_eq!(
+            ToolKindGates::for_target(false, || ToolKindGates::OFF),
+            ToolKindGates::OFF
+        );
+        let mcp_only = ToolKindGates {
+            mcp: true,
+            agent: false,
+        };
+        assert_eq!(ToolKindGates::for_target(false, || mcp_only), mcp_only);
+    }
+
     #[test]
     fn gates_read_strict_true_only() {
         let env = |pairs: &'static [(&'static str, &'static str)]| {
