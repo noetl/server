@@ -3155,7 +3155,8 @@ pub fn execute_batch_size() -> &'static HistogramVec {
     })
 }
 
-/// Record one execution outcome.  `entry` is `"single"` or `"batch"`;
+/// Record one execution outcome.  `entry` is `"single"`, `"batch"` or `"mcp"`
+/// (a `tools/call` on `/api/mcp`, noetl/ai-meta#539 Phase 5);
 /// `outcome` is `"new"` (execution created), `"duplicate"` (dedup window
 /// collapsed it), or `"error"`.
 pub fn record_execute_outcome(entry: &str, outcome: &str) {
