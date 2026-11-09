@@ -208,7 +208,7 @@ fn the_structural_check_can_fail() {
 ///
 /// **Every entry needs a reason.** This is the list a reviewer argues with; the
 /// test below makes it impossible to add an ungated router *without* arguing.
-const PUBLIC_BY_DESIGN: [(&str, &str); 19] = [
+const PUBLIC_BY_DESIGN: [(&str, &str); 20] = [
     ("health_routes", "liveness/readiness probes carry no credential"),
     ("catalog_routes", "register/list is the authoring surface; delete is separately gated by RequireInternalApiToken"),
     ("auth_routes", "the login surface itself — gating it would be circular"),
@@ -225,6 +225,7 @@ const PUBLIC_BY_DESIGN: [(&str, &str); 19] = [
     ("sharding_routes", "shard diagnostics, no data"),
     ("system_routes", "system information endpoints, no data and no credential material"),
     ("dsl_routes", "read-only reflection of the compiled playbook grammar and tool-kind gates; no data, no credential material; mounted only under NOETL_DSL_KB"),
+    ("agent_routes", "agent cards + task send/status over playbooks that opt in (metadata.expose.agent): the execute + status capability of execution_routes, narrowed; outbound callbacks only to NOETL_AGENT_CALLBACK_ORIGINS; per-user checks are the gateway's; mounted only under NOETL_AGENT_ENDPOINT"),
     ("mcp_routes", "MCP tools/list + tools/call over playbooks that opt in (metadata.expose.mcp / kind: Mcp serve: true): the execute + status capability of execution_routes, narrowed; per-user may_execute filtering is the gateway's; mounted only under NOETL_MCP_SERVER"),
     ("dashboard_routes", "read-only aggregate counts for the UI; no per-record data and no credential material"),
     // ⚠ noetl/ai-meta#312. NOT a justification — a record of the current state.
