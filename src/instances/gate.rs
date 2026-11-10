@@ -6,7 +6,7 @@
 //! proves the caller holds the key, and the log line is about a real instance.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::Mutex;
+use std::sync::{Mutex, RwLock};
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -100,6 +100,9 @@ pub struct Gate {
     pub audience: String,
     pub skew_ms: i64,
     nonces: Mutex<Nonces>,
+    /// `NOETL_INSTANCE_TRUST=enroll`: ids that redeemed an enrollment token are trusted too.
+    pub enroll: bool,
+    enrolled: RwLock<HashSet<String>>,
 }
 
 #[derive(Default)]
@@ -115,7 +118,34 @@ impl Gate {
             audience: audience.into(),
             skew_ms,
             nonces: Mutex::new(Nonces::default()),
+            enroll: false,
+            enrolled: RwLock::default(),
         }
+    }
+
+    /// Trust these ids in addition to the allowlist (enrollment mode).
+    pub fn enroll_id(&self, id: &str) {
+        self.enrolled
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(id.to_string());
+    }
+
+    pub fn revoke_id(&self, id: &str) -> bool {
+        self.enrolled
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(id)
+    }
+
+    pub fn is_trusted(&self, id: &str) -> bool {
+        self.trust.admits(id)
+            || (self.enroll
+                && self
+                    .enrolled
+                    .read()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .contains(id))
     }
 
     pub fn from_env() -> Self {
@@ -131,11 +161,39 @@ impl Gate {
             .and_then(|s| s.trim().parse::<i64>().ok())
             .filter(|s| (1..=3600).contains(s))
             .unwrap_or(120);
-        Gate::new(Trust::from_env_with(&get), audience, skew * 1000)
+        let mut g = Gate::new(Trust::from_env_with(&get), audience, skew * 1000);
+        g.enroll = get(TRUST_ENV).as_deref().map(str::trim) == Some("enroll");
+        g
     }
 
     /// Admit `env` for `purpose` at `now_ms`.
     pub fn admit(
+        &self,
+        env: &SignedEnvelope,
+        purpose: &str,
+        now_ms: i64,
+    ) -> Result<Admitted, Refusal> {
+        let a = self.admit_untrusted(env, purpose, now_ms)?;
+        if !self.is_trusted(&a.instance_id) {
+            let how = if self.enroll {
+                "enroll it with a token (POST /api/instances/enroll) or add it to"
+            } else {
+                "add it to"
+            };
+            return Err(refuse(
+                403,
+                format!(
+                    "instance {} is not trusted here; {how} {TRUSTED_IDS_ENV}",
+                    a.instance_id
+                ),
+            ));
+        }
+        Ok(a)
+    }
+
+    /// Every check but trust: signature, header, purpose, audience, skew, nonce. Only for
+    /// `enroll`, where the caller proves trust with a token instead.
+    pub fn admit_untrusted(
         &self,
         env: &SignedEnvelope,
         purpose: &str,
@@ -178,12 +236,6 @@ impl Gate {
             return Err(refuse(400, "nonce must be 16..=128 characters"));
         }
         self.remember(&signer, &h.nonce, now_ms)?;
-        if !self.trust.admits(&signer) {
-            return Err(refuse(
-                403,
-                format!("instance {signer} is not trusted here; add it to {TRUSTED_IDS_ENV}"),
-            ));
-        }
         Ok(Admitted {
             instance_id: signer,
             public_key_b64: env.public_key.clone(),
