@@ -56,6 +56,11 @@ fn build_router(
     wallet_cipher: noetl_server::crypto::EnvelopeCipher,
     ehgraph_routes: Option<Router>,
 ) -> Router {
+    // Built here, before `state` and `execution_service` move into their route
+    // groups; merged below with the other optional routers.
+    let mcp_routes = handlers::mcp_server::mcp_server_enabled()
+        .then(|| handlers::mcp_server::routes(state.clone(), execution_service.clone()));
+
     // CORS configuration - allow all origins for development
     let cors = CorsLayer::new()
         .allow_origin(Any)
@@ -393,7 +398,7 @@ fn build_router(
             get(handlers::ehdb::list_execution_events),
         )
         .route("/api/ehdb/events", get(handlers::ehdb::scan_events))
-        .with_state(execution_service);
+        .with_state(execution_service.clone());
 
     // Raw data-plane tier queries (`/api/ehdb/tiers/{tier}`) are a separate
     // router because they carry a distinct state: the server does NOT open tier
@@ -1036,6 +1041,18 @@ fn build_router(
     if handlers::dsl::dsl_kb_enabled() {
         let dsl_routes = handlers::dsl::routes();
         app = app.merge(dsl_routes);
+    }
+
+    // Playbooks served over MCP (interop RFC Phase 5, noetl/ai-meta#539):
+    // `POST /api/mcp` and `/api/mcp/{*path}` answer `initialize`, `ping`,
+    // `tools/list` and `tools/call` for playbooks that opt in with
+    // `metadata.expose.mcp` or a `kind: Mcp` resource with `spec.serve: true`.
+    // Mounted only under NOETL_MCP_SERVER=true. Same capability as
+    // `execution_routes`, narrowed to opted-in playbooks, so it is listed in
+    // `tests/auth_gate_wiring.rs` PUBLIC_BY_DESIGN; per-user filtering is the
+    // gateway's (`may_execute`).
+    if let Some(mcp_routes) = mcp_routes {
+        app = app.merge(mcp_routes);
     }
 
     if let Some(ehgraph_routes) = ehgraph_routes {

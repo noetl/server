@@ -48,6 +48,7 @@ pub mod health;
 pub mod ingress;
 pub mod internal;
 pub mod keychain;
+pub mod mcp_server;
 pub mod nonconvergence_sweep;
 pub mod objects;
 pub mod orphan_sweep;

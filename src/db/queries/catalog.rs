@@ -356,6 +356,36 @@ pub async fn list_catalog_entries(
     Ok((entries, total.0))
 }
 
+/// `(path, content)` of the newest version of every playbook whose body
+/// contains `needle`, ordered by path.
+///
+/// Used by the MCP endpoint (`handlers::mcp_server`) to find playbooks that opt
+/// in with `metadata.expose.mcp`. The needle is only a prefilter, so the caller
+/// still parses each body; it keeps unexposed bodies inside Postgres.
+///
+/// ⚠ The kind and needle predicates sit OUTSIDE the `DISTINCT ON`: exposure is a
+/// property of the newest version only. Filtering first would pick the newest
+/// version that *mentions* the needle, so a playbook whose latest version
+/// removed `expose:` would keep being served from an older one.
+pub async fn list_latest_playbooks_mentioning(
+    pool: &DbPool,
+    needle: &str,
+) -> AppResult<Vec<(String, String)>> {
+    let sql = format!(
+        "SELECT path, content FROM ( \
+           SELECT DISTINCT ON (path) path, kind, content FROM noetl.catalog \
+           WHERE 1 = 1{archived} ORDER BY path, version DESC \
+         ) t WHERE LOWER(kind) = 'playbook' AND content IS NOT NULL \
+           AND strpos(content, $1) > 0 ORDER BY path",
+        archived = archived_filter()
+    );
+    let rows = sqlx::query_as::<_, (String, String)>(&sql)
+        .bind(needle)
+        .fetch_all(pool)
+        .await?;
+    Ok(rows)
+}
+
 /// Get all versions of a catalog entry by path.
 pub async fn get_catalog_all_versions(pool: &DbPool, path: &str) -> AppResult<Vec<CatalogEntry>> {
     let sql = format!(
