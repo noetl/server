@@ -213,7 +213,13 @@ impl InstanceState {
                 .call("graph.deactivate", graph::sweep(ns, now - ttl, now))
                 .await
             {
-                tracing::warn!(error = %e, "instance graph sweep failed");
+                if sweep_found_nothing(&e) {
+                    // The namespace appears with the first registration's projection; until
+                    // then there is nothing to deactivate.
+                    tracing::debug!("instance graph sweep: no topology namespace yet");
+                } else {
+                    tracing::warn!(error = %e, "instance graph sweep failed");
+                }
             }
         }
     }
@@ -232,6 +238,37 @@ impl InstanceState {
                 "callback_failed"
             });
         }
+    }
+}
+
+/// A sweep error that only means "nothing has been written here yet": ehgraph answers
+/// `NOT_FOUND` for a namespace no upsert has created. Not a failure, so not a WARN every
+/// sweep (2026-11-10: prod logged one per 15 s while no instance had registered).
+fn sweep_found_nothing(e: &str) -> bool {
+    serde_json::from_str::<Value>(e).is_ok_and(|v| {
+        v["code"] == "NOT_FOUND"
+            && v["message"]
+                .as_str()
+                .is_some_and(|m| m.starts_with("namespace ") && m.ends_with(" not found"))
+    })
+}
+
+#[cfg(test)]
+mod sweep_tests {
+    use super::sweep_found_nothing;
+
+    #[test]
+    fn a_missing_namespace_is_not_a_sweep_failure_but_other_errors_are() {
+        assert!(sweep_found_nothing(
+            r#"{"code":"NOT_FOUND","message":"namespace topology not found"}"#
+        ));
+        assert!(!sweep_found_nothing(
+            r#"{"code":"NOT_FOUND","message":"node instance:x not found"}"#
+        ));
+        assert!(!sweep_found_nothing(
+            r#"{"code":"UNAUTHORIZED","message":"unknown credential"}"#
+        ));
+        assert!(!sweep_found_nothing("connection reset"));
     }
 }
 
