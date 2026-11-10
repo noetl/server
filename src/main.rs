@@ -64,7 +64,7 @@ fn build_router(
         .then(|| handlers::agent_endpoint::routes(state.clone(), execution_service.clone()));
     // NoETL instances: register, discover, hand off (build plan item 9). Both routers are
     // empty unless NOETL_INSTANCE_REGISTRY=true.
-    let (instance_routes, instance_admin_routes) = noetl_server::instances::routes();
+    let (instance_routes, instance_admin_routes) = noetl_server::instances::routes(&db_pool);
 
     // CORS configuration - allow all origins for development
     let cors = CorsLayer::new()

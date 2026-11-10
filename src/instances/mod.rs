@@ -36,6 +36,8 @@
 //! Nothing is mounted unless [`REGISTRY_ENV`] is exactly `true`. When it is, the default
 //! trust admits **nobody** until their ids are listed in `NOETL_INSTANCE_TRUSTED_IDS`
 //! (or `NOETL_INSTANCE_TRUST=open`, for kind and local development).
+//!
+//! The task board survives a restart only with `NOETL_INSTANCE_STORE=postgres` ([`store`]).
 
 // The handlers return an early `Response` as their error, which is what axum hands back
 // anyway; boxing it would only add an allocation per refusal.
@@ -45,6 +47,7 @@ pub mod gate;
 pub mod graph;
 pub mod identity;
 pub mod registry;
+pub mod store;
 pub mod tasks;
 
 use std::collections::HashMap;
@@ -102,6 +105,8 @@ pub struct InstanceState {
     pub http: reqwest::Client,
     /// Overridable clock, for tests.
     pub clock: Arc<dyn Fn() -> i64 + Send + Sync>,
+    /// The durable inbox, when `NOETL_INSTANCE_STORE=postgres`.
+    pub store: Option<Arc<dyn store::TaskStore>>,
 }
 
 impl InstanceState {
@@ -121,7 +126,56 @@ impl InstanceState {
                 .build()
                 .unwrap_or_default(),
             clock: Arc::new(now_ms),
+            store: None,
         }
+    }
+
+    /// Write the board's changes through to the durable store. True when there is no store,
+    /// nothing changed, or the write landed; on failure the changes are kept for the next
+    /// write.
+    pub async fn flush(&self) -> bool {
+        let Some(store) = self.store.clone() else {
+            return true;
+        };
+        let changes = self
+            .board
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take_changes();
+        if changes.is_empty() {
+            return true;
+        }
+        match store.write(&changes).await {
+            Ok(()) => true,
+            Err(e) => {
+                crate::metrics::record_instance("store_failed");
+                tracing::warn!(error = %e, "instance task store write failed; retrying with the next write");
+                self.board
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .retry_changes(&changes);
+                false
+            }
+        }
+    }
+
+    /// Rebuild the board from the durable store. Returns how many tasks came back.
+    pub async fn restore(&self) -> Result<usize, String> {
+        let Some(store) = self.store.clone() else {
+            return Ok(0);
+        };
+        let rows = store.load().await?;
+        let n = self
+            .board
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .restore(rows);
+        if n > 0 {
+            crate::metrics::instance_total()
+                .with_label_values(&["store_restored"])
+                .inc_by(n as u64);
+        }
+        Ok(n)
     }
 
     pub fn from_env() -> Self {
@@ -203,6 +257,7 @@ impl InstanceState {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .prune(now);
+        self.flush().await;
         let ttl = {
             let mut r = self.registry.lock().unwrap_or_else(|p| p.into_inner());
             r.forget_expired(now);
@@ -469,6 +524,17 @@ async fn submit(State(s): State<InstanceState>, Json(env): Json<SignedEnvelope>)
             )
         }
     };
+    if !s.flush().await {
+        // Not durable, so not accepted: drop it and let the submitter retry.
+        s.board
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .discard(&task_id);
+        return refused(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the task could not be stored; retry".into(),
+        );
+    }
     crate::metrics::record_instance("task_submitted");
     tracing::info!(%task_id, from = %a.instance_id, %to, playbook = %b.playbook.path, "instance task queued");
     s.waker(&to).notify_waiters();
@@ -517,6 +583,9 @@ async fn inbox(State(s): State<InstanceState>, Json(env): Json<SignedEnvelope>) 
                 .unwrap_or_else(|p| p.into_inner())
                 .claim(&a.instance_id, max, s.now());
         if !claimed.is_empty() || tokio::time::Instant::now() >= until {
+            if !claimed.is_empty() {
+                s.flush().await;
+            }
             for _ in &claimed {
                 crate::metrics::record_instance("task_claimed");
             }
@@ -565,6 +634,7 @@ async fn result(State(s): State<InstanceState>, Json(env): Json<SignedEnvelope>)
     );
     match done {
         Ok(Completion::Recorded) => {
+            s.flush().await;
             crate::metrics::record_instance(if failed {
                 "task_failed"
             } else {
@@ -643,11 +713,40 @@ pub fn spawn_sweeper(state: InstanceState) {
 }
 
 /// `(signed routes, gated routes)` when [`REGISTRY_ENV`] is on, else two empty routers.
-pub fn routes() -> (Router, Router) {
+/// With `NOETL_INSTANCE_STORE=postgres` the board is restored from `noetl.instance_tasks`
+/// before the routes are returned, so the first claim already sees the old tasks. Needs the
+/// multi-threaded runtime (the server's `#[tokio::main]`).
+pub fn routes(pool: &crate::db::DbPool) -> (Router, Router) {
     if !registry_enabled() {
         return (Router::new(), Router::new());
     }
-    let state = InstanceState::from_env();
+    let mut state = InstanceState::from_env();
+    if store::postgres_store_enabled() {
+        let pool = pool.clone();
+        let opened = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(store::PgTaskStore::new(pool))
+        });
+        match opened {
+            Ok(st) => {
+                state.store = Some(Arc::new(st));
+                let s2 = state.clone();
+                match tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(s2.restore())
+                }) {
+                    Ok(n) => tracing::info!(
+                        restored = n,
+                        "instance inbox: durable (noetl.instance_tasks)"
+                    ),
+                    Err(e) => {
+                        tracing::error!(error = %e, "instance inbox: could not read noetl.instance_tasks; starting empty, writes continue")
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "instance inbox: NOETL_INSTANCE_STORE=postgres but the table could not be prepared; the inbox is IN MEMORY")
+            }
+        }
+    }
     if matches!(state.gate.trust, gate::Trust::Open) {
         tracing::warn!("NOETL_INSTANCE_TRUST=open: any instance with a valid key can register. Development only.");
     }

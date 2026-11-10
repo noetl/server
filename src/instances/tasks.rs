@@ -23,13 +23,16 @@
 //! - The playbook travels by reference (path, optional sha256). The target runs its own copy,
 //!   and refuses when the hash does not match.
 //!
-//! # Soft state
+//! # Durability
 //!
-//! The board is in memory, like the registry. A server restart loses queued tasks; the
-//! submitter sees `unknown task` on its next poll and may resubmit. A durable inbox on an
-//! EHDB feed subject (RFC §2.3) is the follow-up.
+//! The board is the working set, in memory. With `NOETL_INSTANCE_STORE=postgres` every change
+//! is also written through to `noetl.instance_tasks` ([`super::store`]) and the board is
+//! rebuilt from that table at start, so queued and claimed tasks, their claims and finished
+//! results survive a server restart. Without it the board is soft state: a restart loses
+//! queued tasks and the submitter sees `unknown task`. Callback tokens are never persisted, so
+//! a callback due after a restart is not sent; the submitter's poll still gets the result.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -93,6 +96,87 @@ pub struct Task {
     /// The submitter's callback: URL and the single-use bearer token. Never serialised.
     #[serde(skip)]
     pub reply: Option<(reqwest::Url, String)>,
+    /// Bumped on every change; the durable store keeps only the newest revision.
+    #[serde(skip)]
+    pub rev: u64,
+}
+
+/// A task as the durable store keeps it: everything but the callback token.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Stored {
+    pub task_id: String,
+    pub from: String,
+    pub to: String,
+    pub playbook: PlaybookRef,
+    pub payload: Value,
+    pub state: State,
+    pub created_ms: i64,
+    pub deadline_ms: i64,
+    pub attempts: u32,
+    pub claim_id: Option<String>,
+    pub lease_until_ms: i64,
+    pub result: Option<Value>,
+    pub error: Option<String>,
+    pub ended_ms: Option<i64>,
+    pub rev: u64,
+}
+
+impl From<&Task> for Stored {
+    fn from(t: &Task) -> Self {
+        Stored {
+            task_id: t.task_id.clone(),
+            from: t.from.clone(),
+            to: t.to.clone(),
+            playbook: t.playbook.clone(),
+            payload: t.payload.clone(),
+            state: t.state,
+            created_ms: t.created_ms,
+            deadline_ms: t.deadline_ms,
+            attempts: t.attempts,
+            claim_id: t.claim_id.clone(),
+            lease_until_ms: t.lease_until_ms,
+            result: t.result.clone(),
+            error: t.error.clone(),
+            ended_ms: t.ended_ms,
+            rev: t.rev,
+        }
+    }
+}
+
+impl From<Stored> for Task {
+    fn from(s: Stored) -> Self {
+        Task {
+            task_id: s.task_id,
+            from: s.from,
+            to: s.to,
+            playbook: s.playbook,
+            payload: s.payload,
+            state: s.state,
+            created_ms: s.created_ms,
+            deadline_ms: s.deadline_ms,
+            attempts: s.attempts,
+            claim_id: s.claim_id,
+            lease_until_ms: s.lease_until_ms,
+            result: s.result,
+            error: s.error,
+            ended_ms: s.ended_ms,
+            reply: None,
+            rev: s.rev,
+        }
+    }
+}
+
+/// What changed since the last [`Board::take_changes`]: rows to upsert and ids to delete.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct Changes {
+    pub upserts: Vec<Stored>,
+    pub removed: Vec<String>,
+}
+
+impl Changes {
+    pub fn is_empty(&self) -> bool {
+        self.upserts.is_empty() && self.removed.is_empty()
+    }
 }
 
 impl Task {
@@ -154,6 +238,8 @@ pub struct Board {
     tasks: HashMap<String, Task>,
     inbox: HashMap<String, VecDeque<String>>,
     pub visibility_ms: i64,
+    changed: HashSet<String>,
+    removed: HashSet<String>,
 }
 
 pub struct NewTask {
@@ -232,8 +318,10 @@ impl Board {
                 error: None,
                 ended_ms: None,
                 reply: t.reply,
+                rev: 1,
             },
         );
+        self.changed.insert(id.clone());
         Ok(id)
     }
 
@@ -260,6 +348,8 @@ impl Board {
             t.attempts += 1;
             t.claim_id = Some(claim.clone());
             t.lease_until_ms = (now + self.visibility_ms).min(t.deadline_ms);
+            t.rev += 1;
+            self.changed.insert(t.task_id.clone());
             out.push(Claimed {
                 task_id: t.task_id.clone(),
                 claim_id: claim,
@@ -326,6 +416,8 @@ impl Board {
             }
         }
         t.ended_ms = Some(now);
+        t.rev += 1;
+        self.changed.insert(task_id.to_string());
         if let Some(q) = self.inbox.get_mut(instance) {
             q.retain(|id| id != task_id);
         }
@@ -351,10 +443,12 @@ impl Board {
                     t.to
                 ));
                 t.ended_ms = Some(now);
+                t.rev += 1;
                 out.push(t.clone());
             }
         }
         for t in &out {
+            self.changed.insert(t.task_id.clone());
             if let Some(q) = self.inbox.get_mut(&t.to) {
                 q.retain(|id| id != &t.task_id);
             }
@@ -364,9 +458,72 @@ impl Board {
 
     /// Forget tasks that ended more than [`KEEP_DONE_MS`] ago.
     pub fn prune(&mut self, now: i64) {
-        self.tasks
-            .retain(|_, t| t.ended_ms.is_none_or(|e| now - e < KEEP_DONE_MS));
+        let gone: Vec<String> = self
+            .tasks
+            .values()
+            .filter(|t| t.ended_ms.is_some_and(|e| now - e >= KEEP_DONE_MS))
+            .map(|t| t.task_id.clone())
+            .collect();
+        for id in gone {
+            self.tasks.remove(&id);
+            self.changed.remove(&id);
+            self.removed.insert(id);
+        }
         self.inbox.retain(|_, q| !q.is_empty());
+    }
+
+    /// Everything that changed since the last call, for the durable store.
+    pub fn take_changes(&mut self) -> Changes {
+        let upserts = self
+            .changed
+            .drain()
+            .filter_map(|id| self.tasks.get(&id).map(Stored::from))
+            .collect();
+        Changes {
+            upserts,
+            removed: self.removed.drain().collect(),
+        }
+    }
+
+    /// Put changes the store could not write back, so the next write retries them.
+    pub fn retry_changes(&mut self, c: &Changes) {
+        for s in &c.upserts {
+            if self.tasks.contains_key(&s.task_id) {
+                self.changed.insert(s.task_id.clone());
+            }
+        }
+        self.removed.extend(c.removed.iter().cloned());
+    }
+
+    /// Forget a task outright (a submit whose write failed). Not recorded as a change.
+    pub fn discard(&mut self, task_id: &str) {
+        if let Some(t) = self.tasks.remove(task_id) {
+            if let Some(q) = self.inbox.get_mut(&t.to) {
+                q.retain(|id| id != task_id);
+            }
+        }
+        self.changed.remove(task_id);
+    }
+
+    /// Rebuild the working set from the store at start. Tasks already on the board win;
+    /// non-terminal tasks rejoin their target's inbox in submission order.
+    pub fn restore(&mut self, rows: Vec<Stored>) -> usize {
+        let mut rows: Vec<Stored> = rows
+            .into_iter()
+            .filter(|r| !self.tasks.contains_key(&r.task_id))
+            .collect();
+        rows.sort_by_key(|r| (r.created_ms, r.task_id.clone()));
+        let n = rows.len();
+        for r in rows {
+            if !r.state.is_terminal() {
+                self.inbox
+                    .entry(r.to.clone())
+                    .or_default()
+                    .push_back(r.task_id.clone());
+            }
+            self.tasks.insert(r.task_id.clone(), Task::from(r));
+        }
+        n
     }
 
     /// Take the callback for an ended task, so it is sent at most once.
@@ -544,5 +701,72 @@ mod tests {
             b.submit(bad("x", None, json!({})), 0).unwrap_err().status,
             429
         );
+    }
+    #[test]
+    fn changes_are_tracked_and_a_restore_rebuilds_the_inbox() {
+        let mut b = Board::new(1000);
+        let now = 1_000_000;
+        let t1 = new(&mut b, now);
+        let t2 = new(&mut b, now + 1);
+        let c = b.take_changes();
+        assert_eq!(c.upserts.len(), 2);
+        assert!(b.take_changes().is_empty(), "drained");
+        let claimed = b.claim(B, 1, now + 2);
+        assert_eq!(claimed[0].task_id, t1);
+        let c = b.take_changes();
+        assert_eq!(c.upserts.len(), 1);
+        assert_eq!(c.upserts[0].rev, 2);
+        assert_eq!(c.upserts[0].state, State::Claimed);
+
+        // Rebuild from what was written: the claim survives, t2 is still claimable.
+        let mut rows: Vec<Stored> = b.tasks.values().map(Stored::from).collect();
+        rows.reverse();
+        let mut r = Board::new(1000);
+        assert_eq!(r.restore(rows), 2);
+        let again = r.claim(B, 4, now + 3);
+        assert_eq!(again.len(), 1, "the claimed task keeps its lease");
+        assert_eq!(again[0].task_id, t2);
+        let done = r
+            .complete(
+                B,
+                &t1,
+                &claimed[0].claim_id,
+                Ok(json!({"ok": true})),
+                now + 4,
+            )
+            .unwrap();
+        assert_eq!(
+            done,
+            Completion::Recorded,
+            "a pre-restart claim id still completes"
+        );
+        assert!(
+            r.take_reply(&t1).is_none(),
+            "callback tokens are not restored"
+        );
+    }
+
+    #[test]
+    fn pruned_tasks_are_reported_removed_and_failed_writes_retry() {
+        let mut b = Board::new(1000);
+        let t = new(&mut b, 0);
+        let c = b.claim(B, 1, 1);
+        b.complete(B, &t, &c[0].claim_id, Ok(json!(1)), 2).unwrap();
+        let ch = b.take_changes();
+        b.retry_changes(&ch);
+        assert_eq!(b.take_changes().upserts.len(), 1, "retried");
+        b.prune(2 + KEEP_DONE_MS);
+        let ch = b.take_changes();
+        assert_eq!(ch.removed, vec![t.clone()]);
+        assert!(ch.upserts.is_empty());
+    }
+
+    #[test]
+    fn discard_drops_a_task_without_a_change() {
+        let mut b = Board::new(1000);
+        let t = new(&mut b, 0);
+        b.discard(&t);
+        assert!(b.take_changes().is_empty());
+        assert!(b.claim(B, 1, 1).is_empty());
     }
 }
