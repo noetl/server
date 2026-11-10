@@ -62,6 +62,9 @@ fn build_router(
         .then(|| handlers::mcp_server::routes(state.clone(), execution_service.clone()));
     let agent_routes = handlers::agent_endpoint::agent_endpoint_enabled()
         .then(|| handlers::agent_endpoint::routes(state.clone(), execution_service.clone()));
+    // NoETL instances: register, discover, hand off (build plan item 9). Both routers are
+    // empty unless NOETL_INSTANCE_REGISTRY=true.
+    let (instance_routes, instance_admin_routes) = noetl_server::instances::routes();
 
     // CORS configuration - allow all origins for development
     let cors = CorsLayer::new()
@@ -971,6 +974,11 @@ fn build_router(
             "internal",
             noetl_server::auth_gate::gate,
         )))
+        // Enumerates NoETL instances, so gated like the topology above (item 9).
+        .merge(instance_admin_routes.layer(axum::middleware::from_fn_with_state(
+            "internal",
+            noetl_server::auth_gate::gate,
+        )))
         .merge(archive_read_routes.layer(axum::middleware::from_fn_with_state(
             "internal",
             noetl_server::auth_gate::gate,
@@ -1065,6 +1073,12 @@ fn build_router(
     if let Some(agent_routes) = agent_routes {
         app = app.merge(agent_routes);
     }
+
+    // Signed instance routes (build plan item 9): every request is an ML-DSA-87 signed
+    // envelope bound to its route, this control plane and a fresh nonce, so the signature is
+    // the authentication. Instances hold no internal token. Listed in
+    // `tests/auth_gate_wiring.rs` PUBLIC_BY_DESIGN.
+    app = app.merge(instance_routes);
 
     if let Some(ehgraph_routes) = ehgraph_routes {
         app = app.nest(noetl_server::ehgraph_embedded::MOUNT, ehgraph_routes);
@@ -1208,6 +1222,7 @@ async fn main() -> anyhow::Result<()> {
     // `registered` staying 0 rather than as an absent series. Before this, the
     // registry's only evidence of not running was silence.
     noetl_server::metrics::init_runtime_registry_series();
+    noetl_server::metrics::init_instance_series();
     noetl_server::metrics::init_ehdb_retention_series();
     noetl_server::metrics::init_replica_reality_series();
     // noetl/ai-meta#366 — pin the chain-certificate series so a zero reads as a

@@ -58,6 +58,7 @@ pub mod engine;
 pub mod error;
 pub mod event_bus;
 pub mod handlers;
+pub mod instances;
 pub mod metrics;
 pub mod playbook;
 pub mod runtime_registry;

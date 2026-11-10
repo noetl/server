@@ -302,6 +302,13 @@ x25519-dalek = { version = "2", features = ["static_secrets"] }
 chacha20poly1305 = "0.10"
 hkdf = "0.12"
 rand_core = "0.6"
+# NoETL instance identity (noetl/ai-meta#544 item 9, `src/instances/identity.rs`):
+# ML-DSA-87 (FIPS 204), the post-quantum signature the quantum-readiness orchestrator
+# standardises on. RustCrypto's pure-Rust implementation: no C toolchain, no FFI.
+# ⚠ Not independently audited (its README says so). Verification only runs when
+# NOETL_INSTANCE_REGISTRY=true. `default-features = false` keeps its own getrandom
+# out: seeds come from `rand` above, and signing is deterministic (FIPS 204 §3.4).
+ml-dsa = { version = "=0.1.2", default-features = false, features = ["alloc"] }
 
 # Utilities
 uuid = { version = "1", features = ["serde", "v4"] }
