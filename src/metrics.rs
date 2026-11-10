@@ -7305,3 +7305,54 @@ mod tests {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// noetl/ai-meta#544 item 9 — NoETL instance registry, discovery and task handoff
+// (`src/instances/`). One counter, every outcome pinned at 0 unconditionally, so a scrape
+// tells "this build has it and nothing happened" apart from "this build predates it".
+// ---------------------------------------------------------------------------
+
+pub const INSTANCE_OUTCOMES: [&str; 16] = [
+    "registered",
+    "renewed",
+    "deregistered",
+    "refused",
+    "discover",
+    "task_submitted",
+    "task_refused",
+    "task_claimed",
+    "task_completed",
+    "task_failed",
+    "task_stale",
+    "task_expired",
+    "callback_delivered",
+    "callback_failed",
+    "graph_written",
+    "graph_failed",
+];
+
+pub fn instance_total() -> &'static prometheus::IntCounterVec {
+    static M: std::sync::OnceLock<prometheus::IntCounterVec> = std::sync::OnceLock::new();
+    M.get_or_init(|| {
+        let m = prometheus::IntCounterVec::new(
+            prometheus::Opts::new(
+                "noetl_instance_total",
+                "NoETL instance registry, discovery and cross-instance task outcomes",
+            ),
+            &["outcome"],
+        )
+        .expect("valid metric");
+        registry().register(Box::new(m.clone())).ok();
+        m
+    })
+}
+
+pub fn record_instance(outcome: &str) {
+    instance_total().with_label_values(&[outcome]).inc();
+}
+
+pub fn init_instance_series() {
+    for o in INSTANCE_OUTCOMES {
+        instance_total().with_label_values(&[o]).inc_by(0);
+    }
+}

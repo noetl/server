@@ -119,7 +119,7 @@ fn every_privileged_router_is_gated_in_main() {
     let src = include_str!("../src/main.rs");
     // Router groups that expose credentials, keychain material, or the internal
     // control surface. Kept explicit so adding one is a deliberate act.
-    const PRIVILEGED: [&str; 19] = [
+    const PRIVILEGED: [&str; 20] = [
         "credential_routes",
         "sealed_credential_routes",
         "keychain_routes",
@@ -157,6 +157,10 @@ fn every_privileged_router_is_gated_in_main() {
         // executions archived on a date — the same enumeration-is-a-capability
         // reasoning as `ehdb_equivalence_routes` and `runtime_topology_routes`.
         "archive_read_routes",
+        // noetl/ai-meta#544 item 9. `GET /api/runtime/instances` ENUMERATES registered
+        // NoETL instances and their capabilities, the same reasoning again. The signed
+        // instance routes (`instance_routes`) authenticate per request instead.
+        "instance_admin_routes",
 ];
     let mut ungated = Vec::new();
     for name in PRIVILEGED {
@@ -208,7 +212,7 @@ fn the_structural_check_can_fail() {
 ///
 /// **Every entry needs a reason.** This is the list a reviewer argues with; the
 /// test below makes it impossible to add an ungated router *without* arguing.
-const PUBLIC_BY_DESIGN: [(&str, &str); 20] = [
+const PUBLIC_BY_DESIGN: [(&str, &str); 21] = [
     ("health_routes", "liveness/readiness probes carry no credential"),
     ("catalog_routes", "register/list is the authoring surface; delete is separately gated by RequireInternalApiToken"),
     ("auth_routes", "the login surface itself — gating it would be circular"),
@@ -227,6 +231,7 @@ const PUBLIC_BY_DESIGN: [(&str, &str); 20] = [
     ("dsl_routes", "read-only reflection of the compiled playbook grammar and tool-kind gates; no data, no credential material; mounted only under NOETL_DSL_KB"),
     ("agent_routes", "agent cards + task send/status over playbooks that opt in (metadata.expose.agent): the execute + status capability of execution_routes, narrowed; outbound callbacks only to NOETL_AGENT_CALLBACK_ORIGINS; per-user checks are the gateway's; mounted only under NOETL_AGENT_ENDPOINT"),
     ("mcp_routes", "MCP tools/list + tools/call over playbooks that opt in (metadata.expose.mcp / kind: Mcp serve: true): the execute + status capability of execution_routes, narrowed; per-user may_execute filtering is the gateway's; mounted only under NOETL_MCP_SERVER"),
+    ("instance_routes", "NoETL instance register/discover/task handoff: every request is an ML-DSA-87 signed envelope bound to its route purpose, this control plane's audience and a fresh nonce, so the signature is the authentication; default trust admits nobody until NOETL_INSTANCE_TRUSTED_IDS lists the instance; mounted only under NOETL_INSTANCE_REGISTRY"),
     ("dashboard_routes", "read-only aggregate counts for the UI; no per-record data and no credential material"),
     // ⚠ noetl/ai-meta#312. NOT a justification — a record of the current state.
     // `/api/postgres/execute` runs arbitrary SQL with no auth and no statement

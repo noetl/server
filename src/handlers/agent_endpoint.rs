@@ -477,33 +477,50 @@ pub async fn watch_and_deliver<B: AgentBackend>(
             _ => tokio::time::sleep(s.timing.poll).await,
         }
     };
-    for attempt in 0..s.timing.attempts {
-        let sent = s
-            .http
+    if !deliver_callback(&s.http, &url, &token, &task_id.to_string(), &view, &s.timing).await {
+        tracing::error!(task_id, "agent callback not delivered; the caller must poll");
+    }
+}
+
+/// POST `body` to `url` with the single-use bearer `token`, retrying with exponential backoff.
+///
+/// Shared by agent callbacks and instance task callbacks (`crate::instances`). `true` when the
+/// receiver accepted it, or refused it with a 4xx that a retry cannot change (other than
+/// 408/429): either way the caller must not send it again.
+pub async fn deliver_callback(
+    http: &reqwest::Client,
+    url: &reqwest::Url,
+    token: &str,
+    task_id: &str,
+    body: &Value,
+    timing: &WatchTiming,
+) -> bool {
+    for attempt in 0..timing.attempts {
+        let sent = http
             .post(url.clone())
-            .bearer_auth(&token)
-            .header("x-noetl-task-id", task_id.to_string())
-            .json(&view)
+            .bearer_auth(token)
+            .header("x-noetl-task-id", task_id)
+            .json(body)
             .send()
             .await;
         match sent {
-            Ok(r) if r.status().is_success() => return,
+            Ok(r) if r.status().is_success() => return true,
             // A 4xx other than 408/429 will not change on retry.
             Ok(r) if r.status().is_client_error() && !matches!(r.status().as_u16(), 408 | 429) => {
-                tracing::warn!(task_id, status = %r.status(), "agent callback refused by the receiver");
-                return;
+                tracing::warn!(task_id, status = %r.status(), "callback refused by the receiver");
+                return true;
             }
             other => {
                 let why = match other {
                     Ok(r) => r.status().to_string(),
                     Err(e) => e.to_string(),
                 };
-                tracing::warn!(task_id, attempt, "agent callback failed: {why}");
-                tokio::time::sleep(s.timing.retry_base * 2u32.pow(attempt)).await;
+                tracing::warn!(task_id, attempt, "callback failed: {why}");
+                tokio::time::sleep(timing.retry_base * 2u32.pow(attempt)).await;
             }
         }
     }
-    tracing::error!(task_id, "agent callback not delivered; the caller must poll");
+    false
 }
 
 async fn get_task<B: AgentBackend>(State(s): State<AgentState<B>>, Path(task_id): Path<String>) -> Response {
