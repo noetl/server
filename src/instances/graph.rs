@@ -258,6 +258,7 @@ mod tests {
             first_seen_ms: 1,
             last_seen_ms: 2,
             heartbeats: 0,
+            push_token: None,
         }
     }
 

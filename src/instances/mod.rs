@@ -39,6 +39,7 @@
 //!
 //! The task board survives a restart only with `NOETL_INSTANCE_STORE=postgres` ([`store`]).
 //! `NOETL_INSTANCE_TRUST=enroll` adds one-time enrollment tokens to the allowlist ([`enroll`]).
+//! `NOETL_INSTANCE_PUSH=true` pushes new tasks to `reach: push` instances ([`InstanceState::push_task`]).
 
 // The handlers return an early `Response` as their error, which is what axum hands back
 // anyway; boxing it would only add an allocation per refusal.
@@ -76,6 +77,10 @@ use tasks::{Board, Completion, NewTask, PlaybookRef};
 
 /// Mounts the instance routes. Strict `== "true"`.
 pub const REGISTRY_ENV: &str = "NOETL_INSTANCE_REGISTRY";
+/// Push delivery to `reach: push` instances. Strict `== "true"`.
+pub const PUSH_ENV: &str = "NOETL_INSTANCE_PUSH";
+/// Origins (`scheme://host[:port]`, comma-separated) a push may go to. Empty = none.
+pub const PUSH_ORIGINS_ENV: &str = "NOETL_INSTANCE_PUSH_ORIGINS";
 /// Longest inbox long-poll the server will hold open.
 pub const MAX_WAIT_MS: u64 = 25_000;
 /// How often expiries, forgetting and the graph sweep run.
@@ -111,6 +116,8 @@ pub struct InstanceState {
     pub store: Option<Arc<dyn store::TaskStore>>,
     /// Enrollment tokens and enrolled ids, when `NOETL_INSTANCE_TRUST=enroll`.
     pub enrollments: Option<Arc<dyn enroll::EnrollStore>>,
+    /// Push delivery: the origins a push may reach. `None` = push off.
+    pub push: Option<CallbackPolicy>,
 }
 
 impl InstanceState {
@@ -132,6 +139,70 @@ impl InstanceState {
             clock: Arc::new(now_ms),
             store: None,
             enrollments: None,
+            push: None,
+        }
+    }
+
+    /// Push one queued task to its `reach: push` target. Best effort: the task is claimed,
+    /// POSTed to the target's endpoint with its push bearer, and released back to the inbox
+    /// if the target does not answer 2xx. The target's result arrives the usual way.
+    pub async fn push_task(&self, to: &str, task_id: &str) {
+        let Some(policy) = &self.push else {
+            return;
+        };
+        let target = {
+            let r = self.registry.lock().unwrap_or_else(|p| p.into_inner());
+            r.get(to).and_then(|rec| {
+                let ep = rec.capabilities.endpoint.clone()?;
+                let tok = rec.push_token.clone()?;
+                (rec.capabilities.reach == registry::Reach::Push).then_some((ep, tok))
+            })
+        };
+        let Some((endpoint, token)) = target else {
+            return;
+        };
+        let url = match policy.check(&endpoint) {
+            Ok(u) => u,
+            Err(e) => {
+                tracing::info!(instance_id = %to, error = %e, "push skipped: endpoint origin not allowed; the task waits in the inbox");
+                return;
+            }
+        };
+        let claimed = self
+            .board
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .claim_one(to, task_id, self.now());
+        let Some(c) = claimed else {
+            return; // pulled already
+        };
+        self.flush().await;
+        let sent = self
+            .http
+            .post(url)
+            .bearer_auth(&token)
+            .json(&json!({"tasks": [c]}))
+            .send()
+            .await;
+        match sent {
+            Ok(r) if r.status().is_success() => {
+                crate::metrics::record_instance("task_pushed");
+                tracing::info!(%task_id, instance_id = %to, "instance task pushed");
+            }
+            other => {
+                let why = match other {
+                    Ok(r) => format!("HTTP {}", r.status()),
+                    Err(e) => e.to_string(),
+                };
+                crate::metrics::record_instance("push_failed");
+                tracing::info!(%task_id, instance_id = %to, error = %why, "push failed; the task is back in the inbox");
+                self.board
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .release(task_id, &c.claim_id);
+                self.flush().await;
+                self.waker(to).notify_waiters();
+            }
         }
     }
 
@@ -202,6 +273,11 @@ impl InstanceState {
             Board::new(tasks::DEFAULT_VISIBILITY_MS),
         );
         s.callbacks = CallbackPolicy::from_env();
+        if std::env::var(PUSH_ENV).ok().as_deref() == Some("true") {
+            s.push = Some(CallbackPolicy::parse(
+                &std::env::var(PUSH_ORIGINS_ENV).unwrap_or_default(),
+            ));
+        }
         s.graph = graph::writer_from_env().map(|(sink, ns)| (Arc::from(sink), ns));
         s
     }
@@ -375,6 +451,9 @@ async fn register(State(s): State<InstanceState>, Json(env): Json<SignedEnvelope
         // Renew at a third of the lease, the D8 rule, so two missed beats still leave margin.
         "heartbeat_secs": (ttl / 3000).max(1),
         "control_plane": s.control_id,
+        // Only for a `reach: push` registration while push is on: the bearer every push to
+        // this instance carries. Returned to the instance itself, never in discovery.
+        "push_token": if s.push.is_some() { rec.push_token.clone() } else { None },
     }))
     .into_response()
 }
@@ -555,6 +634,10 @@ async fn submit(State(s): State<InstanceState>, Json(env): Json<SignedEnvelope>)
     crate::metrics::record_instance("task_submitted");
     tracing::info!(%task_id, from = %a.instance_id, %to, playbook = %b.playbook.path, "instance task queued");
     s.waker(&to).notify_waiters();
+    if s.push.is_some() {
+        let (s2, to2, id2) = (s.clone(), to.clone(), task_id.clone());
+        tokio::spawn(async move { s2.push_task(&to2, &id2).await });
+    }
     if let Some((_, ns)) = &s.graph {
         s.write_graph(vec![graph::delegation(
             ns,

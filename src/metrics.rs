@@ -7312,7 +7312,7 @@ mod tests {
 // tells "this build has it and nothing happened" apart from "this build predates it".
 // ---------------------------------------------------------------------------
 
-pub const INSTANCE_OUTCOMES: [&str; 20] = [
+pub const INSTANCE_OUTCOMES: [&str; 22] = [
     "registered",
     "renewed",
     "deregistered",
@@ -7333,6 +7333,8 @@ pub const INSTANCE_OUTCOMES: [&str; 20] = [
     "store_restored",
     "enrolled",
     "revoked",
+    "task_pushed",
+    "push_failed",
 ];
 
 pub fn instance_total() -> &'static prometheus::IntCounterVec {
