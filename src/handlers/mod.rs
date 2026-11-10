@@ -2,6 +2,7 @@
 //!
 //! This module contains all route handlers organized by domain.
 
+pub mod agent_endpoint;
 pub mod auth;
 pub mod auth_provider;
 pub mod auth_verify;

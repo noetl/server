@@ -210,7 +210,7 @@ fn valid_tool_name(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
 }
 
-fn problem(source: &str, reason: impl Into<String>) -> Problem {
+pub(crate) fn problem(source: &str, reason: impl Into<String>) -> Problem {
     Problem {
         source: source.to_string(),
         reason: reason.into(),
@@ -331,7 +331,7 @@ pub fn parse_declaration(
     })
 }
 
-fn yaml_to_json(content: &str) -> Result<Value, String> {
+pub(crate) fn yaml_to_json(content: &str) -> Result<Value, String> {
     let yaml: serde_yaml::Value = serde_yaml::from_str(content).map_err(|e| e.to_string())?;
     serde_json::to_value(yaml).map_err(|e| e.to_string())
 }
@@ -498,7 +498,7 @@ pub fn select_result(detail: &Value, result_step: Option<&str>) -> Option<Value>
         .or_else(|| events.iter().rev().filter(|ev| is_call_done(ev)).find_map(payload))
 }
 
-fn is_terminal(status: &str) -> bool {
+pub(crate) fn is_terminal(status: &str) -> bool {
     matches!(status, "COMPLETED" | "FAILED" | "CANCELLED")
 }
 

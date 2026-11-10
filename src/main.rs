@@ -60,6 +60,8 @@ fn build_router(
     // groups; merged below with the other optional routers.
     let mcp_routes = handlers::mcp_server::mcp_server_enabled()
         .then(|| handlers::mcp_server::routes(state.clone(), execution_service.clone()));
+    let agent_routes = handlers::agent_endpoint::agent_endpoint_enabled()
+        .then(|| handlers::agent_endpoint::routes(state.clone(), execution_service.clone()));
 
     // CORS configuration - allow all origins for development
     let cors = CorsLayer::new()
@@ -1053,6 +1055,15 @@ fn build_router(
     // gateway's (`may_execute`).
     if let Some(mcp_routes) = mcp_routes {
         app = app.merge(mcp_routes);
+    }
+
+    // Playbooks as agents with completion callbacks (build plan item 7,
+    // noetl/ai-meta#539): agent cards, `POST /api/agents/send`,
+    // `GET /api/agents/tasks/{id}`. Mounted only under NOETL_AGENT_ENDPOINT=true;
+    // callbacks go only to NOETL_AGENT_CALLBACK_ORIGINS. Listed in
+    // `tests/auth_gate_wiring.rs` PUBLIC_BY_DESIGN beside `mcp_routes`.
+    if let Some(agent_routes) = agent_routes {
+        app = app.merge(agent_routes);
     }
 
     if let Some(ehgraph_routes) = ehgraph_routes {
