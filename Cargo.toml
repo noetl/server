@@ -247,7 +247,7 @@ ehdb-l0 = { git = "https://github.com/noetl/ehdb", tag = "v0.15.1" }
 #
 # ehgraph does not link EHDB (its E8), so this pin cannot put a second ehdb-l0 in
 # the graph. It does bring arrow 53 (arrow-array/-ipc/-schema) for snapshots.
-ehgraph = { git = "https://github.com/noetl/ehgraph", rev = "760f5724dd01786e173f880fbffc190a61654ddd" }
+ehgraph = { git = "https://github.com/noetl/ehgraph", rev = "f200516d2f321082e5d6152d1a607f4b96d65718" }
 # Value type for the JetStream KV puts in `src/coherence.rs` (multi-replica
 # watermark/descriptor coherence, RFC #115 program-scale).  Matches the version
 # async-nats already pulls in transitively.
