@@ -38,11 +38,13 @@
 //! (or `NOETL_INSTANCE_TRUST=open`, for kind and local development).
 //!
 //! The task board survives a restart only with `NOETL_INSTANCE_STORE=postgres` ([`store`]).
+//! `NOETL_INSTANCE_TRUST=enroll` adds one-time enrollment tokens to the allowlist ([`enroll`]).
 
 // The handlers return an early `Response` as their error, which is what axum hands back
 // anyway; boxing it would only add an allocation per refusal.
 #![allow(clippy::result_large_err)]
 
+pub mod enroll;
 pub mod gate;
 pub mod graph;
 pub mod identity;
@@ -54,10 +56,10 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use axum::extract::{Query as QueryParams, State};
+use axum::extract::{Path, Query as QueryParams, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -107,6 +109,8 @@ pub struct InstanceState {
     pub clock: Arc<dyn Fn() -> i64 + Send + Sync>,
     /// The durable inbox, when `NOETL_INSTANCE_STORE=postgres`.
     pub store: Option<Arc<dyn store::TaskStore>>,
+    /// Enrollment tokens and enrolled ids, when `NOETL_INSTANCE_TRUST=enroll`.
+    pub enrollments: Option<Arc<dyn enroll::EnrollStore>>,
 }
 
 impl InstanceState {
@@ -127,7 +131,20 @@ impl InstanceState {
                 .unwrap_or_default(),
             clock: Arc::new(now_ms),
             store: None,
+            enrollments: None,
         }
+    }
+
+    /// Load enrolled ids into the gate (start-up).
+    pub async fn load_enrolled(&self) -> Result<usize, String> {
+        let Some(e) = self.enrollments.clone() else {
+            return Ok(0);
+        };
+        let all = e.list().await?;
+        for x in &all {
+            self.gate.enroll_id(&x.instance_id);
+        }
+        Ok(all.len())
     }
 
     /// Write the board's changes through to the durable store. True when there is no store,
@@ -682,6 +699,127 @@ async fn status(State(s): State<InstanceState>, Json(env): Json<SignedEnvelope>)
 }
 
 /// The signed instance routes. Their own authentication; see the module docs.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EnrollBody {
+    token: String,
+}
+
+/// `POST /api/instances/enroll`: an untrusted instance redeems a token for its own key.
+async fn enroll_route(State(s): State<InstanceState>, Json(env): Json<SignedEnvelope>) -> Response {
+    let Some(book) = s.enrollments.clone() else {
+        return error(
+            StatusCode::FORBIDDEN,
+            "enrollment is off here (NOETL_INSTANCE_TRUST is not `enroll`)",
+        );
+    };
+    let a = match s.gate.admit_untrusted(&env, "enroll", s.now()) {
+        Ok(a) => a,
+        Err(r) => {
+            crate::metrics::record_instance("refused");
+            return refusal(r);
+        }
+    };
+    let b: EnrollBody = tri!(body(&a));
+    let label = match book
+        .spend(&enroll::token_hash(b.token.trim()), s.now())
+        .await
+    {
+        Ok(Some(l)) => l,
+        Ok(None) => {
+            crate::metrics::record_instance("refused");
+            tracing::info!(instance_id = %a.instance_id, "enrollment refused: token invalid, expired or spent");
+            return error(
+                StatusCode::FORBIDDEN,
+                "the enrollment token is invalid, expired or already used",
+            );
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "enrollment store failed");
+            return error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "enrollment is unavailable; retry",
+            );
+        }
+    };
+    let rec = enroll::Enrolled {
+        instance_id: a.instance_id.clone(),
+        label: label.clone(),
+        enrolled_ms: s.now(),
+    };
+    if let Err(e) = book.add(&rec).await {
+        tracing::warn!(error = %e, "enrollment store failed after spending the token");
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "enrollment could not be recorded; ask for a new token",
+        );
+    }
+    s.gate.enroll_id(&a.instance_id);
+    crate::metrics::record_instance("enrolled");
+    tracing::info!(instance_id = %a.instance_id, %label, "instance enrolled");
+    Json(json!({"instance_id": a.instance_id, "enrolled": true, "label": label})).into_response()
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MintBody {
+    label: String,
+    #[serde(default)]
+    ttl_secs: Option<i64>,
+    #[serde(default)]
+    uses: Option<i64>,
+}
+
+/// `POST /api/runtime/instances/enrollments` (internal-token gate): mint a token.
+async fn mint_route(State(s): State<InstanceState>, Json(b): Json<MintBody>) -> Response {
+    let Some(book) = s.enrollments.clone() else {
+        return error(
+            StatusCode::CONFLICT,
+            "enrollment is off here (NOETL_INSTANCE_TRUST is not `enroll`)",
+        );
+    };
+    match enroll::mint(book.as_ref(), &b.label, b.ttl_secs, b.uses, s.now()).await {
+        Ok(m) => {
+            tracing::info!(label = %m.label, uses = m.uses, expires_ms = m.expires_ms, "enrollment token minted");
+            (StatusCode::CREATED, Json(json!(m))).into_response()
+        }
+        Err(e) => error(StatusCode::BAD_REQUEST, e),
+    }
+}
+
+/// `GET /api/runtime/instances/enrolled` (internal-token gate).
+async fn enrolled_route(State(s): State<InstanceState>) -> Response {
+    let Some(book) = s.enrollments.clone() else {
+        return Json(json!({"enroll": false, "enrolled": []})).into_response();
+    };
+    match book.list().await {
+        Ok(v) => Json(json!({"enroll": true, "enrolled": v})).into_response(),
+        Err(e) => error(StatusCode::SERVICE_UNAVAILABLE, e),
+    }
+}
+
+/// `DELETE /api/runtime/instances/enrolled/{id}` (internal-token gate): revoke.
+async fn revoke_route(State(s): State<InstanceState>, Path(id): Path<String>) -> Response {
+    let Some(book) = s.enrollments.clone() else {
+        return error(StatusCode::CONFLICT, "enrollment is off here");
+    };
+    let stored = match book.remove(&id).await {
+        Ok(b) => b,
+        Err(e) => return error(StatusCode::SERVICE_UNAVAILABLE, e),
+    };
+    let live = s.gate.revoke_id(&id);
+    s.registry
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .deregister(&id);
+    if !(stored || live) {
+        return error(StatusCode::NOT_FOUND, "not enrolled");
+    }
+    crate::metrics::record_instance("revoked");
+    tracing::info!(instance_id = %id, "instance enrollment revoked");
+    Json(json!({"instance_id": id, "revoked": true})).into_response()
+}
+
 pub fn routes_for(state: InstanceState) -> Router {
     Router::new()
         .route("/api/instances/register", post(register))
@@ -691,6 +829,7 @@ pub fn routes_for(state: InstanceState) -> Router {
         .route("/api/instances/inbox", post(inbox))
         .route("/api/instances/tasks/result", post(result))
         .route("/api/instances/tasks/status", post(status))
+        .route("/api/instances/enroll", post(enroll_route))
         .with_state(state)
 }
 
@@ -698,6 +837,9 @@ pub fn routes_for(state: InstanceState) -> Router {
 pub fn admin_routes_for(state: InstanceState) -> Router {
     Router::new()
         .route("/api/runtime/instances", get(list))
+        .route("/api/runtime/instances/enrollments", post(mint_route))
+        .route("/api/runtime/instances/enrolled", get(enrolled_route))
+        .route("/api/runtime/instances/enrolled/{id}", delete(revoke_route))
         .with_state(state)
 }
 
@@ -744,6 +886,35 @@ pub fn routes(pool: &crate::db::DbPool) -> (Router, Router) {
             }
             Err(e) => {
                 tracing::error!(error = %e, "instance inbox: NOETL_INSTANCE_STORE=postgres but the table could not be prepared; the inbox is IN MEMORY")
+            }
+        }
+    }
+    if state.gate.enroll {
+        let book: Arc<dyn enroll::EnrollStore> = if store::postgres_store_enabled() {
+            let pool = pool.clone();
+            match tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(enroll::PgEnroll::new(pool))
+            }) {
+                Ok(p) => Arc::new(p),
+                Err(e) => {
+                    tracing::error!(error = %e, "instance enrollment: tables could not be prepared; enrollments are IN MEMORY");
+                    Arc::new(enroll::MemEnroll::default())
+                }
+            }
+        } else {
+            Arc::new(enroll::MemEnroll::default())
+        };
+        state.enrollments = Some(book);
+        let s2 = state.clone();
+        match tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(s2.load_enrolled())
+        }) {
+            Ok(n) => tracing::info!(
+                enrolled = n,
+                "instance enrollment on (NOETL_INSTANCE_TRUST=enroll)"
+            ),
+            Err(e) => {
+                tracing::error!(error = %e, "instance enrollment: could not load enrolled ids")
             }
         }
     }
