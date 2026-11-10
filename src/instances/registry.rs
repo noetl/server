@@ -46,8 +46,9 @@ pub enum Reach {
     /// It pulls its inbox. Needs no inbound connectivity. The default.
     #[default]
     Inbox,
-    /// It also serves an endpoint the control plane could call. Advertised only; this
-    /// release delivers every task through the inbox.
+    /// It also serves `endpoint`, and the control plane pushes new tasks there when push
+    /// delivery is on (`NOETL_INSTANCE_PUSH=true` and the origin is allowed). The inbox still
+    /// works, and a failed push goes back to it.
     Push,
 }
 
@@ -156,6 +157,10 @@ pub struct InstanceRecord {
     pub first_seen_ms: i64,
     pub last_seen_ms: i64,
     pub heartbeats: u64,
+    /// The bearer the control plane sends with a push, issued at registration to a `push`
+    /// instance and returned only in its register reply. Never in discovery.
+    #[serde(skip)]
+    pub push_token: Option<String>,
 }
 
 /// `*` matches any run of characters, including `/`. Anything else is literal.
@@ -282,7 +287,13 @@ impl Registry {
         now: i64,
     ) -> Result<Upsert, String> {
         caps.validate()?;
+        let wants_push = caps.reach == Reach::Push;
         if let Some(r) = self.records.get_mut(id) {
+            if !wants_push {
+                r.push_token = None;
+            } else if r.push_token.is_none() {
+                r.push_token = Some(super::tasks::new_id("npt"));
+            }
             r.capabilities = caps;
             r.last_seen_ms = now;
             r.heartbeats += 1;
@@ -304,6 +315,7 @@ impl Registry {
                 first_seen_ms: now,
                 last_seen_ms: now,
                 heartbeats: 0,
+                push_token: wants_push.then(|| super::tasks::new_id("npt")),
             },
         );
         Ok(Upsert::Registered)

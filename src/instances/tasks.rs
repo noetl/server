@@ -363,6 +363,49 @@ impl Board {
         out
     }
 
+    /// Lease one specific task to `instance` (push delivery). `None` if it is not claimable.
+    pub fn claim_one(&mut self, instance: &str, task_id: &str, now: i64) -> Option<Claimed> {
+        let t = self.tasks.get_mut(task_id)?;
+        let free =
+            t.state == State::Queued || (t.state == State::Claimed && t.lease_until_ms <= now);
+        if t.to != instance || !free || now >= t.deadline_ms {
+            return None;
+        }
+        let claim = new_id("claim");
+        t.state = State::Claimed;
+        t.attempts += 1;
+        t.claim_id = Some(claim.clone());
+        t.lease_until_ms = (now + self.visibility_ms).min(t.deadline_ms);
+        t.rev += 1;
+        self.changed.insert(t.task_id.clone());
+        Some(Claimed {
+            task_id: t.task_id.clone(),
+            claim_id: claim,
+            from: t.from.clone(),
+            playbook: t.playbook.clone(),
+            payload: t.payload.clone(),
+            deadline_ms: t.deadline_ms,
+            attempt: t.attempts,
+        })
+    }
+
+    /// Give a claim back (a push that was not accepted): the task is queued again at once,
+    /// instead of waiting for the lease to lapse. No-op unless `claim_id` is still current.
+    pub fn release(&mut self, task_id: &str, claim_id: &str) -> bool {
+        let Some(t) = self.tasks.get_mut(task_id) else {
+            return false;
+        };
+        if t.state != State::Claimed || t.claim_id.as_deref() != Some(claim_id) {
+            return false;
+        }
+        t.state = State::Queued;
+        t.claim_id = None;
+        t.lease_until_ms = 0;
+        t.rev += 1;
+        self.changed.insert(task_id.to_string());
+        true
+    }
+
     /// Does `instance` have anything claimable now?
     pub fn has_work(&self, instance: &str, now: i64) -> bool {
         self.inbox.get(instance).is_some_and(|q| {
