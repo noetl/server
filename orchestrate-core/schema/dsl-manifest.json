@@ -54,6 +54,36 @@
       "<scheme>://<uri>[#sha256:<64hex>]  a source URI (fetched by locate)"
     ],
     "reference_forms_accepted_by": "POST /api/catalog/resolve and /api/catalog/sources (CAS), catalog locate (discovery), and, with pinning on, the `path` of POST /api/execute and of a `kind: playbook` step. A reference in `path` plus a `version`/`digest` field is refused, not merged.",
+    "source_scheme_forms": [
+      {
+        "form": "db://<credential-alias>/<schema>.<table>?path=<playbook path>[&version=<n>]",
+        "reads": "one row from an operator-owned Postgres table with columns path (text), version (integer), content (text); without version the highest version for the path",
+        "requires_env": [
+          "NOETL_CATALOG_URI_FETCH",
+          "NOETL_CATALOG_URI_ALLOW"
+        ],
+        "rules": "the alias names a credential in this server's credential store (host/port/user/password/database, or connection_string), never user:pass in the URI; schema and table are identifiers [A-Za-z_][A-Za-z0-9_]* of at most 63 bytes; path is required; version is a positive integer",
+        "scheme": "db",
+        "since_server": "3.160.0"
+      },
+      {
+        "cluster_note": "the catalog tier holds records only when the server records registrations (NOETL_CATALOG_LOG=shadow) and the worker relay takes the server as the tier's producer (NOETL_EHDB_CATALOG_MIRROR_SOURCE=server, unset by default); otherwise the read finds nothing or the relay reports the tier disabled",
+        "form": "ehdb://catalog/<catalog_id>",
+        "reads": "a registration record in the cluster's EHDB catalog tier, via the worker relay; the record's content_sha256 is checked before the body is returned; found by a paged scan of the tier (a keyed lookup is TARGET)",
+        "requires_env": [
+          "NOETL_CATALOG_URI_FETCH",
+          "NOETL_CATALOG_URI_ALLOW",
+          "NOETL_EHDB_WORKER_QUERY_URL",
+          "NOETL_CATALOG_LOG"
+        ],
+        "rules": "only the `catalog` namespace resolves",
+        "scheme": "ehdb",
+        "since_server": "3.160.0",
+        "worker_env": [
+          "NOETL_EHDB_CATALOG_MIRROR_SOURCE"
+        ]
+      }
+    ],
     "source_schemes": [
       "noetl",
       "gs",
@@ -139,7 +169,7 @@
   "orchestrate_core_version": "0.1.0",
   "tool_kinds": [
     {
-      "availability": "Needs the server gate AND a worker started with NOETL_WORKER_AGENT_TOOL=true (noetl/worker#398, noetl-tools 4.5.0); otherwise the worker fails the command as an unknown tool. The shared pool refuses `framework: claude-code`, and refuses a playbook-bound `tools:` entry before the first model call.",
+      "availability": "Needs the server gate AND a worker started with NOETL_WORKER_AGENT_TOOL=true (noetl/worker#398, noetl-tools 4.5.0); otherwise the worker fails the command as an unknown tool. The shared pool refuses `framework: claude-code`. A playbook-bound `tools:` entry (`playbook: <path>`) is refused before the first model call unless the worker also sets NOETL_WORKER_AGENT_PLAYBOOK_TOOLS=true (noetl/worker v6.14.0); see the manifest's worker_runtime.agent.",
       "enabled": false,
       "gate_env": "NOETL_TOOL_KIND_AGENT",
       "gated": true,
@@ -270,7 +300,7 @@
       "name": "transfer"
     },
     {
-      "availability": "Runs on a noetl/worker built with its `wasm-plugin` cargo feature (on by default and in the shipped image), which routes it to the plug-in host instead of the tool registry. Step: `plugin: { path: <string>, version: <integer>, entry: <export, default run> }` plus optional `input` (sent to the plug-in as `args`). The module is loaded from the catalog.",
+      "availability": "Runs on a noetl/worker built with its `wasm-plugin` cargo feature (on by default and in the shipped image), which routes it to the plug-in host instead of the tool registry. Step: `plugin: { path: <string>, version: <integer>, entry: <export, default run> }` plus optional `input` (sent to the plug-in as `args`). The module is loaded from the catalog. Since noetl/worker v6.13.0 every call runs under fuel, wall-clock and memory limits that are ON by default; see the manifest's worker_runtime.wasm_limits.",
       "enabled": true,
       "gated": false,
       "name": "wasm"
@@ -280,5 +310,75 @@
       "gated": false,
       "name": "workbook"
     }
-  ]
+  ],
+  "worker_runtime": {
+    "agent": {
+      "budget_note": "positive integers; anything else keeps the default; the model cannot override them (max_turns is the session's own)",
+      "budgets": [
+        {
+          "default": 32,
+          "env": "NOETL_AGENT_MAX_TOOL_CALLS",
+          "scope": "tool calls per agent step"
+        },
+        {
+          "default": 180,
+          "env": "NOETL_AGENT_TOOL_TIMEOUT_SECS",
+          "scope": "seconds per playbook-bound child"
+        }
+      ],
+      "event_note": "emitted on the agent's own execution by the hosted loop only (NOETL_WORKER_AGENT_PLAYBOOK_TOOLS=true), through the normal emit path",
+      "event_types": [
+        {
+          "context": "turn, outcome (tool_calls | final), tool_calls [{id, name}]",
+          "type": "agent.turn"
+        },
+        {
+          "context": "turn, tool_use_id, tool, binding, playbook, child_execution_id, is_error, duration_ms, input and result previews (2 KiB)",
+          "type": "agent.tool_call"
+        },
+        {
+          "context": "turns, tool_calls, child_execution_ids, duration_ms; or refused: tool_call_budget",
+          "type": "agent.final"
+        }
+      ],
+      "playbook_tools": {
+        "behaviour": "the worker hosts the agent loop; each playbook-bound call starts a child execution (kind: playbook, return_result: true, parent = this execution) that runs on whatever pool its playbook targets; its result is the next turn's tool_result; a failed child is an is_error tool result",
+        "default": "OFF (strict \"true\"); without it a playbook-bound tools: entry is refused before the first model call",
+        "not_durable": "the loop lives in one command on one worker: if that worker dies mid-loop the step retries from the first turn and children that already ran run again (orchestrator-driven resume is TARGET)",
+        "requires_env": [
+          "NOETL_TOOL_KIND_AGENT",
+          "NOETL_WORKER_AGENT_TOOL"
+        ],
+        "since_worker": "6.14.0",
+        "worker_gate_env": "NOETL_WORKER_AGENT_PLAYBOOK_TOOLS"
+      },
+      "tool_entry_forms": {
+        "other": "`mcp_servers:` / `agents:` entries are answered inside the agent session, as before",
+        "playbook_bound": "{ name, description, input_schema, playbook: <catalog path>, result_step: <step> (optional; without it the child's last step result) }"
+      }
+    },
+    "note": "Read by noetl/worker, not by this server; the values here are the worker's code defaults. Which worker version a cluster runs is the cluster's fact, not this file's.",
+    "wasm_limits": {
+      "default": "ON: every limit applies by default; set a variable to 0 / off / none / unlimited to remove that one limit; an unparseable value keeps the default",
+      "limits": [
+        {
+          "default": 10000000000,
+          "env": "NOETL_WASM_FUEL",
+          "unit": "fuel units"
+        },
+        {
+          "default": 30000,
+          "env": "NOETL_WASM_TIMEOUT_MS",
+          "unit": "milliseconds (wall clock)"
+        },
+        {
+          "default": 1024,
+          "env": "NOETL_WASM_MAX_MEMORY_MB",
+          "unit": "MiB (linear memory)"
+        }
+      ],
+      "on_exceed": "the module is stopped and the step fails with an error naming the variable",
+      "since_worker": "6.13.0"
+    }
+  }
 }

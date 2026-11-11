@@ -319,8 +319,10 @@ impl ToolKind {
                 "Needs the server gate AND a worker started with \
                  NOETL_WORKER_AGENT_TOOL=true (noetl/worker#398, noetl-tools 4.5.0); \
                  otherwise the worker fails the command as an unknown tool. The shared \
-                 pool refuses `framework: claude-code`, and refuses a playbook-bound \
-                 `tools:` entry before the first model call.",
+                 pool refuses `framework: claude-code`. A playbook-bound `tools:` entry \
+                 (`playbook: <path>`) is refused before the first model call unless the \
+                 worker also sets NOETL_WORKER_AGENT_PLAYBOOK_TOOLS=true (noetl/worker \
+                 v6.14.0); see the manifest's worker_runtime.agent.",
             ),
             ToolKind::Playbook => Some(
                 "Runs on any noetl/worker (noetl-tools PlaybookTool). Fields: `path` or \
@@ -336,7 +338,9 @@ impl ToolKind {
                  host instead of the tool registry. Step: `plugin: { path: <string>, \
                  version: <integer>, entry: <export, default run> }` plus optional \
                  `input` (sent to the plug-in as `args`). The module is loaded from the \
-                 catalog.",
+                 catalog. Since noetl/worker v6.13.0 every call runs under fuel, \
+                 wall-clock and memory limits that are ON by default; see the \
+                 manifest's worker_runtime.wasm_limits.",
             ),
             _ => None,
         }
