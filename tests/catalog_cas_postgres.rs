@@ -165,7 +165,7 @@ async fn content_addressing_dedup_and_pinning_against_postgres() {
     // A root execution of a parent playbook that hot-reloads nothing.
     let parent = format!("{base}/parent");
     register(&svc, playbook(&parent, "p", ""), None).await;
-    let root = cas::resolve_execute(&pool, Some(&parent), None, None, None, None)
+    let root = cas::resolve_execute(&pool, Some(&parent), None, None, None, None, None)
         .await
         .unwrap();
     assert_eq!(root.resolution.reason, core::Reason::Latest);
@@ -177,7 +177,7 @@ async fn content_addressing_dedup_and_pinning_against_postgres() {
     let v4 = register(&svc, playbook(&child, "four", ""), None).await;
     assert_eq!(v4.version, 4);
 
-    let pinned = cas::resolve_execute(&pool, Some(&child), None, None, None, Some(root_eid))
+    let pinned = cas::resolve_execute(&pool, Some(&child), None, None, None, Some(root_eid), None)
         .await
         .unwrap();
     assert_eq!(
@@ -185,7 +185,7 @@ async fn content_addressing_dedup_and_pinning_against_postgres() {
         (3, core::Reason::Pinned),
         "a child of a pinned root must not see a version registered after the root started"
     );
-    let unpinned = cas::resolve_execute(&pool, Some(&child), None, None, None, None)
+    let unpinned = cas::resolve_execute(&pool, Some(&child), None, None, None, None, None)
         .await
         .unwrap();
     assert_eq!(unpinned.resolution.entry.version, 4);
@@ -198,6 +198,7 @@ async fn content_addressing_dedup_and_pinning_against_postgres() {
         Some(&json!(2)),
         None,
         Some(root_eid),
+        None,
     )
     .await
     .unwrap();
@@ -213,6 +214,7 @@ async fn content_addressing_dedup_and_pinning_against_postgres() {
         Some(&json!(2)),
         Some(&d1),
         Some(root_eid),
+        None,
     )
     .await
     .unwrap();
@@ -231,7 +233,8 @@ async fn content_addressing_dedup_and_pinning_against_postgres() {
         None,
         None,
         Some(&absent),
-        Some(root_eid)
+        Some(root_eid),
+        None
     )
     .await
     .is_err());
@@ -244,7 +247,7 @@ async fn content_addressing_dedup_and_pinning_against_postgres() {
     )
     .await
     .unwrap();
-    let grand = cas::resolve_execute(&pool, Some(&child), None, None, None, Some(child_eid))
+    let grand = cas::resolve_execute(&pool, Some(&child), None, None, None, Some(child_eid), None)
         .await
         .unwrap();
     assert_eq!(grand.resolution.entry.version, 3);
@@ -263,6 +266,7 @@ async fn content_addressing_dedup_and_pinning_against_postgres() {
         Some(&json!("latest")),
         None,
         Some(root_eid),
+        None,
     )
     .await;
     assert!(refused.is_err());
@@ -275,7 +279,7 @@ async fn content_addressing_dedup_and_pinning_against_postgres() {
         &format!("  catalog:\n    hot_reload: [\"{base}/*\"]\n"),
     );
     register(&svc, hot_yaml.clone(), None).await;
-    let hot_root = cas::resolve_execute(&pool, Some(&hot_parent), None, None, None, None)
+    let hot_root = cas::resolve_execute(&pool, Some(&hot_parent), None, None, None, None, None)
         .await
         .unwrap();
     let hot_eid = root_eid + 10;
@@ -290,6 +294,7 @@ async fn content_addressing_dedup_and_pinning_against_postgres() {
         Some(&json!("latest")),
         None,
         Some(hot_eid),
+        None,
     )
     .await
     .unwrap();
@@ -298,7 +303,7 @@ async fn content_addressing_dedup_and_pinning_against_postgres() {
         (v5.version as i32, core::Reason::HotReload)
     );
     // ...but without @latest it is still pinned.
-    let still = cas::resolve_execute(&pool, Some(&child), None, None, None, Some(hot_eid))
+    let still = cas::resolve_execute(&pool, Some(&child), None, None, None, Some(hot_eid), None)
         .await
         .unwrap();
     assert_eq!(still.resolution.entry.version, 4);
@@ -315,9 +320,10 @@ async fn content_addressing_dedup_and_pinning_against_postgres() {
             .await
             .unwrap();
         // Archived after the root started: still the root tree's version.
-        let after = cas::resolve_execute(&pool, Some(&child), None, None, None, Some(root_eid))
-            .await
-            .unwrap();
+        let after =
+            cas::resolve_execute(&pool, Some(&child), None, None, None, Some(root_eid), None)
+                .await
+                .unwrap();
         assert_eq!(after.resolution.entry.version, 3);
     } else {
         eprintln!("archived_at absent: archive case not exercised");
@@ -332,11 +338,21 @@ async fn content_addressing_dedup_and_pinning_against_postgres() {
     let d2 = core::playbook_digest(&b2).unwrap();
     let src = "db://e2e/s.t?path=x";
     use noetl_server::services::catalog_peer::import;
-    let (c1, v1) = import(&pool, &imp, &b1, &d1, src, "fetched").await.expect("import v1");
-    let (_, v2) = import(&pool, &imp, &b2, &d2, src, "fetched").await.expect("import v2");
-    let (c1b, v1b) = import(&pool, &imp, &b1, &d1, src, "fetched").await.expect("re-import v1");
+    let (c1, v1) = import(&pool, &imp, &b1, &d1, src, "fetched")
+        .await
+        .expect("import v1");
+    let (_, v2) = import(&pool, &imp, &b2, &d2, src, "fetched")
+        .await
+        .expect("import v2");
+    let (c1b, v1b) = import(&pool, &imp, &b1, &d1, src, "fetched")
+        .await
+        .expect("re-import v1");
     assert_eq!((v1, v2), (1, 2));
-    assert_eq!((c1b, v1b), (c1, v1), "re-importing v1's body resolves to the v1 row");
+    assert_eq!(
+        (c1b, v1b),
+        (c1, v1),
+        "re-importing v1's body resolves to the v1 row"
+    );
     let n: i64 = sqlx::query_scalar("SELECT count(*) FROM noetl.catalog WHERE path = $1")
         .bind(&imp)
         .fetch_one(&pool)
