@@ -30,13 +30,41 @@
   ],
   "executable": "not_reported",
   "executable_note": "Kinds the parser accepts. Which kinds a live worker can execute is reported by workers (RFC dsl-knowledge-base Phase 3) and is not known to this process.",
+  "metadata_extensions": [
+    {
+      "keys": {
+        "description": "required",
+        "input_schema": "required; written by hand, never derived from workload; also the tools/call argument allowlist",
+        "mode": "sync (default) | async",
+        "result_step": "optional; the step whose result is returned",
+        "timeout": "sync wait in seconds (default 30, max 120)",
+        "tool": "required; MCP tool name, [A-Za-z0-9_.-]{1,64}"
+      },
+      "path": "metadata.expose.mcp",
+      "server_gate_env": "NOETL_MCP_SERVER",
+      "serves": "POST /api/mcp (one MCP tool per exposed playbook)"
+    },
+    {
+      "callback_origins_env": "NOETL_AGENT_CALLBACK_ORIGINS",
+      "keys": {
+        "card": "required mapping; card.name and card.description required, card.version and card.skills optional",
+        "input_schema": "required unless expose.mcp.input_schema is set; written by hand; the argument allowlist",
+        "result_step": "optional"
+      },
+      "path": "metadata.expose.agent",
+      "server_gate_env": "NOETL_AGENT_ENDPOINT",
+      "serves": "GET /api/agents, GET /api/agents/cards/{path}, POST /api/agents/send, GET /api/agents/tasks/{id}"
+    }
+  ],
   "orchestrate_core_version": "0.1.0",
   "tool_kinds": [
     {
+      "availability": "Needs the server gate AND a worker started with NOETL_WORKER_AGENT_TOOL=true (noetl/worker#398, noetl-tools 4.5.0); otherwise the worker fails the command as an unknown tool. The shared pool refuses `framework: claude-code`, and refuses a playbook-bound `tools:` entry before the first model call.",
       "enabled": false,
       "gate_env": "NOETL_TOOL_KIND_AGENT",
       "gated": true,
-      "name": "agent"
+      "name": "agent",
+      "worker_gate_env": "NOETL_WORKER_AGENT_TOOL"
     },
     {
       "enabled": true,
@@ -79,6 +107,7 @@
       "name": "iterator"
     },
     {
+      "availability": "Runs on any noetl/worker: noetl-tools McpTool, wrapped by the worker's WorkerMcpTool for auth headers. Only the server gate is needed.",
       "enabled": false,
       "gate_env": "NOETL_TOOL_KIND_MCP",
       "gated": true,
@@ -160,6 +189,7 @@
       "name": "transfer"
     },
     {
+      "availability": "Runs on a noetl/worker built with its `wasm-plugin` cargo feature (on by default and in the shipped image), which routes it to the plug-in host instead of the tool registry. `plugin: { path, version }` is loaded from the catalog.",
       "enabled": true,
       "gated": false,
       "name": "wasm"
