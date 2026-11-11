@@ -1,0 +1,43 @@
+# Compiled playbooks (noetl/ai-meta#548 Phase 3, RFC §7): a deterministic
+# playbook, checked pure at BUILD time, baked into a wasm32 module that runs the
+# orchestrate-core drive to completion with zero imports.
+#
+# One module per playbook. `build.rs` reads the YAML named by
+# `NOETL_PBC_PLAYBOOK` (default `examples/sum.yaml`), refuses it unless
+# `catalog::purity` passes, and embeds its sorted-key JSON plus its digest.
+#
+#   NOETL_PBC_PLAYBOOK=$PWD/examples/sum.yaml \
+#     cargo build --release --target wasm32-unknown-unknown
+#
+# Standalone crate: NOT a member of the server workspace (like plugins/orchestrate).
+# Status: PROTOTYPE. See the RFC §7.3 table for what is TARGET.
+[package]
+name = "noetl-playbook-wasm"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+noetl-orchestrate-core = { path = "../../orchestrate-core" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+chrono = { version = "0.4", default-features = false, features = ["serde", "std"] }
+
+[build-dependencies]
+noetl-orchestrate-core = { path = "../../orchestrate-core" }
+serde_json = "1.0"
+
+[dev-dependencies]
+# The hot-reload test hosts the built modules the way the worker does
+# (alloc + entry(ptr,len) -> packed i64), plus fuel. Same major as the worker.
+wasmtime = "27"
+sha2 = "0.10"
+hex = "0.4"
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true

@@ -634,6 +634,70 @@ pub fn verify_fetched(content: &str, expect: Option<&str>) -> Result<String, Cat
 }
 
 // ---------------------------------------------------------------------------
+// Purity: what may be compiled to WASM (RFC §7)
+// ---------------------------------------------------------------------------
+
+/// Tool kinds a compiled playbook may contain. Only `noop`: `rhai` registers
+/// `http_*`, `timestamp`, `sleep` and `random_*` (tools `rhai.rs`), so it is
+/// NOT pure as shipped, whatever `kind_is_side_effecting` says.
+pub const PURE_TOOL_KINDS: &[&str] = &["noop"];
+
+/// Why a playbook cannot be compiled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Impure {
+    pub step: Option<String>,
+    pub why: String,
+}
+
+impl fmt::Display for Impure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.step {
+            Some(s) => write!(f, "step '{s}': {}", self.why),
+            None => write!(f, "{}", self.why),
+        }
+    }
+}
+
+/// Check that every step is deterministic and does no I/O: a single
+/// `noop` tool (templates in `result`/`message` are fine), no pipelines, no
+/// cursor loops, no keychain, no sub-playbooks.
+pub fn purity(v: &Value) -> Result<(), Impure> {
+    let top = |why: &str| Impure {
+        step: None,
+        why: why.to_string(),
+    };
+    if v.get("keychain").is_some_and(|k| !k.is_null()) {
+        return Err(top("a keychain means credentials, which means I/O"));
+    }
+    let steps = v
+        .get("workflow")
+        .and_then(Value::as_array)
+        .ok_or_else(|| top("no workflow"))?;
+    for s in steps {
+        let name = s.get("step").and_then(Value::as_str).map(str::to_string);
+        let bad = |why: String| Impure {
+            step: name.clone(),
+            why,
+        };
+        let tool = s.get("tool").ok_or_else(|| bad("no tool".into()))?;
+        let kind = match tool {
+            Value::Object(t) => t.get("kind").and_then(Value::as_str).unwrap_or(""),
+            Value::Array(_) => return Err(bad("pipelines are not compiled yet (TARGET)".into())),
+            _ => return Err(bad("tool is not an object".into())),
+        };
+        if !PURE_TOOL_KINDS.contains(&kind) {
+            return Err(bad(format!(
+                "tool kind '{kind}' is not pure (allowed: {PURE_TOOL_KINDS:?})"
+            )));
+        }
+        if s.pointer("/loop/cursor").is_some_and(|c| !c.is_null()) {
+            return Err(bad("cursor loops claim rows from a store".into()));
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // In-memory store (tests, the CLI, the WASM runner)
 // ---------------------------------------------------------------------------
 
@@ -1099,6 +1163,26 @@ mod tests {
             verify_fetched(PB, Some(&d(7))),
             Err(CatalogError::DigestMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn purity_admits_noop_graphs_and_names_what_is_not() {
+        let ok = playbook_value(PB).unwrap();
+        assert_eq!(purity(&ok), Ok(()));
+        let looped = playbook_value("workflow:\n  - step: s\n    loop: {in: '{{ workload.xs }}', iterator: x}\n    tool: {kind: noop}\n").unwrap();
+        assert_eq!(purity(&looped), Ok(()));
+        for (yaml, step, needle) in [
+            ("workflow:\n  - step: a\n    tool: {kind: noop}\n  - step: b\n    tool: {kind: http, url: x}\n", Some("b"), "http"),
+            ("workflow:\n  - step: r\n    tool: {kind: rhai, code: '1'}\n", Some("r"), "rhai"),
+            ("workflow:\n  - step: p\n    tool: {kind: playbook, path: x}\n", Some("p"), "playbook"),
+            ("workflow:\n  - step: c\n    loop: {cursor: {kind: postgres}, iterator: r}\n    tool: {kind: noop}\n", Some("c"), "cursor"),
+            ("workflow:\n  - step: t\n    tool: [{a: {kind: noop}}]\n", Some("t"), "pipeline"),
+            ("keychain: [{name: k}]\nworkflow: []\n", None, "keychain"),
+        ] {
+            let e = purity(&playbook_value(yaml).unwrap()).unwrap_err();
+            assert_eq!(e.step.as_deref(), step, "{yaml}");
+            assert!(e.why.contains(needle), "{yaml}: {e}");
+        }
     }
 
     #[test]
