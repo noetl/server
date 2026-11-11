@@ -84,8 +84,8 @@ use super::mcp_server::{
 };
 use crate::sanitize::sanitize_sensitive_data;
 
-pub const AGENT_ENDPOINT_ENV: &str = "NOETL_AGENT_ENDPOINT";
-pub const CALLBACK_ORIGINS_ENV: &str = "NOETL_AGENT_CALLBACK_ORIGINS";
+pub const AGENT_ENDPOINT_ENV: &str = noetl_orchestrate_core::dsl::EXPOSE_AGENT_ENV;
+pub const CALLBACK_ORIGINS_ENV: &str = noetl_orchestrate_core::dsl::AGENT_CALLBACK_ORIGINS_ENV;
 
 /// Pending callbacks at once, per process.
 pub const MAX_WATCHERS: usize = 256;
