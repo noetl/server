@@ -1,5 +1,73 @@
 {
   "api_version": "noetl.io/v2",
+  "catalog_features": {
+    "default": "every catalog flag is OFF by default (each is strict \"true\", read once per process); with a flag off the server behaves as if the feature did not exist",
+    "features": [
+      {
+        "name": "content_addressing",
+        "server_gate_env": "NOETL_CATALOG_CAS",
+        "serves": "digest on register, dedup, /api/catalog/{resolve,blob,sources,pin}"
+      },
+      {
+        "affects": "POST /api/execute `version` (a positive integer or \"latest\") and `digest` (sha256:, wins over version) are honoured, and `path` may be a reference form. A `kind: playbook` step sends `version` as an integer only, so it asks for @latest or a digest through its `path`. A child of a pinned execution with no version resolves to the root's pinned version. With the flag off, version/digest are ignored and the path resolves to its latest version",
+        "name": "execution_pinning",
+        "requires_env": [
+          "NOETL_CATALOG_CAS"
+        ],
+        "server_gate_env": "NOETL_CATALOG_PINNING"
+      },
+      {
+        "affects": "`@latest` (e.g. a `kind: playbook` path `a/b@latest`) inside a pinned tree, only for paths the root lists in metadata.catalog.hot_reload; otherwise refused, never silently downgraded",
+        "name": "hot_reload",
+        "requires_env": [
+          "NOETL_CATALOG_PINNING",
+          "NOETL_CATALOG_CAS"
+        ],
+        "server_gate_env": "NOETL_CATALOG_HOT_RELOAD"
+      },
+      {
+        "name": "discovery",
+        "requires_env": [
+          "NOETL_CATALOG_CAS",
+          "NOETL_INSTANCE_REGISTRY",
+          "NOETL_CATALOG_PEER_KEY_FILE"
+        ],
+        "server_gate_env": "NOETL_CATALOG_DISCOVERY",
+        "serves": "POST /api/catalog/peer/resolve (signed, trusted peers only), POST /api/catalog/locate (internal token); imports under peer/<instance>/<path>"
+      },
+      {
+        "affects": "locate fetches a reference's own source URI; fail closed, nothing is fetched without an allowlist",
+        "name": "uri_fetch",
+        "requires_env": [
+          "NOETL_CATALOG_DISCOVERY",
+          "NOETL_CATALOG_URI_ALLOW"
+        ],
+        "server_gate_env": "NOETL_CATALOG_URI_FETCH"
+      }
+    ],
+    "reference_forms": [
+      "<path>                 the pinned version inside a pinned tree, else latest",
+      "<path>@<n>             an exact version",
+      "<path>@latest          latest; inside a pinned tree only with hot reload allowed",
+      "<path>@sha256:<64hex>  this name, and it must have this body",
+      "sha256:<64hex>         this body, under any name",
+      "<scheme>://<uri>[#sha256:<64hex>]  a source URI (fetched by locate)"
+    ],
+    "reference_forms_accepted_by": "POST /api/catalog/resolve and /api/catalog/sources (CAS), catalog locate (discovery), and, with pinning on, the `path` of POST /api/execute and of a `kind: playbook` step. A reference in `path` plus a `version`/`digest` field is refused, not merged.",
+    "source_schemes": [
+      "noetl",
+      "gs",
+      "s3",
+      "az",
+      "minio+http",
+      "minio+https",
+      "https",
+      "http",
+      "db",
+      "ehdb",
+      "file"
+    ]
+  },
   "document_kind": "Playbook",
   "enabled_tool_kinds": [
     "artifact",
@@ -54,6 +122,18 @@
       "path": "metadata.expose.agent",
       "server_gate_env": "NOETL_AGENT_ENDPOINT",
       "serves": "GET /api/agents, GET /api/agents/cards/{path}, POST /api/agents/send, GET /api/agents/tasks/{id}"
+    },
+    {
+      "keys": {
+        "(list)": "globs over sub-playbook paths, read from the ROOT playbook only; at most 64, each 1-512 chars; malformed entries are ignored, so a typo only narrows the policy"
+      },
+      "path": "metadata.catalog.hot_reload",
+      "requires_env": [
+        "NOETL_CATALOG_PINNING",
+        "NOETL_CATALOG_CAS"
+      ],
+      "server_gate_env": "NOETL_CATALOG_HOT_RELOAD",
+      "serves": "an explicit `@latest` sub-playbook reference inside this root's pinned execution tree"
     }
   ],
   "orchestrate_core_version": "0.1.0",
@@ -124,6 +204,7 @@
       "name": "noop"
     },
     {
+      "availability": "Runs on any noetl/worker (noetl-tools PlaybookTool). Fields: `path` or `catalog_id`, `version` (integer), `payload`/`args`, `return_step`, `return_result`. With NOETL_CATALOG_PINNING on, `path` may be a catalog reference (`a/b@3`, `a/b@latest`, `a/b@sha256:...`, `sha256:...`, a source URI) and the child resolves inside the root's pin; see the manifest's catalog_features.",
       "enabled": true,
       "gated": false,
       "name": "playbook"
@@ -189,7 +270,7 @@
       "name": "transfer"
     },
     {
-      "availability": "Runs on a noetl/worker built with its `wasm-plugin` cargo feature (on by default and in the shipped image), which routes it to the plug-in host instead of the tool registry. `plugin: { path, version }` is loaded from the catalog.",
+      "availability": "Runs on a noetl/worker built with its `wasm-plugin` cargo feature (on by default and in the shipped image), which routes it to the plug-in host instead of the tool registry. Step: `plugin: { path: <string>, version: <integer>, entry: <export, default run> }` plus optional `input` (sent to the plug-in as `args`). The module is loaded from the catalog.",
       "enabled": true,
       "gated": false,
       "name": "wasm"

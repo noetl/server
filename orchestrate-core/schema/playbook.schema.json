@@ -772,7 +772,7 @@
         },
         {
           "const": "wasm",
-          "description": "Compiled WASM system plug-in (noetl/ai-meta#105). The step's tool\ncarries `plugin: { path, version }` (+ optional `input`); the server\nonly accepts the kind so playbook validation passes, and the worker's\n`wasm-plugin` dispatcher routes `tool_kind: \"wasm\"` to the host (load\nfrom the catalog → run → flush capability intents).",
+          "description": "Compiled WASM plug-in (noetl/ai-meta#105). The step's tool carries\n`plugin: { path, version, entry? }` and an optional `input` (the server\ncanonicalises it to `args`, which becomes the plug-in's input bytes as\nJSON). `path` is a string, `version` an integer, `entry` the guest export\nto call (default `run`). The server only accepts the kind; the worker's\n`wasm-plugin` dispatcher loads the module from the catalog, runs it and\nflushes its capability intents.",
           "type": "string"
         }
       ]
