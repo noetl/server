@@ -1542,6 +1542,8 @@ async fn main() -> anyhow::Result<()> {
     let keychain_service = KeychainService::new(db_pool.clone(), wallet_cipher.clone());
     let credential_service =
         CredentialService::new(db_pool.clone(), wallet_cipher, keychain_service.clone());
+    // `db://` catalog sources resolve their credential alias here (#548).
+    noetl_server::services::catalog_sources::set_credentials(credential_service.clone());
     // Phase F R4-4b: ExecutionService now takes the DbPoolMap so
     // its per-execution methods route via pool_for(execution_id)
     // and `list()` fan-outs via for_each_shard.  In single-pool
