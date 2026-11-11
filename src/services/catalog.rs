@@ -76,6 +76,51 @@ impl CatalogService {
         // NOETL_CATALOG_PARSE_ON_REGISTER=shadow.
         parse_on_register(&path, &kind, &content);
 
+        // Content addressing (noetl/ai-meta#548). Off unless NOETL_CATALOG_CAS=true
+        // AND its tables were found at boot. The digest is computed before the
+        // insert, so a body with no JSON form is refused rather than stored with
+        // no identity.
+        let cas = crate::services::catalog_cas::ready();
+        let digest = if cas {
+            Some(
+                noetl_orchestrate_core::catalog::playbook_digest(&content)
+                    .map_err(|e| AppError::Validation(e.to_string()))?,
+            )
+        } else {
+            None
+        };
+        let declared_source = match (&request.source, &digest) {
+            (Some(s), Some(d)) => Some(crate::services::catalog_cas::check_declared_source(s, d)?),
+            _ => None,
+        };
+        // RFC §3.2 rule 2: the same body as this path's latest version makes no
+        // new version. An older version's body does — that is a real roll-back.
+        if let Some(d) = &digest {
+            if let Some((row, latest)) =
+                crate::services::catalog_cas::latest_with_digest(&self.pool, &path).await?
+            {
+                if &latest == d {
+                    if let Some(uri) = &declared_source {
+                        crate::services::catalog_cas::add_source(&self.pool, d, uri, "declared", false)
+                            .await?;
+                    }
+                    return Ok(CatalogRegisterResponse {
+                        status: "success".to_string(),
+                        message: format!(
+                            "Resource '{}' version '{}' unchanged (same content digest).",
+                            path, row.version
+                        ),
+                        path,
+                        version: row.version,
+                        catalog_id: row.catalog_id.to_string(),
+                        kind,
+                        digest: digest.clone(),
+                        deduplicated: Some(true),
+                    });
+                }
+            }
+        }
+
         // Get next version
         let version = queries::get_next_version(&self.pool, &path).await?;
 
@@ -121,6 +166,24 @@ impl CatalogService {
         )
         .await;
 
+        // The row is committed; a failure to index it must not fail the request
+        // (the caller would re-register). `digest_for` fills the index lazily.
+        if let Some(d) = &digest {
+            if let Err(e) = crate::services::catalog_cas::record_registered(
+                &self.pool,
+                catalog_id,
+                &path,
+                version,
+                &content,
+                d,
+                declared_source.as_deref(),
+            )
+            .await
+            {
+                tracing::warn!(catalog_id, error = %e, "catalog CAS index write failed after insert; will fill lazily");
+            }
+        }
+
         Ok(CatalogRegisterResponse {
             status: "success".to_string(),
             message: format!("Resource '{}' version '{}' registered.", path, version),
@@ -128,6 +191,8 @@ impl CatalogService {
             version,
             catalog_id: catalog_id.to_string(),
             kind,
+            deduplicated: digest.as_ref().map(|_| false),
+            digest,
         })
     }
 

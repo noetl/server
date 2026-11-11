@@ -22,6 +22,11 @@ tracing = "0.1"
 sha2 = "0.10"
 hex = "0.4"
 
+# Content-addressed catalog (ai-meta#548): the playbook digest is computed
+# over the YAML's JSON value, so the core parses YAML itself.  Pure Rust;
+# builds for wasm32.
+serde_yaml = "0.9"
+
 # DSL knowledge base (ai-meta RFC `dsl-knowledge-base.md`): derive the playbook
 # JSON Schema from the authoring types below.  OPTIONAL so the wasm32
 # `system/orchestrate` plug-in (which never emits a schema) carries none of it;
@@ -32,7 +37,6 @@ schemars = { version = "1", optional = true }
 json-schema = ["dep:schemars"]
 
 [dev-dependencies]
-serde_yaml = "0.9"
 # Phase 0 determinism probe (ai-meta#265): the digest under test.
 sha2 = "0.10"
 hex = "0.4"

@@ -116,6 +116,14 @@ fn build_router(
         // are served; everything else returns 404.
         .route("/api/catalog/{*tail}", get(handlers::catalog::ui_schema))
         .with_state(catalog_service);
+    // Content-addressed catalog (noetl/ai-meta#548): only when the flag is on
+    // AND its tables were found at boot, so a database without them never
+    // serves a route that would 500.
+    let catalog_routes = if noetl_server::services::catalog_cas::ready() {
+        catalog_routes.merge(handlers::catalog_cas::routes(db_pool.clone()))
+    } else {
+        catalog_routes
+    };
 
     // Credential routes
     let credential_routes = Router::new()
@@ -1465,6 +1473,16 @@ async fn main() -> anyhow::Result<()> {
             "could not ensure noetl.catalog.archived_at (needs table ownership); \
              soft delete will report it is unavailable until an operator adds the column"
         );
+    }
+    // Content-addressed catalog tables (noetl/ai-meta#548). Best-effort create,
+    // then detect: absent tables leave every CAS flag behaving as off.
+    noetl_server::services::catalog_cas::ensure_schema(&db_pool).await;
+    if noetl_server::services::catalog_cas::ready() {
+        let pool = db_pool.clone();
+        tokio::spawn(async move {
+            let n = noetl_server::services::catalog_cas::backfill_digests(&pool, 20_000).await;
+            tracing::info!(rows = n, "catalog CAS digest backfill done");
+        });
     }
     // Seed built-in system plug-ins (noetl/ai-meta#108 slice 3) — the
     // server-owned `system/orchestrate` (+ future built-ins) compiled to wasm32
