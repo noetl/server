@@ -1,0 +1,10 @@
+# Not compilable: an http step is I/O. build.rs must refuse it.
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata: { name: impure, path: compiled/impure }
+workflow:
+  - step: start
+    tool: { kind: noop }
+    next: [ { step: fetch } ]
+  - step: fetch
+    tool: { kind: http, url: "https://example.com" }

@@ -1,0 +1,15 @@
+# A deterministic playbook: no I/O, only templates over the workload and over
+# earlier steps' results. Version 2.
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata: { name: sum, path: compiled/sum }
+workload: { a: 2, b: 3, xs: [1, 2, 3] }
+workflow:
+  - step: start
+    tool: { kind: noop, result: { total: "{{ workload.a + workload.b }}" } }
+    next: [ { step: scale } ]
+  - step: scale
+    tool: { kind: noop, result: { scaled: "{{ start.total * 100 }}", formula: "v2: (a+b)*100" } }
+    next: [ { step: end } ]
+  - step: end
+    tool: { kind: noop, result: { answer: "{{ scale.scaled }}", version: 2 } }
