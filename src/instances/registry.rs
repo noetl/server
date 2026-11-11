@@ -84,6 +84,59 @@ pub struct Capabilities {
     /// Instances it has discovered or handed work to. Becomes `knows` edges in the graph.
     #[serde(default)]
     pub known_peers: Vec<String>,
+    /// A server's catalog advertisement (noetl/ai-meta#548 Phase 2): a bloom
+    /// filter over what its catalog holds, so a peer can ask "might you have X?"
+    /// without a request. Absent for CLI and daemon instances.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog: Option<CatalogAdvert>,
+}
+
+/// The bloom families an advert may carry (RFC §4.2): `p:<path>`,
+/// `v:<path>@<version>`, `d:<digest>`.
+pub const ADVERT_FAMILIES: [&str; 3] = ["p", "v", "d"];
+/// Upper bound on an advert's filter: ehdb-l0's Mixed cap, 32 KiB of bits.
+pub const ADVERT_MAX_BITS: u32 = 1 << 18;
+
+/// A bounded, typed catalog advertisement. `deny_unknown_fields` for the same
+/// reason as [`Capabilities`]: nothing free-form rides a registration.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CatalogAdvert {
+    /// Monotonic per advertiser; a lower generation never replaces a higher one.
+    pub generation: u64,
+    /// Catalog entries folded into the filter.
+    pub entries: u32,
+    /// Which key families were inserted.
+    pub families: Vec<String>,
+    /// `ehdb_l0::Bloom`, Mixed scheme only.
+    pub bloom: ehdb_l0::Bloom,
+}
+
+impl CatalogAdvert {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.families.is_empty()
+            || self.families.len() > ADVERT_FAMILIES.len()
+            || self.families.iter().any(|f| !ADVERT_FAMILIES.contains(&f.as_str()))
+        {
+            return Err("catalog.families: a non-empty subset of p, v, d".into());
+        }
+        if self.bloom.size_bits() > ADVERT_MAX_BITS {
+            return Err(format!("catalog.bloom: at most {ADVERT_MAX_BITS} bits"));
+        }
+        // ⚠ The Legacy scheme collapses probes (the ai-meta#517 retention-floor
+        // bug), so a Legacy advert would answer "maybe" for nearly everything.
+        let wire = serde_json::to_value(&self.bloom).map_err(|e| e.to_string())?;
+        if wire.get("scheme").and_then(|v| v.as_u64()) != Some(2) {
+            return Err("catalog.bloom: only the Mixed scheme (2) is accepted".into());
+        }
+        Ok(())
+    }
+
+    /// No false negatives; a "maybe" costs one peer query.
+    pub fn may_hold(&self, key: &str) -> bool {
+        let family = key.split(':').next().unwrap_or("");
+        self.families.iter().any(|f| f == family) && self.bloom.maybe_contains(key)
+    }
 }
 
 const MAX_STR: usize = 256;
@@ -131,6 +184,12 @@ impl Capabilities {
             .find(|p| !super::identity::is_instance_id(p))
         {
             return Err(format!("known_peers: `{p}` is not an instance id"));
+        }
+        if let Some(c) = &self.catalog {
+            c.validate()?;
+            if self.endpoint.is_none() {
+                return Err("catalog: an advert needs an endpoint to fetch from".into());
+            }
         }
         if let Some(e) = &self.endpoint {
             let u = reqwest::Url::parse(e).map_err(|_| "endpoint: not a URL".to_string())?;
@@ -380,7 +439,43 @@ pub(crate) mod tests {
             endpoint: None,
             accepts_tasks: true,
             known_peers: vec![],
+            catalog: None,
         }
+    }
+
+    fn advert(scheme: ehdb_l0::bloom::BloomScheme, keys: &[&str]) -> CatalogAdvert {
+        let mut bloom = ehdb_l0::Bloom::for_expected_in(64, scheme);
+        keys.iter().for_each(|k| bloom.insert(k));
+        CatalogAdvert { generation: 1, entries: 1, families: vec!["p".into(), "d".into()], bloom }
+    }
+
+    #[test]
+    fn a_catalog_advert_is_typed_bounded_and_mixed_only() {
+        let mut c = caps(RuntimeKind::Distributed);
+        c.endpoint = Some("http://b.example:8082".into());
+        c.catalog = Some(advert(ehdb_l0::bloom::BloomScheme::Mixed, &["p:a/b"]));
+        c.validate().unwrap();
+        let a = c.catalog.as_ref().unwrap();
+        assert!(a.may_hold("p:a/b"));
+        assert!(!a.may_hold("v:a/b@1"), "a family that was not inserted never answers maybe");
+        // Round-trips through the registration JSON.
+        let back: Capabilities = serde_json::from_value(serde_json::to_value(&c).unwrap()).unwrap();
+        assert_eq!(back, c);
+        // Legacy is refused.
+        c.catalog = Some(advert(ehdb_l0::bloom::BloomScheme::Legacy, &["p:a/b"]));
+        assert!(c.validate().unwrap_err().contains("Mixed"));
+        // Unknown families, and an advert with no endpoint, are refused.
+        let mut bad = advert(ehdb_l0::bloom::BloomScheme::Mixed, &[]);
+        bad.families = vec!["x".into()];
+        c.catalog = Some(bad);
+        assert!(c.validate().is_err());
+        c.catalog = Some(advert(ehdb_l0::bloom::BloomScheme::Mixed, &[]));
+        c.endpoint = None;
+        assert!(c.validate().is_err());
+        // An unknown field inside the advert is refused, like the rest of Capabilities.
+        let mut v = serde_json::to_value(advert(ehdb_l0::bloom::BloomScheme::Mixed, &[])).unwrap();
+        v["extra"] = serde_json::json!(1);
+        assert!(serde_json::from_value::<CatalogAdvert>(v).is_err());
     }
 
     const A: &str = "ni-0000000000000000000000000000000a";

@@ -293,6 +293,10 @@ subtle = "2.6"
 sha2 = "0.10"
 hmac = "0.12"
 hex = "0.4"
+# Catalog source fetch (noetl/ai-meta#548 Phase 2): gs://, s3://, az:// and MinIO
+# through one maintained client rather than three hand-rolled ones
+# (agents/rules/self-sufficiency.md). Same major the CLI executor already ships.
+object_store = { version = "0.11", default-features = false, features = ["aws", "gcp", "azure"] }
 # Secrets Wallet Phase 5a (noetl/ai-meta#61) — sealed payload primitives
 # (src/crypto/sealed.rs).  X25519 ECDH + HKDF-SHA256 key derivation + ChaCha20-
 # Poly1305 AEAD, no SDK dep tree.  The recipient (worker) holds a long-lived

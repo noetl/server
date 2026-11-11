@@ -568,6 +568,72 @@ pub fn describe(l: &Lookup) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Discovery keys (RFC §4.2) and imports (§4.4)
+// ---------------------------------------------------------------------------
+
+/// The three bloom keys an entry is advertised under: `p:<path>`,
+/// `v:<path>@<version>`, `d:<digest>`.
+pub fn advert_keys(path: &str, version: i32, digest: &str) -> [String; 3] {
+    [
+        format!("p:{path}"),
+        format!("v:{path}@{version}"),
+        format!("d:{digest}"),
+    ]
+}
+
+/// The bloom key a reference is probed with, or `None` when a reference names
+/// its source (it is fetched directly, never probed).
+pub fn probe_key(r: &PlaybookRef) -> Option<String> {
+    match r {
+        PlaybookRef::Digest { digest } => Some(format!("d:{digest}")),
+        PlaybookRef::Name { path, version } => Some(match version {
+            VersionSel::Exact(v) => format!("v:{path}@{v}"),
+            VersionSel::Digest(d) => format!("d:{d}"),
+            VersionSel::Default | VersionSel::Latest => format!("p:{path}"),
+        }),
+        PlaybookRef::Source { .. } => None,
+    }
+}
+
+/// Where a peer's playbook is imported locally: `peer/<instance-id>/<path>`, so
+/// an imported copy can never shadow a local path of the same name.
+pub fn import_path(instance_id: &str, path: &str) -> String {
+    format!("peer/{instance_id}/{path}")
+}
+
+/// A `noetl://<instance>/<path>[@<version>]` source, split. `local` is this
+/// catalog.
+pub fn split_noetl_uri(uri: &str) -> Result<(String, PlaybookRef), CatalogError> {
+    let rest = uri
+        .strip_prefix("noetl://")
+        .ok_or_else(|| CatalogError::BadRef(format!("'{uri}' is not a noetl:// URI")))?;
+    let (instance, reference) = rest
+        .split_once('/')
+        .ok_or_else(|| CatalogError::BadRef(format!("'{uri}' names no playbook")))?;
+    if instance.is_empty() {
+        return Err(CatalogError::BadRef(format!("'{uri}' names no instance")));
+    }
+    let r = PlaybookRef::parse(reference)?;
+    if matches!(r, PlaybookRef::Source { .. }) {
+        return Err(CatalogError::BadRef(format!("'{uri}' nests a URI")));
+    }
+    Ok((instance.to_string(), r))
+}
+
+/// Verify a fetched body against the digest it must have (if any) and return
+/// its digest. The digest of what was fetched is what gets pinned.
+pub fn verify_fetched(content: &str, expect: Option<&str>) -> Result<String, CatalogError> {
+    let actual = playbook_digest(content)?;
+    match expect {
+        Some(e) if e != actual => Err(CatalogError::DigestMismatch {
+            expected: e.to_string(),
+            actual,
+        }),
+        _ => Ok(actual),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // In-memory store (tests, the CLI, the WASM runner)
 // ---------------------------------------------------------------------------
 
@@ -787,18 +853,30 @@ mod tests {
         use PlaybookRef as R;
         assert_eq!(
             R::from_request("a@latest", None, None).unwrap(),
-            R::Name { path: "a".into(), version: VersionSel::Latest }
+            R::Name {
+                path: "a".into(),
+                version: VersionSel::Latest
+            }
         );
         assert_eq!(
             R::from_request("a@3", Some(&Value::Null), None).unwrap(),
-            R::Name { path: "a".into(), version: VersionSel::Exact(3) }
+            R::Name {
+                path: "a".into(),
+                version: VersionSel::Exact(3)
+            }
         );
-        assert_eq!(R::from_request(&d(9), None, None).unwrap(), R::Digest { digest: d(9) });
+        assert_eq!(
+            R::from_request(&d(9), None, None).unwrap(),
+            R::Digest { digest: d(9) }
+        );
         assert!(R::from_request("a@3", Some(&json!(4)), None).is_err());
         assert!(R::from_request("a@3", None, Some(&d(1))).is_err());
         assert_eq!(
             R::from_request("a", Some(&json!(4)), None).unwrap(),
-            R::Name { path: "a".into(), version: VersionSel::Exact(4) }
+            R::Name {
+                path: "a".into(),
+                version: VersionSel::Exact(4)
+            }
         );
     }
 
@@ -976,6 +1054,51 @@ mod tests {
             PinPolicy::from_playbook(&json!({"metadata": {}})),
             PinPolicy::default()
         );
+    }
+
+    #[test]
+    fn advert_and_probe_keys_agree() {
+        let keys = advert_keys("a/b", 3, &d(1));
+        let probe = |s: &str| probe_key(&PlaybookRef::parse(s).unwrap()).unwrap();
+        assert!(keys.contains(&probe("a/b")));
+        assert!(keys.contains(&probe("a/b@latest")));
+        assert!(keys.contains(&probe("a/b@3")));
+        assert!(keys.contains(&probe(&d(1))));
+        assert!(keys.contains(&probe(&format!("x/y@{}", d(1)))));
+        assert!(!keys.contains(&probe("a/b@4")));
+        assert_eq!(probe_key(&PlaybookRef::parse("gs://b/k").unwrap()), None);
+    }
+
+    #[test]
+    fn noetl_uris_split_into_instance_and_reference() {
+        let (i, r) = split_noetl_uri("noetl://ni-abc/a/b@2").unwrap();
+        assert_eq!(
+            (i.as_str(), r),
+            (
+                "ni-abc",
+                PlaybookRef::Name {
+                    path: "a/b".into(),
+                    version: VersionSel::Exact(2)
+                }
+            )
+        );
+        let (_, r) = split_noetl_uri(&format!("noetl://local/{}", d(2))).unwrap();
+        assert_eq!(r, PlaybookRef::Digest { digest: d(2) });
+        assert!(split_noetl_uri("noetl:///a").is_err());
+        assert!(split_noetl_uri("noetl://ni-x").is_err());
+        assert!(split_noetl_uri("noetl://ni-x/gs://b/k").is_err());
+        assert_eq!(import_path("ni-x", "a/b"), "peer/ni-x/a/b");
+    }
+
+    #[test]
+    fn fetched_bodies_are_verified() {
+        let good = playbook_digest(PB).unwrap();
+        assert_eq!(verify_fetched(PB, Some(&good)).unwrap(), good);
+        assert_eq!(verify_fetched(PB, None).unwrap(), good);
+        assert!(matches!(
+            verify_fetched(PB, Some(&d(7))),
+            Err(CatalogError::DigestMismatch { .. })
+        ));
     }
 
     #[test]
