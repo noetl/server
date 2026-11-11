@@ -323,6 +323,32 @@ async fn content_addressing_dedup_and_pinning_against_postgres() {
         eprintln!("archived_at absent: archive case not exercised");
     }
 
+    // Imports dedup by digest at ANY version of the import path (a source that
+    // alternates v1, v2, v1 must not grow a copy of v1 as v3).
+    let imp = format!("{base}/imported");
+    let b1 = playbook(&imp, "one", "");
+    let b2 = playbook(&imp, "two", "");
+    let d1 = core::playbook_digest(&b1).unwrap();
+    let d2 = core::playbook_digest(&b2).unwrap();
+    let src = "db://e2e/s.t?path=x";
+    use noetl_server::services::catalog_peer::import;
+    let (c1, v1) = import(&pool, &imp, &b1, &d1, src, "fetched").await.expect("import v1");
+    let (_, v2) = import(&pool, &imp, &b2, &d2, src, "fetched").await.expect("import v2");
+    let (c1b, v1b) = import(&pool, &imp, &b1, &d1, src, "fetched").await.expect("re-import v1");
+    assert_eq!((v1, v2), (1, 2));
+    assert_eq!((c1b, v1b), (c1, v1), "re-importing v1's body resolves to the v1 row");
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM noetl.catalog WHERE path = $1")
+        .bind(&imp)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(n, 2, "two distinct bodies, two rows");
+    sqlx::query("DELETE FROM noetl.catalog_source WHERE uri = $1")
+        .bind(src)
+        .execute(&pool)
+        .await
+        .unwrap();
+
     cleanup(&pool, "tests/cas/").await;
 }
 

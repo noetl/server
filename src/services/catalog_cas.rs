@@ -445,6 +445,34 @@ pub async fn latest_with_digest(pool: &DbPool, path: &str) -> AppResult<Option<(
     Ok(Some((row, digest)))
 }
 
+/// The newest live row at `path` whose body has `digest`, at any version.
+///
+/// Imports dedup against this rather than only the path's latest version: a
+/// source that alternates v1, v2, v1 resolves its third fetch to the existing
+/// v1 row instead of inserting a copy of it as v3.
+pub async fn row_at_path_with_digest(
+    pool: &DbPool,
+    path: &str,
+    digest: &str,
+) -> AppResult<Option<CasRow>> {
+    let live = if crate::db::queries::catalog::archived_column_present() {
+        " AND c.archived_at IS NULL"
+    } else {
+        ""
+    };
+    let r: Option<RowTuple> = sqlx::query_as(&format!(
+        "SELECT {ROW_COLS} FROM noetl.catalog c
+         JOIN noetl.catalog_digest d ON d.catalog_id = c.catalog_id
+         WHERE c.path = $1 AND d.digest = $2{live}
+         ORDER BY c.version DESC LIMIT 1"
+    ))
+    .bind(path)
+    .bind(digest)
+    .fetch_optional(pool)
+    .await?;
+    Ok(r.map(to_row))
+}
+
 /// Record a freshly inserted row: body, digest index, its own source, and an
 /// optional declared source.
 pub async fn record_registered(

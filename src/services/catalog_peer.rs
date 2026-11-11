@@ -853,11 +853,10 @@ pub async fn import(
             "credential resources are never imported".into(),
         ));
     }
-    if let Some((row, d)) = cas::latest_with_digest(pool, local_path).await? {
-        if d == digest {
-            cas::add_source(pool, digest, source, origin, true).await?;
-            return Ok((row.catalog_id, row.version));
-        }
+    // Dedup by digest at any version of this path, not only the latest.
+    if let Some(row) = cas::row_at_path_with_digest(pool, local_path, digest).await? {
+        cas::add_source(pool, digest, source, origin, true).await?;
+        return Ok((row.catalog_id, row.version));
     }
     let version = crate::db::queries::catalog::get_next_version(pool, local_path).await?;
     let to_json = |k: &str| {
