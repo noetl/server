@@ -885,8 +885,26 @@ pub async fn import(
     Ok((catalog_id, version))
 }
 
-/// Fetch a playbook body from a source URI. Ambient credentials only.
+/// Fetch a playbook body from a source URI. Object stores use ambient
+/// credentials only; `db://` resolves its credential alias in this server's
+/// credential store; `ehdb://` reads the cluster's EHDB catalog tier
+/// ([`super::catalog_sources`]).
 pub async fn fetch_uri(http: &reqwest::Client, uri: &str) -> AppResult<String> {
+    let body = if uri.starts_with("db://") {
+        Some(super::catalog_sources::fetch_db(uri).await?)
+    } else if uri.starts_with("ehdb://") {
+        Some(super::catalog_sources::fetch_ehdb(http, uri).await?)
+    } else {
+        None
+    };
+    if let Some(b) = body {
+        if b.len() > MAX_BODY_BYTES {
+            return Err(AppError::Validation(format!(
+                "{uri}: body over {MAX_BODY_BYTES} bytes"
+            )));
+        }
+        return Ok(b);
+    }
     let bytes: Vec<u8> = if uri.starts_with("https://") || uri.starts_with("http://") {
         let r = http
             .get(uri)
@@ -991,7 +1009,7 @@ pub fn object_store_for(
         }
         "db" | "ehdb" => {
             return Err(bad(format!(
-                "'{scheme}://' sources are TARGET (RFC §9), not implemented"
+                "'{scheme}://' is not an object store (fetch_uri resolves it through catalog_sources)"
             )))
         }
         "file" => {
@@ -1109,8 +1127,8 @@ mod tests {
         assert!(object_store_for("minio+http://minio:9000/pb/a/b.yaml").is_ok());
         assert!(object_store_for("minio+http://minio:9000/pb").is_err());
         for (u, why) in [
-            ("db://alias/s.t", "TARGET"),
-            ("ehdb://catalog/1", "TARGET"),
+            ("db://alias/s.t", "not an object store"),
+            ("ehdb://catalog/1", "not an object store"),
             ("file:///x", "never a server"),
         ] {
             let e = object_store_for(u).err().unwrap().to_string();
