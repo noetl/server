@@ -71,7 +71,7 @@ use serde_json::{json, Map, Value};
 use crate::sanitize::sanitize_sensitive_data;
 
 /// The arming flag. Strict `== "true"`.
-pub const MCP_SERVER_ENV: &str = "NOETL_MCP_SERVER";
+pub const MCP_SERVER_ENV: &str = noetl_orchestrate_core::dsl::EXPOSE_MCP_ENV;
 
 /// Is the playbook MCP server mounted on this process?
 pub fn mcp_server_enabled() -> bool {
