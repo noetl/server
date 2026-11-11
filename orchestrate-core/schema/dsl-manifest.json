@@ -43,6 +43,31 @@
           "NOETL_CATALOG_URI_ALLOW"
         ],
         "server_gate_env": "NOETL_CATALOG_URI_FETCH"
+      },
+      {
+        "affects": "inside a pinned tree a remote reference resolves to what the ROOT first got for it, in both modes, even if the owner registers a new version mid-run; a child of an imported playbook resolves bare names on its home instance (peer/<instance>/<name>). With the flag off `remote: delegate` is refused by name and nothing else changes",
+        "delegate_requires_env": [
+          "NOETL_CATALOG_DISCOVERY"
+        ],
+        "name": "remote_execution",
+        "reference_forms": [
+          "noetl://<instance>/<path>[@<version>][#sha256:<hex>]",
+          "peer/<instance>/<path>"
+        ],
+        "requires_env": [
+          "NOETL_CATALOG_PINNING",
+          "NOETL_CATALOG_CAS"
+        ],
+        "server_gate_env": "NOETL_CATALOG_REMOTE_CALLS",
+        "serving_side": {
+          "allow_env": "NOETL_CATALOG_REMOTE_SERVE_ALLOW",
+          "server_gate_env": "NOETL_CATALOG_REMOTE_SERVE",
+          "serves": "POST /api/catalog/peer/execute (signed, purpose catalog.execute), POST /api/catalog/peer/execution (signed, catalog.execution; only the starting instance may read); fail closed without an allowlist glob. Delegated runs from one calling root share one pin on the owner"
+        },
+        "step_keys": {
+          "digest": "on a `kind: playbook` tool: sha256: the resolved body must have",
+          "remote": "on a `kind: playbook` tool: import (default; verify, import under peer/<instance>/<path>, run here) | delegate (the owner runs that digest on its own workers; the step's return_result/result_step read its result). Default from NOETL_CATALOG_REMOTE_MODE"
+        }
       }
     ],
     "reference_forms": [
