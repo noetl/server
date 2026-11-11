@@ -94,6 +94,23 @@ pub const EXPOSE_AGENT_ENV: &str = "NOETL_AGENT_ENDPOINT";
 /// Origins `expose.agent` callbacks may be delivered to (comma-separated; empty refuses all).
 pub const AGENT_CALLBACK_ORIGINS_ENV: &str = "NOETL_AGENT_CALLBACK_ORIGINS";
 
+/// Content-addressed catalog: digest on register, dedup, `/api/catalog/{resolve,blob,sources,pin}`.
+pub const CATALOG_CAS_ENV: &str = "NOETL_CATALOG_CAS";
+/// Execution pinning (needs [`CATALOG_CAS_ENV`]).
+pub const CATALOG_PINNING_ENV: &str = "NOETL_CATALOG_PINNING";
+/// `@latest` inside a pinned tree for paths in `metadata.catalog.hot_reload`.
+pub const CATALOG_HOT_RELOAD_ENV: &str = "NOETL_CATALOG_HOT_RELOAD";
+/// Cross-cluster discovery: advertise, `/api/catalog/peer/resolve`, `/api/catalog/locate`.
+pub const CATALOG_DISCOVERY_ENV: &str = "NOETL_CATALOG_DISCOVERY";
+/// Direct fetch of a reference's source URI during locate.
+pub const CATALOG_URI_FETCH_ENV: &str = "NOETL_CATALOG_URI_FETCH";
+/// Globs of source URIs locate may fetch. Empty or unset fetches nothing.
+pub const CATALOG_URI_ALLOW_ENV: &str = "NOETL_CATALOG_URI_ALLOW";
+/// The instance key discovery signs with.
+pub const CATALOG_PEER_KEY_FILE_ENV: &str = "NOETL_CATALOG_PEER_KEY_FILE";
+/// The instance registry discovery admits peers through (server `instances`).
+pub const INSTANCE_REGISTRY_ENV: &str = "NOETL_INSTANCE_REGISTRY";
+
 /// Playbook `metadata` keys a server acts on, with the flag that arms each.
 ///
 /// `metadata` is an open map in the schema, so these are invisible there; they
@@ -124,8 +141,68 @@ pub fn metadata_extensions() -> Value {
                 "result_step": "optional"
             },
             "callback_origins_env": AGENT_CALLBACK_ORIGINS_ENV
+        },
+        {
+            "path": "metadata.catalog.hot_reload",
+            "server_gate_env": CATALOG_HOT_RELOAD_ENV,
+            "requires_env": [CATALOG_PINNING_ENV, CATALOG_CAS_ENV],
+            "serves": "an explicit `@latest` sub-playbook reference inside this root's pinned execution tree",
+            "keys": {
+                "(list)": "globs over sub-playbook paths, read from the ROOT playbook only; at most 64, each 1-512 chars; malformed entries are ignored, so a typo only narrows the policy"
+            }
         }
     ])
+}
+
+/// Catalog capabilities a playbook can rely on only where their flags are on.
+///
+/// All are strict `"true"`, read once per process. With a flag off the server
+/// behaves exactly as before the feature existed, which for pinning means the
+/// playbook tool's `version` / `digest` are ignored and the path resolves to
+/// its latest version.
+pub fn catalog_features() -> Value {
+    json!({
+        "reference_forms": [
+            "<path>                 the pinned version inside a pinned tree, else latest",
+            "<path>@<n>             an exact version",
+            "<path>@latest          latest; inside a pinned tree only with hot reload allowed",
+            "<path>@sha256:<64hex>  this name, and it must have this body",
+            "sha256:<64hex>         this body, under any name",
+            "<scheme>://<uri>[#sha256:<64hex>]  a source URI (resolved by locate)"
+        ],
+        "source_schemes": crate::catalog::SOURCE_SCHEMES,
+        "features": [
+            {
+                "name": "content_addressing",
+                "server_gate_env": CATALOG_CAS_ENV,
+                "serves": "digest on register, dedup, /api/catalog/{resolve,blob,sources,pin}"
+            },
+            {
+                "name": "execution_pinning",
+                "server_gate_env": CATALOG_PINNING_ENV,
+                "requires_env": [CATALOG_CAS_ENV],
+                "affects": "kind: playbook `version` (a number or \"latest\") and `digest` (sha256:) are honoured, and sub-playbooks resolve inside the root's pin; with the flag off both are ignored"
+            },
+            {
+                "name": "hot_reload",
+                "server_gate_env": CATALOG_HOT_RELOAD_ENV,
+                "requires_env": [CATALOG_PINNING_ENV, CATALOG_CAS_ENV],
+                "affects": "`@latest` inside a pinned tree, only for paths the root lists in metadata.catalog.hot_reload; otherwise refused, never silently downgraded"
+            },
+            {
+                "name": "discovery",
+                "server_gate_env": CATALOG_DISCOVERY_ENV,
+                "requires_env": [CATALOG_CAS_ENV, INSTANCE_REGISTRY_ENV, CATALOG_PEER_KEY_FILE_ENV],
+                "serves": "POST /api/catalog/peer/resolve (signed, trusted peers only), POST /api/catalog/locate (internal token); imports under peer/<instance>/<path>"
+            },
+            {
+                "name": "uri_fetch",
+                "server_gate_env": CATALOG_URI_FETCH_ENV,
+                "requires_env": [CATALOG_DISCOVERY_ENV, CATALOG_URI_ALLOW_ENV],
+                "affects": "locate fetches a reference's own source URI; fail closed, nothing is fetched without an allowlist"
+            }
+        ]
+    })
 }
 
 /// The tool-kind manifest under `gates`.
@@ -148,6 +225,7 @@ pub fn manifest(gates: ToolKindGates) -> Value {
         "tool_kinds": kinds,
         "enabled_tool_kinds": enabled,
         "metadata_extensions": metadata_extensions(),
+        "catalog_features": catalog_features(),
         "executable": "not_reported",
         "executable_note": "Kinds the parser accepts. Which kinds a live worker can execute is \
                             reported by workers (RFC dsl-knowledge-base Phase 3) and is not \
@@ -324,9 +402,45 @@ mod tests {
         let m = manifest(ToolKindGates::OFF);
         let ext = m["metadata_extensions"].as_array().unwrap();
         let paths: Vec<&str> = ext.iter().map(|e| e["path"].as_str().unwrap()).collect();
-        assert_eq!(paths, ["metadata.expose.mcp", "metadata.expose.agent"]);
+        assert_eq!(
+            paths,
+            [
+                "metadata.expose.mcp",
+                "metadata.expose.agent",
+                "metadata.catalog.hot_reload"
+            ]
+        );
         assert_eq!(ext[0]["server_gate_env"], EXPOSE_MCP_ENV);
         assert_eq!(ext[1]["server_gate_env"], EXPOSE_AGENT_ENV);
+    }
+
+    #[test]
+    fn catalog_features_name_their_flags_and_the_core_schemes() {
+        let c = catalog_features();
+        let names: Vec<&str> = c["features"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "content_addressing",
+                "execution_pinning",
+                "hot_reload",
+                "discovery",
+                "uri_fetch"
+            ]
+        );
+        let schemes: Vec<&str> = c["source_schemes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s.as_str().unwrap())
+            .collect();
+        assert_eq!(schemes, crate::catalog::SOURCE_SCHEMES);
+        assert_eq!(manifest(ToolKindGates::OFF)["catalog_features"], c);
     }
 
     #[test]

@@ -1,5 +1,71 @@
 {
   "api_version": "noetl.io/v2",
+  "catalog_features": {
+    "features": [
+      {
+        "name": "content_addressing",
+        "server_gate_env": "NOETL_CATALOG_CAS",
+        "serves": "digest on register, dedup, /api/catalog/{resolve,blob,sources,pin}"
+      },
+      {
+        "affects": "kind: playbook `version` (a number or \"latest\") and `digest` (sha256:) are honoured, and sub-playbooks resolve inside the root's pin; with the flag off both are ignored",
+        "name": "execution_pinning",
+        "requires_env": [
+          "NOETL_CATALOG_CAS"
+        ],
+        "server_gate_env": "NOETL_CATALOG_PINNING"
+      },
+      {
+        "affects": "`@latest` inside a pinned tree, only for paths the root lists in metadata.catalog.hot_reload; otherwise refused, never silently downgraded",
+        "name": "hot_reload",
+        "requires_env": [
+          "NOETL_CATALOG_PINNING",
+          "NOETL_CATALOG_CAS"
+        ],
+        "server_gate_env": "NOETL_CATALOG_HOT_RELOAD"
+      },
+      {
+        "name": "discovery",
+        "requires_env": [
+          "NOETL_CATALOG_CAS",
+          "NOETL_INSTANCE_REGISTRY",
+          "NOETL_CATALOG_PEER_KEY_FILE"
+        ],
+        "server_gate_env": "NOETL_CATALOG_DISCOVERY",
+        "serves": "POST /api/catalog/peer/resolve (signed, trusted peers only), POST /api/catalog/locate (internal token); imports under peer/<instance>/<path>"
+      },
+      {
+        "affects": "locate fetches a reference's own source URI; fail closed, nothing is fetched without an allowlist",
+        "name": "uri_fetch",
+        "requires_env": [
+          "NOETL_CATALOG_DISCOVERY",
+          "NOETL_CATALOG_URI_ALLOW"
+        ],
+        "server_gate_env": "NOETL_CATALOG_URI_FETCH"
+      }
+    ],
+    "reference_forms": [
+      "<path>                 the pinned version inside a pinned tree, else latest",
+      "<path>@<n>             an exact version",
+      "<path>@latest          latest; inside a pinned tree only with hot reload allowed",
+      "<path>@sha256:<64hex>  this name, and it must have this body",
+      "sha256:<64hex>         this body, under any name",
+      "<scheme>://<uri>[#sha256:<64hex>]  a source URI (resolved by locate)"
+    ],
+    "source_schemes": [
+      "noetl",
+      "gs",
+      "s3",
+      "az",
+      "minio+http",
+      "minio+https",
+      "https",
+      "http",
+      "db",
+      "ehdb",
+      "file"
+    ]
+  },
   "document_kind": "Playbook",
   "enabled_tool_kinds": [
     "artifact",
@@ -54,6 +120,18 @@
       "path": "metadata.expose.agent",
       "server_gate_env": "NOETL_AGENT_ENDPOINT",
       "serves": "GET /api/agents, GET /api/agents/cards/{path}, POST /api/agents/send, GET /api/agents/tasks/{id}"
+    },
+    {
+      "keys": {
+        "(list)": "globs over sub-playbook paths, read from the ROOT playbook only; at most 64, each 1-512 chars; malformed entries are ignored, so a typo only narrows the policy"
+      },
+      "path": "metadata.catalog.hot_reload",
+      "requires_env": [
+        "NOETL_CATALOG_PINNING",
+        "NOETL_CATALOG_CAS"
+      ],
+      "server_gate_env": "NOETL_CATALOG_HOT_RELOAD",
+      "serves": "an explicit `@latest` sub-playbook reference inside this root's pinned execution tree"
     }
   ],
   "orchestrate_core_version": "0.1.0",
