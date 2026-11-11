@@ -163,14 +163,16 @@ pub fn metadata_extensions() -> Value {
 pub fn catalog_features() -> Value {
     json!({
         "reference_forms": [
-            "<path>                 the pinned version inside a pinned tree, else latest",
-            "<path>@<n>             an exact version",
-            "<path>@latest          latest; inside a pinned tree only with hot reload allowed",
-            "<path>@sha256:<64hex>  this name, and it must have this body",
-            "sha256:<64hex>         this body, under any name",
-            "<scheme>://<uri>[#sha256:<64hex>]  a source URI (resolved by locate)"
-        ],
-        "source_schemes": crate::catalog::SOURCE_SCHEMES,
+                "<path>                 the pinned version inside a pinned tree, else latest",
+                "<path>@<n>             an exact version",
+                "<path>@latest          latest; inside a pinned tree only with hot reload allowed",
+                "<path>@sha256:<64hex>  this name, and it must have this body",
+                "sha256:<64hex>         this body, under any name",
+                "<scheme>://<uri>[#sha256:<64hex>]  a source URI (fetched by locate)"
+            ],
+            "reference_forms_accepted_by": "POST /api/catalog/resolve and /api/catalog/sources (CAS), catalog locate (discovery), and, with pinning on, the `path` of POST /api/execute and of a `kind: playbook` step. A reference in `path` plus a `version`/`digest` field is refused, not merged.",
+            "default": "every catalog flag is OFF by default (each is strict \"true\", read once per process); with a flag off the server behaves as if the feature did not exist",
+            "source_schemes": crate::catalog::SOURCE_SCHEMES,
         "features": [
             {
                 "name": "content_addressing",
@@ -181,13 +183,13 @@ pub fn catalog_features() -> Value {
                 "name": "execution_pinning",
                 "server_gate_env": CATALOG_PINNING_ENV,
                 "requires_env": [CATALOG_CAS_ENV],
-                "affects": "kind: playbook `version` (a number or \"latest\") and `digest` (sha256:) are honoured, and sub-playbooks resolve inside the root's pin; with the flag off both are ignored"
+                "affects": "POST /api/execute `version` (a positive integer or \"latest\") and `digest` (sha256:, wins over version) are honoured, and `path` may be a reference form. A `kind: playbook` step sends `version` as an integer only, so it asks for @latest or a digest through its `path`. A child of a pinned execution with no version resolves to the root's pinned version. With the flag off, version/digest are ignored and the path resolves to its latest version"
             },
             {
                 "name": "hot_reload",
                 "server_gate_env": CATALOG_HOT_RELOAD_ENV,
                 "requires_env": [CATALOG_PINNING_ENV, CATALOG_CAS_ENV],
-                "affects": "`@latest` inside a pinned tree, only for paths the root lists in metadata.catalog.hot_reload; otherwise refused, never silently downgraded"
+                "affects": "`@latest` (e.g. a `kind: playbook` path `a/b@latest`) inside a pinned tree, only for paths the root lists in metadata.catalog.hot_reload; otherwise refused, never silently downgraded"
             },
             {
                 "name": "discovery",
