@@ -76,11 +76,13 @@ pub enum ToolKind {
     /// through the noetl-tools registry; the server only needs to accept
     /// the kind so playbook validation passes.
     Subscription,
-    /// Compiled WASM system plug-in (noetl/ai-meta#105). The step's tool
-    /// carries `plugin: { path, version }` (+ optional `input`); the server
-    /// only accepts the kind so playbook validation passes, and the worker's
-    /// `wasm-plugin` dispatcher routes `tool_kind: "wasm"` to the host (load
-    /// from the catalog → run → flush capability intents).
+    /// Compiled WASM plug-in (noetl/ai-meta#105). The step's tool carries
+    /// `plugin: { path, version, entry? }` and an optional `input` (the server
+    /// canonicalises it to `args`, which becomes the plug-in's input bytes as
+    /// JSON). `path` is a string, `version` an integer, `entry` the guest export
+    /// to call (default `run`). The server only accepts the kind; the worker's
+    /// `wasm-plugin` dispatcher loads the module from the catalog, runs it and
+    /// flushes its capability intents.
     Wasm,
     /// MCP (Model Context Protocol) JSON-RPC call — `tools/call`, `tools/list` or a
     /// passthrough method against an MCP server. The worker already executes it through
@@ -320,11 +322,21 @@ impl ToolKind {
                  pool refuses `framework: claude-code`, and refuses a playbook-bound \
                  `tools:` entry before the first model call.",
             ),
+            ToolKind::Playbook => Some(
+                "Runs on any noetl/worker (noetl-tools PlaybookTool). Fields: `path` or \
+                 `catalog_id`, `version` (integer), `payload`/`args`, `return_step`, \
+                 `return_result`. With NOETL_CATALOG_PINNING on, `path` may be a \
+                 catalog reference (`a/b@3`, `a/b@latest`, `a/b@sha256:...`, \
+                 `sha256:...`, a source URI) and the child resolves inside the root's \
+                 pin; see the manifest's catalog_features.",
+            ),
             ToolKind::Wasm => Some(
                 "Runs on a noetl/worker built with its `wasm-plugin` cargo feature (on \
                  by default and in the shipped image), which routes it to the plug-in \
-                 host instead of the tool registry. `plugin: { path, version }` is loaded \
-                 from the catalog.",
+                 host instead of the tool registry. Step: `plugin: { path: <string>, \
+                 version: <integer>, entry: <export, default run> }` plus optional \
+                 `input` (sent to the plug-in as `args`). The module is loaded from the \
+                 catalog.",
             ),
             _ => None,
         }

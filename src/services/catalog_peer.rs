@@ -62,13 +62,13 @@ use crate::instances::registry::{Capabilities, CatalogAdvert, Query, Reach, Runt
 use crate::instances::InstanceState;
 use crate::services::catalog_cas as cas;
 
-pub const DISCOVERY_ENV: &str = "NOETL_CATALOG_DISCOVERY";
+pub const DISCOVERY_ENV: &str = noetl_orchestrate_core::dsl::CATALOG_DISCOVERY_ENV;
 pub const PEERS_ENV: &str = "NOETL_CATALOG_PEERS";
-pub const KEY_FILE_ENV: &str = "NOETL_CATALOG_PEER_KEY_FILE";
+pub const KEY_FILE_ENV: &str = noetl_orchestrate_core::dsl::CATALOG_PEER_KEY_FILE_ENV;
 pub const SELF_URL_ENV: &str = "NOETL_CATALOG_SELF_URL";
 pub const ADVERT_SECS_ENV: &str = "NOETL_CATALOG_ADVERT_SECS";
-pub const URI_FETCH_ENV: &str = "NOETL_CATALOG_URI_FETCH";
-pub const URI_ALLOW_ENV: &str = "NOETL_CATALOG_URI_ALLOW";
+pub const URI_FETCH_ENV: &str = noetl_orchestrate_core::dsl::CATALOG_URI_FETCH_ENV;
+pub const URI_ALLOW_ENV: &str = noetl_orchestrate_core::dsl::CATALOG_URI_ALLOW_ENV;
 
 /// The label a server puts on its registration so peers sign for the right audience.
 pub const AUDIENCE_LABEL: &str = "noetl.audience";

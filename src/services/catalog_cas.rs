@@ -40,9 +40,9 @@ use serde::{Deserialize, Serialize};
 use crate::db::DbPool;
 use crate::error::{AppError, AppResult};
 
-pub const CAS_ENV: &str = "NOETL_CATALOG_CAS";
-pub const PINNING_ENV: &str = "NOETL_CATALOG_PINNING";
-pub const HOT_RELOAD_ENV: &str = "NOETL_CATALOG_HOT_RELOAD";
+pub const CAS_ENV: &str = noetl_orchestrate_core::dsl::CATALOG_CAS_ENV;
+pub const PINNING_ENV: &str = noetl_orchestrate_core::dsl::CATALOG_PINNING_ENV;
+pub const HOT_RELOAD_ENV: &str = noetl_orchestrate_core::dsl::CATALOG_HOT_RELOAD_ENV;
 
 /// The three flags, parsed from a lookup so tests need no process env.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

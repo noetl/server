@@ -70,7 +70,7 @@ use registry::{Capabilities, Query, Registry, Upsert};
 use tasks::{Board, Completion, NewTask, PlaybookRef};
 
 /// Mounts the instance routes. Strict `== "true"`.
-pub const REGISTRY_ENV: &str = "NOETL_INSTANCE_REGISTRY";
+pub const REGISTRY_ENV: &str = noetl_orchestrate_core::dsl::INSTANCE_REGISTRY_ENV;
 /// Longest inbox long-poll the server will hold open.
 pub const MAX_WAIT_MS: u64 = 25_000;
 /// How often expiries, forgetting and the graph sweep run.
