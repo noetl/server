@@ -111,6 +111,26 @@ pub const CATALOG_PEER_KEY_FILE_ENV: &str = "NOETL_CATALOG_PEER_KEY_FILE";
 /// The instance registry discovery admits peers through (server `instances`).
 pub const INSTANCE_REGISTRY_ENV: &str = "NOETL_INSTANCE_REGISTRY";
 
+/// Server: base URL of the worker relay the `ehdb://` resolver reads the catalog tier through.
+pub const EHDB_WORKER_QUERY_URL_ENV: &str = "NOETL_EHDB_WORKER_QUERY_URL";
+/// Server: whether registrations are also recorded to the EHDB catalog tier (`off` | `shadow`).
+pub const CATALOG_LOG_ENV: &str = "NOETL_CATALOG_LOG";
+/// Worker relay: the catalog tier's mirror source (noetl/worker `CATALOG_MIRROR_SOURCE_ENV`).
+pub const EHDB_CATALOG_MIRROR_SOURCE_ENV: &str = "NOETL_EHDB_CATALOG_MIRROR_SOURCE";
+
+/// Worker: fuel units per WASM call (noetl/worker `plugin.rs`).
+pub const WASM_FUEL_ENV: &str = "NOETL_WASM_FUEL";
+/// Worker: wall-clock limit per WASM call, milliseconds.
+pub const WASM_TIMEOUT_MS_ENV: &str = "NOETL_WASM_TIMEOUT_MS";
+/// Worker: linear-memory cap per WASM instance, MiB.
+pub const WASM_MAX_MEMORY_MB_ENV: &str = "NOETL_WASM_MAX_MEMORY_MB";
+/// Worker: arms the hosted agent loop for playbook-bound `tools:` (noetl/worker `agent_host.rs`).
+pub const WORKER_AGENT_PLAYBOOK_TOOLS_ENV: &str = "NOETL_WORKER_AGENT_PLAYBOOK_TOOLS";
+/// Worker: tool calls per agent step in the hosted loop.
+pub const AGENT_MAX_TOOL_CALLS_ENV: &str = "NOETL_AGENT_MAX_TOOL_CALLS";
+/// Worker: seconds each playbook-bound tool call (a child execution) may take.
+pub const AGENT_TOOL_TIMEOUT_SECS_ENV: &str = "NOETL_AGENT_TOOL_TIMEOUT_SECS";
+
 /// Playbook `metadata` keys a server acts on, with the flag that arms each.
 ///
 /// `metadata` is an open map in the schema, so these are invisible there; they
@@ -173,6 +193,7 @@ pub fn catalog_features() -> Value {
             "reference_forms_accepted_by": "POST /api/catalog/resolve and /api/catalog/sources (CAS), catalog locate (discovery), and, with pinning on, the `path` of POST /api/execute and of a `kind: playbook` step. A reference in `path` plus a `version`/`digest` field is refused, not merged.",
             "default": "every catalog flag is OFF by default (each is strict \"true\", read once per process); with a flag off the server behaves as if the feature did not exist",
             "source_schemes": crate::catalog::SOURCE_SCHEMES,
+            "source_scheme_forms": source_scheme_forms(),
         "features": [
             {
                 "name": "content_addressing",
@@ -207,6 +228,82 @@ pub fn catalog_features() -> Value {
     })
 }
 
+/// URI shapes of the source schemes the server resolves itself rather than as
+/// an object store (noetl/server `services/catalog_sources.rs`, server v3.160.0).
+///
+/// Like every source URI these are fetched only by catalog locate with
+/// `uri_fetch` armed and a matching allowlist glob; a `#sha256:` pin is checked
+/// against the fetched body.
+pub fn source_scheme_forms() -> Value {
+    json!([
+        {
+            "scheme": "db",
+            "form": "db://<credential-alias>/<schema>.<table>?path=<playbook path>[&version=<n>]",
+            "since_server": "3.160.0",
+            "reads": "one row from an operator-owned Postgres table with columns path (text), version (integer), content (text); without version the highest version for the path",
+            "rules": "the alias names a credential in this server's credential store (host/port/user/password/database, or connection_string), never user:pass in the URI; schema and table are identifiers [A-Za-z_][A-Za-z0-9_]* of at most 63 bytes; path is required; version is a positive integer",
+            "requires_env": [CATALOG_URI_FETCH_ENV, CATALOG_URI_ALLOW_ENV]
+        },
+        {
+            "scheme": "ehdb",
+            "form": "ehdb://catalog/<catalog_id>",
+            "since_server": "3.160.0",
+            "reads": "a registration record in the cluster's EHDB catalog tier, via the worker relay; the record's content_sha256 is checked before the body is returned; found by a paged scan of the tier (a keyed lookup is TARGET)",
+            "rules": "only the `catalog` namespace resolves",
+            "requires_env": [CATALOG_URI_FETCH_ENV, CATALOG_URI_ALLOW_ENV, EHDB_WORKER_QUERY_URL_ENV, CATALOG_LOG_ENV],
+            "cluster_note": "the catalog tier holds records only when the server records registrations (NOETL_CATALOG_LOG=shadow) and the worker relay takes the server as the tier's producer (NOETL_EHDB_CATALOG_MIRROR_SOURCE=server, unset by default); otherwise the read finds nothing or the relay reports the tier disabled",
+            "worker_env": [EHDB_CATALOG_MIRROR_SOURCE_ENV]
+        }
+    ])
+}
+
+/// What a step runs under on a noetl/worker, beyond the parser's vocabulary.
+///
+/// These variables are read by the **worker**, not by this server; a server's
+/// `/api/dsl/*` cannot see a worker's values. They are listed so a generator
+/// knows the limits a `kind: wasm` or `kind: agent` step meets, and which agent
+/// `tools:` shapes need a worker flag.
+pub fn worker_runtime() -> Value {
+    json!({
+        "note": "Read by noetl/worker, not by this server; the values here are the worker's code defaults. Which worker version a cluster runs is the cluster's fact, not this file's.",
+        "wasm_limits": {
+            "since_worker": "6.13.0",
+            "default": "ON: every limit applies by default; set a variable to 0 / off / none / unlimited to remove that one limit; an unparseable value keeps the default",
+            "on_exceed": "the module is stopped and the step fails with an error naming the variable",
+            "limits": [
+                { "env": WASM_FUEL_ENV, "unit": "fuel units", "default": 10_000_000_000u64 },
+                { "env": WASM_TIMEOUT_MS_ENV, "unit": "milliseconds (wall clock)", "default": 30_000 },
+                { "env": WASM_MAX_MEMORY_MB_ENV, "unit": "MiB (linear memory)", "default": 1024 }
+            ]
+        },
+        "agent": {
+            "tool_entry_forms": {
+                "playbook_bound": "{ name, description, input_schema, playbook: <catalog path>, result_step: <step> (optional; without it the child's last step result) }",
+                "other": "`mcp_servers:` / `agents:` entries are answered inside the agent session, as before"
+            },
+            "playbook_tools": {
+                "since_worker": "6.14.0",
+                "worker_gate_env": WORKER_AGENT_PLAYBOOK_TOOLS_ENV,
+                "requires_env": [crate::playbook::TOOL_KIND_AGENT_ENV, crate::playbook::WORKER_AGENT_TOOL_ENV],
+                "default": "OFF (strict \"true\"); without it a playbook-bound tools: entry is refused before the first model call",
+                "behaviour": "the worker hosts the agent loop; each playbook-bound call starts a child execution (kind: playbook, return_result: true, parent = this execution) that runs on whatever pool its playbook targets; its result is the next turn's tool_result; a failed child is an is_error tool result",
+                "not_durable": "the loop lives in one command on one worker: if that worker dies mid-loop the step retries from the first turn and children that already ran run again (orchestrator-driven resume is TARGET)"
+            },
+            "budgets": [
+                { "env": AGENT_MAX_TOOL_CALLS_ENV, "scope": "tool calls per agent step", "default": 32 },
+                { "env": AGENT_TOOL_TIMEOUT_SECS_ENV, "scope": "seconds per playbook-bound child", "default": 180 }
+            ],
+            "budget_note": "positive integers; anything else keeps the default; the model cannot override them (max_turns is the session's own)",
+            "event_types": [
+                { "type": "agent.turn", "context": "turn, outcome (tool_calls | final), tool_calls [{id, name}]" },
+                { "type": "agent.tool_call", "context": "turn, tool_use_id, tool, binding, playbook, child_execution_id, is_error, duration_ms, input and result previews (2 KiB)" },
+                { "type": "agent.final", "context": "turns, tool_calls, child_execution_ids, duration_ms; or refused: tool_call_budget" }
+            ],
+            "event_note": "emitted on the agent's own execution by the hosted loop only (NOETL_WORKER_AGENT_PLAYBOOK_TOOLS=true), through the normal emit path"
+        }
+    })
+}
+
 /// The tool-kind manifest under `gates`.
 ///
 /// `executable` is reported as `"not_reported"`: this process cannot know what
@@ -228,6 +325,7 @@ pub fn manifest(gates: ToolKindGates) -> Value {
         "enabled_tool_kinds": enabled,
         "metadata_extensions": metadata_extensions(),
         "catalog_features": catalog_features(),
+        "worker_runtime": worker_runtime(),
         "executable": "not_reported",
         "executable_note": "Kinds the parser accepts. Which kinds a live worker can execute is \
                             reported by workers (RFC dsl-knowledge-base Phase 3) and is not \
@@ -443,6 +541,46 @@ mod tests {
             .collect();
         assert_eq!(schemes, crate::catalog::SOURCE_SCHEMES);
         assert_eq!(manifest(ToolKindGates::OFF)["catalog_features"], c);
+    }
+
+    #[test]
+    fn source_scheme_forms_cover_only_known_schemes() {
+        let forms = source_scheme_forms();
+        for f in forms.as_array().unwrap() {
+            let scheme = f["scheme"].as_str().unwrap();
+            assert!(crate::catalog::SOURCE_SCHEMES.contains(&scheme), "{scheme}");
+            assert!(f["form"]
+                .as_str()
+                .unwrap()
+                .starts_with(&format!("{scheme}://")));
+        }
+        assert_eq!(catalog_features()["source_scheme_forms"], forms);
+    }
+
+    #[test]
+    fn worker_runtime_names_the_worker_flags() {
+        let w = manifest(ToolKindGates::OFF)["worker_runtime"].clone();
+        let envs: Vec<&str> = w["wasm_limits"]["limits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|l| l["env"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            envs,
+            [WASM_FUEL_ENV, WASM_TIMEOUT_MS_ENV, WASM_MAX_MEMORY_MB_ENV]
+        );
+        assert_eq!(
+            w["agent"]["playbook_tools"]["worker_gate_env"],
+            WORKER_AGENT_PLAYBOOK_TOOLS_ENV
+        );
+        let types: Vec<&str> = w["agent"]["event_types"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["type"].as_str().unwrap())
+            .collect();
+        assert_eq!(types, ["agent.turn", "agent.tool_call", "agent.final"]);
     }
 
     #[test]
