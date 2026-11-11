@@ -764,8 +764,11 @@ pub async fn resolve_execute(
         // reference resolves to what the ROOT first got for it, so a peer
         // registering a new version mid-run never reaches this tree.
         let tree_root = inherited.as_ref().map(|p| p.root_execution_id);
-        let remote_key = match (&found, discovery, tree_root, remote_on, reason) {
-            (None, _, Some(_), true, r) if r != Reason::HotReload => {
+        // A local `peer/<B>/…` row is only a cached import (perhaps from another
+        // tree); the root's remote pin, or B itself, is the authority. The local
+        // copy is used only when B cannot answer.
+        let remote_key = match (tree_root, remote_on, reason) {
+            (Some(_), true, r) if r != Reason::HotReload => {
                 match remote::remote_target(path, version, digest).map_err(AppError::Validation)? {
                     Some(t) => Some(remote::PinKey::Peer(t)),
                     None => match &l {
@@ -780,15 +783,15 @@ pub async fn resolve_execute(
             _ => None,
         };
         match (found, discovery) {
-            (Some(row), _) => (row, reason),
-            (None, rt) if remote_key.is_some() => {
+            (cached, rt) if remote_key.is_some() => {
                 let key = remote_key.expect("checked");
                 let root = tree_root.expect("remote pins are only for pinned trees");
                 (
-                    remote::resolve_import(pool, rt, root, &key).await?,
+                    remote::resolve_import(pool, rt, root, &key, cached).await?,
                     Reason::Import,
                 )
             }
+            (Some(row), _) => (row, reason),
             (None, Some(rt)) if matches!(l, Lookup::Source { .. }) || inherited.is_none() => {
                 let loc = rt
                     .locate(&crate::services::catalog_peer::ref_string(&r))

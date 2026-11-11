@@ -280,6 +280,26 @@ async fn the_version_pin_holds_across_remote_calls_against_postgres() {
         .expect_err("no pin, no discovery");
     assert!(e.to_string().contains("NOETL_CATALOG_DISCOVERY"), "{e}");
 
+    // The same tree names the import by its peer/ path. The owner cannot be
+    // asked here (no discovery), so the local import it already holds is used
+    // AND pinned: the next call in this tree gets the same answer.
+    let r = cas::resolve_execute(&pool, Some(&imported), None, None, None, Some(root2), None)
+        .await
+        .expect("cached import used when the owner cannot answer");
+    assert_eq!(
+        r.resolution.entry.digest, d2,
+        "the newest cached import at root2's start"
+    );
+    let p = remote::pin_get(&pool, root2, &key)
+        .await
+        .unwrap()
+        .expect("pinned");
+    assert_eq!(p.digest, d2);
+    let again = cas::resolve_execute(&pool, Some(&key), None, None, None, Some(root2), None)
+        .await
+        .expect("the noetl:// spelling now hits the pin");
+    assert_eq!(again.resolution.entry.digest, d2);
+
     cleanup(&pool).await;
 }
 

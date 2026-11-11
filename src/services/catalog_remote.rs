@@ -470,22 +470,35 @@ pub async fn resolve_import(
     rt: Option<&PeerRuntime>,
     root: i64,
     target: &PinKey,
+    cached: Option<cas::CasRow>,
 ) -> AppResult<cas::CasRow> {
     let key = target.key();
     let pinned = match pin_get(pool, root, &key).await? {
         Some(p) => p,
         None => {
-            let rt = rt.ok_or_else(|| {
-                AppError::NotFound(format!(
+            let located = match rt {
+                Some(rt) => rt.locate(&target.locate_uri()).await.map(|l| (l.path, l.version, l.digest)),
+                None => Err(AppError::NotFound(format!(
                     "{key}: not pinned in this tree yet, and NOETL_CATALOG_DISCOVERY is not running to locate it"
-                ))
-            })?;
-            let loc = rt.locate(&target.locate_uri()).await?;
+                ))),
+            };
+            let (path, version, digest) = match (located, cached) {
+                (Ok(l), _) => l,
+                // A wrong digest or a bad reference is the caller's error, never
+                // papered over by a cached copy.
+                (Err(e @ AppError::Validation(_)), _) => return Err(e),
+                (Err(e), Some(row)) => {
+                    tracing::warn!(%key, root, error = %e, path = %row.path, "owner unreachable; pinning this tree to the local import");
+                    let d = cas::digest_for(pool, &row).await?;
+                    (row.path.clone(), row.version as i32, d)
+                }
+                (Err(e), None) => return Err(e),
+            };
             let p = RemotePin {
                 instance_id: target.instance().to_string(),
-                path: loc.path.clone(),
-                version: loc.version,
-                digest: loc.digest.clone(),
+                path,
+                version,
+                digest,
                 mode: Mode::Import.as_str().into(),
             };
             let won = pin_put(pool, root, &key, &p).await?;
