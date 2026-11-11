@@ -905,6 +905,8 @@ impl McpBackend for ServerBackend {
 
     async fn start(&self, playbook: &str, workload: Map<String, Value>) -> Result<i64, String> {
         let request = crate::handlers::execute::ExecuteRequest {
+            version: None,
+            digest: None,
             path: Some(playbook.to_string()),
             catalog_id: None,
             payload: workload.into_iter().collect(),

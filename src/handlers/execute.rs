@@ -20,6 +20,18 @@ pub struct ExecuteRequest {
     /// Catalog ID (alternative to path).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub catalog_id: Option<i64>,
+    /// Version of `path`: a number, or `"latest"` (noetl/ai-meta#548).
+    ///
+    /// ⚠ Honoured only with `NOETL_CATALOG_PINNING=true`. With the flag off it
+    /// is ignored exactly as before this field existed, and the path resolves
+    /// to its latest version. That is the silent drop the RFC fixes: the
+    /// playbook tool has always sent `version`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<serde_json::Value>,
+    /// `sha256:` content digest the resolved row must have (noetl/ai-meta#548).
+    /// Honoured only with `NOETL_CATALOG_PINNING=true`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
     /// Input payload/workload.
     #[serde(default, alias = "workload")]
     pub payload: HashMap<String, serde_json::Value>,
@@ -425,6 +437,19 @@ pub(crate) async fn execute_one(
         trace,
     };
 
+    // Execution pin (noetl/ai-meta#548), written BEFORE the first event so a
+    // child — which can only be dispatched after `playbook_started` — always
+    // finds its parent's pin. Fail closed: if the pin cannot be written, the
+    // children would resolve to latest and the guarantee would be silently lost.
+    let catalog_pin = match &catalog.pin {
+        Some(pending) => {
+            let pin = pending.to_row(execution_id, request.parent_execution_id, &playbook_yaml);
+            crate::services::catalog_cas::insert_pin(state.pools.cluster(), &pin).await?;
+            Some(pin.event_json())
+        }
+        None => None,
+    };
+
     // Emit playbook_started event
     let start_event_id = emit_playbook_started_event(
         state,
@@ -434,6 +459,7 @@ pub(crate) async fn execute_one(
         &workload,
         request.parent_execution_id,
         &routing,
+        catalog_pin,
     )
     .await?;
 
@@ -631,9 +657,40 @@ pub(crate) struct ResolvedCatalog {
     pub version: i16,
     pub content: Option<String>,
     pub payload: Option<serde_json::Value>,
+    /// The pin to write for this execution, when `NOETL_CATALOG_PINNING` is
+    /// active (noetl/ai-meta#548). `None` on the legacy path.
+    pub pin: Option<crate::services::catalog_cas::PendingPin>,
+}
+
+/// Pinned resolution (noetl/ai-meta#548): the root resolves to a version and a
+/// digest under a fresh watermark. A child of a pinned execution resolves inside
+/// its parent's pin. The SQL lives in `services::catalog_cas`, not here.
+async fn resolve_pinned(state: &AppState, request: &ExecuteRequest) -> AppResult<ResolvedCatalog> {
+    let pending = crate::services::catalog_cas::resolve_execute(
+        state.pools.cluster(),
+        request.path.as_deref(),
+        request.catalog_id,
+        request.version.as_ref(),
+        request.digest.as_deref(),
+        request.parent_execution_id,
+    )
+    .await?;
+    let row = pending.row.clone();
+    Ok(ResolvedCatalog {
+        catalog_id: row.catalog_id,
+        path: row.path,
+        kind: row.kind,
+        version: row.version,
+        content: row.content,
+        payload: row.payload,
+        pin: Some(pending),
+    })
 }
 
 async fn resolve_catalog(state: &AppState, request: &ExecuteRequest) -> AppResult<ResolvedCatalog> {
+    if crate::services::catalog_cas::pinning_active() {
+        return resolve_pinned(state, request).await;
+    }
     if let Some(catalog_id) = request.catalog_id {
         // Lookup by catalog_id (Phase F R4-3: noetl.catalog is cluster-wide)
         let entry = sqlx::query_as::<
@@ -662,6 +719,7 @@ async fn resolve_catalog(state: &AppState, request: &ExecuteRequest) -> AppResul
             version: entry.3,
             content: entry.4,
             payload: entry.5,
+            pin: None,
         })
     } else if let Some(path) = &request.path {
         // Lookup by path (latest version; Phase F R4-3: cluster-wide)
@@ -718,6 +776,7 @@ async fn resolve_catalog(state: &AppState, request: &ExecuteRequest) -> AppResul
             version: entry.2,
             content: entry.4.clone(),
             payload: entry.5.clone(),
+            pin: None,
         };
 
         let m = crate::handlers::catalog_read::mode();
@@ -808,6 +867,7 @@ async fn load_catalog_by_id(state: &AppState, catalog_id: i64) -> AppResult<Reso
         version: entry.3,
         content: entry.4,
         payload: entry.5,
+        pin: None,
     })
 }
 
@@ -833,6 +893,7 @@ pub(crate) fn playbook_yaml_from(entry: &ResolvedCatalog) -> AppResult<String> {
 }
 
 /// Emit playbook_started event.
+#[allow(clippy::too_many_arguments)]
 async fn emit_playbook_started_event(
     state: &AppState,
     execution_id: i64,
@@ -841,15 +902,21 @@ async fn emit_playbook_started_event(
     workload: &serde_json::Value,
     parent_execution_id: Option<i64>,
     routing: &CommandRouting,
+    catalog_pin: Option<serde_json::Value>,
 ) -> AppResult<i64> {
     let event_id = state.snowflake.generate()?;
 
-    let context = serde_json::json!({
+    let mut context = serde_json::json!({
         "catalog_id": catalog_id.to_string(),
         "execution_id": execution_id.to_string(),
         "path": path,
         "workload": workload,
     });
+    // ⚠ Under `catalog_pin`, never `version`: `WorkflowState` re-exposes a
+    // context `version` key into templates (orchestrate-core state.rs).
+    if let (Some(pin), serde_json::Value::Object(m)) = (catalog_pin, &mut context) {
+        m.insert("catalog_pin".to_string(), pin);
+    }
 
     // Persist the per-execution routing (pool segment + trace) on the
     // start event's meta so the orchestrator — which rebuilds state from
@@ -2203,6 +2270,8 @@ mod tests {
     #[test]
     fn test_execute_request_validation() {
         let request = ExecuteRequest {
+            version: None,
+            digest: None,
             path: None,
             catalog_id: None,
             payload: HashMap::new(),
@@ -2214,6 +2283,8 @@ mod tests {
         assert!(request.validate().is_err());
 
         let request = ExecuteRequest {
+            version: None,
+            digest: None,
             path: Some("test/playbook".to_string()),
             catalog_id: None,
             payload: HashMap::new(),
@@ -2225,6 +2296,8 @@ mod tests {
         assert!(request.validate().is_ok());
 
         let request = ExecuteRequest {
+            version: None,
+            digest: None,
             path: None,
             catalog_id: Some(12345),
             payload: HashMap::new(),

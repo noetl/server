@@ -70,6 +70,12 @@ pub struct CatalogRegisterRequest {
     /// Resource type (default: "Playbook")
     #[serde(default = "default_resource_type")]
     pub resource_type: String,
+
+    /// Where this body can also be fetched from (`gs://…`, `s3://…`, `https://…`),
+    /// recorded as a declared source of its digest (noetl/ai-meta#548). Used only
+    /// with `NOETL_CATALOG_CAS=true`; ignored otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 fn default_resource_type() -> String {
@@ -132,6 +138,16 @@ pub struct CatalogRegisterResponse {
 
     /// Resource kind
     pub kind: String,
+
+    /// `sha256:` content digest (noetl/ai-meta#548). Present only with
+    /// `NOETL_CATALOG_CAS=true`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
+
+    /// True when the body equals the path's latest version, so no new version
+    /// was created (RFC §3.2 rule 2). Present only with `NOETL_CATALOG_CAS=true`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deduplicated: Option<bool>,
 }
 
 /// Request to list catalog entries.
