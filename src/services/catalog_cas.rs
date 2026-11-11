@@ -709,10 +709,43 @@ pub async fn resolve_execute(
             .map_err(|e| AppError::Validation(e.to_string()))?;
         let (l, reason) = core::plan(&r, inherited.as_ref(), hot_reload_enabled())
             .map_err(|e| AppError::Validation(e.to_string()))?;
-        let row = lookup(pool, &l).await?.ok_or_else(|| {
-            AppError::NotFound(format!("Playbook not found: {}", core::describe(&l)))
-        })?;
-        (row, reason)
+        // Discovery (Phase 2): a source reference is always fetched; a name or
+        // digest missing locally is located on peers, but ONLY for a root. A
+        // pinned child that misses locally fails: importing for it would hand it
+        // a row its root never saw, which is the drift pinning exists to stop.
+        let discovery = crate::services::catalog_peer::runtime();
+        let found = if matches!(l, Lookup::Source { .. }) {
+            None
+        } else {
+            lookup(pool, &l).await?
+        };
+        match (found, discovery) {
+            (Some(row), _) => (row, reason),
+            (None, Some(rt)) if matches!(l, Lookup::Source { .. }) || inherited.is_none() => {
+                let loc = rt
+                    .locate(&crate::services::catalog_peer::ref_string(&r))
+                    .await?;
+                let id: i64 = loc
+                    .catalog_id
+                    .parse()
+                    .map_err(|_| AppError::Internal("bad catalog id".into()))?;
+                let row = row_by_id(pool, id).await?.ok_or_else(|| {
+                    AppError::NotFound(format!("located {} but row {id} is gone", loc.path))
+                })?;
+                let reason = if loc.found_at == "local" {
+                    reason
+                } else {
+                    Reason::Import
+                };
+                (row, reason)
+            }
+            (None, _) => {
+                return Err(AppError::NotFound(format!(
+                    "Playbook not found: {}",
+                    core::describe(&l)
+                )))
+            }
+        }
     };
     let digest_now = digest_for(pool, &row).await?;
     if let Some(d) = digest {

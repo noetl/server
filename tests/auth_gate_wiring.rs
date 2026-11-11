@@ -212,7 +212,7 @@ fn the_structural_check_can_fail() {
 ///
 /// **Every entry needs a reason.** This is the list a reviewer argues with; the
 /// test below makes it impossible to add an ungated router *without* arguing.
-const PUBLIC_BY_DESIGN: [(&str, &str); 21] = [
+const PUBLIC_BY_DESIGN: [(&str, &str); 22] = [
     ("health_routes", "liveness/readiness probes carry no credential"),
     ("catalog_routes", "register/list is the authoring surface; delete is separately gated by RequireInternalApiToken"),
     ("auth_routes", "the login surface itself — gating it would be circular"),
@@ -232,6 +232,7 @@ const PUBLIC_BY_DESIGN: [(&str, &str); 21] = [
     ("agent_routes", "agent cards + task send/status over playbooks that opt in (metadata.expose.agent): the execute + status capability of execution_routes, narrowed; outbound callbacks only to NOETL_AGENT_CALLBACK_ORIGINS; per-user checks are the gateway's; mounted only under NOETL_AGENT_ENDPOINT"),
     ("mcp_routes", "MCP tools/list + tools/call over playbooks that opt in (metadata.expose.mcp / kind: Mcp serve: true): the execute + status capability of execution_routes, narrowed; per-user may_execute filtering is the gateway's; mounted only under NOETL_MCP_SERVER"),
     ("instance_routes", "NoETL instance register/discover/task handoff: every request is an ML-DSA-87 signed envelope bound to its route purpose, this control plane's audience and a fresh nonce, so the signature is the authentication; default trust admits nobody until NOETL_INSTANCE_TRUSTED_IDS lists the instance; mounted only under NOETL_INSTANCE_REGISTRY"),
+    ("catalog_peer_routes", "catalog discovery (noetl/ai-meta#548): /api/catalog/peer/resolve is an ML-DSA-87 signed envelope admitted by the instance gate (purpose catalog.resolve, NOETL_INSTANCE_TRUSTED_IDS), never answers credential rows; /api/catalog/locate requires RequireInternalApiToken in its extractor; mounted only under NOETL_CATALOG_DISCOVERY"),
     ("dashboard_routes", "read-only aggregate counts for the UI; no per-record data and no credential material"),
     // ⚠ noetl/ai-meta#312. NOT a justification — a record of the current state.
     // `/api/postgres/execute` runs arbitrary SQL with no auth and no statement

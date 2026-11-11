@@ -64,7 +64,10 @@ fn build_router(
         .then(|| handlers::agent_endpoint::routes(state.clone(), execution_service.clone()));
     // NoETL instances: register, discover, hand off (build plan item 9). Both routers are
     // empty unless NOETL_INSTANCE_REGISTRY=true.
-    let (instance_routes, instance_admin_routes) = noetl_server::instances::routes();
+    let (instance_routes, instance_admin_routes, instance_state) = noetl_server::instances::routes();
+    // Cross-cluster catalog discovery (noetl/ai-meta#548 Phase 2): off unless
+    // NOETL_CATALOG_DISCOVERY=true with CAS, the registry and a peer key.
+    let catalog_peer_routes = noetl_server::services::catalog_peer::init(db_pool.clone(), instance_state);
 
     // CORS configuration - allow all origins for development
     let cors = CorsLayer::new()
@@ -1087,6 +1090,12 @@ fn build_router(
     // the authentication. Instances hold no internal token. Listed in
     // `tests/auth_gate_wiring.rs` PUBLIC_BY_DESIGN.
     app = app.merge(instance_routes);
+    // Catalog discovery (noetl/ai-meta#548 Phase 2). `/api/catalog/peer/resolve` is a
+    // signed envelope admitted by the instance gate (PUBLIC_BY_DESIGN, like the routes
+    // above); `/api/catalog/locate` carries the internal token in its extractor.
+    if let Some(catalog_peer_routes) = catalog_peer_routes {
+        app = app.merge(catalog_peer_routes);
+    }
 
     if let Some(ehgraph_routes) = ehgraph_routes {
         app = app.nest(noetl_server::ehgraph_embedded::MOUNT, ehgraph_routes);

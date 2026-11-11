@@ -679,10 +679,12 @@ pub fn spawn_sweeper(state: InstanceState) {
     });
 }
 
-/// `(signed routes, gated routes)` when [`REGISTRY_ENV`] is on, else two empty routers.
-pub fn routes() -> (Router, Router) {
+/// `(signed routes, gated routes, state)` when [`REGISTRY_ENV`] is on, else two
+/// empty routers and no state. The state is handed to catalog discovery
+/// (noetl/ai-meta#548), which reuses this gate and this registry.
+pub fn routes() -> (Router, Router, Option<InstanceState>) {
     if !registry_enabled() {
-        return (Router::new(), Router::new());
+        return (Router::new(), Router::new(), None);
     }
     let state = InstanceState::from_env();
     if matches!(state.gate.trust, gate::Trust::Open) {
@@ -693,5 +695,5 @@ pub fn routes() -> (Router, Router) {
         graph = state.graph.is_some(),
         "instance registry serving at /api/instances"
     );
-    (routes_for(state.clone()), admin_routes_for(state))
+    (routes_for(state.clone()), admin_routes_for(state.clone()), Some(state))
 }

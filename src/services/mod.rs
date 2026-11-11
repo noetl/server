@@ -5,6 +5,7 @@
 
 pub mod catalog;
 pub mod catalog_cas;
+pub mod catalog_peer;
 pub mod cell_registry;
 pub mod certified_fold;
 pub mod credential;
