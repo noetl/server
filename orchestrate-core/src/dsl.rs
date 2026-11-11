@@ -58,6 +58,12 @@ pub struct ToolKindEntry {
     pub gate_env: Option<&'static str>,
     /// Does the parser accept it under the given gates?
     pub enabled: bool,
+    /// The flag a worker must also set to execute it, when there is one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_gate_env: Option<&'static str>,
+    /// What a worker needs to execute it, when that is not "any noetl/worker".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub availability: Option<&'static str>,
 }
 
 /// Every kind in [`ToolKind::ALL`], sorted by name, with its state under `gates`.
@@ -73,10 +79,53 @@ pub fn tool_kinds(gates: ToolKindGates) -> Vec<ToolKindEntry> {
             gated: k.gate_env().is_some(),
             gate_env: k.gate_env(),
             enabled: gates.allows(k),
+            worker_gate_env: k.worker_gate_env(),
+            availability: k.availability_note(),
         })
         .collect();
     v.sort_by(|a, b| a.name.cmp(&b.name));
     v
+}
+
+/// Arming flag for `metadata.expose.mcp` (the server's `/api/mcp`). Strict `== "true"`.
+pub const EXPOSE_MCP_ENV: &str = "NOETL_MCP_SERVER";
+/// Arming flag for `metadata.expose.agent` (the server's `/api/agents`). Strict `== "true"`.
+pub const EXPOSE_AGENT_ENV: &str = "NOETL_AGENT_ENDPOINT";
+/// Origins `expose.agent` callbacks may be delivered to (comma-separated; empty refuses all).
+pub const AGENT_CALLBACK_ORIGINS_ENV: &str = "NOETL_AGENT_CALLBACK_ORIGINS";
+
+/// Playbook `metadata` keys a server acts on, with the flag that arms each.
+///
+/// `metadata` is an open map in the schema, so these are invisible there; they
+/// are listed here so a generator knows they exist and that they do nothing on a
+/// server where the flag is off. The server's handlers read these same constants.
+pub fn metadata_extensions() -> Value {
+    json!([
+        {
+            "path": "metadata.expose.mcp",
+            "server_gate_env": EXPOSE_MCP_ENV,
+            "serves": "POST /api/mcp (one MCP tool per exposed playbook)",
+            "keys": {
+                "tool": "required; MCP tool name, [A-Za-z0-9_.-]{1,64}",
+                "description": "required",
+                "input_schema": "required; written by hand, never derived from workload; also the tools/call argument allowlist",
+                "mode": "sync (default) | async",
+                "timeout": "sync wait in seconds (default 30, max 120)",
+                "result_step": "optional; the step whose result is returned"
+            }
+        },
+        {
+            "path": "metadata.expose.agent",
+            "server_gate_env": EXPOSE_AGENT_ENV,
+            "serves": "GET /api/agents, GET /api/agents/cards/{path}, POST /api/agents/send, GET /api/agents/tasks/{id}",
+            "keys": {
+                "card": "required mapping; card.name and card.description required, card.version and card.skills optional",
+                "input_schema": "required unless expose.mcp.input_schema is set; written by hand; the argument allowlist",
+                "result_step": "optional"
+            },
+            "callback_origins_env": AGENT_CALLBACK_ORIGINS_ENV
+        }
+    ])
 }
 
 /// The tool-kind manifest under `gates`.
@@ -98,6 +147,7 @@ pub fn manifest(gates: ToolKindGates) -> Value {
         "orchestrate_core_version": CORE_VERSION,
         "tool_kinds": kinds,
         "enabled_tool_kinds": enabled,
+        "metadata_extensions": metadata_extensions(),
         "executable": "not_reported",
         "executable_note": "Kinds the parser accepts. Which kinds a live worker can execute is \
                             reported by workers (RFC dsl-knowledge-base Phase 3) and is not \
@@ -249,6 +299,35 @@ fn sort_value(v: Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn availability_names_the_worker_side_requirement() {
+        let kinds = tool_kinds(ToolKindGates::ALL_ON);
+        let get = |n: &str| kinds.iter().find(|k| k.name == n).unwrap().clone();
+        // agent needs a worker flag as well as the server gate.
+        assert_eq!(
+            get("agent").worker_gate_env,
+            Some("NOETL_WORKER_AGENT_TOOL")
+        );
+        assert!(get("agent").availability.is_some());
+        // mcp and wasm need no worker flag, but say what runs them.
+        assert_eq!(get("mcp").worker_gate_env, None);
+        assert!(get("mcp").availability.is_some());
+        assert!(get("wasm").availability.is_some());
+        // A plain kind claims nothing extra.
+        assert_eq!(get("http").worker_gate_env, None);
+        assert_eq!(get("http").availability, None);
+    }
+
+    #[test]
+    fn manifest_lists_the_flag_armed_metadata_extensions() {
+        let m = manifest(ToolKindGates::OFF);
+        let ext = m["metadata_extensions"].as_array().unwrap();
+        let paths: Vec<&str> = ext.iter().map(|e| e["path"].as_str().unwrap()).collect();
+        assert_eq!(paths, ["metadata.expose.mcp", "metadata.expose.agent"]);
+        assert_eq!(ext[0]["server_gate_env"], EXPOSE_MCP_ENV);
+        assert_eq!(ext[1]["server_gate_env"], EXPOSE_AGENT_ENV);
+    }
 
     #[test]
     fn manifest_lists_every_kind_once_sorted() {

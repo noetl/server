@@ -93,12 +93,12 @@ pub enum ToolKind {
     Mcp,
     /// AI agent loop (noetl-tools `kind: agent`, `framework: claude | claude-code`).
     ///
-    /// ⚠ **Flag-gated, OFF by default** (`NOETL_TOOL_KIND_AGENT`). Do NOT enable it until
-    /// the worker registers noetl-tools' `AgentTool`: the worker is held at noetl-tools
-    /// `=4.0.1` (noetl/ai-meta#330), which has no agent tool, and `AgentTool` is not in
-    /// `create_default_registry` in any release. Enabling this first recreates the #256
-    /// defect — a kind that registers but can never execute. See
-    /// `ai-meta/docs/rfc/interop-topology-and-ai-mcp-playbooks.md` Phase 6.
+    /// ⚠ **Flag-gated, OFF by default** (`NOETL_TOOL_KIND_AGENT`). Accepting the kind is
+    /// not enough to run it: the worker registers noetl-tools' `AgentTool` only when it
+    /// starts with `NOETL_WORKER_AGENT_TOOL=true` (noetl/worker#398, noetl-tools 4.5.0,
+    /// noetl/ai-meta#330). Without it the worker fails the command as an unknown tool,
+    /// the #256 defect. The worker registers the shared-pool variant, which refuses
+    /// `framework: claude-code`. See [`ToolKind::worker_gate_env`].
     Agent,
 }
 
@@ -106,6 +106,8 @@ pub enum ToolKind {
 pub const TOOL_KIND_MCP_ENV: &str = "NOETL_TOOL_KIND_MCP";
 /// Environment flag that enables `tool.kind: agent` on this server. Strict `== "true"`.
 pub const TOOL_KIND_AGENT_ENV: &str = "NOETL_TOOL_KIND_AGENT";
+/// Worker-side flag that registers the agent tool (noetl/worker `AGENT_TOOL_ENV`).
+pub const WORKER_AGENT_TOOL_ENV: &str = "NOETL_WORKER_AGENT_TOOL";
 
 /// Which flag-gated tool kinds this server accepts in an authored playbook.
 ///
@@ -287,6 +289,43 @@ impl ToolKind {
         match self {
             ToolKind::Mcp => Some(TOOL_KIND_MCP_ENV),
             ToolKind::Agent => Some(TOOL_KIND_AGENT_ENV),
+            _ => None,
+        }
+    }
+
+    /// The env flag a **worker** must also set before it can execute this kind, if
+    /// any. The server gate ([`Self::gate_env`]) decides what the parser accepts; this
+    /// one decides whether anything can run it. Keep in step with noetl/worker
+    /// `AGENT_TOOL_ENV`.
+    pub fn worker_gate_env(&self) -> Option<&'static str> {
+        match self {
+            ToolKind::Agent => Some(WORKER_AGENT_TOOL_ENV),
+            _ => None,
+        }
+    }
+
+    /// What it takes for a worker to execute this kind, beyond the flags, for the
+    /// kinds where that is not simply "any noetl/worker". `None` means a stock
+    /// worker runs it through the noetl-tools registry.
+    pub fn availability_note(&self) -> Option<&'static str> {
+        match self {
+            ToolKind::Mcp => Some(
+                "Runs on any noetl/worker: noetl-tools McpTool, wrapped by the worker's \
+                 WorkerMcpTool for auth headers. Only the server gate is needed.",
+            ),
+            ToolKind::Agent => Some(
+                "Needs the server gate AND a worker started with \
+                 NOETL_WORKER_AGENT_TOOL=true (noetl/worker#398, noetl-tools 4.5.0); \
+                 otherwise the worker fails the command as an unknown tool. The shared \
+                 pool refuses `framework: claude-code`, and refuses a playbook-bound \
+                 `tools:` entry before the first model call.",
+            ),
+            ToolKind::Wasm => Some(
+                "Runs on a noetl/worker built with its `wasm-plugin` cargo feature (on \
+                 by default and in the shipped image), which routes it to the plug-in \
+                 host instead of the tool registry. `plugin: { path, version }` is loaded \
+                 from the catalog.",
+            ),
             _ => None,
         }
     }
