@@ -64,6 +64,16 @@ pub struct ExecuteRequest {
     /// is too costly, so dedup is opt-in per subscription).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dedup: Option<DedupSpec>,
+    /// Cross-instance mode for a remote reference (`noetl://<B>/…` or
+    /// `peer/<B>/…`): `import` or `delegate` (noetl/ai-meta#548 follow-up).
+    /// Ignored unless `NOETL_CATALOG_REMOTE_CALLS=true`, except that
+    /// `delegate` is then refused by name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<String>,
+    /// Server-internal: the pin a delegated execution resolves inside (the
+    /// one its calling root shares on this instance). Never read from JSON.
+    #[serde(skip)]
+    pub pin_override: Option<noetl_orchestrate_core::catalog::Pin>,
 }
 
 /// Opt-in dedup directive carried on an execute request (noetl/ai-meta#90
@@ -133,6 +143,10 @@ pub struct ExecuteResponse {
     pub status: String,
     /// Number of commands generated.
     pub commands_generated: i32,
+    /// A delegated call (`remote: delegate`): where it runs and where the
+    /// caller polls. `execution_id` is then this server's call id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<crate::services::catalog_remote::Delegated>,
 }
 
 /// Start playbook execution.
@@ -286,6 +300,7 @@ pub(crate) struct ExecuteOutcome {
     /// collapsed this delivery onto an existing execution.
     pub status: &'static str,
     pub commands_generated: i32,
+    pub remote: Option<crate::services::catalog_remote::Delegated>,
 }
 
 impl ExecuteOutcome {
@@ -294,6 +309,7 @@ impl ExecuteOutcome {
             execution_id: self.execution_id.to_string(),
             status: self.status.to_string(),
             commands_generated: self.commands_generated,
+            remote: self.remote,
         }
     }
 }
@@ -314,6 +330,38 @@ pub(crate) async fn execute_one(
         "Execute request: path={:?}, catalog_id={:?}",
         request.path, request.catalog_id
     );
+
+    // Cross-instance delegation (noetl/ai-meta#548 follow-up): a remote
+    // reference in `delegate` mode starts nothing here. The owner runs it and
+    // the caller polls this server's call id. Off → `None`, and the request
+    // continues exactly as before.
+    if let Some(path) = request.path.as_deref() {
+        use crate::services::catalog_remote as remote;
+        let ask = remote::DelegateAsk {
+            path,
+            version: request.version.as_ref(),
+            digest: request.digest.as_deref(),
+            remote: request.remote.as_deref(),
+            payload: serde_json::to_value(&request.payload).unwrap_or_default(),
+            parent_execution_id: request.parent_execution_id,
+        };
+        if let Some(target) = remote::wants_delegate(&ask)? {
+            if request.dedup.is_some() || entry == "batch" {
+                return Err(AppError::Validation(
+                    "a delegated (remote: delegate) call takes no dedup and is not batchable"
+                        .into(),
+                ));
+            }
+            let (call_id, delegated) = remote::delegate(state, &target, ask).await?;
+            crate::metrics::record_execute_outcome(entry, "delegated");
+            return Ok(ExecuteOutcome {
+                execution_id: call_id,
+                status: "started",
+                commands_generated: 0,
+                remote: Some(delegated),
+            });
+        }
+    }
 
     // Generate execution_id via the application-side snowflake
     // generator (Phase F R1.5 of noetl/ai-meta#49).  ID is
@@ -363,6 +411,7 @@ pub(crate) async fn execute_one(
                     execution_id: existing_execution_id,
                     status: "duplicate",
                     commands_generated: 0,
+                    remote: None,
                 });
             }
             DedupOutcome::Fresh => { /* reserved execution_id; proceed */ }
@@ -522,6 +571,7 @@ pub(crate) async fn execute_one(
         execution_id,
         status: "started",
         commands_generated,
+        remote: None,
     })
 }
 
@@ -673,6 +723,7 @@ async fn resolve_pinned(state: &AppState, request: &ExecuteRequest) -> AppResult
         request.version.as_ref(),
         request.digest.as_deref(),
         request.parent_execution_id,
+        request.pin_override.clone(),
     )
     .await?;
     let row = pending.row.clone();
@@ -2279,6 +2330,8 @@ mod tests {
             execution_pool: None,
             trace: None,
             dedup: None,
+            remote: None,
+            pin_override: None,
         };
         assert!(request.validate().is_err());
 
@@ -2292,6 +2345,8 @@ mod tests {
             execution_pool: None,
             trace: None,
             dedup: None,
+            remote: None,
+            pin_override: None,
         };
         assert!(request.validate().is_ok());
 
@@ -2305,6 +2360,8 @@ mod tests {
             execution_pool: None,
             trace: None,
             dedup: None,
+            remote: None,
+            pin_override: None,
         };
         assert!(request.validate().is_ok());
     }
@@ -2315,6 +2372,7 @@ mod tests {
             execution_id: "12345".to_string(),
             status: "started".to_string(),
             commands_generated: 1,
+            remote: None,
         };
 
         let json = serde_json::to_string(&response).unwrap();
@@ -2422,6 +2480,7 @@ mod tests {
             execution_id: 42,
             status: "duplicate",
             commands_generated: 0,
+            remote: None,
         };
         let resp = outcome.into_response();
         assert_eq!(resp.execution_id, "42");

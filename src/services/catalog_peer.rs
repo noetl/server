@@ -368,7 +368,7 @@ impl PeerRuntime {
         }
     }
 
-    async fn signed(
+    pub(crate) async fn signed(
         &self,
         base: &str,
         route: &str,
@@ -629,7 +629,7 @@ impl PeerRuntime {
         }))
     }
 
-    fn peer_endpoint(&self, instance: &str) -> AppResult<(String, String)> {
+    pub(crate) fn peer_endpoint(&self, instance: &str) -> AppResult<(String, String)> {
         let reg = self
             .instances
             .registry
@@ -738,7 +738,12 @@ impl PeerRuntime {
         )))
     }
 
-    async fn ask(&self, endpoint: &str, audience: &str, reference: &str) -> AppResult<PeerAnswer> {
+    pub(crate) async fn ask(
+        &self,
+        endpoint: &str,
+        audience: &str,
+        reference: &str,
+    ) -> AppResult<PeerAnswer> {
         let (status, v) = self
             .signed(
                 endpoint,
@@ -1006,11 +1011,9 @@ pub fn object_store_for(
             };
             (store, key)
         }
-        "db" | "ehdb" => {
-            return Err(bad(format!(
-                "'{scheme}://' is not an object store (fetch_uri resolves it through catalog_sources)"
-            )))
-        }
+        "db" | "ehdb" => return Err(bad(format!(
+            "'{scheme}://' is not an object store (fetch_uri resolves it through catalog_sources)"
+        ))),
         "file" => {
             return Err(bad(
                 "file:// sources are for the CLI and daemon, never a server".into(),

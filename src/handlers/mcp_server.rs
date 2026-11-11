@@ -914,6 +914,8 @@ impl McpBackend for ServerBackend {
             execution_pool: None,
             trace: None,
             dedup: None,
+            remote: None,
+            pin_override: None,
         };
         crate::handlers::execute::execute_one(&self.state, request, "mcp")
             .await

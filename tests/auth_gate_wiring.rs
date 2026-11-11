@@ -153,7 +153,7 @@ fn every_privileged_router_is_gated_in_main() {
         // distinct from reporting on an id the caller already holds, which is the
         // same reason the two routers above carry the gate.
         "runtime_topology_routes",
-            // noetl/ai-meta#459 P5. `/api/archive/executions?date=` ENUMERATES the
+        // noetl/ai-meta#459 P5. `/api/archive/executions?date=` ENUMERATES the
         // executions archived on a date — the same enumeration-is-a-capability
         // reasoning as `ehdb_equivalence_routes` and `runtime_topology_routes`.
         "archive_read_routes",
@@ -161,7 +161,7 @@ fn every_privileged_router_is_gated_in_main() {
         // NoETL instances and their capabilities, the same reasoning again. The signed
         // instance routes (`instance_routes`) authenticate per request instead.
         "instance_admin_routes",
-];
+    ];
     let mut ungated = Vec::new();
     for name in PRIVILEGED {
         let needle = format!(".merge({name}.layer(");
@@ -212,7 +212,7 @@ fn the_structural_check_can_fail() {
 ///
 /// **Every entry needs a reason.** This is the list a reviewer argues with; the
 /// test below makes it impossible to add an ungated router *without* arguing.
-const PUBLIC_BY_DESIGN: [(&str, &str); 22] = [
+const PUBLIC_BY_DESIGN: [(&str, &str); 23] = [
     ("health_routes", "liveness/readiness probes carry no credential"),
     ("catalog_routes", "register/list is the authoring surface; delete is separately gated by RequireInternalApiToken"),
     ("auth_routes", "the login surface itself — gating it would be circular"),
@@ -233,6 +233,7 @@ const PUBLIC_BY_DESIGN: [(&str, &str); 22] = [
     ("mcp_routes", "MCP tools/list + tools/call over playbooks that opt in (metadata.expose.mcp / kind: Mcp serve: true): the execute + status capability of execution_routes, narrowed; per-user may_execute filtering is the gateway's; mounted only under NOETL_MCP_SERVER"),
     ("instance_routes", "NoETL instance register/discover/task handoff: every request is an ML-DSA-87 signed envelope bound to its route purpose, this control plane's audience and a fresh nonce, so the signature is the authentication; default trust admits nobody until NOETL_INSTANCE_TRUSTED_IDS lists the instance; mounted only under NOETL_INSTANCE_REGISTRY"),
     ("catalog_peer_routes", "catalog discovery (noetl/ai-meta#548): /api/catalog/peer/resolve is an ML-DSA-87 signed envelope admitted by the instance gate (purpose catalog.resolve, NOETL_INSTANCE_TRUSTED_IDS), never answers credential rows; /api/catalog/locate requires RequireInternalApiToken in its extractor; mounted only under NOETL_CATALOG_DISCOVERY"),
+    ("catalog_remote_routes", "cross-instance execution (noetl/ai-meta#548 follow-up): /api/catalog/peer/execute and /api/catalog/peer/execution are ML-DSA-87 signed envelopes admitted by the instance gate (purposes catalog.execute / catalog.execution, NOETL_INSTANCE_TRUSTED_IDS), execute is fail-closed on NOETL_CATALOG_REMOTE_SERVE_ALLOW and execution answers only the instance that started it; /api/catalog/remote/calls/{id} is the delegated twin of /api/executions/{id}, polled by the caller's own workers; mounted only under NOETL_CATALOG_REMOTE_CALLS / _SERVE"),
     ("dashboard_routes", "read-only aggregate counts for the UI; no per-record data and no credential material"),
     // ⚠ noetl/ai-meta#312. NOT a justification — a record of the current state.
     // `/api/postgres/execute` runs arbitrary SQL with no auth and no statement
@@ -297,8 +298,7 @@ fn no_router_is_merged_ungated_without_an_explicit_reason() {
         sites.len()
     );
 
-    let allowed: std::collections::HashMap<&str, &str> =
-        PUBLIC_BY_DESIGN.iter().copied().collect();
+    let allowed: std::collections::HashMap<&str, &str> = PUBLIC_BY_DESIGN.iter().copied().collect();
     let mut unjustified = Vec::new();
     for (name, chunk) in &sites {
         let gated = chunk.contains("auth_gate::gate");
@@ -322,8 +322,10 @@ fn no_router_is_merged_ungated_without_an_explicit_reason() {
 /// linger, silently pre-approving a future router that reused the name.
 #[test]
 fn every_public_by_design_entry_still_exists() {
-    let names: std::collections::HashSet<String> =
-        merge_sites(EXECUTE_MAIN).into_iter().map(|(n, _)| n).collect();
+    let names: std::collections::HashSet<String> = merge_sites(EXECUTE_MAIN)
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
     let stale: Vec<&str> = PUBLIC_BY_DESIGN
         .iter()
         .map(|(n, _)| *n)

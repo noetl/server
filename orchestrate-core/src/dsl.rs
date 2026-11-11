@@ -102,6 +102,12 @@ pub const CATALOG_PINNING_ENV: &str = "NOETL_CATALOG_PINNING";
 pub const CATALOG_HOT_RELOAD_ENV: &str = "NOETL_CATALOG_HOT_RELOAD";
 /// Cross-cluster discovery: advertise, `/api/catalog/peer/resolve`, `/api/catalog/locate`.
 pub const CATALOG_DISCOVERY_ENV: &str = "NOETL_CATALOG_DISCOVERY";
+/// Cross-instance calls, the caller side (`noetl/server` services/catalog_remote.rs).
+pub const CATALOG_REMOTE_CALLS_ENV: &str = "NOETL_CATALOG_REMOTE_CALLS";
+/// Cross-instance calls, the serving side.
+pub const CATALOG_REMOTE_SERVE_ENV: &str = "NOETL_CATALOG_REMOTE_SERVE";
+/// Path globs the serving side runs for a peer (fail closed).
+pub const CATALOG_REMOTE_SERVE_ALLOW_ENV: &str = "NOETL_CATALOG_REMOTE_SERVE_ALLOW";
 /// Direct fetch of a reference's source URI during locate.
 pub const CATALOG_URI_FETCH_ENV: &str = "NOETL_CATALOG_URI_FETCH";
 /// Globs of source URIs locate may fetch. Empty or unset fetches nothing.
@@ -223,6 +229,23 @@ pub fn catalog_features() -> Value {
                 "server_gate_env": CATALOG_URI_FETCH_ENV,
                 "requires_env": [CATALOG_DISCOVERY_ENV, CATALOG_URI_ALLOW_ENV],
                 "affects": "locate fetches a reference's own source URI; fail closed, nothing is fetched without an allowlist"
+            },
+            {
+                "name": "remote_execution",
+                "server_gate_env": CATALOG_REMOTE_CALLS_ENV,
+                "requires_env": [CATALOG_PINNING_ENV, CATALOG_CAS_ENV],
+                "reference_forms": ["noetl://<instance>/<path>[@<version>][#sha256:<hex>]", "peer/<instance>/<path>"],
+                "step_keys": {
+                    "remote": "on a `kind: playbook` tool: import (default; verify, import under peer/<instance>/<path>, run here) | delegate (the owner runs that digest on its own workers; the step's return_result/result_step read its result). Default from NOETL_CATALOG_REMOTE_MODE",
+                    "digest": "on a `kind: playbook` tool: sha256: the resolved body must have"
+                },
+                "affects": "inside a pinned tree a remote reference resolves to what the ROOT first got for it, in both modes, even if the owner registers a new version mid-run; a child of an imported playbook resolves bare names on its home instance (peer/<instance>/<name>). With the flag off `remote: delegate` is refused by name and nothing else changes",
+                "delegate_requires_env": [CATALOG_DISCOVERY_ENV],
+                "serving_side": {
+                    "server_gate_env": CATALOG_REMOTE_SERVE_ENV,
+                    "allow_env": CATALOG_REMOTE_SERVE_ALLOW_ENV,
+                    "serves": "POST /api/catalog/peer/execute (signed, purpose catalog.execute), POST /api/catalog/peer/execution (signed, catalog.execution; only the starting instance may read); fail closed without an allowlist glob. Delegated runs from one calling root share one pin on the owner"
+                }
             }
         ]
     })
@@ -530,7 +553,8 @@ mod tests {
                 "execution_pinning",
                 "hot_reload",
                 "discovery",
-                "uri_fetch"
+                "uri_fetch",
+                "remote_execution"
             ]
         );
         let schemes: Vec<&str> = c["source_schemes"]

@@ -713,11 +713,15 @@ pub async fn resolve_execute(
     version: Option<&serde_json::Value>,
     digest: Option<&str>,
     parent_execution_id: Option<i64>,
+    pin_override: Option<Pin>,
 ) -> AppResult<PendingPin> {
-    let inherited = match parent_execution_id {
-        Some(p) => get_pin(pool, p).await?.map(|r| r.inherited()),
+    let parent_pin = match parent_execution_id {
+        Some(p) => get_pin(pool, p).await?,
         None => None,
     };
+    // A delegated execution (catalog_remote) resolves inside the pin its
+    // calling root shares on this instance; anything else inherits its parent's.
+    let inherited = pin_override.or_else(|| parent_pin.as_ref().map(|r| r.inherited()));
     let fresh = if inherited.is_none() {
         Some(watermark_now(pool).await?)
     } else {
@@ -733,6 +737,15 @@ pub async fn resolve_execute(
         let path = path.ok_or_else(|| {
             AppError::Validation("Either path or catalog_id must be provided".into())
         })?;
+        use crate::services::catalog_remote as remote;
+        let remote_on = remote::calls_active();
+        // Home-instance resolution: a bare name called from an imported
+        // playbook (`peer/<B>/…`) means B's playbook of that name.
+        let home = match (&parent_pin, remote_on) {
+            (Some(pp), true) => remote::home_rewrite(&pp.path, path),
+            _ => None,
+        };
+        let path = home.as_deref().unwrap_or(path);
         let r = core::PlaybookRef::from_request(path, version, digest)
             .map_err(|e| AppError::Validation(e.to_string()))?;
         let (l, reason) = core::plan(&r, inherited.as_ref(), hot_reload_enabled())
@@ -747,7 +760,37 @@ pub async fn resolve_execute(
         } else {
             lookup(pool, &l).await?
         };
+        // Cross-instance (catalog_remote): inside a pinned tree, a remote
+        // reference resolves to what the ROOT first got for it, so a peer
+        // registering a new version mid-run never reaches this tree.
+        let tree_root = inherited.as_ref().map(|p| p.root_execution_id);
+        // A local `peer/<B>/…` row is only a cached import (perhaps from another
+        // tree); the root's remote pin, or B itself, is the authority. The local
+        // copy is used only when B cannot answer.
+        let remote_key = match (tree_root, remote_on, reason) {
+            (Some(_), true, r) if r != Reason::HotReload => {
+                match remote::remote_target(path, version, digest).map_err(AppError::Validation)? {
+                    Some(t) => Some(remote::PinKey::Peer(t)),
+                    None => match &l {
+                        Lookup::Source { uri, expect, .. } => Some(remote::PinKey::Source {
+                            uri: uri.clone(),
+                            expect: expect.clone(),
+                        }),
+                        _ => None,
+                    },
+                }
+            }
+            _ => None,
+        };
         match (found, discovery) {
+            (cached, rt) if remote_key.is_some() => {
+                let key = remote_key.expect("checked");
+                let root = tree_root.expect("remote pins are only for pinned trees");
+                (
+                    remote::resolve_import(pool, rt, root, &key, cached).await?,
+                    Reason::Import,
+                )
+            }
             (Some(row), _) => (row, reason),
             (None, Some(rt)) if matches!(l, Lookup::Source { .. }) || inherited.is_none() => {
                 let loc = rt

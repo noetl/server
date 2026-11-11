@@ -68,6 +68,11 @@ fn build_router(
     // Cross-cluster catalog discovery (noetl/ai-meta#548 Phase 2): off unless
     // NOETL_CATALOG_DISCOVERY=true with CAS, the registry and a peer key.
     let catalog_peer_routes = noetl_server::services::catalog_peer::init(db_pool.clone(), instance_state);
+    // Cross-instance execution (noetl/ai-meta#548 follow-up): delegated calls
+    // and the serving side. Off unless NOETL_CATALOG_REMOTE_CALLS / _SERVE with
+    // CAS, pinning and discovery; needs catalog_peer::init above.
+    let catalog_remote_routes =
+        noetl_server::services::catalog_remote::routes(state.clone(), execution_service.clone());
 
     // CORS configuration - allow all origins for development
     let cors = CorsLayer::new()
@@ -1096,6 +1101,13 @@ fn build_router(
     if let Some(catalog_peer_routes) = catalog_peer_routes {
         app = app.merge(catalog_peer_routes);
     }
+    // Cross-instance execution. `/api/catalog/peer/execute|execution` are signed
+    // envelopes admitted by the instance gate (purposes catalog.execute /
+    // catalog.execution); `/api/catalog/remote/calls/{id}` is the read surface
+    // the caller's own workers poll, like `/api/executions/{id}`.
+    if let Some(catalog_remote_routes) = catalog_remote_routes {
+        app = app.merge(catalog_remote_routes);
+    }
 
     if let Some(ehgraph_routes) = ehgraph_routes {
         app = app.nest(noetl_server::ehgraph_embedded::MOUNT, ehgraph_routes);
@@ -1486,6 +1498,7 @@ async fn main() -> anyhow::Result<()> {
     // Content-addressed catalog tables (noetl/ai-meta#548). Best-effort create,
     // then detect: absent tables leave every CAS flag behaving as off.
     noetl_server::services::catalog_cas::ensure_schema(&db_pool).await;
+    noetl_server::services::catalog_remote::ensure_schema(&db_pool).await;
     if noetl_server::services::catalog_cas::ready() {
         let pool = db_pool.clone();
         tokio::spawn(async move {
