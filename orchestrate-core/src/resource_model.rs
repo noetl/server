@@ -10,7 +10,7 @@
 //!
 //! Every figure carries a `label`:
 //!
-//! - `MEASURED` — observed on a cluster or a harness; `env`, `date` and a
+//! - `MEASURED` — observed on a cluster or a harness; `environment`, `date` and a
 //!   public `source` say where. A measurement is a fact about the build and
 //!   load it was taken under, not a promise about the next one.
 //! - `DEFAULT` — a value written in code (env var + default), cited by
@@ -65,7 +65,7 @@ pub fn model() -> Value {
         "as_of": RESOURCE_MODEL_AS_OF,
         "purpose": "Plan a playbook's time, slots, fuel, memory and tool calls before running it, then measure the run and refine.",
         "labels": {
-            "MEASURED": "observed on a cluster or harness; read env/date/source before reusing it",
+            "MEASURED": "observed on a cluster or harness; read environment/date/source before reusing it",
             "DEFAULT": "a code default (env var + value); a deployment may override it",
             "DEPLOYED": "read off the production cluster on as_of; configuration, not code",
             "GUIDANCE": "a planning rule derived from the figures; not a measurement",
@@ -113,8 +113,8 @@ fn step_kinds() -> Value {
                 "other_limits": [{ "what": "remote script-source loader", "value": 30, "unit": "s", "label": "DEFAULT", "source": src(T, "src/tools/python.rs:23") }],
                 "memory_class": "the subprocess shares the worker pod's memory limit; stdout is collected whole",
                 "measured": [
-                    { "what": "test/simple_python playbook end to end on idle kind", "value": "0.66 s warm / 1.20 s cold", "label": "MEASURED", "env": "kind", "date": "2026-05", "source": "noetl/ai-meta handoffs/archive/2026-05-23-gke-provision-validation/round-01-prompt.md" },
-                    { "what": "provider dispatch moved from a kind: playbook child to inline python (HotelBeds hotels)", "value": "9.3 s -> 3.0 s", "label": "MEASURED", "env": "prod", "date": "2026-08-24", "source": "noetl/travel wiki playbook-itinerary-planner (#286); ".to_owned() + SL + " 2026-08-24" }
+                    { "what": "test/simple_python playbook end to end on idle kind", "value": "0.66 s warm / 1.20 s cold", "label": "MEASURED", "environment": "kind", "date": "2026-05", "source": "noetl/ai-meta handoffs/archive/2026-05-23-gke-provision-validation/round-01-prompt.md" },
+                    { "what": "provider dispatch moved from a kind: playbook child to inline python (HotelBeds hotels)", "value": "9.3 s -> 3.0 s", "label": "MEASURED", "environment": "prod", "date": "2026-08-24", "source": "noetl/travel wiki playbook-itinerary-planner (#286); ".to_owned() + SL + " 2026-08-24" }
                 ]
             },
             {
@@ -160,7 +160,7 @@ fn step_kinds() -> Value {
                 ],
                 "serialization_source": src(W, "src/executor/command.rs:163, 2415"),
                 "measured": [
-                    { "what": "first dispatch of a ~1.6 MB module on a fresh pod (Cranelift compile ~99%, fetch ~1%); later hops hit the digest cache, and the drive pool pre-compiles at boot behind /readyz", "value": "~1.5 s once", "label": "MEASURED", "env": "kind (fresh system-pool pod)", "date": "2026-06", "source": "noetl/worker wiki deployment-specification (boot warmup)" }
+                    { "what": "first dispatch of a ~1.6 MB module on a fresh pod (Cranelift compile ~99%, fetch ~1%); later hops hit the digest cache, and the drive pool pre-compiles at boot behind /readyz", "value": "~1.5 s once", "label": "MEASURED", "environment": "kind (fresh system-pool pod)", "date": "2026-06", "source": "noetl/worker wiki deployment-specification (boot warmup)" }
                 ]
             },
             {
@@ -185,7 +185,7 @@ fn step_kinds() -> Value {
                 "durability": "the hosted loop lives in one command: if its worker dies the step restarts from turn 1 and children that already ran run again",
                 "measured": [
                     { "what": "a hosted LLM (OpenAI / Anthropic) call inside a real playbook step", "value": null, "label": "NOT_YET_MEASURED" },
-                    { "what": "candidate small language model, unoptimised local serving, 2 generations per turn", "value": "p50 9.2 s / p95 13.1 s per turn", "label": "MEASURED", "env": "local", "source": "noetl/travel wiki Travel-SLM-Journey" }
+                    { "what": "candidate small language model, unoptimised local serving, 2 generations per turn", "value": "p50 9.2 s / p95 13.1 s per turn", "label": "MEASURED", "environment": "local", "source": "noetl/travel wiki Travel-SLM-Journey" }
                 ]
             },
             {
@@ -195,9 +195,9 @@ fn step_kinds() -> Value {
                 "timeout": { "value": 30, "unit": "s", "meaning": "start request; the await wait is the step's timeout, else 180 s (return_result) / 300 s (return_step)", "label": "DEFAULT", "source": src(T, "src/tools/playbook.rs:42-69, 237-242, 402-405, 433-488") },
                 "deadlock_note": "an awaited child needs a free slot on its own pool while the parent holds one; if both target the same small pool, enough concurrent awaiting parents can occupy every slot",
                 "measured": [
-                    { "what": "orchestration cost of one kind: playbook hop, regardless of the work inside it", "value": "~9 s", "label": "MEASURED", "env": "prod", "date": "2026-08-24", "source": "noetl/travel wiki playbook-itinerary-planner (#286); ".to_owned() + SL + " 2026-08-24" },
-                    { "what": "child-playbook hop vs the same work inline (Firestore read: 369 ms of work took 11.4 s as a child; Places: 663 ms of work took 1.5 s inline)", "value": "~10-15 s per hop", "label": "MEASURED", "env": "prod", "date": "2026-08", "source": "noetl/travel wiki playbook-itinerary-planner#latency" },
-                    { "what": "paired A/B: provider children inlined into the planner as python (4 places turns each)", "value": "median 34.7 s -> 19.4 s (-44%)", "label": "MEASURED", "env": "prod", "date": "2026-06-29", "source": SL.to_owned() + " 2026-06-29" }
+                    { "what": "orchestration cost of one kind: playbook hop, regardless of the work inside it", "value": "~9 s", "label": "MEASURED", "environment": "prod", "date": "2026-08-24", "source": "noetl/travel wiki playbook-itinerary-planner (#286); ".to_owned() + SL + " 2026-08-24" },
+                    { "what": "child-playbook hop vs the same work inline (Firestore read: 369 ms of work took 11.4 s as a child; Places: 663 ms of work took 1.5 s inline)", "value": "~10-15 s per hop", "label": "MEASURED", "environment": "prod", "date": "2026-08", "source": "noetl/travel wiki playbook-itinerary-planner#latency" },
+                    { "what": "paired A/B: provider children inlined into the planner as python (4 places turns each)", "value": "median 34.7 s -> 19.4 s (-44%)", "label": "MEASURED", "environment": "prod", "date": "2026-06-29", "source": SL.to_owned() + " 2026-06-29" }
                 ]
             },
             {
@@ -333,15 +333,15 @@ fn concurrency() -> Value {
                 { "target": "noetl-worker-rust", "min": 2, "max": 20, "trigger": "metrics-api: ehdb_feed_subject_lag{subject=\"commands.shared.shard.0\"} from the command-bus writer", "target_value": 2, "polling_interval_s": 10, "cooldown_s": 30, "rule": "replicas ~ ceil(lag / 2)" }
             ], "note": "ops/ci/manifests also declares a system-pool ScaledObject (3-10); it is not on the cluster, so the system pool does not scale" },
             "measured": [
-                { "what": "user pool under 200 real executions (200/200 completed)", "value": "replicas 2 -> 4 -> 8 -> 16 -> 20 -> 2", "label": "MEASURED", "env": "prod", "date": "2026-07-31", "source": "noetl/ai-meta wiki Home (#210)" },
+                { "what": "user pool under 200 real executions (200/200 completed)", "value": "replicas 2 -> 4 -> 8 -> 16 -> 20 -> 2", "label": "MEASURED", "environment": "prod", "date": "2026-07-31", "source": "noetl/ai-meta wiki Home (#210)" },
                 { "what": "time for the user pool to ramp under load on the EHDB trigger", "value": null, "label": "NOT_YET_MEASURED" },
-                { "what": "GKE Autopilot node provisioning when a scale-up needs a new node", "value": "~60-90 s", "label": "MEASURED", "env": "prod", "source": "noetl/ai-meta playbooks/load-test/README.md" }
+                { "what": "GKE Autopilot node provisioning when a scale-up needs a new node", "value": "~60-90 s", "label": "MEASURED", "environment": "prod", "source": "noetl/ai-meta playbooks/load-test/README.md" }
             ]
         },
         "measured": [
-            { "what": "command.issued -> command.claimed, pool not saturated", "value": "p50 138.5 / p95 156.4 / p99 181.0 ms (n=60)", "label": "MEASURED", "env": "prod", "date": "2026-07-30", "source": SL.to_owned() + " 2026-07-30 (prod deploy)" },
-            { "what": "same, with 90 commands offered in 1.2 s against 8 slots (2 replicas x 4)", "value": "p50 2123 / p99 3735 ms", "label": "MEASURED", "env": "prod", "date": "2026-07-30", "source": SL.to_owned() + " 2026-07-30 (prod deploy)", "note": "this measures the pool queue, not the bus" },
-            { "what": "POST /api/execute submit latency by client concurrency (server v3.100.4, 2 reps)", "value": "c=1 p50 120-150 ms; c=2 p50 140-150 ms; c>=4 bimodal with errors and 30 s timeouts", "label": "MEASURED", "env": "prod", "date": "2026-09-03", "source": "noetl/ai-meta wiki Umbrella-Request-Latency", "note": "p95 at c=1 rests on single samples" },
+            { "what": "command.issued -> command.claimed, pool not saturated", "value": "p50 138.5 / p95 156.4 / p99 181.0 ms (n=60)", "label": "MEASURED", "environment": "prod", "date": "2026-07-30", "source": SL.to_owned() + " 2026-07-30 (prod deploy)" },
+            { "what": "same, with 90 commands offered in 1.2 s against 8 slots (2 replicas x 4)", "value": "p50 2123 / p99 3735 ms", "label": "MEASURED", "environment": "prod", "date": "2026-07-30", "source": SL.to_owned() + " 2026-07-30 (prod deploy)", "note": "this measures the pool queue, not the bus" },
+            { "what": "POST /api/execute submit latency by client concurrency (server v3.100.4, 2 reps)", "value": "c=1 p50 120-150 ms; c=2 p50 140-150 ms; c>=4 bimodal with errors and 30 s timeouts", "label": "MEASURED", "environment": "prod", "date": "2026-09-03", "source": "noetl/ai-meta wiki Umbrella-Request-Latency", "note": "p95 at c=1 rests on single samples" },
             { "what": "sustained executions per second the platform can complete", "value": null, "label": "NOT_YET_MEASURED" }
         ]
     })
@@ -351,13 +351,13 @@ fn orchestration_overhead() -> Value {
     json!({
         "summary": "Each step pays a fixed orchestration cost (command dispatch, claim, and three lifecycle event emits) on top of its work; each kind: playbook hop pays a whole child execution's worth.",
         "measured": [
-            { "what": "fixed cost per step in the travel itinerary planner; events spaced a near-uniform 0.8-1.2 s apart", "value": "~4.5 s per step", "label": "MEASURED", "env": "prod", "date": "2026-08", "source": "noetl/travel wiki playbook-itinerary-planner#latency" },
-            { "what": "share of a planner turn that is orchestration (63 events, ~15-17 s of work in a ~76-107 s turn)", "value": "~82%", "label": "MEASURED", "env": "prod", "date": "2026-08", "source": "noetl/travel wiki playbook-itinerary-planner#latency" },
-            { "what": "10-hop probe playbook: share of a turn in two command-dispatch gaps per hop (~510 ms p50 each)", "value": "79%", "label": "MEASURED", "env": "prod", "date": "2026-08-18", "source": SL.to_owned() + " 2026-08-18" },
-            { "what": "server event ingest per emit: command.started / command.completed vs call.done (three emits per hop)", "value": "~336 ms / ~1021 ms on prod, ~40 ms on kind", "label": "MEASURED", "env": "prod and kind", "source": "noetl/server src/metrics.rs (doc comment on noetl_event_ingest_phase_seconds)" },
-            { "what": "prod smoke turns through the gateway: travel planner turn / ranch concierge turn", "value": "17.0-21.2 s / 6.4-7.0 s", "label": "MEASURED", "env": "prod", "date": "2026-11-04", "source": SL.to_owned() + " 2026-11-04" },
-            { "what": "first drive of a fresh system-pool pod after a roll (state builder replays the feed)", "value": "drives stall ~7-10 min", "label": "MEASURED", "env": "prod", "date": "2026-11-03", "source": SL.to_owned() + " 2026-11-03 (early)" },
-            { "what": "command-bus writer restart (lease election)", "value": "failover window 21 s; plan for a 20-60 s write outage", "label": "MEASURED", "env": "prod", "date": "2026-11-04", "source": "noetl/worker wiki cmdbus-writer-tier-service" }
+            { "what": "fixed cost per step in the travel itinerary planner; events spaced a near-uniform 0.8-1.2 s apart", "value": "~4.5 s per step", "label": "MEASURED", "environment": "prod", "date": "2026-08", "source": "noetl/travel wiki playbook-itinerary-planner#latency" },
+            { "what": "share of a planner turn that is orchestration (63 events, ~15-17 s of work in a ~76-107 s turn)", "value": "~82%", "label": "MEASURED", "environment": "prod", "date": "2026-08", "source": "noetl/travel wiki playbook-itinerary-planner#latency" },
+            { "what": "10-hop probe playbook: share of a turn in two command-dispatch gaps per hop (~510 ms p50 each)", "value": "79%", "label": "MEASURED", "environment": "prod", "date": "2026-08-18", "source": SL.to_owned() + " 2026-08-18" },
+            { "what": "server event ingest per emit: command.started / command.completed vs call.done (three emits per hop)", "value": "~336 ms / ~1021 ms on prod, ~40 ms on kind", "label": "MEASURED", "environment": "prod and kind", "source": "noetl/server src/metrics.rs (doc comment on noetl_event_ingest_phase_seconds)" },
+            { "what": "prod smoke turns through the gateway: travel planner turn / ranch concierge turn", "value": "17.0-21.2 s / 6.4-7.0 s", "label": "MEASURED", "environment": "prod", "date": "2026-11-04", "source": SL.to_owned() + " 2026-11-04" },
+            { "what": "first drive of a fresh system-pool pod after a roll (state builder replays the feed)", "value": "drives stall ~7-10 min", "label": "MEASURED", "environment": "prod", "date": "2026-11-03", "source": SL.to_owned() + " 2026-11-03 (early)" },
+            { "what": "command-bus writer restart (lease election)", "value": "failover window 21 s; plan for a 20-60 s write outage", "label": "MEASURED", "environment": "prod", "date": "2026-11-04", "source": "noetl/worker wiki cmdbus-writer-tier-service" }
         ],
         "caveat": "Per-step cost varies with load and with the server build: several of these figures predate later dispatch fixes. Measure on the target cluster at the target load before committing to a budget."
     })
@@ -457,6 +457,16 @@ mod tests {
                 if label == Some("NOT_YET_MEASURED") && m.get("value").is_some_and(|v| !v.is_null())
                 {
                     bad.push(format!("{path}: NOT_YET_MEASURED carries a number"));
+                }
+                if let Some(e) = m.get("env") {
+                    let ok = e.as_str().is_some_and(|e| {
+                        !e.is_empty()
+                            && e.chars()
+                                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+                    });
+                    if !ok {
+                        bad.push(format!("{path}: env must name an env var (use environment for where a figure was measured)"));
+                    }
                 }
                 for (k, c) in m {
                     check(c, label, &format!("{path}.{k}"), bad);

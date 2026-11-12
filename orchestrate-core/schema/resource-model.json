@@ -22,7 +22,7 @@
       "measured": [
         {
           "date": "2026-07-31",
-          "env": "prod",
+          "environment": "prod",
           "label": "MEASURED",
           "source": "noetl/ai-meta wiki Home (#210)",
           "value": "replicas 2 -> 4 -> 8 -> 16 -> 20 -> 2",
@@ -34,7 +34,7 @@
           "what": "time for the user pool to ramp under load on the EHDB trigger"
         },
         {
-          "env": "prod",
+          "environment": "prod",
           "label": "MEASURED",
           "source": "noetl/ai-meta playbooks/load-test/README.md",
           "value": "~60-90 s",
@@ -45,7 +45,7 @@
     "measured": [
       {
         "date": "2026-07-30",
-        "env": "prod",
+        "environment": "prod",
         "label": "MEASURED",
         "source": "noetl/ai-meta wiki Sessions-Log 2026-07-30 (prod deploy)",
         "value": "p50 138.5 / p95 156.4 / p99 181.0 ms (n=60)",
@@ -53,7 +53,7 @@
       },
       {
         "date": "2026-07-30",
-        "env": "prod",
+        "environment": "prod",
         "label": "MEASURED",
         "note": "this measures the pool queue, not the bus",
         "source": "noetl/ai-meta wiki Sessions-Log 2026-07-30 (prod deploy)",
@@ -62,7 +62,7 @@
       },
       {
         "date": "2026-09-03",
-        "env": "prod",
+        "environment": "prod",
         "label": "MEASURED",
         "note": "p95 at c=1 rests on single samples",
         "source": "noetl/ai-meta wiki Umbrella-Request-Latency",
@@ -159,7 +159,7 @@
     "DEFAULT": "a code default (env var + value); a deployment may override it",
     "DEPLOYED": "read off the production cluster on as_of; configuration, not code",
     "GUIDANCE": "a planning rule derived from the figures; not a measurement",
-    "MEASURED": "observed on a cluster or harness; read env/date/source before reusing it",
+    "MEASURED": "observed on a cluster or harness; read environment/date/source before reusing it",
     "NOT_YET_MEASURED": "a real question with no number; do not invent one",
     "TARGET": "a goal or budget; not a measurement"
   },
@@ -478,7 +478,7 @@
     "measured": [
       {
         "date": "2026-08",
-        "env": "prod",
+        "environment": "prod",
         "label": "MEASURED",
         "source": "noetl/travel wiki playbook-itinerary-planner#latency",
         "value": "~4.5 s per step",
@@ -486,7 +486,7 @@
       },
       {
         "date": "2026-08",
-        "env": "prod",
+        "environment": "prod",
         "label": "MEASURED",
         "source": "noetl/travel wiki playbook-itinerary-planner#latency",
         "value": "~82%",
@@ -494,14 +494,14 @@
       },
       {
         "date": "2026-08-18",
-        "env": "prod",
+        "environment": "prod",
         "label": "MEASURED",
         "source": "noetl/ai-meta wiki Sessions-Log 2026-08-18",
         "value": "79%",
         "what": "10-hop probe playbook: share of a turn in two command-dispatch gaps per hop (~510 ms p50 each)"
       },
       {
-        "env": "prod and kind",
+        "environment": "prod and kind",
         "label": "MEASURED",
         "source": "noetl/server src/metrics.rs (doc comment on noetl_event_ingest_phase_seconds)",
         "value": "~336 ms / ~1021 ms on prod, ~40 ms on kind",
@@ -509,7 +509,7 @@
       },
       {
         "date": "2026-11-04",
-        "env": "prod",
+        "environment": "prod",
         "label": "MEASURED",
         "source": "noetl/ai-meta wiki Sessions-Log 2026-11-04",
         "value": "17.0-21.2 s / 6.4-7.0 s",
@@ -517,7 +517,7 @@
       },
       {
         "date": "2026-11-03",
-        "env": "prod",
+        "environment": "prod",
         "label": "MEASURED",
         "source": "noetl/ai-meta wiki Sessions-Log 2026-11-03 (early)",
         "value": "drives stall ~7-10 min",
@@ -525,7 +525,7 @@
       },
       {
         "date": "2026-11-04",
-        "env": "prod",
+        "environment": "prod",
         "label": "MEASURED",
         "source": "noetl/worker wiki cmdbus-writer-tier-service",
         "value": "failover window 21 s; plan for a 20-60 s write outage",
@@ -549,7 +549,7 @@
         "measured": [
           {
             "date": "2026-05",
-            "env": "kind",
+            "environment": "kind",
             "label": "MEASURED",
             "source": "noetl/ai-meta handoffs/archive/2026-05-23-gke-provision-validation/round-01-prompt.md",
             "value": "0.66 s warm / 1.20 s cold",
@@ -557,7 +557,7 @@
           },
           {
             "date": "2026-08-24",
-            "env": "prod",
+            "environment": "prod",
             "label": "MEASURED",
             "source": "noetl/travel wiki playbook-itinerary-planner (#286); noetl/ai-meta wiki Sessions-Log 2026-08-24",
             "value": "9.3 s -> 3.0 s",
@@ -651,7 +651,7 @@
         "measured": [
           {
             "date": "2026-06",
-            "env": "kind (fresh system-pool pod)",
+            "environment": "kind (fresh system-pool pod)",
             "label": "MEASURED",
             "source": "noetl/worker wiki deployment-specification (boot warmup)",
             "value": "~1.5 s once",
@@ -709,7 +709,7 @@
             "what": "a hosted LLM (OpenAI / Anthropic) call inside a real playbook step"
           },
           {
-            "env": "local",
+            "environment": "local",
             "label": "MEASURED",
             "source": "noetl/travel wiki Travel-SLM-Journey",
             "value": "p50 9.2 s / p95 13.1 s per turn",
@@ -768,7 +768,7 @@
         "measured": [
           {
             "date": "2026-08-24",
-            "env": "prod",
+            "environment": "prod",
             "label": "MEASURED",
             "source": "noetl/travel wiki playbook-itinerary-planner (#286); noetl/ai-meta wiki Sessions-Log 2026-08-24",
             "value": "~9 s",
@@ -776,7 +776,7 @@
           },
           {
             "date": "2026-08",
-            "env": "prod",
+            "environment": "prod",
             "label": "MEASURED",
             "source": "noetl/travel wiki playbook-itinerary-planner#latency",
             "value": "~10-15 s per hop",
@@ -784,7 +784,7 @@
           },
           {
             "date": "2026-06-29",
-            "env": "prod",
+            "environment": "prod",
             "label": "MEASURED",
             "source": "noetl/ai-meta wiki Sessions-Log 2026-06-29",
             "value": "median 34.7 s -> 19.4 s (-44%)",
