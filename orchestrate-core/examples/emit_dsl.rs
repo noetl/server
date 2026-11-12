@@ -5,13 +5,14 @@
 //! cargo run -p noetl-orchestrate-core --example emit_dsl --features json-schema
 //! ```
 //!
-//! Writes `orchestrate-core/schema/{playbook.schema.json,dsl-manifest.json}`
+//! Writes `orchestrate-core/schema/{playbook.schema.json,dsl-manifest.json,resource-model.json}`
 //! under the DEFAULT gates (every flag-gated kind off) — the vocabulary a
 //! server with no arming flags serves. `tests/dsl_artifacts.rs` fails when the
 //! committed files differ from what this would write.
 
 use noetl_orchestrate_core::dsl;
 use noetl_orchestrate_core::playbook::ToolKindGates;
+use noetl_orchestrate_core::resource_model;
 
 fn main() {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("schema");
@@ -29,6 +30,13 @@ fn main() {
         dsl::pretty_canonical(&manifest),
     )
     .expect("write manifest");
+    let model = resource_model::model();
+    std::fs::write(
+        dir.join("resource-model.json"),
+        dsl::pretty_canonical(&model),
+    )
+    .expect("write resource model");
     println!("schema   {}", dsl::digest(&schema));
     println!("manifest {}", dsl::digest(&manifest));
+    println!("resource {}", dsl::digest(&model));
 }
