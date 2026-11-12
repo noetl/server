@@ -1045,17 +1045,20 @@ pub async fn claim_command(
         ));
     }
 
-    // If execution already cancelled, reject claim.
+    // If execution already cancelled, reject claim.  Match every cancel
+    // spelling: the cancel API writes `playbook_cancelled`, and checking only
+    // `execution.cancelled` left queued commands claimable after a cancel.
     let cancelled_row = sqlx::query(
         r#"
         SELECT 1
         FROM noetl.event
         WHERE execution_id = $1
-          AND event_type = 'execution.cancelled'
+          AND event_type = ANY($2)
         LIMIT 1
         "#,
     )
     .bind(execution_id)
+    .bind(&crate::db::queries::event::CANCELLED_EVENT_TYPES[..])
     .fetch_optional(&mut *tx)
     .await?;
 
@@ -6587,6 +6590,39 @@ mod wal_snapshot_double_apply_tests {
         assert_eq!(
             canonical_state_digest(&fold_after_snapshot(snap, 0, &[])),
             want
+        );
+    }
+}
+
+/// The claim path must refuse a claim for every cancel spelling, not one of
+/// them.  CI has no Postgres, so this guards the wiring from source; the
+/// end-to-end proof is `tests/claim_refused_after_cancel_postgres.rs`.
+#[cfg(test)]
+mod claim_cancel_check_tests {
+    fn claim_command_body() -> &'static str {
+        let src = include_str!("events.rs");
+        let start = src
+            .find("pub async fn claim_command(")
+            .expect("claim_command exists");
+        let rest = &src[start..];
+        let end = rest[1..]
+            .find("\npub async fn ")
+            .map(|i| i + 1)
+            .unwrap_or(rest.len());
+        &rest[..end]
+    }
+
+    #[test]
+    fn claim_checks_the_shared_cancelled_event_list() {
+        let body = claim_command_body();
+        assert!(
+            body.contains("CANCELLED_EVENT_TYPES"),
+            "claim_command must bind CANCELLED_EVENT_TYPES for its cancel check"
+        );
+        assert!(
+            !body.contains("event_type = 'execution.cancelled'"),
+            "claim_command must not check a single cancel spelling: the cancel \
+             API writes `playbook_cancelled`"
         );
     }
 }

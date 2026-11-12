@@ -290,6 +290,25 @@ pub async fn get_all_step_results(
         .collect())
 }
 
+/// The event type `POST /api/executions/{id}/cancel` writes
+/// (`ExecutionService::cancel`).
+pub const CANCEL_API_EVENT_TYPE: &str = "playbook_cancelled";
+
+/// Every event type that means "this execution is cancelled".
+///
+/// Three spellings exist: the cancel API writes the underscore form
+/// ([`CANCEL_API_EVENT_TYPE`]), the orchestrator's terminal path uses the
+/// dotted form, and `execution.cancelled` is the status-projection form
+/// (noetl/ai-meta#227).  Any check that asks "is this execution cancelled?"
+/// must match all three.  The claim path once matched only
+/// `execution.cancelled`, so a queued command stayed claimable after an API
+/// cancel; it now binds this list.
+pub const CANCELLED_EVENT_TYPES: [&str; 3] = [
+    CANCEL_API_EVENT_TYPE,
+    "playbook.cancelled",
+    "execution.cancelled",
+];
+
 /// Check if an event type exists for an execution.
 pub async fn has_event_type(pool: &DbPool, execution_id: i64, event_type: &str) -> AppResult<bool> {
     let row: Option<(i32,)> = sqlx::query_as(
@@ -496,5 +515,25 @@ mod tests {
             after.contains("has_errored_step"),
             "the COMPLETED branch itself must consult step outcomes"
         );
+    }
+}
+
+#[cfg(test)]
+mod cancelled_event_types_tests {
+    use super::{CANCELLED_EVENT_TYPES, CANCEL_API_EVENT_TYPE};
+
+    /// The event the cancel API writes must be one the "is cancelled?"
+    /// checks recognise.  This is the exact mismatch that let a queued
+    /// command be claimed after a cancel.
+    #[test]
+    fn the_cancel_api_event_is_a_cancelled_event() {
+        assert!(CANCELLED_EVENT_TYPES.contains(&CANCEL_API_EVENT_TYPE));
+    }
+
+    #[test]
+    fn every_known_spelling_is_listed() {
+        for t in ["playbook_cancelled", "playbook.cancelled", "execution.cancelled"] {
+            assert!(CANCELLED_EVENT_TYPES.contains(&t), "missing {t}");
+        }
     }
 }

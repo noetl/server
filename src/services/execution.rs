@@ -1020,11 +1020,12 @@ impl ExecutionService {
             SELECT EXISTS(
                 SELECT 1 FROM noetl.event
                 WHERE execution_id = $1
-                  AND event_type IN ('playbook.cancelled', 'playbook_cancelled', 'execution.cancelled')
+                  AND event_type = ANY($2)
             )
             "#,
         )
         .bind(execution_id)
+        .bind(&crate::db::queries::event::CANCELLED_EVENT_TYPES[..])
         .fetch_one(self.pool_for(execution_id))
         .await?;
 
@@ -1138,7 +1139,7 @@ impl ExecutionService {
             event_id,
             execution_id,
             catalog_id,
-            "playbook_cancelled",
+            crate::db::queries::event::CANCEL_API_EVENT_TYPE,
             "CANCELLED",
             Utc::now(),
         )
@@ -1155,11 +1156,12 @@ impl ExecutionService {
             SELECT EXISTS(
                 SELECT 1 FROM noetl.event
                 WHERE execution_id = $1
-                  AND event_type IN ('playbook.cancelled', 'playbook_cancelled', 'execution.cancelled')
+                  AND event_type = ANY($2)
             )
             "#,
         )
         .bind(execution_id)
+        .bind(&crate::db::queries::event::CANCELLED_EVENT_TYPES[..])
         .fetch_one(self.pool_for(execution_id))
         .await?;
 
