@@ -25,5 +25,6 @@ pub mod event;
 pub mod input_binding;
 pub mod orchestrator;
 pub mod playbook;
+pub mod resource_model;
 pub mod state;
 pub mod template;

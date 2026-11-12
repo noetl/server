@@ -42,6 +42,14 @@ fn committed_manifest_is_what_the_registry_generates() {
     );
 }
 
+#[test]
+fn committed_resource_model_is_what_the_code_generates() {
+    check(
+        "resource-model.json",
+        dsl::pretty_canonical(&noetl_orchestrate_core::resource_model::model()),
+    );
+}
+
 /// Negative control: the comparison must be able to fail.
 #[test]
 fn the_freshness_check_can_fail() {
