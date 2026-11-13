@@ -242,6 +242,36 @@ fn plan_dispositions(
         .collect()
 }
 
+/// Event types that end an execution, so its head claim is not an orphan.
+///
+/// The cancel spellings come from the shared list: the cancel API writes
+/// `playbook_cancelled`, which the old dotted-only list missed, so a cancelled
+/// execution with a dead claim was swept and failed after the cancel
+/// (noetl/server#581 family).
+pub fn terminal_event_types() -> Vec<&'static str> {
+    let mut types = vec!["playbook.completed", "playbook.failed"];
+    types.extend(crate::db::queries::event::CANCELLED_EVENT_TYPES);
+    types
+}
+
+/// Execution ids [`query_orphan_candidates`] would return.  Exposed for the
+/// Postgres regression test; the sweep itself uses the full candidates.
+#[doc(hidden)]
+pub async fn orphan_candidate_execution_ids(
+    pool: &DbPool,
+    grace_secs: i64,
+    lookback_secs: i64,
+    scan_limit: i64,
+) -> AppResult<Vec<i64>> {
+    Ok(
+        query_orphan_candidates(pool, grace_secs, lookback_secs, scan_limit)
+            .await?
+            .into_iter()
+            .map(|c| c.execution_id)
+            .collect(),
+    )
+}
+
 /// The head outstanding `command.claimed` per non-terminal execution on one
 /// shard, older than the grace period and within the lookback window.
 ///
@@ -291,7 +321,7 @@ async fn query_orphan_candidates(
           AND NOT EXISTS (
             SELECT 1 FROM noetl.event p
             WHERE p.execution_id = c.execution_id
-              AND p.event_type IN ('playbook.completed', 'playbook.failed', 'playbook.cancelled')
+              AND p.event_type = ANY($4)
           )
           AND NOT EXISTS (
             SELECT 1 FROM noetl.event c2
@@ -313,6 +343,7 @@ async fn query_orphan_candidates(
     .bind(grace_secs)
     .bind(lookback_secs)
     .bind(scan_limit)
+    .bind(terminal_event_types())
     .fetch_all(pool)
     .await?;
 
@@ -459,5 +490,27 @@ mod tests {
         let live = live_set(&[]);
         let plan = plan_dispositions(&cands, &live, 0);
         assert_eq!(plan, vec![Disposition::Capped, Disposition::Capped]);
+    }
+
+    /// A cancelled execution is terminal for the sweep in every spelling.
+    #[test]
+    fn terminal_types_include_every_cancel_spelling() {
+        let t = super::terminal_event_types();
+        for c in crate::db::queries::event::CANCELLED_EVENT_TYPES {
+            assert!(t.contains(&c), "sweep terminal list misses {c}");
+        }
+        assert!(t.contains(&"playbook.completed") && t.contains(&"playbook.failed"));
+    }
+
+    /// The candidate query binds the list instead of hand-listing spellings.
+    #[test]
+    fn candidate_query_binds_the_terminal_list() {
+        let src = include_str!("orphan_sweep.rs");
+        let body = src
+            .split_once("async fn query_orphan_candidates(")
+            .map(|(_, rest)| rest.split_once("\n}\n").map(|(b, _)| b).unwrap_or(rest))
+            .expect("query_orphan_candidates present");
+        assert!(body.contains("terminal_event_types()"));
+        assert!(!body.contains("'playbook.cancelled'"));
     }
 }

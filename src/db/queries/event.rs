@@ -327,6 +327,24 @@ pub async fn has_event_type(pool: &DbPool, execution_id: i64, event_type: &str) 
     Ok(row.is_some())
 }
 
+/// Has any [`CANCELLED_EVENT_TYPES`] event been written for this execution?
+pub async fn is_execution_cancelled(pool: &DbPool, execution_id: i64) -> AppResult<bool> {
+    let row: Option<(i32,)> = sqlx::query_as(
+        r#"
+        SELECT 1
+        FROM noetl.event
+        WHERE execution_id = $1 AND event_type = ANY($2)
+        LIMIT 1
+        "#,
+    )
+    .bind(execution_id)
+    .bind(&CANCELLED_EVENT_TYPES[..])
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.is_some())
+}
+
 /// Check if workflow is initialized.
 pub async fn is_workflow_initialized(pool: &DbPool, execution_id: i64) -> AppResult<bool> {
     has_event_type(pool, execution_id, "workflow.initialized").await
@@ -402,8 +420,9 @@ pub async fn get_execution_status(pool: &DbPool, execution_id: i64) -> AppResult
         return Ok("COMPLETED".to_string());
     }
 
-    // Check for cancellation
-    if has_event_type(pool, execution_id, "playbook.cancelled").await? {
+    // Check for cancellation.  Any spelling counts: the cancel API writes
+    // `playbook_cancelled`, which a dotted-only check never saw (noetl/server#581).
+    if is_execution_cancelled(pool, execution_id).await? {
         return Ok("CANCELLED".to_string());
     }
 
@@ -535,5 +554,28 @@ mod cancelled_event_types_tests {
         for t in ["playbook_cancelled", "playbook.cancelled", "execution.cancelled"] {
             assert!(CANCELLED_EVENT_TYPES.contains(&t), "missing {t}");
         }
+    }
+
+    /// `get_execution_status` must ask the shared list, not one spelling.
+    #[test]
+    fn execution_status_uses_the_shared_cancel_list() {
+        let src = include_str!("event.rs");
+        let body = src
+            .split_once("pub async fn get_execution_status(")
+            .map(|(_, rest)| rest.split_once("\n}\n").map(|(b, _)| b).unwrap_or(rest))
+            .expect("get_execution_status present");
+        assert!(
+            body.contains("is_execution_cancelled("),
+            "status must use is_execution_cancelled"
+        );
+        assert!(
+            !body.contains("\"playbook.cancelled\""),
+            "status must not check a single cancel spelling"
+        );
+        let checker = src
+            .split_once("pub async fn is_execution_cancelled(")
+            .map(|(_, rest)| rest.split_once("\n}\n").map(|(b, _)| b).unwrap_or(rest))
+            .expect("is_execution_cancelled present");
+        assert!(checker.contains("CANCELLED_EVENT_TYPES"));
     }
 }
