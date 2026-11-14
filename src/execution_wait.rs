@@ -89,16 +89,23 @@ pub fn is_terminal_event(event_type: &str) -> bool {
 /// Wake every waiter of an execution that just had a terminal row written.
 /// Cheap when nobody waits (one map lookup per terminal row).
 pub fn notify_written<'a>(rows: impl IntoIterator<Item = (i64, &'a str)>) {
-    let t = table().lock().unwrap();
-    if t.is_empty() {
+    let terminal: Vec<i64> = rows
+        .into_iter()
+        .filter(|(_, t)| is_terminal_event(t))
+        .map(|(id, _)| id)
+        .collect();
+    if terminal.is_empty() {
         return;
     }
-    for (execution_id, event_type) in rows {
-        if is_terminal_event(event_type) {
-            if let Some((n, _)) = t.get(&execution_id) {
-                n.notify_waiters();
-                crate::metrics::record_execution_wait("woken");
-            }
+    // noetl/ai-meta#559 2b: a parked parent may be waiting on this child.
+    for id in &terminal {
+        crate::services::await_park::child_terminal(*id);
+    }
+    let t = table().lock().unwrap();
+    for id in terminal {
+        if let Some((n, _)) = t.get(&id) {
+            n.notify_waiters();
+            crate::metrics::record_execution_wait("woken");
         }
     }
 }

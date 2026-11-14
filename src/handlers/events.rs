@@ -742,6 +742,21 @@ async fn handle_event_inner(
         event_id, execution_id, request.event_type
     );
 
+    // noetl/ai-meta#559 2b: a parent's parked completion is what a resolved
+    // child waits for before resuming it.
+    if state.config.playbook_await_park && request.event_type == "command.completed" {
+        let parked = request
+            .payload
+            .get("pending_callback")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if parked {
+            if let Some(cmd) = request.payload.get("command_id").and_then(|v| v.as_str()) {
+                crate::services::await_park::parked_completion_seen(cmd);
+            }
+        }
+    }
+
     // Process through engine if applicable
     let commands_generated = if !skip_engine_events.contains(&request.event_type.as_str()) {
         // TODO: Implement engine event handling

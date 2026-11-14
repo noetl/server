@@ -970,6 +970,7 @@ async fn serve_execute(State(s): State<RemoteState>, Json(env): Json<SignedEnvel
         dedup: None,
         remote: None,
         pin_override: Some(pin.clone()),
+        await_park: None,
     };
     let out = match crate::handlers::execute::execute_one(&s.app, request, "remote").await {
         Ok(o) => o,

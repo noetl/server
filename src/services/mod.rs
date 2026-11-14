@@ -13,6 +13,7 @@ pub mod certified_fold;
 pub mod credential;
 pub mod event;
 pub mod archive_store;
+pub mod await_park;
 pub mod event_archive;
 pub mod execution;
 pub mod internal;

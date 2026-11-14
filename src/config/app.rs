@@ -154,6 +154,18 @@ pub struct AppConfig {
     #[serde(default)]
     pub execution_wait: bool,
 
+    /// Park an awaiting `kind: playbook` step and free its worker slot
+    /// (noetl/ai-meta#559 2b). Envy maps `NOETL_PLAYBOOK_AWAIT_PARK`. When true,
+    /// `/api/execute` accepts an `await_park` request from the parent's tool,
+    /// records it in `noetl.execution_await_park`, and the server resumes the
+    /// parent step with the child's result when the child is terminal
+    /// (`services::await_park`). **Default false**: `await_park` is ignored and
+    /// the tool waits on its slot as today. **Revert:** set to `false` (open
+    /// parks still resolve: the resolver keeps running for rows it already holds
+    /// only while the flag is on, so drain before reverting).
+    #[serde(default)]
+    pub playbook_await_park: bool,
+
     /// CQRS write-path cutover (noetl/ai-meta#103 phase 2d-3).  When true, every
     /// server-originated `noetl.event` write goes through the `emit_event`
     /// chokepoint as a **publish** to the `noetl_events` JetStream stream
@@ -1201,6 +1213,7 @@ impl Default for AppConfig {
             local_drive_claim_ttl_ms: default_local_drive_claim_ttl_ms(),
             // noetl/ai-meta#559: the wait long poll is opt-in.
             execution_wait: false,
+            playbook_await_park: false,
             // noetl/ai-meta#103 2d-3: synchronous INSERT path by default.
             event_ingest_publish_only: false,
             auto_recreate_runtime: true,

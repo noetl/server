@@ -1387,6 +1387,14 @@ async fn main() -> anyhow::Result<()> {
     // non-triggering straggler, so the orchestrator never permanently stalls
     // under DB backpressure (e.g. a small Cloud SQL tier behind PgBouncer).
     handlers::events::spawn_orchestrator_reconciler(state.clone());
+    // noetl/ai-meta#559 2b: resume parked awaits (wake-driven + a 5 s sweep).
+    if state.config.playbook_await_park {
+        tracing::warn!(
+            "NOETL_PLAYBOOK_AWAIT_PARK=ON — awaiting kind: playbook steps may park and free \
+             their slot; the server resumes them (noetl/ai-meta#559)"
+        );
+        noetl_server::services::await_park::spawn(state.clone());
+    }
 
     // Orphaned-command guardrail sweep (zombie-exec fix; refs #154/#161/#163):
     // terminates append-only (playbook.failed) any RUNNING execution whose head
@@ -1529,6 +1537,10 @@ async fn main() -> anyhow::Result<()> {
     // then detect: absent tables leave every CAS flag behaving as off.
     noetl_server::services::catalog_cas::ensure_schema(&db_pool).await;
     noetl_server::services::catalog_remote::ensure_schema(&db_pool).await;
+    // noetl/ai-meta#559 2b: the parked-await table; only with the flag on.
+    if state.config.playbook_await_park {
+        noetl_server::services::await_park::ensure_schema(&db_pool).await;
+    }
     if noetl_server::services::catalog_cas::ready() {
         let pool = db_pool.clone();
         tokio::spawn(async move {
