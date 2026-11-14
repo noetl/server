@@ -128,6 +128,71 @@ pub async fn get_status(
     Ok(Json(status))
 }
 
+/// Query for [`wait`].
+#[derive(Debug, serde::Deserialize)]
+pub struct WaitQuery {
+    /// Seconds to hold the request open (default 25, capped at 60).
+    #[serde(default)]
+    pub timeout: Option<u64>,
+}
+
+/// `GET /api/executions/{execution_id}/wait?timeout=s` — long-poll until the
+/// execution is terminal or the timeout passes (noetl/ai-meta#559).
+///
+/// Returns the same body as `/status` (so a caller's terminal test is
+/// unchanged), plus the `x-noetl-wait: 1` header, which is how a caller tells
+/// this route from a server that does not mount it (both would otherwise be a
+/// 404 for an execution that has no rows yet). An execution with no rows yet
+/// answers `{"status": "PENDING"}`, not 404: right after `/api/execute` under
+/// publish-only the start event is not materialized yet, and a waiter must keep
+/// waiting rather than give up. Woken by `execution_wait::notify_written`;
+/// re-checks once a second regardless, so a missed wake costs at most 1 s.
+pub async fn wait(
+    State(service): State<ExecutionService>,
+    Path(execution_id): Path<i64>,
+    axum::extract::Query(q): axum::extract::Query<WaitQuery>,
+) -> Result<axum::response::Response, AppError> {
+    use axum::response::IntoResponse;
+    let timeout = std::time::Duration::from_secs(q.timeout.unwrap_or(25).min(60));
+    let deadline = tokio::time::Instant::now() + timeout;
+    let waiter = crate::execution_wait::subscribe(execution_id);
+    let body = loop {
+        // Arm the wake BEFORE reading, so a row written between the read and
+        // the wait is not missed.
+        let notified = waiter.notify().notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        let current = match service.get_status(execution_id).await {
+            Ok(st) => serde_json::to_value(&st).unwrap_or_default(),
+            Err(AppError::NotFound(_)) => {
+                serde_json::json!({"execution_id": execution_id, "status": "PENDING", "is_cancelled": false})
+            }
+            Err(e) => return Err(e),
+        };
+        let st = current.get("status").and_then(|v| v.as_str()).unwrap_or("");
+        let cancelled = current.get("is_cancelled").and_then(|v| v.as_bool()).unwrap_or(false);
+        if matches!(st, "COMPLETED" | "FAILED" | "CANCELLED") || cancelled {
+            crate::metrics::record_execution_wait("returned_terminal");
+            break current;
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            crate::metrics::record_execution_wait("returned_timeout");
+            break current;
+        }
+        let recheck = std::cmp::min(std::time::Duration::from_secs(1), deadline - now);
+        tokio::select! {
+            _ = notified => {}
+            _ = tokio::time::sleep(recheck) => crate::metrics::record_execution_wait("rechecked"),
+        }
+    };
+    drop(waiter);
+    let mut resp = Json(body).into_response();
+    resp.headers_mut()
+        .insert("x-noetl-wait", axum::http::HeaderValue::from_static("1"));
+    Ok(resp)
+}
+
 /// Cancel an execution.
 ///
 /// POST /api/executions/{execution_id}/cancel

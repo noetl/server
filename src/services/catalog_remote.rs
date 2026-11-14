@@ -806,6 +806,62 @@ async fn call_detail(
     Ok(Json(d))
 }
 
+/// `GET /api/catalog/remote/calls/{call_id}/wait?timeout=s` (noetl/ai-meta#559):
+/// the delegated call's status, held until it is terminal. One signed request to
+/// the owner carries `wait_secs` and the owner answers on completion. An owner
+/// that predates the field (it refuses it) is polled here once a second instead,
+/// which is still one signed request per second, not the tool's 2 s sleep.
+/// Answers with `x-noetl-wait: 1`, like the local `/wait`.
+async fn call_wait(
+    State(s): State<RemoteState>,
+    Path(call_id): Path<i64>,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Result<Response, AppError> {
+    let timeout = q
+        .get("timeout")
+        .and_then(|t| t.parse::<u64>().ok())
+        .unwrap_or(MAX_PEER_WAIT_SECS)
+        .min(MAX_PEER_WAIT_SECS);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout);
+    let rt =
+        peer::runtime().ok_or_else(|| AppError::NotFound("catalog discovery is off".into()))?;
+    let row = call_row(s.app.pools.cluster(), call_id).await?;
+    let (endpoint, audience) = rt.peer_endpoint(&row.instance_id)?;
+    let mut held = true;
+    let mut st = loop {
+        let mut ask = json!({ "execution_id": row.remote_execution_id.to_string() });
+        if held {
+            ask["wait_secs"] = json!(timeout);
+        }
+        let (status, v) = rt
+            .signed(&endpoint, "/api/catalog/peer/execution", PURPOSE_EXECUTION, &audience, ask)
+            .await
+            .map_err(AppError::ExternalService)?;
+        if status == 400 && held {
+            // An owner without the field: poll it instead.
+            held = false;
+            crate::metrics::record_execution_wait("remote_owner_no_wait");
+            continue;
+        }
+        if !(200..300).contains(&status) {
+            return Err(AppError::ExternalService(format!("{endpoint}: HTTP {status}: {v}")));
+        }
+        let st = v.get("status").cloned().unwrap_or(Value::Null);
+        if held || is_terminal(&st) || tokio::time::Instant::now() >= deadline {
+            crate::metrics::record_execution_wait(if held { "remote_held" } else { "remote_polled" });
+            break st;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    };
+    if let Value::Object(m) = &mut st {
+        m.insert("remote".into(), remote_note(call_id, &row));
+    }
+    let mut resp = Json(st).into_response();
+    resp.headers_mut()
+        .insert("x-noetl-wait", axum::http::HeaderValue::from_static("1"));
+    Ok(resp)
+}
+
 async fn call_status(
     State(s): State<RemoteState>,
     Path(call_id): Path<i64>,
@@ -840,6 +896,30 @@ struct ExecuteAsk {
 #[serde(deny_unknown_fields)]
 struct ExecutionAsk {
     execution_id: String,
+    /// noetl/ai-meta#559: hold the answer until the execution is terminal (at
+    /// most this many seconds, capped at [`MAX_PEER_WAIT_SECS`]). Honoured only
+    /// under `NOETL_CATALOG_REMOTE_PUSH`; an older owner rejects the field
+    /// (`deny_unknown_fields`) and the caller falls back to polling.
+    #[serde(default)]
+    wait_secs: Option<u64>,
+}
+
+/// `NOETL_CATALOG_REMOTE_PUSH` (noetl/ai-meta#559): one held signed request per
+/// delegated call instead of one every 2 s. On the caller it mounts
+/// `/api/catalog/remote/calls/{id}/wait`; on the owner it honours `wait_secs`.
+pub const PUSH_ENV: &str = "NOETL_CATALOG_REMOTE_PUSH";
+
+/// A held peer request stays under the signed client's 15 s timeout.
+pub const MAX_PEER_WAIT_SECS: u64 = 10;
+
+fn push_enabled() -> bool {
+    std::env::var(PUSH_ENV).map(|v| v.trim() == "true").unwrap_or(false)
+}
+
+fn is_terminal(status: &Value) -> bool {
+    let st = status.get("status").and_then(|v| v.as_str()).unwrap_or("");
+    matches!(st, "COMPLETED" | "FAILED" | "CANCELLED")
+        || status.get("is_cancelled").and_then(|v| v.as_bool()).unwrap_or(false)
 }
 
 fn err(status: StatusCode, msg: impl Into<String>) -> Response {
@@ -970,6 +1050,7 @@ async fn serve_execute(State(s): State<RemoteState>, Json(env): Json<SignedEnvel
         dedup: None,
         remote: None,
         pin_override: Some(pin.clone()),
+        await_park: None,
     };
     let out = match crate::handlers::execute::execute_one(&s.app, request, "remote").await {
         Ok(o) => o,
@@ -1051,11 +1132,38 @@ async fn serve_execution(
         }
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
-    let status = match s.executions.get_status(id).await {
-        Ok(st) => serde_json::to_value(st).unwrap_or(Value::Null),
-        Err(AppError::NotFound(m)) => return err(StatusCode::NOT_FOUND, m),
-        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    // noetl/ai-meta#559: a held ask answers the moment its execution is terminal.
+    let wait = ask
+        .wait_secs
+        .filter(|_| push_enabled())
+        .map(|w| std::time::Duration::from_secs(w.min(MAX_PEER_WAIT_SECS)));
+    let deadline = wait.map(|w| tokio::time::Instant::now() + w);
+    let waiter = wait.map(|_| crate::execution_wait::subscribe(id));
+    let status = loop {
+        let notified = waiter.as_ref().map(|w| w.notify().notified());
+        let mut notified = notified.map(Box::pin);
+        if let Some(n) = notified.as_mut() {
+            n.as_mut().enable();
+        }
+        let status = match s.executions.get_status(id).await {
+            Ok(st) => serde_json::to_value(st).unwrap_or(Value::Null),
+            Err(AppError::NotFound(m)) => return err(StatusCode::NOT_FOUND, m),
+            Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        };
+        let (Some(deadline), Some(n)) = (deadline, notified) else {
+            break status;
+        };
+        let now = tokio::time::Instant::now();
+        if is_terminal(&status) || now >= deadline {
+            break status;
+        }
+        let recheck = std::cmp::min(std::time::Duration::from_secs(1), deadline - now);
+        tokio::select! {
+            _ = n => {}
+            _ = tokio::time::sleep(recheck) => {}
+        }
     };
+    drop(waiter);
     let detail = match s.executions.get(id).await {
         Ok(d) => serde_json::to_value(d).unwrap_or(Value::Null),
         Err(e) => json!({ "error": e.to_string() }),
@@ -1094,6 +1202,9 @@ pub fn routes(app: AppState, executions: ExecutionService) -> Option<Router> {
                 "/api/catalog/remote/calls/{call_id}/status",
                 get(call_status),
             );
+        if push_enabled() {
+            r = r.route("/api/catalog/remote/calls/{call_id}/wait", get(call_wait));
+        }
     }
     if f.serve {
         if f.serve_allow.is_empty() {

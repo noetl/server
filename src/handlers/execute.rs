@@ -74,6 +74,11 @@ pub struct ExecuteRequest {
     /// one its calling root shares on this instance). Never read from JSON.
     #[serde(skip)]
     pub pin_override: Option<noetl_orchestrate_core::catalog::Pin>,
+    /// noetl/ai-meta#559 2b: the parent's tool asks to park its await (free its
+    /// slot) and be resumed by the server. Honoured only under
+    /// `NOETL_PLAYBOOK_AWAIT_PARK`; ignored otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub await_park: Option<crate::services::await_park::AwaitPark>,
 }
 
 /// Opt-in dedup directive carried on an execute request (noetl/ai-meta#90
@@ -147,6 +152,10 @@ pub struct ExecuteResponse {
     /// caller polls. `execution_id` is then this server's call id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote: Option<crate::services::catalog_remote::Delegated>,
+    /// noetl/ai-meta#559 2b: `true` when the server accepted `await_park` — the
+    /// tool returns `pending_callback` and the server resumes the step.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parked: Option<bool>,
 }
 
 /// Start playbook execution.
@@ -157,10 +166,24 @@ pub struct ExecuteResponse {
 /// All state is derived from events - no separate workflow/transition tables.
 pub async fn execute(
     State(state): State<AppState>,
-    Json(request): Json<ExecuteRequest>,
+    Json(mut request): Json<ExecuteRequest>,
 ) -> Result<Json<ExecuteResponse>, AppError> {
+    let park = request.await_park.take();
     let outcome = execute_one(&state, request, "single").await?;
-    Ok(Json(outcome.into_response()))
+    let fresh_local = outcome.status == "started" && outcome.remote.is_none();
+    let child = outcome.execution_id;
+    let mut response = outcome.into_response();
+    // noetl/ai-meta#559 2b: park the parent's await. Only for a fresh local child
+    // (a delegated or deduplicated one keeps today's wait); any refusal or error
+    // leaves `parked` unset and the tool waits on its slot as before.
+    if let (true, Some(park), true) = (state.config.playbook_await_park, park, fresh_local) {
+        match crate::services::await_park::register(&state, child, park).await {
+            Ok(true) => response.parked = Some(true),
+            Ok(false) => {}
+            Err(e) => tracing::warn!(child, %e, "await-park: register failed; the tool waits as today"),
+        }
+    }
+    Ok(Json(response))
 }
 
 /// Hard cap on items in one `POST /api/execute/batch` call.  A runaway-loop
@@ -310,6 +333,7 @@ impl ExecuteOutcome {
             status: self.status.to_string(),
             commands_generated: self.commands_generated,
             remote: self.remote,
+            parked: None,
         }
     }
 }
@@ -2478,6 +2502,7 @@ mod tests {
             dedup: None,
             remote: None,
             pin_override: None,
+            await_park: None,
         };
         assert!(request.validate().is_err());
 
@@ -2493,6 +2518,7 @@ mod tests {
             dedup: None,
             remote: None,
             pin_override: None,
+            await_park: None,
         };
         assert!(request.validate().is_ok());
 
@@ -2508,6 +2534,7 @@ mod tests {
             dedup: None,
             remote: None,
             pin_override: None,
+            await_park: None,
         };
         assert!(request.validate().is_ok());
     }
@@ -2519,6 +2546,7 @@ mod tests {
             status: "started".to_string(),
             commands_generated: 1,
             remote: None,
+            parked: None,
         };
 
         let json = serde_json::to_string(&response).unwrap();

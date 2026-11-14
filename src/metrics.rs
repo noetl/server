@@ -175,6 +175,52 @@ pub fn orchestrate_drive_total() -> &'static IntCounterVec {
     })
 }
 
+/// `noetl_execution_wait_total{outcome}` (noetl/ai-meta#559): `woken` (a
+/// terminal row woke waiters), `returned_terminal`, `returned_timeout`,
+/// `rechecked` (the 1 s safety re-check ran).
+pub fn record_execution_wait(outcome: &str) {
+    static M: OnceLock<IntCounterVec> = OnceLock::new();
+    M.get_or_init(|| {
+        let counter = IntCounterVec::new(
+            Opts::new(
+                "noetl_execution_wait_total",
+                "Execution wait long-poll events by outcome (noetl/ai-meta#559).",
+            ),
+            &["outcome"],
+        )
+        .expect("static counter spec must be valid");
+        registry()
+            .register(Box::new(counter.clone()))
+            .expect("counter registration must succeed");
+        counter
+    })
+    .with_label_values(&[outcome])
+    .inc();
+}
+
+/// `noetl_await_park_total{outcome}` (noetl/ai-meta#559 2b): `parked`,
+/// `refused_no_parent`, `refused_step_shape`, `held_for_parent`,
+/// `resumed_completed`, `resumed_failed`, `resumed_cancelled`, `resumed_timeout`.
+pub fn record_await_park(outcome: &str) {
+    static M: OnceLock<IntCounterVec> = OnceLock::new();
+    M.get_or_init(|| {
+        let counter = IntCounterVec::new(
+            Opts::new(
+                "noetl_await_park_total",
+                "Parked kind: playbook awaits by outcome (noetl/ai-meta#559).",
+            ),
+            &["outcome"],
+        )
+        .expect("static counter spec must be valid");
+        registry()
+            .register(Box::new(counter.clone()))
+            .expect("counter registration must succeed");
+        counter
+    })
+    .with_label_values(&[outcome])
+    .inc();
+}
+
 /// Record one worker-driven drive event (`dispatched` / `applied` /
 /// `decode_error` / `skipped_in_flight`).
 pub fn record_orchestrate_drive(stage: &str) {
