@@ -97,6 +97,28 @@ struct Mem {
     ready: HashSet<i64>,
     /// Parent command ids whose parked `command.completed` was ingested.
     parked_seen: HashSet<String>,
+    /// Children whose terminal row is in but whose result `call.done` is not
+    /// yet: how many times we have waited for it.
+    settle: HashMap<i64, u32>,
+}
+
+const SETTLE_STEP: Duration = Duration::from_millis(250);
+const SETTLE_TRIES: u32 = 20;
+
+/// The child's result event is present: the named step's `call.done`, or (no
+/// step named) any non-terminal `call.done`. Anything weaker is the selection
+/// fallback, which must not be taken while the `call.done` may still be in flight.
+pub fn result_ready(detail: &Value, result_step: Option<&str>) -> bool {
+    let Some(events) = detail.get("events").and_then(|v| v.as_array()) else {
+        return false;
+    };
+    events.iter().any(|ev| {
+        ev.get("event_type").and_then(|v| v.as_str()) == Some("call.done")
+            && match result_step {
+                Some(step) => ev.get("node_name").and_then(|v| v.as_str()) == Some(step),
+                None => ev.get("node_name").and_then(|v| v.as_str()) != Some("playbook"),
+            }
+    })
 }
 
 fn mem() -> &'static Mutex<Mem> {
@@ -313,6 +335,38 @@ async fn try_resolve(state: &AppState, child: i64, expired: bool) -> AppResult<(
         }
         return Ok(());
     }
+    // A completed child's result must be READ before we resume: the terminal row
+    // can be written before the step's `call.done` is (materializer order), and
+    // selecting then falls back to a `command.completed` envelope — a wrong
+    // answer, not a slow one (kind 2026-11-14, a nested import park). Wait for
+    // the `call.done` (250 ms steps, ~5 s); the tool's 2 s poll hid this race.
+    let completed = !(expired && !terminal)
+        && status.as_ref().map(|s| s.status == "COMPLETED").unwrap_or(false);
+    let detail = if completed {
+        let d = serde_json::to_value(service.get(child).await?).unwrap_or_default();
+        if !result_ready(&d, park.result_step.as_deref()) {
+            let n = {
+                let mut m = mem().lock().unwrap();
+                let n = m.settle.entry(child).or_insert(0);
+                *n += 1;
+                *n
+            };
+            if n <= SETTLE_TRIES {
+                crate::metrics::record_await_park("settle_wait");
+                tokio::spawn(async move {
+                    tokio::time::sleep(SETTLE_STEP).await;
+                    if let Some(t) = tx().get() {
+                        let _ = t.send(child);
+                    }
+                });
+                return Ok(());
+            }
+        }
+        Some(d)
+    } else {
+        None
+    };
+
     // Claim the row (exactly one resolver wins).
     let outcome_label = if expired && !terminal {
         "timeout".to_string()
@@ -335,6 +389,7 @@ async fn try_resolve(state: &AppState, child: i64, expired: bool) -> AppResult<(
         m.open.remove(&child);
         m.ready.remove(&child);
         m.parked_seen.remove(&park.parent_command_id);
+        m.settle.remove(&child);
     }
     if claimed.is_none() {
         return Ok(());
@@ -342,7 +397,7 @@ async fn try_resolve(state: &AppState, child: i64, expired: bool) -> AppResult<(
 
     // The parent's call.done, in the envelope the worker would have built.
     let (status_label, inner) = if outcome_label == "completed" {
-        let detail = serde_json::to_value(service.get(child).await?).unwrap_or_default();
+        let detail = detail.unwrap_or_default();
         match select_result_event(&detail, park.result_step.as_deref()) {
             Some(ev) => {
                 let payload = extract_child_payload(ev.get("result").unwrap_or(&Value::Null));
@@ -525,6 +580,22 @@ mod tests {
         let r = json!({"status": "COMPLETED", "context": {"call_index": 0, "command_id": "c",
             "result": {"status": "success", "context": {"data": {"answer": 42}, "status": "success"}}}});
         assert_eq!(extract_child_payload(&r), json!({"answer": 42}));
+    }
+
+    #[test]
+    fn a_result_is_ready_only_once_its_call_done_is_in() {
+        let early = json!({"events": [
+            {"event_type": "command.completed", "node_name": "start", "result": {"context": {"status": "success"}}},
+            {"event_type": "playbook.completed", "node_name": "playbook"}
+        ]});
+        assert!(!result_ready(&early, Some("start")), "terminal before call.done: not ready");
+        assert!(!result_ready(&early, None));
+        let late = json!({"events": [
+            {"event_type": "call.done", "node_name": "start", "result": {"context": {"data": {"leaf": "v2"}}}}
+        ]});
+        assert!(result_ready(&late, Some("start")));
+        assert!(result_ready(&late, None));
+        assert!(!result_ready(&late, Some("end")));
     }
 
     #[test]
