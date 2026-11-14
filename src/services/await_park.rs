@@ -130,11 +130,23 @@ fn step_is_single_playbook_tool(playbook: &crate::playbook::types::Playbook, ste
 
 /// Register a park. Returns `Ok(true)` when the parent may park (the tool then
 /// frees its slot), `Ok(false)` when it must wait as today.
+/// The entry step is dispatched at `/api/execute` without a `step.enter`. On a
+/// server-side state builder (kind A, 2026-11-14) a parked `command.completed`
+/// on it read as "never started" and the orchestrator RE-ISSUED the step 63
+/// times, each issue spawning another child. (The off-server builder prod runs
+/// resumed it correctly.) Never park the entry step; it waits on its slot as
+/// today.
+pub const NEVER_PARK_STEP: &str = "start";
+
 pub async fn register(
     state: &AppState,
     child_execution_id: i64,
     park: AwaitPark,
 ) -> AppResult<bool> {
+    if park.parent_step == NEVER_PARK_STEP {
+        crate::metrics::record_await_park("refused_entry_step");
+        return Ok(false);
+    }
     // The parent's step must be a single `kind: playbook` tool.
     let parent_catalog = state
         .exec_descriptors
@@ -513,6 +525,13 @@ mod tests {
         let r = json!({"status": "COMPLETED", "context": {"call_index": 0, "command_id": "c",
             "result": {"status": "success", "context": {"data": {"answer": 42}, "status": "success"}}}});
         assert_eq!(extract_child_payload(&r), json!({"answer": 42}));
+    }
+
+    #[test]
+    fn the_entry_step_is_never_parked() {
+        // register() refuses it before any I/O; pin the name so a rename of
+        // the entry step cannot silently re-open the re-issue loop.
+        assert_eq!(NEVER_PARK_STEP, "start");
     }
 
     #[test]
