@@ -72,6 +72,17 @@ pub struct AdvanceRequest {
     /// `abort`: why the worker could not drive (a metric label).
     #[serde(default)]
     pub reason: Option<String>,
+    /// `apply`: hand the first issued command whose subject matches
+    /// `subject_filter` to `worker_id` (claimed for it, never published).
+    #[serde(default)]
+    pub handoff: Option<Handoff>,
+}
+
+/// See [`AdvanceRequest::handoff`].
+#[derive(Debug, Deserialize)]
+pub struct Handoff {
+    pub worker_id: String,
+    pub subject_filter: String,
 }
 
 /// Response body.
@@ -96,6 +107,10 @@ pub struct AdvanceResponse {
     /// `applied`: the commands this application issued.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub issued: Vec<IssuedCommand>,
+    /// `applied`: the command handed to the driving worker, already claimed
+    /// for it (the `/api/commands/{id}/claim` response body).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_command: Option<serde_json::Value>,
 }
 
 fn de_i64<'de, D: serde::Deserializer<'de>>(d: D) -> Result<i64, D::Error> {
@@ -128,7 +143,13 @@ pub async fn advance(
 ) -> AppResult<Json<AdvanceResponse>> {
     match req.phase.as_str() {
         "begin" => begin(&state, execution_id, req.trigger_event_id).await,
-        "apply" => apply(&state, execution_id, req.trigger_event_id, &req.payload).await,
+        "apply" => {
+            let handoff = req
+                .handoff
+                .map(|h| (h.worker_id, h.subject_filter))
+                .filter(|(w, f)| !w.is_empty() && !f.is_empty());
+            apply(&state, execution_id, req.trigger_event_id, &req.payload, handoff).await
+        }
         "abort" => {
             abort(
                 &state,
@@ -274,6 +295,7 @@ async fn apply(
     execution_id: i64,
     trigger_event_id: i64,
     payload: &serde_json::Value,
+    handoff: Option<(String, String)>,
 ) -> AppResult<Json<AdvanceResponse>> {
     if state.local_drive.phase(trigger_event_id) != Some(crate::state::LocalDrivePhase::Driving) {
         // Not ours to apply (never began, or already finished). The guard is not
@@ -282,8 +304,8 @@ async fn apply(
         return Ok(fallback("not_driving"));
     }
     state.local_drive.done(trigger_event_id, execution_id);
-    let (res, issued) =
-        crate::handlers::execute::collect_issued_commands(crate::handlers::events::apply_worker_orchestration(
+    let (res, issued, next_command) =
+        crate::handlers::execute::collect_issued_commands(handoff, crate::handlers::events::apply_worker_orchestration(
             state,
             execution_id,
             trigger_event_id,
@@ -303,6 +325,7 @@ async fn apply(
                 status: "applied".into(),
                 commands: Some(commands),
                 issued,
+                next_command,
                 ..Default::default()
             }))
         }
