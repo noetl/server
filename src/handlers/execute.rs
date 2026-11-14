@@ -1554,6 +1554,45 @@ pub(crate) async fn persist_engine_commands_batch(
     Ok(prepared.len() as i32)
 }
 
+/// A command an orchestration application issued (noetl/ai-meta#558).  Collected
+/// only inside [`collect_issued_commands`]; the worker-local drive's `apply`
+/// returns them so the driving worker can claim a same-pool one directly.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct IssuedCommand {
+    pub event_id: i64,
+    pub command_id: String,
+    pub step: String,
+    /// The command-bus subject the notification was published on.
+    pub subject: String,
+    /// The pool segment of that subject (`shared`, `system`, …).
+    pub pool: String,
+}
+
+tokio::task_local! {
+    static ISSUED_COMMANDS: std::cell::RefCell<Vec<IssuedCommand>>;
+}
+
+fn record_issued_command(cmd: IssuedCommand) {
+    let _ = ISSUED_COMMANDS.try_with(|v| v.borrow_mut().push(cmd));
+}
+
+/// Run `fut` and return, alongside its output, every command whose notification
+/// it published (noetl/ai-meta#558).  The collector is task-local, so only
+/// publishes made on this task — the `apply` itself, not a re-drive it spawns —
+/// are captured.
+pub(crate) async fn collect_issued_commands<F, T>(fut: F) -> (T, Vec<IssuedCommand>)
+where
+    F: std::future::Future<Output = T>,
+{
+    ISSUED_COMMANDS
+        .scope(std::cell::RefCell::new(Vec::new()), async move {
+            let out = fut.await;
+            let issued = ISSUED_COMMANDS.with(|v| std::mem::take(&mut *v.borrow_mut()));
+            (out, issued)
+        })
+        .await
+}
+
 /// Dispatch the worker-driven orchestrate "meta" command (noetl/ai-meta#108
 /// slice 3): issue `system/orchestrate` (entry `run_state`) as a single wasm
 /// command under the reserved `__orchestrate__` step, carrying the serialized
@@ -2027,6 +2066,18 @@ async fn publish_command_notification(
     }
     let payload = serde_json::to_vec(&notification)
         .map_err(|e| AppError::Internal(format!("Serialize command notification: {e}")))?;
+
+    // noetl/ai-meta#558: inside an `advance/apply` the worker-local drive wants
+    // the commands this application issued, so it can claim a same-pool one
+    // directly instead of waiting for the feed. Outside that scope this is a
+    // no-op (the task-local is unset).
+    record_issued_command(IssuedCommand {
+        event_id,
+        command_id: command_id.to_string(),
+        step: step.to_string(),
+        subject: subject.clone(),
+        pool: pool_segment.to_string(),
+    });
 
     // --- EHDB command bus (L1 T4) --------------------------------------------
     // In `ehdb`/`shadow` mode, mirror the command onto the per-shard EHDB writer

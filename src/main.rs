@@ -352,8 +352,24 @@ fn build_router(
         .route(
             "/api/commands/{event_id}/claim",
             post(handlers::events::claim_command),
+        );
+    // noetl/ai-meta#558: worker-local drive. Mounted only with the flag on, so a
+    // worker probing it against a flag-off server gets 404 and stays on today's path.
+    let execution_routes = if state.config.server_advance_api {
+        tracing::warn!(
+            tail_cap = state.config.local_drive_tail_cap,
+            claim_ttl_ms = state.config.local_drive_claim_ttl_ms,
+            "NOETL_SERVER_ADVANCE_API=ON — workers may drive their own next step \
+             (POST /api/executions/{{id}}/advance, noetl/ai-meta#558)"
+        );
+        execution_routes.route(
+            "/api/executions/{execution_id}/advance",
+            post(handlers::advance::advance),
         )
-        .with_state(state.clone());
+    } else {
+        execution_routes
+    };
+    let execution_routes = execution_routes.with_state(state.clone());
 
     // Subscription lifecycle routes (noetl/ai-meta#90 Phase 2).  A
     // `kind: Subscription` is registered + activated here; the continuous

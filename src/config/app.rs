@@ -105,6 +105,46 @@ pub struct AppConfig {
     #[serde(default)]
     pub orch_retrigger_on_clear: bool,
 
+    /// Worker-local drive: the advance API (noetl/ai-meta#558, Stage 1 of the
+    /// latency-reduction plan, RFC #556).  Envy maps `NOETL_SERVER_ADVANCE_API`.
+    ///
+    /// When true, a worker that completed a step may drive the execution's
+    /// next step ITSELF instead of the server dispatching `__orchestrate__` to
+    /// the system pool: it marks its `command.completed` with the
+    /// `x-noetl-local-drive` header, the server suppresses the normal trigger
+    /// for that event, and the worker calls `POST /api/executions/{id}/advance`
+    /// (`begin` → the same drive input the system pool would get; `apply` →
+    /// the same `apply_worker_orchestration` the system pool's `call.done`
+    /// reaches; `abort` → today's dispatch).  Every refusal falls back to the
+    /// normal path, so the worst case is today's behaviour plus one round trip.
+    ///
+    /// **Default false.** With the flag off the route is not mounted, the
+    /// header is ignored, and nothing else changes.  **Revert:** set to `false`.
+    /// Requires `NOETL_STATE_BUILDER=offserver` + publish-only ingest (the
+    /// stateless off-server drive); on any other topology `begin` falls back.
+    #[serde(default)]
+    pub server_advance_api: bool,
+
+    /// Event-tail ring depth kept per execution for the worker-local drive
+    /// (noetl/ai-meta#558).  Envy maps `NOETL_LOCAL_DRIVE_TAIL_CAP`.  The ring
+    /// is the linked `noetl_events` payloads the server published; `begin`
+    /// hands it to the driving worker, whose execution-scoped index walks the
+    /// spine from `expected_head`.  An execution longer than the ring can still
+    /// drive locally on a worker that has been chaining it (its index holds the
+    /// head of the spine); a worker that cannot complete the walk aborts to the
+    /// normal path.  Only read when `server_advance_api` is on.  Default 256.
+    #[serde(default = "default_local_drive_tail_cap")]
+    pub local_drive_tail_cap: usize,
+
+    /// How long a `command.completed` marked for local drive suppresses the
+    /// normal trigger before `begin` arrives (noetl/ai-meta#558).  Envy maps
+    /// `NOETL_LOCAL_DRIVE_CLAIM_TTL_MS`.  Past it the claim lapses and the next
+    /// trigger (or the 8 s reconcile poller) drives normally, so a worker that
+    /// dies between its completion and `begin` costs at most one poll interval.
+    /// Default 5000.
+    #[serde(default = "default_local_drive_claim_ttl_ms")]
+    pub local_drive_claim_ttl_ms: u64,
+
     /// CQRS write-path cutover (noetl/ai-meta#103 phase 2d-3).  When true, every
     /// server-originated `noetl.event` write goes through the `emit_event`
     /// chokepoint as a **publish** to the `noetl_events` JetStream stream
@@ -1072,6 +1112,14 @@ fn default_nonconvergence_sweep_scan_limit() -> i64 {
     500
 }
 
+fn default_local_drive_tail_cap() -> usize {
+    256
+}
+
+fn default_local_drive_claim_ttl_ms() -> u64 {
+    5_000
+}
+
 fn default_offserver_tail_cap() -> usize {
     // 64 events — far more than the 1–3 event tail between consecutive hops, so a
     // worker index that fell a few hops behind still completes from the attached
@@ -1138,6 +1186,10 @@ impl Default for AppConfig {
             orchestrate_plugin_drive: true,
             // noetl/ai-meta#155: opt-in; 8s-poller recovery stays the default.
             orch_retrigger_on_clear: false,
+            // noetl/ai-meta#558: worker-local drive is opt-in.
+            server_advance_api: false,
+            local_drive_tail_cap: default_local_drive_tail_cap(),
+            local_drive_claim_ttl_ms: default_local_drive_claim_ttl_ms(),
             // noetl/ai-meta#103 2d-3: synchronous INSERT path by default.
             event_ingest_publish_only: false,
             auto_recreate_runtime: true,

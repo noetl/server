@@ -492,6 +492,33 @@ pub async fn handle_event(
     let event_type_for_metrics = request.0.event_type.clone();
     let started_at = std::time::Instant::now();
 
+    // noetl/ai-meta#558: the completing worker announces it will drive this
+    // execution's next step itself. Registered BEFORE ingest so the trigger the
+    // ingest (or, under publish-only, the materializer) fires for this event is
+    // suppressed. The marker rides a header, not the event body, so the event
+    // log is identical with the flag on and off.
+    if state.0.config.server_advance_api
+        && request.0.event_type == "command.completed"
+        && request.0.step != noetl_orchestrate_core::state::WorkflowState::ORCHESTRATE_META_STEP
+        && !state.0.affinity.active()
+        && headers
+            .get(LOCAL_DRIVE_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    {
+        if let (Ok(execution_id), Some(Ok(event_id))) = (
+            request.0.execution_id.parse::<i64>(),
+            request.0.event_id.as_deref().map(str::parse::<i64>),
+        ) {
+            state.0.local_drive.claim(
+                event_id,
+                execution_id,
+                std::time::Duration::from_millis(state.0.config.local_drive_claim_ttl_ms),
+            );
+            crate::metrics::record_orchestrate_drive("local_drive_claimed");
+        }
+    }
+
     let result = handle_event_inner(state, request).await;
 
     let status_label = if result.is_ok() { "ok" } else { "error" };
@@ -2884,8 +2911,29 @@ pub(crate) async fn trigger_orchestrator(
     execution_id: i64,
     trigger_event_id: i64,
 ) -> AppResult<i32> {
+    // noetl/ai-meta#558: the worker that produced this completion is driving it
+    // (or has). Only event-specific triggers are suppressed; the reconcile
+    // poller (`trigger_orchestrator_inner` with `i64::MAX`) is untouched and
+    // stays the safety net for a worker that dies mid-drive.
+    if state.config.server_advance_api
+        && state.local_drive.suppresses(
+            trigger_event_id,
+            std::time::Duration::from_millis(state.config.local_drive_claim_ttl_ms),
+        )
+    {
+        crate::metrics::record_orchestrate_drive("local_drive_suppressed");
+        debug!(
+            execution_id,
+            trigger_event_id, "trigger suppressed: the completing worker drives this step"
+        );
+        return Ok(0);
+    }
     trigger_orchestrator_inner(state, execution_id, trigger_event_id, false).await
 }
+
+/// Request header a worker sets on its `command.completed` when it will drive
+/// the next step itself (noetl/ai-meta#558).
+pub const LOCAL_DRIVE_HEADER: &str = "x-noetl-local-drive";
 
 /// Background reconcile poller (noetl/ai-meta#101 block b — small-tier
 /// resilience).  Guarantees the orchestrator never permanently stalls.
@@ -2969,7 +3017,7 @@ pub(crate) const RECONCILE_INTERVAL: std::time::Duration = std::time::Duration::
 /// occurs it is precisely the unbounded case being eliminated: a guard whose age
 /// cannot be known is one that can never be shown to be stale. It is counted
 /// separately so the impossible case is visible rather than silent.
-fn in_flight_guard_holds(cache: &crate::state::ExecOrchState) -> bool {
+pub(crate) fn in_flight_guard_holds(cache: &crate::state::ExecOrchState) -> bool {
     if !cache.orchestrate_in_flight {
         return false;
     }
@@ -2980,7 +3028,7 @@ fn in_flight_guard_holds(cache: &crate::state::ExecOrchState) -> bool {
 }
 
 /// Release an expired guard and record why, so the expiry is never silent.
-fn expire_in_flight_guard(cache: &mut crate::state::ExecOrchState, execution_id: i64) {
+pub(crate) fn expire_in_flight_guard(cache: &mut crate::state::ExecOrchState, execution_id: i64) {
     let age = cache
         .orchestrate_in_flight_since
         .map(|t| t.elapsed().as_secs())
@@ -3431,7 +3479,7 @@ async fn dispatch_offserver_stateless_drive(
 /// non-triggering straggler and therefore stopped emitting events, leaving no
 /// trigger to retry on — is reconciled and advanced.  The poller passes
 /// `trigger_event_id = i64::MAX` so the immediate-straggler shortcut is skipped.
-async fn trigger_orchestrator_inner(
+pub(crate) async fn trigger_orchestrator_inner(
     state: &AppState,
     execution_id: i64,
     trigger_event_id: i64,
@@ -4362,7 +4410,7 @@ fn decode_orchestrate_error(b64: Option<&str>) -> Option<String> {
 /// completion, then emit events + issue commands via `apply_orchestration_result`
 /// — the same emission the in-process drive uses. Always clears the per-execution
 /// in-flight guard so the next trigger can dispatch again.
-async fn apply_worker_orchestration(
+pub(crate) async fn apply_worker_orchestration(
     state: &AppState,
     execution_id: i64,
     trigger_event_id: i64,

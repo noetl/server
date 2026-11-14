@@ -124,6 +124,12 @@ pub struct AppState {
     /// [`ChainTails`].
     pub chain_tails: Arc<ChainTails>,
 
+    /// Worker-local drive claims (noetl/ai-meta#558).  A `command.completed`
+    /// the completing worker announced it will drive itself; while a claim is
+    /// live, `trigger_orchestrator` skips that trigger event.  Only populated
+    /// when `config.server_advance_api` is on.  See [`LocalDriveClaims`].
+    pub local_drive: Arc<LocalDriveClaims>,
+
     /// Execute-time descriptors for the stateless off-server drive edge (RFC
     /// #115 Phase 4 remainder, noetl/ai-meta#107 step 2).  Carries the
     /// execution-scoped, immutable facts the drive dispatch needs —
@@ -597,6 +603,115 @@ impl ChainTails {
     /// [`ChainHeads::evict`] on the terminal-event paths.
     pub fn evict(&self, execution_id: i64) {
         self.map.lock().unwrap().remove(&execution_id);
+    }
+}
+
+/// Where a worker-local drive claim stands (noetl/ai-meta#558).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalDrivePhase {
+    /// The completion arrived marked for local drive; `begin` has not.
+    Claimed,
+    /// `begin` handed the drive input to the worker; the in-flight guard is held.
+    Driving,
+    /// Applied, aborted or refused.  Kept briefly so a late trigger for the same
+    /// event (the materializer's post-write trigger under publish-only) does not
+    /// dispatch a redundant system-pool drive.
+    Done,
+}
+
+/// Worker-local drive claims, keyed by the trigger (`command.completed`)
+/// event id (noetl/ai-meta#558).
+///
+/// The table only ever SUPPRESSES a trigger; it never drives.  Every path out of
+/// it ends in either the worker's `apply` or today's dispatch:
+/// - `Claimed` suppresses for `ttl`; past that it lapses and the trigger runs.
+/// - `Driving` suppresses until the entry is moved on; the orchestrate in-flight
+///   guard `begin` took bounds it (its 40 s stale expiry + the reconcile poller).
+/// - `Done` suppresses for [`LocalDriveClaims::DONE_TTL`], then is collected.
+#[derive(Default)]
+pub struct LocalDriveClaims {
+    map: std::sync::Mutex<std::collections::HashMap<i64, (i64, LocalDrivePhase, std::time::Instant)>>,
+}
+
+impl LocalDriveClaims {
+    /// How long a finished entry keeps suppressing a late trigger.
+    pub const DONE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+    /// Entries are swept on insert once the table is at least this large.
+    const SWEEP_AT: usize = 1024;
+
+    /// Record that `trigger_event_id` (a `command.completed` of `execution_id`)
+    /// will be driven by the worker that produced it.
+    pub fn claim(&self, trigger_event_id: i64, execution_id: i64, ttl: std::time::Duration) {
+        let mut map = self.map.lock().unwrap();
+        if map.len() >= Self::SWEEP_AT {
+            Self::sweep(&mut map, ttl);
+        }
+        map.insert(
+            trigger_event_id,
+            (execution_id, LocalDrivePhase::Claimed, std::time::Instant::now()),
+        );
+    }
+
+    /// True when a trigger for this event must be skipped.
+    pub fn suppresses(&self, trigger_event_id: i64, ttl: std::time::Duration) -> bool {
+        let map = self.map.lock().unwrap();
+        match map.get(&trigger_event_id) {
+            Some((_, LocalDrivePhase::Claimed, at)) => at.elapsed() < ttl,
+            Some((_, LocalDrivePhase::Driving, _)) => true,
+            Some((_, LocalDrivePhase::Done, at)) => at.elapsed() < Self::DONE_TTL,
+            None => false,
+        }
+    }
+
+    /// `begin`: move a live `Claimed` entry to `Driving`.  Returns the claim's
+    /// execution id, or `None` when there is no claim to take (never claimed,
+    /// already taken, or done) — the caller then falls back.
+    pub fn begin(&self, trigger_event_id: i64) -> Option<i64> {
+        let mut map = self.map.lock().unwrap();
+        match map.get_mut(&trigger_event_id) {
+            Some(entry) if entry.1 == LocalDrivePhase::Claimed => {
+                entry.1 = LocalDrivePhase::Driving;
+                entry.2 = std::time::Instant::now();
+                Some(entry.0)
+            }
+            _ => None,
+        }
+    }
+
+    /// The phase of an entry, if any (tests + `apply` validation).
+    pub fn phase(&self, trigger_event_id: i64) -> Option<LocalDrivePhase> {
+        self.map.lock().unwrap().get(&trigger_event_id).map(|e| e.1)
+    }
+
+    /// Mark an entry finished (applied, aborted or refused).
+    pub fn done(&self, trigger_event_id: i64, execution_id: i64) {
+        self.map.lock().unwrap().insert(
+            trigger_event_id,
+            (execution_id, LocalDrivePhase::Done, std::time::Instant::now()),
+        );
+    }
+
+    fn sweep(
+        map: &mut std::collections::HashMap<i64, (i64, LocalDrivePhase, std::time::Instant)>,
+        ttl: std::time::Duration,
+    ) {
+        map.retain(|_, (_, phase, at)| match phase {
+            LocalDrivePhase::Claimed => at.elapsed() < ttl,
+            // A Driving entry older than the in-flight guard's stale window is
+            // abandoned (the guard itself has expired by then).
+            LocalDrivePhase::Driving => at.elapsed() < std::time::Duration::from_secs(120),
+            LocalDrivePhase::Done => at.elapsed() < Self::DONE_TTL,
+        });
+    }
+
+    /// Entry count (metrics / tests).
+    pub fn len(&self) -> usize {
+        self.map.lock().unwrap().len()
+    }
+
+    /// Whether the table is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 
@@ -1283,6 +1398,7 @@ impl AppState {
             chain_source,
             chain_heads: Arc::new(ChainHeads::with_coherence(coherence.clone())),
             chain_tails: Arc::new(ChainTails::default()),
+            local_drive: Arc::new(LocalDriveClaims::default()),
             exec_descriptors: Arc::new(ExecDescriptors::with_coherence(coherence)),
             finalized_guard: Arc::new(FinalizedGuard::default()),
         }
@@ -1311,7 +1427,9 @@ impl AppState {
 
 #[cfg(test)]
 mod tests {
-    use super::{ChainHeads, ChainTails, ExecDescriptors, FinalizedGuard};
+    use super::{
+        ChainHeads, ChainTails, ExecDescriptors, FinalizedGuard, LocalDriveClaims, LocalDrivePhase,
+    };
 
     // Note: Full tests require a database connection
     // These are placeholder tests for documentation
@@ -1324,6 +1442,34 @@ mod tests {
 
     // noetl/ai-meta#156: the per-execution event-tail ring is a bounded,
     // oldest-first FIFO, snapshot-able, evicted on terminal.
+    #[test]
+    fn local_drive_claims_lifecycle() {
+        let c = LocalDriveClaims::default();
+        let ttl = std::time::Duration::from_secs(5);
+        assert!(!c.suppresses(1, ttl), "an unknown event never suppresses");
+        assert_eq!(c.begin(1), None, "begin without a claim falls back");
+        c.claim(1, 77, ttl);
+        assert!(c.suppresses(1, ttl), "a live claim suppresses the trigger");
+        assert_eq!(c.begin(1), Some(77));
+        assert_eq!(c.begin(1), None, "a claim is taken once");
+        assert!(c.suppresses(1, ttl), "a driving entry suppresses");
+        c.done(1, 77);
+        assert!(c.suppresses(1, ttl), "a done entry suppresses a late trigger");
+        assert_eq!(c.phase(1), Some(LocalDrivePhase::Done));
+    }
+
+    #[test]
+    fn local_drive_claim_lapses_after_ttl() {
+        let c = LocalDriveClaims::default();
+        let ttl = std::time::Duration::from_millis(1);
+        c.claim(9, 1, ttl);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert!(!c.suppresses(9, ttl), "a lapsed claim lets the trigger run");
+        // begin on a lapsed claim still takes it: the worker is alive and asking,
+        // and the in-flight guard serialises it against any trigger that ran.
+        assert_eq!(c.begin(9), Some(1));
+    }
+
     #[test]
     fn chain_tails_ring_is_bounded_fifo() {
         let tails = ChainTails::default();
