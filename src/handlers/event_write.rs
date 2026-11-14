@@ -558,16 +558,26 @@ pub async fn emit_events(state: &AppState, pool: &DbPool, rows: &[EventRow]) -> 
                     );
                 }
                 crate::metrics::record_event_published(&row.event_type);
-                if state.config.offserver_attach_tail {
+                if state.config.offserver_attach_tail || state.config.server_advance_api {
                     tail_payloads.push(stream_json);
                 }
             }
-            if state.config.offserver_attach_tail && !tail_payloads.is_empty() {
-                state.chain_tails.push(
-                    rows[0].execution_id,
-                    &tail_payloads,
-                    state.config.offserver_tail_cap,
-                );
+            if (state.config.offserver_attach_tail || state.config.server_advance_api)
+                && !tail_payloads.is_empty()
+            {
+                // noetl/ai-meta#558: the worker-local drive reads the same ring,
+                // deeper — `begin` hands it to the worker as its spine.
+                let cap = if state.config.server_advance_api {
+                    state
+                        .config
+                        .offserver_tail_cap
+                        .max(state.config.local_drive_tail_cap)
+                } else {
+                    state.config.offserver_tail_cap
+                };
+                state
+                    .chain_tails
+                    .push(rows[0].execution_id, &tail_payloads, cap);
             }
             return Ok(());
         }

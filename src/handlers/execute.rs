@@ -1554,6 +1554,110 @@ pub(crate) async fn persist_engine_commands_batch(
     Ok(prepared.len() as i32)
 }
 
+/// A command an orchestration application issued (noetl/ai-meta#558).  Collected
+/// only inside [`collect_issued_commands`]; the worker-local drive's `apply`
+/// returns them so the driving worker can claim a same-pool one directly.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct IssuedCommand {
+    pub event_id: i64,
+    pub command_id: String,
+    pub step: String,
+    /// The command-bus subject the notification was published on.
+    pub subject: String,
+    /// The pool segment of that subject (`shared`, `system`, …).
+    pub pool: String,
+}
+
+/// What one `apply` collects (noetl/ai-meta#558).
+#[derive(Default)]
+struct Collected {
+    issued: Vec<IssuedCommand>,
+    /// (worker id, subject filter) to hand the first matching command to.
+    handoff: Option<(String, String)>,
+    /// The claimed command handed off (the claim response body).
+    handed: Option<serde_json::Value>,
+}
+
+tokio::task_local! {
+    static ISSUED_COMMANDS: std::cell::RefCell<Collected>;
+}
+
+fn record_issued_command(cmd: IssuedCommand) {
+    let _ = ISSUED_COMMANDS.try_with(|v| v.borrow_mut().issued.push(cmd));
+}
+
+/// The handoff worker id when `subject` matches its filter and nothing was
+/// handed yet (consumes the handoff).
+fn take_handoff_for(subject: &str) -> Option<String> {
+    ISSUED_COMMANDS
+        .try_with(|v| {
+            let mut c = v.borrow_mut();
+            if c.handed.is_some() {
+                return None;
+            }
+            match c.handoff.as_ref() {
+                Some((_, filter)) if subject_matches(filter, subject) => {
+                    c.handoff.take().map(|(w, _)| w)
+                }
+                _ => None,
+            }
+        })
+        .ok()
+        .flatten()
+}
+
+fn record_handoff(cmd: serde_json::Value) {
+    let _ = ISSUED_COMMANDS.try_with(|v| v.borrow_mut().handed = Some(cmd));
+}
+
+/// NATS-style subject match: `*` one token, `>` the rest (one or more).
+pub(crate) fn subject_matches(filter: &str, subject: &str) -> bool {
+    let f: Vec<&str> = filter.split('.').collect();
+    let s: Vec<&str> = subject.split('.').collect();
+    for (i, tok) in f.iter().enumerate() {
+        match *tok {
+            ">" => return s.len() > i,
+            "*" => {
+                if i >= s.len() {
+                    return false;
+                }
+            }
+            t => {
+                if s.get(i) != Some(&t) {
+                    return false;
+                }
+            }
+        }
+    }
+    f.len() == s.len()
+}
+
+/// Run `fut` and return, alongside its output, every command whose notification
+/// it published (noetl/ai-meta#558).  The collector is task-local, so only
+/// publishes made on this task — the `apply` itself, not a re-drive it spawns —
+/// are captured.
+pub(crate) async fn collect_issued_commands<F, T>(
+    handoff: Option<(String, String)>,
+    fut: F,
+) -> (T, Vec<IssuedCommand>, Option<serde_json::Value>)
+where
+    F: std::future::Future<Output = T>,
+{
+    ISSUED_COMMANDS
+        .scope(
+            std::cell::RefCell::new(Collected {
+                handoff,
+                ..Default::default()
+            }),
+            async move {
+                let out = fut.await;
+                let c = ISSUED_COMMANDS.with(|v| std::mem::take(&mut *v.borrow_mut()));
+                (out, c.issued, c.handed)
+            },
+        )
+        .await
+}
+
 /// Dispatch the worker-driven orchestrate "meta" command (noetl/ai-meta#108
 /// slice 3): issue `system/orchestrate` (entry `run_state`) as a single wasm
 /// command under the reserved `__orchestrate__` step, carrying the serialized
@@ -2027,6 +2131,48 @@ async fn publish_command_notification(
     }
     let payload = serde_json::to_vec(&notification)
         .map_err(|e| AppError::Internal(format!("Serialize command notification: {e}")))?;
+
+    // noetl/ai-meta#558: inside an `advance/apply` the worker-local drive wants
+    // the commands this application issued, so it can claim a same-pool one
+    // directly instead of waiting for the feed. Outside that scope this is a
+    // no-op (the task-local is unset).
+    record_issued_command(IssuedCommand {
+        event_id,
+        command_id: command_id.to_string(),
+        step: step.to_string(),
+        subject: subject.clone(),
+        pool: pool_segment.to_string(),
+    });
+
+    // noetl/ai-meta#558: hand the first same-pool command straight to the
+    // worker that drove this step. Claimed for it here — after the command row
+    // and its `command.issued` exist, before any notification — so the feed
+    // never offers it to anyone (a feed delivery would beat the driver's own
+    // claim by milliseconds and break the chain). A failed claim publishes as
+    // usual, so a command is never left neither published nor claimed. If the
+    // driver dies after this, the command is claimed by a dead worker: exactly
+    // today's crash shape, recovered by the orphan sweep.
+    if let Some(worker_id) = take_handoff_for(&subject) {
+        let claimed = crate::handlers::events::claim_command(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(event_id),
+            axum::Json(crate::handlers::events::ClaimRequest {
+                worker_id: worker_id.clone(),
+            }),
+        )
+        .await;
+        match claimed {
+            Ok(axum::Json(cmd)) => {
+                record_handoff(serde_json::to_value(&cmd).unwrap_or_default());
+                crate::metrics::record_orchestrate_drive("local_drive_handoff");
+                return Ok(());
+            }
+            Err(e) => {
+                tracing::warn!(execution_id, event_id, %e, "local drive handoff claim failed; publishing to the feed");
+                crate::metrics::record_orchestrate_drive("local_drive_handoff_failed");
+            }
+        }
+    }
 
     // --- EHDB command bus (L1 T4) --------------------------------------------
     // In `ehdb`/`shadow` mode, mirror the command onto the per-shard EHDB writer
