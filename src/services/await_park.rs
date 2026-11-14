@@ -130,7 +130,11 @@ fn step_is_single_playbook_tool(playbook: &crate::playbook::types::Playbook, ste
 
 /// Register a park. Returns `Ok(true)` when the parent may park (the tool then
 /// frees its slot), `Ok(false)` when it must wait as today.
-pub async fn register(state: &AppState, child_execution_id: i64, park: AwaitPark) -> AppResult<bool> {
+pub async fn register(
+    state: &AppState,
+    child_execution_id: i64,
+    park: AwaitPark,
+) -> AppResult<bool> {
     // The parent's step must be a single `kind: playbook` tool.
     let parent_catalog = state
         .exec_descriptors
@@ -239,13 +243,18 @@ async fn sweep(state: &AppState) -> AppResult<()> {
     .fetch_all(state.pools.cluster())
     .await?;
     for (child, parent, step, cmd, result_step, expired) in rows {
-        mem().lock().unwrap().open.entry(child).or_insert(AwaitPark {
-            parent_execution_id: parent,
-            parent_step: step,
-            parent_command_id: cmd,
-            result_step,
-            timeout_secs: None,
-        });
+        mem()
+            .lock()
+            .unwrap()
+            .open
+            .entry(child)
+            .or_insert(AwaitPark {
+                parent_execution_id: parent,
+                parent_step: step,
+                parent_command_id: cmd,
+                result_step,
+                timeout_secs: None,
+            });
         if let Err(e) = try_resolve(state, child, expired).await {
             debug!(child, %e, "await-park: sweep resolve deferred");
         }
@@ -271,13 +280,19 @@ async fn try_resolve(state: &AppState, child: i64, expired: bool) -> AppResult<(
     };
     let terminal = status
         .as_ref()
-        .map(|s| matches!(s.status.as_str(), "COMPLETED" | "FAILED" | "CANCELLED") || s.is_cancelled)
+        .map(|s| {
+            matches!(s.status.as_str(), "COMPLETED" | "FAILED" | "CANCELLED") || s.is_cancelled
+        })
         .unwrap_or(false);
     if !terminal && !expired {
         return Ok(());
     }
     // The parent's parked completion must be in the log first.
-    let seen = mem().lock().unwrap().parked_seen.contains(&park.parent_command_id)
+    let seen = mem()
+        .lock()
+        .unwrap()
+        .parked_seen
+        .contains(&park.parent_command_id)
         || parked_completion_in_log(state, &park).await?;
     if !seen {
         if terminal {
@@ -290,7 +305,10 @@ async fn try_resolve(state: &AppState, child: i64, expired: bool) -> AppResult<(
     let outcome_label = if expired && !terminal {
         "timeout".to_string()
     } else {
-        status.as_ref().map(|s| s.status.to_ascii_lowercase()).unwrap_or_default()
+        status
+            .as_ref()
+            .map(|s| s.status.to_ascii_lowercase())
+            .unwrap_or_default()
     };
     let claimed: Option<(i64,)> = sqlx::query_as(
         "UPDATE noetl.execution_await_park SET resolved_at = now(), outcome = $2 \
@@ -338,7 +356,10 @@ async fn try_resolve(state: &AppState, child: i64, expired: bool) -> AppResult<(
         let reason = if outcome_label == "timeout" {
             format!("child playbook {child} did not finish before the await timeout")
         } else {
-            format!("child execution {child} {}", outcome_label.to_ascii_uppercase())
+            format!(
+                "child execution {child} {}",
+                outcome_label.to_ascii_uppercase()
+            )
         };
         (
             "FAILED",
@@ -403,7 +424,8 @@ async fn parked_completion_in_log(state: &AppState, park: &AwaitPark) -> AppResu
 /// parked await returns exactly what a waiting one would.
 pub fn select_result_event<'a>(detail: &'a Value, result_step: Option<&str>) -> Option<&'a Value> {
     let events = detail.get("events").and_then(|v| v.as_array())?;
-    let is_call_done = |ev: &Value| ev.get("event_type").and_then(|v| v.as_str()) == Some("call.done");
+    let is_call_done =
+        |ev: &Value| ev.get("event_type").and_then(|v| v.as_str()) == Some("call.done");
     let has_payload = |ev: &Value| {
         ev.get("result")
             .map(|r| !r.is_null() && extract_child_payload(r) != Value::Null)
@@ -485,7 +507,10 @@ workflow:
 "#;
         let pb = crate::playbook::parser::parse_playbook(yaml).expect("parse");
         assert!(step_is_single_playbook_tool(&pb, "h1"));
-        assert!(!step_is_single_playbook_tool(&pb, "listed"), "a tool list runs in task_sequence");
+        assert!(
+            !step_is_single_playbook_tool(&pb, "listed"),
+            "a tool list runs in task_sequence"
+        );
         assert!(!step_is_single_playbook_tool(&pb, "start"));
         assert!(!step_is_single_playbook_tool(&pb, "missing"));
     }
