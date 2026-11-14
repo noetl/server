@@ -370,10 +370,6 @@ async fn try_resolve(state: &AppState, child: i64, expired: bool) -> AppResult<(
             }}),
         )
     };
-    let result_obj = json!({
-        "status": status_label,
-        "context": {"call_index": 0, "command_id": park.parent_command_id, "result": inner},
-    });
     let parent = park.parent_execution_id;
     let catalog_id = state
         .exec_descriptors
@@ -381,26 +377,58 @@ async fn try_resolve(state: &AppState, child: i64, expired: bool) -> AppResult<(
         .await
         .map(|d| d.catalog_id)
         .unwrap_or(0);
-    let event_id = state
-        .snowflake
-        .generate()
-        .map_err(|e| AppError::Internal(format!("await-park: snowflake: {e}")))?;
-    let ev = crate::handlers::event_write::EventRow::new(
-        event_id,
-        parent,
-        catalog_id,
-        "call.done",
-        status_label,
-        chrono::Utc::now(),
-    )
-    .with_node(&park.parent_step)
-    .with_result(result_obj)
-    .with_meta(json!({"node_type": "playbook", "resumed_by": "await_park"}));
-    crate::handlers::event_write::emit_event(state, state.pools.pool_for(parent), ev).await?;
+    let pool = state.pools.pool_for(parent);
+    let mk_id = || {
+        state
+            .snowflake
+            .generate()
+            .map_err(|e| AppError::Internal(format!("await-park: snowflake: {e}")))
+    };
+    let trigger_event_id = if status_label == "COMPLETED" {
+        // The `call.done` the worker would have emitted for a successful await.
+        let event_id = mk_id()?;
+        let result_obj = json!({
+            "status": status_label,
+            "context": {"call_index": 0, "command_id": park.parent_command_id, "result": inner},
+        });
+        let ev = crate::handlers::event_write::EventRow::new(
+            event_id, parent, catalog_id, "call.done", status_label, chrono::Utc::now(),
+        )
+        .with_node(&park.parent_step)
+        .with_result(result_obj)
+        .with_meta(json!({"node_type": "playbook", "resumed_by": "await_park"}));
+        crate::handlers::event_write::emit_event(state, pool, ev).await?;
+        event_id
+    } else {
+        // A failed await is what the worker emits when the tool errors:
+        // `call.error` then `command.failed`, which fails the step (a FAILED
+        // `call.done` would let the DAG advance past it — found on kind).
+        let error = inner["context"]["error"].as_str().unwrap_or("child failed").to_string();
+        let err_id = mk_id()?;
+        let ev = crate::handlers::event_write::EventRow::new(
+            err_id, parent, catalog_id, "call.error", "FAILED", chrono::Utc::now(),
+        )
+        .with_node(&park.parent_step)
+        .with_result(json!({"status": "FAILED", "context": {
+            "command_id": park.parent_command_id, "call_index": 0, "error": error,
+            "child_execution_id": child.to_string()}}))
+        .with_meta(json!({"node_type": "playbook", "resumed_by": "await_park"}));
+        crate::handlers::event_write::emit_event(state, pool, ev).await?;
+        let failed_id = mk_id()?;
+        let ev = crate::handlers::event_write::EventRow::new(
+            failed_id, parent, catalog_id, "command.failed", "FAILED", chrono::Utc::now(),
+        )
+        .with_node(&park.parent_step)
+        .with_result(json!({"status": "FAILED", "context": {
+            "command_id": park.parent_command_id, "error": error}}))
+        .with_meta(json!({"node_type": "playbook", "resumed_by": "await_park"}));
+        crate::handlers::event_write::emit_event(state, pool, ev).await?;
+        failed_id
+    };
     crate::metrics::record_await_park(&format!("resumed_{outcome_label}"));
     info!(parent, child, step = %park.parent_step, outcome = %outcome_label, "await-park: resumed parent");
     if let Err(e) =
-        crate::handlers::events::trigger_orchestrator_inner(state, parent, event_id, false).await
+        crate::handlers::events::trigger_orchestrator_inner(state, parent, trigger_event_id, false).await
     {
         warn!(parent, %e, "await-park: drive after resume failed; reconcile re-drives");
     }
