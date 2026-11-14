@@ -56,6 +56,7 @@ pub mod db;
 pub mod ehgraph_embedded;
 pub mod engine;
 pub mod error;
+pub mod execution_wait;
 pub mod event_bus;
 pub mod handlers;
 pub mod instances;

@@ -144,6 +144,15 @@ pub struct AppConfig {
     /// Default 5000.
     #[serde(default = "default_local_drive_claim_ttl_ms")]
     pub local_drive_claim_ttl_ms: u64,
+    /// Push completion to waiters (noetl/ai-meta#559, Stage 2a of RFC #556).
+    /// Envy maps `NOETL_EXECUTION_WAIT`. When true the server serves
+    /// `GET /api/executions/{id}/wait?timeout=s`, a long poll woken when a
+    /// terminal row for the execution is written, so an awaiting `kind:
+    /// playbook` step learns of its child's completion at once instead of on
+    /// its next 2 s poll. **Default false**: the route is not mounted and the
+    /// tool keeps polling. **Revert:** set to `false`.
+    #[serde(default)]
+    pub execution_wait: bool,
 
     /// CQRS write-path cutover (noetl/ai-meta#103 phase 2d-3).  When true, every
     /// server-originated `noetl.event` write goes through the `emit_event`
@@ -1190,6 +1199,8 @@ impl Default for AppConfig {
             server_advance_api: false,
             local_drive_tail_cap: default_local_drive_tail_cap(),
             local_drive_claim_ttl_ms: default_local_drive_claim_ttl_ms(),
+            // noetl/ai-meta#559: the wait long poll is opt-in.
+            execution_wait: false,
             // noetl/ai-meta#103 2d-3: synchronous INSERT path by default.
             event_ingest_publish_only: false,
             auto_recreate_runtime: true,

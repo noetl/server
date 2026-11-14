@@ -478,6 +478,13 @@ pub async fn events_project(
 
     let (projected, duplicates, inserted) = svc::project_events(&state.db, &request.events).await?;
     info!(projected, duplicates, "events/project done");
+    // noetl/ai-meta#559: under publish-only this is where a terminal row becomes
+    // readable by `/status`; wake its waiters.
+    crate::execution_wait::notify_written(
+        inserted
+            .iter()
+            .map(|r| (r.execution_id, r.event_type.as_str())),
+    );
 
     // Mirror what this sink just wrote (noetl/ai-meta#307).
     //

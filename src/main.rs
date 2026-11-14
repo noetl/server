@@ -412,8 +412,22 @@ fn build_router(
         .route(
             "/api/executions/{execution_id}/finalize",
             post(handlers::executions::finalize),
+        );
+    // noetl/ai-meta#559: the completion long poll. Mounted only with the flag on,
+    // so a tool probing it against a flag-off server gets a plain 404 and polls.
+    let executions_routes = if state.config.execution_wait {
+        tracing::warn!(
+            "NOETL_EXECUTION_WAIT=ON — GET /api/executions/{{id}}/wait serves awaited \
+             children their completion as soon as it is written (noetl/ai-meta#559)"
+        );
+        executions_routes.route(
+            "/api/executions/{execution_id}/wait",
+            get(handlers::executions::wait),
         )
-        .with_state(execution_service.clone());
+    } else {
+        executions_routes
+    };
+    let executions_routes = executions_routes.with_state(execution_service.clone());
 
     // EHDB Data Query Interface (noetl/ai-meta#178).  Read-only query
     // API over NoETL platform read-model data under `/api/ehdb/...`.
