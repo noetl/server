@@ -148,7 +148,14 @@ pub async fn advance(
                 .handoff
                 .map(|h| (h.worker_id, h.subject_filter))
                 .filter(|(w, f)| !w.is_empty() && !f.is_empty());
-            apply(&state, execution_id, req.trigger_event_id, &req.payload, handoff).await
+            apply(
+                &state,
+                execution_id,
+                req.trigger_event_id,
+                &req.payload,
+                handoff,
+            )
+            .await
         }
         "abort" => {
             abort(
@@ -304,14 +311,16 @@ async fn apply(
         return Ok(fallback("not_driving"));
     }
     state.local_drive.done(trigger_event_id, execution_id);
-    let (res, issued, next_command) =
-        crate::handlers::execute::collect_issued_commands(handoff, crate::handlers::events::apply_worker_orchestration(
+    let (res, issued, next_command) = crate::handlers::execute::collect_issued_commands(
+        handoff,
+        crate::handlers::events::apply_worker_orchestration(
             state,
             execution_id,
             trigger_event_id,
             payload,
-        ))
-        .await;
+        ),
+    )
+    .await;
     match res {
         Ok(commands) => {
             crate::metrics::record_orchestrate_drive("local_drive_applied");
@@ -359,7 +368,10 @@ async fn abort(
         _ => "other",
     };
     crate::metrics::record_orchestrate_drive(&format!("local_drive_abort_{label}"));
-    debug!(execution_id, reason, "local drive: aborted; dispatching the normal drive");
+    debug!(
+        execution_id,
+        reason, "local drive: aborted; dispatching the normal drive"
+    );
     release_and_trigger(state, execution_id, trigger_event_id).await;
     Ok(Json(AdvanceResponse {
         status: "aborted".into(),
@@ -384,11 +396,14 @@ async fn load_playbook(
     if let Some(p) = cache.lock().unwrap().get(&catalog_id).cloned() {
         return Ok(p);
     }
-    let yaml: String = sqlx::query_scalar("SELECT content FROM noetl.catalog WHERE catalog_id = $1")
-        .bind(catalog_id)
-        .fetch_one(state.pools.cluster())
-        .await
-        .map_err(|e| AppError::Internal(format!("local drive: load playbook {catalog_id}: {e}")))?;
+    let yaml: String =
+        sqlx::query_scalar("SELECT content FROM noetl.catalog WHERE catalog_id = $1")
+            .bind(catalog_id)
+            .fetch_one(state.pools.cluster())
+            .await
+            .map_err(|e| {
+                AppError::Internal(format!("local drive: load playbook {catalog_id}: {e}"))
+            })?;
     let parsed = std::sync::Arc::new(crate::playbook::parser::parse_playbook(&yaml)?);
     let mut map = cache.lock().unwrap();
     if map.len() >= 512 {
