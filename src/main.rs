@@ -1387,6 +1387,10 @@ async fn main() -> anyhow::Result<()> {
     // non-triggering straggler, so the orchestrator never permanently stalls
     // under DB backpressure (e.g. a small Cloud SQL tier behind PgBouncer).
     handlers::events::spawn_orchestrator_reconciler(state.clone());
+    // noetl/ai-meta#561: re-drive local-drive claims whose worker went away.
+    if state.config.server_advance_api && state.config.local_drive_sweep {
+        handlers::advance::spawn_claim_sweeper(state.clone());
+    }
     // noetl/ai-meta#559 2b: resume parked awaits (wake-driven + a 5 s sweep).
     if state.config.playbook_await_park {
         tracing::warn!(
