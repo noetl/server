@@ -173,6 +173,66 @@ pub async fn advance(
 }
 
 /// Release a claim we will not drive and run today's trigger for it.
+/// Re-drive abandoned local-drive claims (noetl/ai-meta#561).
+///
+/// A worker that marked a completion for local drive and then went away (pod
+/// deleted by a rollout or a KEDA scale-down) left the server's own trigger
+/// suppressed: the claim lapsed passively and the step waited for the 8 s
+/// reconcile poller (kind churn: 11 of 400 runs stalled 2-5 s; 0 of 400 with local
+/// drive off).  Every 250 ms this takes each `Claimed` entry past
+/// `NOETL_LOCAL_DRIVE_CLAIM_TTL_MS` and each `Driving` entry past
+/// `NOETL_LOCAL_DRIVE_DRIVE_DEADLINE_MS`, marks it done (a late `begin`/`apply`
+/// from that worker is then refused, so nothing is issued twice), clears the
+/// in-flight guard an abandoned `begin` took, and drives the step the normal way.
+pub fn spawn_claim_sweeper(state: AppState) {
+    let ttl = std::time::Duration::from_millis(state.config.local_drive_claim_ttl_ms);
+    let deadline = std::time::Duration::from_millis(state.config.local_drive_drive_deadline_ms);
+    tracing::info!(
+        claim_ttl_ms = state.config.local_drive_claim_ttl_ms,
+        drive_deadline_ms = state.config.local_drive_drive_deadline_ms,
+        "local drive: abandoned-claim sweeper on (noetl/ai-meta#561)"
+    );
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tick.tick().await;
+            for (trigger, execution_id, driving) in state.local_drive.take_abandoned(ttl, deadline) {
+                if driving {
+                    let slot = state.orch_cache.entry(execution_id);
+                    let mut cache = slot.lock().await;
+                    cache.orchestrate_in_flight = false;
+                    cache.orchestrate_in_flight_since = None;
+                }
+                crate::metrics::record_orchestrate_drive(if driving {
+                    "local_drive_swept_driving"
+                } else {
+                    "local_drive_swept_claimed"
+                });
+                warn!(
+                    execution_id,
+                    trigger_event_id = trigger,
+                    driving,
+                    "local drive: claim abandoned by its worker; driving normally"
+                );
+                let st = state.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = crate::handlers::events::trigger_orchestrator_inner(
+                        &st,
+                        execution_id,
+                        trigger,
+                        false,
+                    )
+                    .await
+                    {
+                        warn!(execution_id, %e, "local drive sweep: normal trigger failed");
+                    }
+                });
+            }
+        }
+    });
+}
+
 async fn release_and_trigger(state: &AppState, execution_id: i64, trigger_event_id: i64) {
     state.local_drive.done(trigger_event_id, execution_id);
     if let Err(e) = crate::handlers::events::trigger_orchestrator_inner(

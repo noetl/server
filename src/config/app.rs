@@ -144,6 +144,20 @@ pub struct AppConfig {
     /// Default 5000.
     #[serde(default = "default_local_drive_claim_ttl_ms")]
     pub local_drive_claim_ttl_ms: u64,
+    /// Re-drive abandoned local-drive claims promptly (noetl/ai-meta#561).  Envy
+    /// maps `NOETL_LOCAL_DRIVE_SWEEP`; default true, only active with
+    /// `NOETL_SERVER_ADVANCE_API`.  Without it a claim whose worker died (rollout,
+    /// scale-down) lapses passively and waits for the 8 s reconcile poller; kind
+    /// pod churn measured 11/400 runs stalled 2-5 s.
+    #[serde(default = "default_true_sweep")]
+    pub local_drive_sweep: bool,
+    /// How long a `begin`-taken (Driving) local drive may run before the sweeper
+    /// treats it as abandoned, clears its in-flight guard and drives normally.
+    /// Envy maps `NOETL_LOCAL_DRIVE_DRIVE_DEADLINE_MS`; default 5000.  A late
+    /// `apply` from a slow-but-alive worker is then refused (`not_driving`), so a
+    /// step is never issued twice.
+    #[serde(default = "default_local_drive_drive_deadline_ms")]
+    pub local_drive_drive_deadline_ms: u64,
     /// Push completion to waiters (noetl/ai-meta#559, Stage 2a of RFC #556).
     /// Envy maps `NOETL_EXECUTION_WAIT`. When true the server serves
     /// `GET /api/executions/{id}/wait?timeout=s`, a long poll woken when a
@@ -1141,6 +1155,14 @@ fn default_local_drive_claim_ttl_ms() -> u64 {
     5_000
 }
 
+fn default_true_sweep() -> bool {
+    true
+}
+
+fn default_local_drive_drive_deadline_ms() -> u64 {
+    5_000
+}
+
 fn default_offserver_tail_cap() -> usize {
     // 64 events — far more than the 1–3 event tail between consecutive hops, so a
     // worker index that fell a few hops behind still completes from the attached
@@ -1211,6 +1233,8 @@ impl Default for AppConfig {
             server_advance_api: false,
             local_drive_tail_cap: default_local_drive_tail_cap(),
             local_drive_claim_ttl_ms: default_local_drive_claim_ttl_ms(),
+            local_drive_sweep: default_true_sweep(),
+            local_drive_drive_deadline_ms: default_local_drive_drive_deadline_ms(),
             // noetl/ai-meta#559: the wait long poll is opt-in.
             execution_wait: false,
             playbook_await_park: false,
