@@ -26,3 +26,10 @@ target
 # would have looked like infrastructure work and silently compiled the old code.
 # Removed in noetl/ai-meta#463. Ignored so it cannot come back untracked and unnoticed.
 vendor/
+
+# ⚠ Local kind-image build output: `target-kind/` (a cargo target dir) and `.g?/`
+# (per-image build contexts holding a ~30 MB noetl-control-plane binary each) were
+# tracked by accident, ~1.2 GB, and went into every source upload (Cloud Build,
+# clones). Nothing reads them from git. Untracked in chore/untrack-kind-build-output.
+target-*/
+/.g?/
