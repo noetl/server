@@ -704,6 +704,33 @@ impl LocalDriveClaims {
         });
     }
 
+    /// Take every abandoned entry (noetl/ai-meta#561): a `Claimed` older than
+    /// `claim_ttl` (the worker never called `begin`) or a `Driving` older than
+    /// `drive_deadline` (it never applied or aborted).  Each is moved to `Done`, so
+    /// a late `begin`/`apply` from that worker is refused, and returned as
+    /// `(trigger_event_id, execution_id, was_driving)` for the caller to drive.
+    pub fn take_abandoned(
+        &self,
+        claim_ttl: std::time::Duration,
+        drive_deadline: std::time::Duration,
+    ) -> Vec<(i64, i64, bool)> {
+        let mut map = self.map.lock().unwrap();
+        let mut out = Vec::new();
+        for (trigger, entry) in map.iter_mut() {
+            let abandoned = match entry.1 {
+                LocalDrivePhase::Claimed => entry.2.elapsed() >= claim_ttl,
+                LocalDrivePhase::Driving => entry.2.elapsed() >= drive_deadline,
+                LocalDrivePhase::Done => false,
+            };
+            if abandoned {
+                out.push((*trigger, entry.0, entry.1 == LocalDrivePhase::Driving));
+                entry.1 = LocalDrivePhase::Done;
+                entry.2 = std::time::Instant::now();
+            }
+        }
+        out
+    }
+
     /// Entry count (metrics / tests).
     pub fn len(&self) -> usize {
         self.map.lock().unwrap().len()
@@ -1456,6 +1483,30 @@ mod tests {
         c.done(1, 77);
         assert!(c.suppresses(1, ttl), "a done entry suppresses a late trigger");
         assert_eq!(c.phase(1), Some(LocalDrivePhase::Done));
+    }
+
+    #[test]
+    fn local_drive_take_abandoned_claimed_and_driving() {
+        let c = LocalDriveClaims::default();
+        let ttl = std::time::Duration::from_millis(1);
+        let long = std::time::Duration::from_secs(60);
+        c.claim(1, 10, ttl); // will be an abandoned Claimed
+        c.claim(2, 20, ttl);
+        assert_eq!(c.begin(2), Some(20)); // Driving
+        c.claim(3, 30, ttl);
+        c.done(3, 30); // Done: never taken
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        // Driving within its deadline is left alone; the stale claim is taken.
+        let got = c.take_abandoned(ttl, long);
+        assert_eq!(got, vec![(1, 10, false)]);
+        assert_eq!(c.phase(1), Some(LocalDrivePhase::Done));
+        assert_eq!(c.begin(1), None, "a late begin from that worker is refused");
+        // Past the drive deadline the Driving entry is taken too.
+        let mut got = c.take_abandoned(ttl, ttl);
+        got.sort();
+        assert_eq!(got, vec![(2, 20, true)]);
+        assert_eq!(c.phase(2), Some(LocalDrivePhase::Done));
+        assert!(c.take_abandoned(ttl, ttl).is_empty(), "taken once");
     }
 
     #[test]
