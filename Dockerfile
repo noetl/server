@@ -8,7 +8,7 @@ COPY . .
 RUN cargo chef prepare --recipe-path recipe.json
 
 FROM chef AS builder
-# ⚠ Copy the toolchain pin BEFORE `cargo chef cook`. The base image ships Rust
+# ⚠ Copy the toolchain pin BEFORE the dependency cook step. The base image ships Rust
 # 1.91.1, but rust-toolchain.toml pins a newer release and cargo honours that file.
 # Without this line, cook compiles every dependency with 1.91.1. Then `COPY . .`
 # brings the pin in, the app stage syncs the pinned toolchain and recompiles
