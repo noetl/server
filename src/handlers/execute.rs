@@ -129,6 +129,25 @@ impl CommandRouting {
     }
 }
 
+/// Resolve a configured path-prefix → pool route (`NOETL_POOL_ROUTES`,
+/// noetl/ai-meta#562). First matching prefix wins; malformed pairs and pool
+/// names outside `[a-z0-9_-]` are ignored; `system/` paths are never rerouted
+/// (the system pool owns orchestration). `None` → the path-derived default.
+pub(crate) fn route_pool_for_path(routes: &str, path: &str) -> Option<String> {
+    if routes.trim().is_empty() || path.starts_with("system/") {
+        return None;
+    }
+    routes.split(',').find_map(|pair| {
+        let (prefix, pool) = pair.trim().split_once('=')?;
+        let (prefix, pool) = (prefix.trim(), pool.trim());
+        let valid_pool = !pool.is_empty()
+            && pool
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-');
+        (!prefix.is_empty() && valid_pool && path.starts_with(prefix)).then(|| pool.to_string())
+    })
+}
+
 impl ExecuteRequest {
     /// Validate the request.
     pub fn validate(&self) -> Result<(), String> {
@@ -506,7 +525,11 @@ pub(crate) async fn execute_one(
         _ => None,
     };
     let routing = CommandRouting {
-        pool: request.execution_pool.clone().filter(|s| !s.is_empty()),
+        pool: request
+            .execution_pool
+            .clone()
+            .filter(|s| !s.is_empty())
+            .or_else(|| route_pool_for_path(&state.config.pool_routes, &path)),
         trace,
     };
 
@@ -2290,6 +2313,21 @@ async fn publish_command_notification(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn pool_routes_match_prefix_and_default_off() {
+        use super::route_pool_for_path as r;
+        assert_eq!(r("", "api_integration/auth0/check_playbook_access"), None);
+        let routes = "api_integration/auth0/=auth, bench/x=Bad!, =x";
+        assert_eq!(
+            r(routes, "api_integration/auth0/check_playbook_access").as_deref(),
+            Some("auth")
+        );
+        assert_eq!(r(routes, "api_integration/other/p"), None);
+        assert_eq!(r(routes, "bench/x/y"), None, "invalid pool name ignored");
+        assert_eq!(r("system/=auth", "system/orchestrate"), None, "system never rerouted");
+        assert_eq!(r("a/=one,a/b=two", "a/b/c").as_deref(), Some("one"), "first wins");
+    }
     use super::*;
     use crate::engine::commands::{CommandBuilder, IteratorMetadata};
     use crate::playbook::types::{Loop, Step, ToolDefinition, ToolKind, ToolSpec};

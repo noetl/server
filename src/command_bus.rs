@@ -359,6 +359,86 @@ impl EhdbCommandPublisher {
         .await
     }
 
+    /// Publish several records for ONE execution as a single pipelined burst
+    /// (noetl/ai-meta#561 fused ingest); returns their sort keys in order.
+    ///
+    /// Every frame is put on the one shard connection before any ack is awaited,
+    /// so the writer's committer drains them into one group commit (one fsync)
+    /// rather than paying a full round-trip + fsync per record. Order is kept:
+    /// `join_all` polls its futures in sequence on the first pass, and a
+    /// pipelined publish enqueues its frame before its first await, so frames —
+    /// and therefore writer-assigned keys — follow `items`.
+    ///
+    /// On any failure the connection is dead from that frame on (acks are FIFO),
+    /// so the first unacknowledged record and everything after it go through the
+    /// existing per-record retry loop, in order, inside the same deadline. A
+    /// record whose frame was durably written but whose ack was lost is
+    /// republished with the same `event_id` — the same at-least-once shape a
+    /// single publish's retry already has.
+    pub async fn publish_many(
+        &self,
+        execution_id: i64,
+        items: &[(i64, &[u8])],
+    ) -> Result<Vec<u64>, String> {
+        let started = std::time::Instant::now();
+        let mut seqs: Vec<u64> = Vec::with_capacity(items.len());
+        if items.len() > 1 {
+            if let Ok(router) = self.router().await {
+                let records: Vec<EventRecord> = items
+                    .iter()
+                    .map(|(event_id, payload)| {
+                        EventRecord::new(
+                            *event_id as u64,
+                            execution_id.to_string(),
+                            String::new(),
+                            String::from_utf8_lossy(payload).into_owned(),
+                        )
+                    })
+                    .collect();
+                let results =
+                    futures::future::join_all(records.iter().map(|r| router.publish(r))).await;
+                let mut failed = None;
+                for r in results {
+                    match r {
+                        Ok(seq) if failed.is_none() => seqs.push(seq),
+                        Ok(_) => {}
+                        Err(e) => {
+                            failed.get_or_insert(e);
+                        }
+                    }
+                }
+                if let Some(e) = failed {
+                    crate::metrics::record_ehdb_command_publish_failed("attempt");
+                    let mut guard = self.router.lock().await;
+                    if guard.as_ref().is_some_and(|r| Arc::ptr_eq(r, &router)) {
+                        *guard = None;
+                    }
+                    drop(guard);
+                    tracing::warn!(
+                        execution_id,
+                        acked = seqs.len(),
+                        total = items.len(),
+                        error = %e,
+                        "EHDB batched publish failed; retrying the rest one at a time"
+                    );
+                }
+            }
+        }
+        for (event_id, payload) in &items[seqs.len()..] {
+            seqs.push(
+                self.publish_until(
+                    execution_id,
+                    *event_id,
+                    payload,
+                    Self::PUBLISH_DEADLINE,
+                    started,
+                )
+                .await?,
+            );
+        }
+        Ok(seqs)
+    }
+
     /// The retry loop, parameterised by how long it may run.
     async fn publish_until(
         &self,

@@ -534,7 +534,31 @@ pub async fn emit_events(state: &AppState, pool: &DbPool, rows: &[EventRow]) -> 
             // link is already stamped above), so the attached tail is byte-identical
             // to what the worker would have drained off `noetl_events`.
             let mut tail_payloads: Vec<serde_json::Value> = Vec::new();
-            for row in rows {
+            // noetl/ai-meta#561 fused ingest: one pipelined burst for the batch.
+            let batched = state.config.event_publish_batch && rows.len() > 1;
+            if batched {
+                let mut encoded: Vec<(serde_json::Value, Vec<u8>)> = Vec::with_capacity(rows.len());
+                for row in rows {
+                    let stream_json = row.to_stream_json();
+                    let bytes = serde_json::to_vec(&stream_json).map_err(|e| {
+                        crate::error::AppError::Internal(format!("event publish encode: {e}"))
+                    })?;
+                    encoded.push((stream_json, bytes));
+                }
+                let __t = std::time::Instant::now();
+                publish_events_to_ehdb_batch(state, rows, &encoded).await?;
+                crate::metrics::record_event_ingest_phase(
+                    "emit_publish_batch",
+                    __t.elapsed().as_secs_f64(),
+                );
+                for (row, (stream_json, _)) in rows.iter().zip(encoded) {
+                    crate::metrics::record_event_published(&row.event_type);
+                    if state.config.offserver_attach_tail || state.config.server_advance_api {
+                        tail_payloads.push(stream_json);
+                    }
+                }
+            }
+            for row in rows.iter().filter(|_| !batched) {
                 let stream_json = row.to_stream_json();
                 let bytes = serde_json::to_vec(&stream_json).map_err(|e| {
                     crate::error::AppError::Internal(format!("event publish encode: {e}"))
@@ -632,6 +656,51 @@ async fn insert_rows(pool: &DbPool, rows: &[EventRow]) -> AppResult<()> {
     // terminal one (a no-op map check when nobody waits).
     crate::execution_wait::notify_written(rows.iter().map(|r| (r.execution_id, r.event_type.as_str())));
     Ok(())
+}
+
+/// [`publish_event_to_ehdb`] for a whole batch of one execution in one pipelined
+/// burst (noetl/ai-meta#561 fused ingest). Same failure semantics per mode: in
+/// `shadow` a failure is counted and swallowed; in `ehdb` it fails the caller.
+async fn publish_events_to_ehdb_batch(
+    state: &crate::state::AppState,
+    rows: &[EventRow],
+    encoded: &[(serde_json::Value, Vec<u8>)],
+) -> Result<(), crate::error::AppError> {
+    let Some(publisher) = state.ehdb_event_publisher.as_ref() else {
+        return Ok(());
+    };
+    let execution_id = rows[0].execution_id;
+    let items: Vec<(i64, &[u8])> = rows
+        .iter()
+        .zip(encoded)
+        .map(|(r, (_, b))| (r.event_id, b.as_slice()))
+        .collect();
+    match publisher.publish_events(execution_id, &items).await {
+        Ok(_) => {
+            for r in rows {
+                crate::metrics::record_ehdb_event_published(&r.event_type);
+            }
+            Ok(())
+        }
+        Err(e) => {
+            for r in rows {
+                crate::metrics::record_ehdb_event_publish_error(&r.event_type);
+            }
+            if state.event_bus_mode == crate::event_bus::EventBusMode::Shadow {
+                tracing::warn!(
+                    execution_id,
+                    rows = rows.len(),
+                    error = %e,
+                    "EHDB shadow batched event publish failed; NATS remains authoritative"
+                );
+                Ok(())
+            } else {
+                Err(crate::error::AppError::Internal(format!(
+                    "EHDB event publish: {e}"
+                )))
+            }
+        }
+    }
 }
 
 /// Mirror one event onto the EHDB events feed (noetl/ai-meta#212 L1 T3).
