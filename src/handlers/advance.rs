@@ -440,10 +440,11 @@ async fn abort(
 }
 
 /// Playbook by catalog id, cached: a `catalog_id` names immutable content (a new
-/// registration is a new id), so the parse is reusable for the life of the
-/// process. Only the local-drive path uses this cache; today's dispatch and
-/// apply are untouched.
-async fn load_playbook(
+/// registration is a new id; only `archived_at` is ever updated), so the parse
+/// is reusable for the life of the process. The local-drive path always uses
+/// it; dispatch and apply use it under `NOETL_PLAYBOOK_PARSE_CACHE`
+/// (noetl/ai-meta#561 slice 2).
+pub(crate) async fn load_playbook(
     state: &AppState,
     catalog_id: i64,
 ) -> AppResult<std::sync::Arc<crate::playbook::types::Playbook>> {
