@@ -1399,8 +1399,20 @@ pub(crate) async fn persist_engine_commands_batch(
     commands: &[crate::engine::commands::Command],
     playbook: &crate::playbook::types::Playbook,
     routing: &CommandRouting,
+    // noetl/ai-meta#561 fused ingest: orchestration events (step.enter, …) to
+    // write AHEAD of the `command.issued` rows in the same `emit_events` call.
+    // Empty unless `NOETL_EVENT_PUBLISH_BATCH`.
+    fused_events: Vec<crate::handlers::event_write::EventRow>,
 ) -> AppResult<i32> {
     if commands.is_empty() {
+        if !fused_events.is_empty() {
+            crate::handlers::event_write::emit_events(
+                state,
+                state.pools.pool_for(execution_id),
+                &fused_events,
+            )
+            .await?;
+        }
         return Ok(0);
     }
 
@@ -1522,14 +1534,21 @@ pub(crate) async fn persist_engine_commands_batch(
     // back at its fan-out origin (§4.4).  Fallback to `parent_event_id` only if
     // the chain head is somehow unset (no events yet — shouldn't happen after
     // playbook_started).
-    let issuing_event = state
-        .chain_heads
-        .head(execution_id)
-        .await
-        .unwrap_or(parent_event_id);
-    let event_rows: Vec<crate::handlers::event_write::EventRow> = prepared
-        .iter()
-        .map(|p| {
+    //
+    // Fused (noetl/ai-meta#561): the orchestration events ride in this same
+    // batch, so they have not advanced the head yet — the last of them is the
+    // head they WOULD have left, i.e. the same issuing event as unfused.
+    let issuing_event = match fused_events.last() {
+        Some(last) => last.event_id,
+        None => state
+            .chain_heads
+            .head(execution_id)
+            .await
+            .unwrap_or(parent_event_id),
+    };
+    let event_rows: Vec<crate::handlers::event_write::EventRow> = fused_events
+        .into_iter()
+        .chain(prepared.iter().map(|p| {
             crate::handlers::event_write::EventRow::new(
                 p.event_id,
                 execution_id,
@@ -1543,7 +1562,7 @@ pub(crate) async fn persist_engine_commands_batch(
             .with_context(p.cmd_context.clone())
             .with_meta(p.cmd_meta.clone())
             .with_parent_event_id(parent_event_id)
-        })
+        }))
         .collect();
     crate::handlers::event_write::emit_events(state, pool, &event_rows).await?;
 

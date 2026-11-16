@@ -154,3 +154,15 @@ fn the_batch_path_is_flag_gated_and_keeps_the_per_row_loop() {
     assert!(src.contains("state.config.event_publish_batch && rows.len() > 1"));
     assert!(src.contains("for row in rows.iter().filter(|_| !batched)"));
 }
+
+#[test]
+fn step_events_are_fused_ahead_of_command_issued_only_under_the_flag() {
+    let ev = include_str!("../src/handlers/events.rs");
+    assert!(ev.contains("let fuse = state.config.event_publish_batch;"));
+    assert!(ev.contains("if fuse {\n            fused.push(ev);\n            continue;\n        }"));
+    let ex = include_str!("../src/handlers/execute.rs");
+    // orchestration events first, then command.issued — the unfused order
+    assert!(ex.contains("let event_rows: Vec<crate::handlers::event_write::EventRow> = fused_events\n        .into_iter()\n        .chain(prepared.iter()"));
+    // the command row's issuing event is the one the unfused head would hold
+    assert!(ex.contains("let issuing_event = match fused_events.last() {\n        Some(last) => last.event_id,"));
+}
