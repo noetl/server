@@ -290,26 +290,17 @@ mod tests {
         // execution.
         let key_wrong = "noetl/env=p/execution=42/results/map_offers/0/0/1.json";
         let key_right = "noetl/env=p/execution=42/results/map/0/0/1.json";
-        assert!(
-            !like_matches(&p, key_wrong),
-            "must not match a sibling step"
-        );
+        assert!(!like_matches(&p, key_wrong), "must not match a sibling step");
         assert!(like_matches(&p, key_right));
 
         // Scoped to the execution: the same step name in another execution is a
         // different result.
-        assert!(!like_matches(
-            &p,
-            "noetl/env=p/execution=43/results/map/0/0/1.json"
-        ));
+        assert!(!like_matches(&p, "noetl/env=p/execution=43/results/map/0/0/1.json"));
 
         // Scoped to the JSON tier. Feather is decoded by the worker's
         // resolve-by-URN path, which owns the arrow decode the control plane
         // deliberately does not carry.
-        assert!(!like_matches(
-            &p,
-            "noetl/env=p/execution=42/results/map/0/0/1.feather"
-        ));
+        assert!(!like_matches(&p, "noetl/env=p/execution=42/results/map/0/0/1.feather"));
     }
 
     #[test]
@@ -319,21 +310,12 @@ mod tests {
         // `%` would match every result in the execution.
         let p = tier_step_pattern(42, "map_offers");
         assert!(p.contains("map\\_offers"), "`_` must be escaped, got {p}");
-        assert!(!like_matches(
-            &p,
-            "noetl/env=p/execution=42/results/mapXoffers/0/0/1.json"
-        ));
-        assert!(like_matches(
-            &p,
-            "noetl/env=p/execution=42/results/map_offers/0/0/1.json"
-        ));
+        assert!(!like_matches(&p, "noetl/env=p/execution=42/results/mapXoffers/0/0/1.json"));
+        assert!(like_matches(&p, "noetl/env=p/execution=42/results/map_offers/0/0/1.json"));
 
         let wild = tier_step_pattern(42, "%");
         assert!(wild.contains("\\%"), "`%` must be escaped, got {wild}");
-        assert!(!like_matches(
-            &wild,
-            "noetl/env=p/execution=42/results/anything/0/0/1.json"
-        ));
+        assert!(!like_matches(&wild, "noetl/env=p/execution=42/results/anything/0/0/1.json"));
     }
 
     /// A minimal SQL-`LIKE` evaluator for `%`, `_` and `\` escapes — enough to

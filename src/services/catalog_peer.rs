@@ -1011,11 +1011,9 @@ pub fn object_store_for(
             };
             (store, key)
         }
-        "db" | "ehdb" => {
-            return Err(bad(format!(
+        "db" | "ehdb" => return Err(bad(format!(
             "'{scheme}://' is not an object store (fetch_uri resolves it through catalog_sources)"
-        )))
-        }
+        ))),
         "file" => {
             return Err(bad(
                 "file:// sources are for the CLI and daemon, never a server".into(),

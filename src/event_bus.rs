@@ -192,10 +192,7 @@ mod tests {
         let stale = EventBusMode::from_env_value("nats").unwrap_err();
 
         assert!(unset.contains("required and unset"), "{unset}");
-        assert!(
-            typo.contains("ehbd"),
-            "the typo must be quoted back: {typo}"
-        );
+        assert!(typo.contains("ehbd"), "the typo must be quoted back: {typo}");
         assert!(
             stale.contains("no longer exists"),
             "a stale nats must say the transport is gone, not just 'invalid': {stale}"
@@ -221,18 +218,8 @@ mod tests {
     #[test]
     fn no_unrecognised_value_ever_yields_a_mode() {
         for v in [
-            "",
-            " ",
-            "ehbd",
-            "EHDB ehdb",
-            "natss",
-            "true",
-            "1",
-            "off",
-            "none",
-            "shadow-mode",
-            "ehdb;shadow",
-            "\u{0}",
+            "", " ", "ehbd", "EHDB ehdb", "natss", "true", "1", "off", "none",
+            "shadow-mode", "ehdb;shadow", "\u{0}",
         ] {
             assert!(
                 EventBusMode::from_env_value(v).is_err(),

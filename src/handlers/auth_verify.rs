@@ -400,10 +400,7 @@ fn verify_with_jwks(token: &str, jwks: &JwkSet, params: &VerifyParams) -> Result
 /// lowercase. `https://Tenant.us.auth0.com/` and `tenant.us.auth0.com` are equal.
 fn normalize_domain(raw: &str) -> String {
     let d = raw.trim();
-    let d = d
-        .strip_prefix("https://")
-        .or_else(|| d.strip_prefix("http://"))
-        .unwrap_or(d);
+    let d = d.strip_prefix("https://").or_else(|| d.strip_prefix("http://")).unwrap_or(d);
     d.trim_end_matches('/').to_ascii_lowercase()
 }
 
@@ -878,12 +875,7 @@ Dldy1Heb7ToI9gII+9ovhFfVtw==\n\
     fn each_tenant_verifies_with_its_own_jwks() {
         // Tenant A (the original) and tenant B both verify, each with its own keys.
         let a = sign(TEST_KID, &good_claims());
-        assert!(verify_with_jwks(
-            &a,
-            &jwks_with(TEST_KID),
-            &params(vec!["spa-client-id", "ranch-client-id"])
-        )
-        .is_ok());
+        assert!(verify_with_jwks(&a, &jwks_with(TEST_KID), &params(vec!["spa-client-id", "ranch-client-id"])).is_ok());
         let b = sign_b(&tenant_b_claims());
         assert!(verify_with_jwks(&b, &tenant_b_jwks(), &tenant_b_params()).is_ok());
     }
@@ -896,32 +888,17 @@ Dldy1Heb7ToI9gII+9ovhFfVtw==\n\
         assert_eq!(err.outcome, VerifyOutcome::UnknownKid);
         // Tenant A's token checked as tenant B: wrong keys too.
         let a = sign(TEST_KID, &good_claims());
-        assert_eq!(
-            verify_with_jwks(&a, &tenant_b_jwks(), &tenant_b_params())
-                .unwrap_err()
-                .outcome,
-            VerifyOutcome::UnknownKid
-        );
+        assert_eq!(verify_with_jwks(&a, &tenant_b_jwks(), &tenant_b_params()).unwrap_err().outcome, VerifyOutcome::UnknownKid);
         // Tenant A's key forging a tenant-B token under B's kid: bad signature.
         let mut header = Header::new(Algorithm::RS256);
         header.kid = Some(TENANT_B_KID.to_string());
         let key = EncodingKey::from_rsa_pem(TEST_PRIV_PEM.as_bytes()).unwrap();
         let forged = encode(&header, &tenant_b_claims(), &key).unwrap();
-        assert_eq!(
-            verify_with_jwks(&forged, &tenant_b_jwks(), &tenant_b_params())
-                .unwrap_err()
-                .outcome,
-            VerifyOutcome::BadSignature
-        );
+        assert_eq!(verify_with_jwks(&forged, &tenant_b_jwks(), &tenant_b_params()).unwrap_err().outcome, VerifyOutcome::BadSignature);
         // Tenant B's genuine token naming tenant A as issuer: B's keys, A's issuer expected -> bad claims.
         let mut c = tenant_b_claims();
         c["iss"] = serde_json::json!(format!("https://{TEST_ISSUER_DOMAIN}/"));
-        assert_eq!(
-            verify_with_jwks(&sign_b(&c), &tenant_b_jwks(), &tenant_b_params())
-                .unwrap_err()
-                .outcome,
-            VerifyOutcome::BadClaims
-        );
+        assert_eq!(verify_with_jwks(&sign_b(&c), &tenant_b_jwks(), &tenant_b_params()).unwrap_err().outcome, VerifyOutcome::BadClaims);
     }
 
     #[test]
@@ -941,39 +918,20 @@ mod trusted_domain_tests {
 
     #[test]
     fn uses_the_configured_tenant_when_the_request_names_none() {
-        assert_eq!(
-            trusted_auth0_domain(Some(TENANT), ""),
-            Ok(TENANT.to_string())
-        );
+        assert_eq!(trusted_auth0_domain(Some(TENANT), ""), Ok(TENANT.to_string()));
     }
 
     #[test]
     fn accepts_a_request_that_names_the_configured_tenant_in_any_spelling() {
-        for spelled in [
-            TENANT,
-            "https://tenant.us.auth0.com/",
-            " Tenant.US.auth0.com ",
-            "tenant.us.auth0.com/",
-        ] {
-            assert_eq!(
-                trusted_auth0_domain(Some(TENANT), spelled),
-                Ok(TENANT.to_string()),
-                "{spelled}"
-            );
+        for spelled in [TENANT, "https://tenant.us.auth0.com/", " Tenant.US.auth0.com ", "tenant.us.auth0.com/"] {
+            assert_eq!(trusted_auth0_domain(Some(TENANT), spelled), Ok(TENANT.to_string()), "{spelled}");
         }
     }
 
     #[test]
     fn refuses_a_request_that_names_a_different_tenant() {
-        for other in [
-            "other.us.auth0.com",
-            "https://other.example/",
-            "tenant.us.auth0.com.example",
-        ] {
-            assert!(
-                trusted_auth0_domain(Some(TENANT), other).is_err(),
-                "{other}"
-            );
+        for other in ["other.us.auth0.com", "https://other.example/", "tenant.us.auth0.com.example"] {
+            assert!(trusted_auth0_domain(Some(TENANT), other).is_err(), "{other}");
         }
     }
 
@@ -986,8 +944,7 @@ mod trusted_domain_tests {
 
     #[test]
     fn the_returned_domain_is_always_the_configured_one() {
-        let d = trusted_auth0_domain(Some("https://Tenant.us.auth0.com/"), "tenant.us.auth0.com")
-            .unwrap();
+        let d = trusted_auth0_domain(Some("https://Tenant.us.auth0.com/"), "tenant.us.auth0.com").unwrap();
         assert_eq!(d, TENANT);
     }
 
@@ -995,53 +952,29 @@ mod trusted_domain_tests {
 
     #[test]
     fn each_listed_tenant_is_accepted_as_itself() {
-        assert_eq!(
-            trusted_auth0_domain(Some(TWO), TENANT),
-            Ok(TENANT.to_string())
-        );
-        assert_eq!(
-            trusted_auth0_domain(Some(TWO), "ranch.us.auth0.com"),
-            Ok("ranch.us.auth0.com".to_string())
-        );
-        assert_eq!(
-            trusted_auth0_domain(Some(TWO), "https://RANCH.us.auth0.com"),
-            Ok("ranch.us.auth0.com".to_string())
-        );
+        assert_eq!(trusted_auth0_domain(Some(TWO), TENANT), Ok(TENANT.to_string()));
+        assert_eq!(trusted_auth0_domain(Some(TWO), "ranch.us.auth0.com"), Ok("ranch.us.auth0.com".to_string()));
+        assert_eq!(trusted_auth0_domain(Some(TWO), "https://RANCH.us.auth0.com"), Ok("ranch.us.auth0.com".to_string()));
     }
 
     #[test]
     fn a_request_naming_no_tenant_gets_the_first_listed() {
         assert_eq!(trusted_auth0_domain(Some(TWO), ""), Ok(TENANT.to_string()));
-        assert_eq!(
-            trusted_auth0_domain(Some("ranch.us.auth0.com,tenant.us.auth0.com"), " "),
-            Ok("ranch.us.auth0.com".to_string())
-        );
+        assert_eq!(trusted_auth0_domain(Some("ranch.us.auth0.com,tenant.us.auth0.com"), " "), Ok("ranch.us.auth0.com".to_string()));
     }
 
     #[test]
     fn an_unlisted_tenant_is_refused_even_with_several_trusted() {
-        for other in [
-            "other.us.auth0.com",
-            "ranch.us.auth0.com.example",
-            "us.auth0.com",
-            "tenant.us.auth0.com,ranch.us.auth0.com",
-        ] {
+        for other in ["other.us.auth0.com", "ranch.us.auth0.com.example", "us.auth0.com", "tenant.us.auth0.com,ranch.us.auth0.com"] {
             assert!(trusted_auth0_domain(Some(TWO), other).is_err(), "{other}");
         }
     }
 
     #[test]
     fn empty_and_repeated_entries_are_ignored() {
-        assert_eq!(
-            super::trusted_domains(
-                " , tenant.us.auth0.com,,TENANT.us.auth0.com/ , ranch.us.auth0.com,"
-            ),
-            vec![TENANT.to_string(), "ranch.us.auth0.com".to_string()]
-        );
+        assert_eq!(super::trusted_domains(" , tenant.us.auth0.com,,TENANT.us.auth0.com/ , ranch.us.auth0.com,"),
+            vec![TENANT.to_string(), "ranch.us.auth0.com".to_string()]);
         assert!(trusted_auth0_domain(Some(" , ,"), TENANT).is_err());
-        assert_eq!(
-            trusted_auth0_domain(Some(",tenant.us.auth0.com"), ""),
-            Ok(TENANT.to_string())
-        );
+        assert_eq!(trusted_auth0_domain(Some(",tenant.us.auth0.com"), ""), Ok(TENANT.to_string()));
     }
 }

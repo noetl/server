@@ -386,7 +386,9 @@ impl LogSourcedChainSource {
             idx.iter().map(|&i| raw[i].clone()).collect();
         let terminal: Vec<bool> = idx
             .iter()
-            .map(|&i| crate::db::queries::event_chain::is_terminal_event_type(&rows[i].event_type))
+            .map(|&i| {
+                crate::db::queries::event_chain::is_terminal_event_type(&rows[i].event_type)
+            })
             .collect();
 
         Some((events, terminal))
@@ -880,7 +882,9 @@ pub fn spawn_root_invariant_sampler(state: crate::state::AppState) {
                     // ⚠ Sampled-at is published too. A gauge with no freshness marker
                     // reads identically whether it was written a second ago or the
                     // sampler died an hour ago.
-                    crate::metrics::set_chain_invariant_sampled_at(chrono::Utc::now().timestamp());
+                    crate::metrics::set_chain_invariant_sampled_at(
+                        chrono::Utc::now().timestamp(),
+                    );
                     if multi > 0 {
                         tracing::warn!(target: "noetl_server::chain_populate",
                             multi_root = multi, one_root = one, window_hours = hours,

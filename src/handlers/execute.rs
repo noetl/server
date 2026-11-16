@@ -180,9 +180,7 @@ pub async fn execute(
         match crate::services::await_park::register(&state, child, park).await {
             Ok(true) => response.parked = Some(true),
             Ok(false) => {}
-            Err(e) => {
-                tracing::warn!(child, %e, "await-park: register failed; the tool waits as today")
-            }
+            Err(e) => tracing::warn!(child, %e, "await-park: register failed; the tool waits as today"),
         }
     }
     Ok(Json(response))

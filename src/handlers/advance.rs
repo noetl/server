@@ -197,8 +197,7 @@ pub fn spawn_claim_sweeper(state: AppState) {
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tick.tick().await;
-            for (trigger, execution_id, driving) in state.local_drive.take_abandoned(ttl, deadline)
-            {
+            for (trigger, execution_id, driving) in state.local_drive.take_abandoned(ttl, deadline) {
                 if driving {
                     let slot = state.orch_cache.entry(execution_id);
                     let mut cache = slot.lock().await;

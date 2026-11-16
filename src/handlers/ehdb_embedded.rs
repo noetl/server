@@ -28,9 +28,9 @@
 use std::sync::Arc;
 
 use ehdb_l0::dataset::D1EventLog;
+use ehdb_l0::ReplicaTarget;
 use ehdb_l0::engine::{L0Config, L0Engine};
 use ehdb_l0::substrate::{DurableSubstrate, LocalFsSubstrate};
-use ehdb_l0::ReplicaTarget;
 
 /// Env flag. Absent or anything but `true` means the whole module is inert.
 pub const EMBEDDED_ENV: &str = "NOETL_EHDB_EMBEDDED";
@@ -168,7 +168,8 @@ pub fn open_embedded() -> Option<Arc<std::sync::Mutex<L0Engine<D1EventLog>>>> {
         Some(bucket) => {
             let endpoint = replica_gcs_endpoint();
             let prefix = std::env::var("NOETL_EHDB_REPLICA_GCS_PREFIX").unwrap_or_default();
-            match crate::services::gcs_substrate::GcsSubstrate::open(&endpoint, &bucket, &prefix) {
+            match crate::services::gcs_substrate::GcsSubstrate::open(&endpoint, &bucket, &prefix)
+            {
                 Ok(s) => {
                     tracing::info!(target: "noetl_server::ehdb_embedded", bucket = %bucket,
                         "off-box GCS replica opened: SEALED parts will be replicated off-node \
@@ -697,13 +698,13 @@ pub fn read_archive_records(
                     .and_then(|v| v.get("event_type").and_then(|e| e.as_str()))
                     .unwrap_or("")
                     .to_string();
-                let from_payload =
-                    v.as_ref()
-                        .and_then(|v| v.get("event_id"))
-                        .map(|e| match e.as_str() {
-                            Some(s) => s.to_string(),
-                            None => e.to_string(),
-                        });
+                let from_payload = v
+                    .as_ref()
+                    .and_then(|v| v.get("event_id"))
+                    .map(|e| match e.as_str() {
+                        Some(s) => s.to_string(),
+                        None => e.to_string(),
+                    });
                 crate::services::event_archive::ArchiveRecord {
                     global_sequence: r.global_sequence,
                     event_id: r.event_id.clone().or(from_payload),
@@ -766,7 +767,9 @@ pub fn seal_max_age() -> Option<std::time::Duration> {
 /// seal interval (B2, 900 s on prod) to this value; it does not reach zero.
 /// Saying "the tail is replicated" without naming the interval overstates it in
 /// exactly the way "no data loss" would.
-pub fn spawn_tail_replication_task(engine: std::sync::Arc<std::sync::Mutex<L0Engine<D1EventLog>>>) {
+pub fn spawn_tail_replication_task(
+    engine: std::sync::Arc<std::sync::Mutex<L0Engine<D1EventLog>>>,
+) {
     let interval = tail_replication_interval();
     let enabled = tail_replication_enabled();
     let cleanup = tail_cleanup_enabled();
@@ -822,8 +825,11 @@ pub fn spawn_tail_replication_task(engine: std::sync::Arc<std::sync::Mutex<L0Eng
                     let results: Vec<(bool, ehdb_l0::engine::TailBatch)> = batches
                         .into_iter()
                         .map(|b| {
-                            let ok =
-                                ehdb_l0::engine::upload_tail_batch(&replicas, &b, metrics.as_ref());
+                            let ok = ehdb_l0::engine::upload_tail_batch(
+                                &replicas,
+                                &b,
+                                metrics.as_ref(),
+                            );
                             (ok, b)
                         })
                         .collect();
@@ -1138,7 +1144,9 @@ pub fn retouch_suspects(extents: &[(i64, u64)]) -> Option<Vec<(i64, u64)>> {
     Some(out.into_iter().collect())
 }
 
-pub fn hot_footprint(ids: &[i64]) -> Option<Vec<crate::services::event_archive::HotExecution>> {
+pub fn hot_footprint(
+    ids: &[i64],
+) -> Option<Vec<crate::services::event_archive::HotExecution>> {
     use std::collections::HashMap;
     let engine = engine()?;
     let manifest = {
@@ -1163,22 +1171,22 @@ pub fn hot_footprint(ids: &[i64]) -> Option<Vec<crate::services::event_archive::
             if !may {
                 continue;
             }
-            let e = acc
-                .entry(*id)
-                .or_insert((part.min_sequence, part.max_sequence));
+            let e = acc.entry(*id).or_insert((part.min_sequence, part.max_sequence));
             e.0 = e.0.min(part.min_sequence);
             e.1 = e.1.max(part.max_sequence);
         }
     }
     Some(
         acc.into_iter()
-            .map(|(execution_id, (min_sequence, max_sequence))| {
-                crate::services::event_archive::HotExecution {
-                    execution_id,
-                    min_sequence,
-                    max_sequence,
-                }
-            })
+            .map(
+                |(execution_id, (min_sequence, max_sequence))| {
+                    crate::services::event_archive::HotExecution {
+                        execution_id,
+                        min_sequence,
+                        max_sequence,
+                    }
+                },
+            )
             .collect(),
     )
 }
@@ -1194,14 +1202,7 @@ pub fn manifest_bytes() -> Option<u64> {
         Ok(g) => g,
         Err(poisoned) => poisoned.into_inner(),
     };
-    Some(
-        guard
-            .manifest_snapshot()
-            .parts
-            .iter()
-            .map(|p| p.byte_size)
-            .sum(),
-    )
+    Some(guard.manifest_snapshot().parts.iter().map(|p| p.byte_size).sum())
 }
 
 /// Drop every part lying entirely below `keep_from_sequence`.
@@ -1218,20 +1219,11 @@ pub fn prune_below(keep_from_sequence: u64) -> Option<Result<(usize, u64), Strin
         Ok(g) => g,
         Err(poisoned) => poisoned.into_inner(),
     };
-    let before: u64 = guard
-        .manifest_snapshot()
-        .parts
-        .iter()
-        .map(|p| p.byte_size)
-        .sum();
+    let before: u64 = guard.manifest_snapshot().parts.iter().map(|p| p.byte_size).sum();
     match guard.apply_retention(keep_from_sequence) {
         Ok(dropped) => {
-            let after: u64 = guard
-                .manifest_snapshot()
-                .parts
-                .iter()
-                .map(|p| p.byte_size)
-                .sum();
+            let after: u64 =
+                guard.manifest_snapshot().parts.iter().map(|p| p.byte_size).sum();
             Some(Ok((dropped, before.saturating_sub(after))))
         }
         Err(e) => Some(Err(e.to_string())),

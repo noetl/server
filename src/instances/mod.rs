@@ -695,9 +695,5 @@ pub fn routes() -> (Router, Router, Option<InstanceState>) {
         graph = state.graph.is_some(),
         "instance registry serving at /api/instances"
     );
-    (
-        routes_for(state.clone()),
-        admin_routes_for(state.clone()),
-        Some(state),
-    )
+    (routes_for(state.clone()), admin_routes_for(state.clone()), Some(state))
 }

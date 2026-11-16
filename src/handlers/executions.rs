@@ -171,10 +171,7 @@ pub async fn wait(
             Err(e) => return Err(e),
         };
         let st = current.get("status").and_then(|v| v.as_str()).unwrap_or("");
-        let cancelled = current
-            .get("is_cancelled")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+        let cancelled = current.get("is_cancelled").and_then(|v| v.as_bool()).unwrap_or(false);
         if matches!(st, "COMPLETED" | "FAILED" | "CANCELLED") || cancelled {
             crate::metrics::record_execution_wait("returned_terminal");
             break current;

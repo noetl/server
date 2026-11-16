@@ -45,8 +45,8 @@
 //! }
 //! ```
 
-pub mod affinity;
 pub mod auth_gate;
+pub mod affinity;
 pub mod chain_advance;
 pub mod coherence;
 pub mod command_bus;
@@ -56,14 +56,14 @@ pub mod db;
 pub mod ehgraph_embedded;
 pub mod engine;
 pub mod error;
-pub mod event_bus;
 pub mod execution_wait;
+pub mod event_bus;
 pub mod handlers;
 pub mod instances;
 pub mod metrics;
 pub mod playbook;
-pub mod result_ext;
 pub mod runtime_registry;
+pub mod result_ext;
 pub mod sanitize;
 pub mod secrets;
 pub mod services;

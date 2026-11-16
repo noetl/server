@@ -34,9 +34,7 @@
 use std::io::Cursor;
 use std::time::Duration;
 
-use arrow_array::{
-    Array, BinaryArray, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray,
-};
+use arrow_array::{Array, BinaryArray, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray};
 use arrow_ipc::reader::FileReader;
 use axum::{
     body::Bytes,
@@ -84,13 +82,7 @@ pub fn is_arrow(headers: &HeaderMap) -> bool {
     headers
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
-        .map(|v| {
-            v.split(';')
-                .next()
-                .unwrap_or("")
-                .trim()
-                .eq_ignore_ascii_case(MEDIA_TYPE)
-        })
+        .map(|v| v.split(';').next().unwrap_or("").trim().eq_ignore_ascii_case(MEDIA_TYPE))
         .unwrap_or(false)
 }
 
@@ -98,9 +90,7 @@ pub fn is_arrow(headers: &HeaderMap) -> bool {
 pub async fn batch_dispatch(State(state): State<AppState>, req: Request) -> Response {
     if !is_arrow(req.headers()) {
         // The original path, through the original extractor.
-        return match Json::<crate::handlers::events::BatchEventRequest>::from_request(req, &state)
-            .await
-        {
+        return match Json::<crate::handlers::events::BatchEventRequest>::from_request(req, &state).await {
             Ok(body) => crate::handlers::events::handle_batch_events(State(state), body)
                 .await
                 .into_response(),
@@ -178,8 +168,7 @@ pub fn decode(bytes: &[u8]) -> Result<Vec<PushedEvent>, String> {
     if bytes.len() < 6 || &bytes[..6] != b"ARROW1" {
         return Err("body is not a Feather V2 / Arrow IPC file (missing ARROW1 magic)".into());
     }
-    let reader = FileReader::try_new(Cursor::new(bytes), None)
-        .map_err(|e| format!("open Arrow file: {e}"))?;
+    let reader = FileReader::try_new(Cursor::new(bytes), None).map_err(|e| format!("open Arrow file: {e}"))?;
     let mut out = Vec::new();
     for batch in reader {
         let b = batch.map_err(|e| format!("read Arrow chunk: {e}"))?;
@@ -227,10 +216,7 @@ pub fn validate(headers: &HeaderMap, events: &[PushedEvent]) -> Result<i64, Stri
         .parse()
         .map_err(|_| "X-NoETL-Event-Count is not an integer")?;
     if count != events.len() {
-        return Err(format!(
-            "X-NoETL-Event-Count is {count} but the file holds {} event(s)",
-            events.len()
-        ));
+        return Err(format!("X-NoETL-Event-Count is {count} but the file holds {} event(s)", events.len()));
     }
     if let Some(e) = events.iter().find(|e| e.execution_id != execution_id) {
         return Err(format!(
@@ -323,22 +309,10 @@ async fn ingest(worker_base: Option<String>, headers: &HeaderMap, bytes: Bytes) 
     let mut appended = 0u64;
     for (n, chunk) in records.chunks(APPEND_CHUNK).enumerate() {
         let body = json!({ "execution_id": execution_id.to_string(), "records": chunk });
-        let resp = match http()
-            .post(&url)
-            .json(&body)
-            .timeout(APPEND_TIMEOUT)
-            .send()
-            .await
-        {
+        let resp = match http().post(&url).json(&body).timeout(APPEND_TIMEOUT).send().await {
             Ok(r) => r,
             Err(e) => {
-                return partial(
-                    StatusCode::BAD_GATEWAY,
-                    execution_id,
-                    appended,
-                    n,
-                    format!("tier append failed: {e}"),
-                )
+                return partial(StatusCode::BAD_GATEWAY, execution_id, appended, n, format!("tier append failed: {e}"))
             }
         };
         let status = resp.status();
@@ -346,18 +320,8 @@ async fn ingest(worker_base: Option<String>, headers: &HeaderMap, bytes: Bytes) 
         if !status.is_success() {
             // Relay the worker's 501 (mirror source not `server`) as-is: it
             // is a configuration answer, not a gateway failure.
-            let code = if status == StatusCode::NOT_IMPLEMENTED {
-                status
-            } else {
-                StatusCode::BAD_GATEWAY
-            };
-            return partial(
-                code,
-                execution_id,
-                appended,
-                n,
-                format!("tier answered {status}: {detail}"),
-            );
+            let code = if status == StatusCode::NOT_IMPLEMENTED { status } else { StatusCode::BAD_GATEWAY };
+            return partial(code, execution_id, appended, n, format!("tier answered {status}: {detail}"));
         }
         appended += detail
             .get("appended")
@@ -383,13 +347,7 @@ async fn ingest(worker_base: Option<String>, headers: &HeaderMap, bytes: Bytes) 
 
 /// A failure after zero or more chunks landed. Says how many did, so a retry
 /// (`noetl push --force`) is an informed decision rather than a blind one.
-fn partial(
-    status: StatusCode,
-    execution_id: i64,
-    appended: u64,
-    chunk: usize,
-    error: String,
-) -> Response {
+fn partial(status: StatusCode, execution_id: i64, appended: u64, chunk: usize, error: String) -> Response {
     (
         status,
         Json(json!({
@@ -420,11 +378,7 @@ mod tests {
             Field::new("event_type", DataType::Utf8, false),
             Field::new("step", DataType::Utf8, false),
             Field::new("status", DataType::Utf8, false),
-            Field::new(
-                "created_at",
-                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
-                false,
-            ),
+            Field::new("created_at", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), false),
             Field::new("context", DataType::Binary, false),
             Field::new("result", DataType::Binary, false),
             Field::new("meta", DataType::Binary, false),
@@ -439,29 +393,21 @@ mod tests {
         let s = schema();
         let mut w = FileWriter::try_new(&mut buf, &s).unwrap();
         for (k, chunk) in rows.chunks(1).enumerate() {
-            let bin = |v: &Value| {
-                Arc::new(BinaryArray::from_iter_values([
-                    serde_json::to_vec(v).unwrap()
-                ])) as ArrayRef
-            };
+            let bin = |v: &Value| Arc::new(BinaryArray::from_iter_values([serde_json::to_vec(v).unwrap()])) as ArrayRef;
             let cols: Vec<ArrayRef> = vec![
                 Arc::new(Int64Array::from(vec![1000 + k as i64])),
                 Arc::new(Int64Array::from(vec![eid])),
                 Arc::new(StringArray::from(vec![chunk[0].0])),
                 Arc::new(StringArray::from(vec!["record_state"])),
                 Arc::new(StringArray::from(vec!["COMPLETED"])),
-                Arc::new(
-                    TimestampMicrosecondArray::from(vec![1_762_500_000_000_000])
-                        .with_timezone("UTC"),
-                ),
+                Arc::new(TimestampMicrosecondArray::from(vec![1_762_500_000_000_000]).with_timezone("UTC")),
                 bin(&json!({})),
                 bin(&chunk[0].1),
                 bin(&json!({"password": "hunter2"})),
                 Arc::new(Int64Array::from(vec![None::<i64>])),
                 Arc::new(StringArray::from(vec![None::<&str>])),
             ];
-            w.write(&RecordBatch::try_new(s.clone(), cols).unwrap())
-                .unwrap();
+            w.write(&RecordBatch::try_new(s.clone(), cols).unwrap()).unwrap();
         }
         w.finish().unwrap();
         drop(w);
@@ -470,10 +416,7 @@ mod tests {
 
     fn headers(eid: &str, count: &str) -> HeaderMap {
         let mut h = HeaderMap::new();
-        h.insert(
-            axum::http::header::CONTENT_TYPE,
-            HeaderValue::from_static(MEDIA_TYPE),
-        );
+        h.insert(axum::http::header::CONTENT_TYPE, HeaderValue::from_static(MEDIA_TYPE));
         h.insert(EXECUTION_ID_HEADER, HeaderValue::from_str(eid).unwrap());
         h.insert(EVENT_COUNT_HEADER, HeaderValue::from_str(count).unwrap());
         h
@@ -499,42 +442,23 @@ mod tests {
     fn only_the_arrow_media_type_is_diverted() {
         let mut h = HeaderMap::new();
         assert!(!is_arrow(&h), "no content-type stays on the JSON path");
-        h.insert(
-            axum::http::header::CONTENT_TYPE,
-            HeaderValue::from_static("application/json"),
-        );
+        h.insert(axum::http::header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
         assert!(!is_arrow(&h));
-        h.insert(
-            axum::http::header::CONTENT_TYPE,
-            HeaderValue::from_static("application/vnd.apache.arrow.stream"),
-        );
-        assert!(
-            !is_arrow(&h),
-            "the IPC *stream* type is not the § H.11.5 contract"
-        );
-        h.insert(
-            axum::http::header::CONTENT_TYPE,
-            HeaderValue::from_static("Application/Vnd.Apache.Arrow.File; x=1"),
-        );
+        h.insert(axum::http::header::CONTENT_TYPE, HeaderValue::from_static("application/vnd.apache.arrow.stream"));
+        assert!(!is_arrow(&h), "the IPC *stream* type is not the § H.11.5 contract");
+        h.insert(axum::http::header::CONTENT_TYPE, HeaderValue::from_static("Application/Vnd.Apache.Arrow.File; x=1"));
         assert!(is_arrow(&h));
     }
 
     #[test]
     fn decodes_multi_chunk_files_and_validates_headers() {
-        let bytes = feather(
-            42,
-            &[("provider.fact", fact()), ("step.exit", json!({"data": 1}))],
-        );
+        let bytes = feather(42, &[("provider.fact", fact()), ("step.exit", json!({"data": 1}))]);
         let ev = decode(&bytes).unwrap();
         assert_eq!(ev.len(), 2);
         assert_eq!(ev[0].result, fact());
         assert_eq!(validate(&headers("42", "2"), &ev).unwrap(), 42);
-        assert!(validate(&headers("42", "3"), &ev)
-            .unwrap_err()
-            .contains("Event-Count"));
-        assert!(validate(&headers("43", "2"), &ev)
-            .unwrap_err()
-            .contains("not the header"));
+        assert!(validate(&headers("42", "3"), &ev).unwrap_err().contains("Event-Count"));
+        assert!(validate(&headers("43", "2"), &ev).unwrap_err().contains("not the header"));
         assert!(validate(&HeaderMap::new(), &ev).is_err());
     }
 
@@ -544,16 +468,10 @@ mod tests {
     fn decodes_a_file_written_by_the_noetl_cli() {
         let bytes = include_bytes!("../../tests/fixtures/cli_local_buffer_events.feather");
         let ev = decode(bytes).unwrap();
-        assert_eq!(
-            ev.iter().map(|e| e.event_type.as_str()).collect::<Vec<_>>(),
-            ["step.exit", "provider.fact"]
-        );
+        assert_eq!(ev.iter().map(|e| e.event_type.as_str()).collect::<Vec<_>>(), ["step.exit", "provider.fact"]);
         assert_eq!(ev[1].result["data"]["provider_fact"]["urn"], "k8s://x");
         let eid = ev[0].execution_id.to_string();
-        assert_eq!(
-            validate(&headers(&eid, "2"), &ev).unwrap(),
-            ev[0].execution_id
-        );
+        assert_eq!(validate(&headers(&eid, "2"), &ev).unwrap(), ev[0].execution_id);
     }
 
     #[test]
@@ -563,14 +481,8 @@ mod tests {
         let mut buf = Vec::new();
         {
             let mut w = FileWriter::try_new(&mut buf, &s).unwrap();
-            w.write(
-                &RecordBatch::try_new(
-                    s.clone(),
-                    vec![Arc::new(Int64Array::from(vec![1])) as ArrayRef],
-                )
-                .unwrap(),
-            )
-            .unwrap();
+            w.write(&RecordBatch::try_new(s.clone(), vec![Arc::new(Int64Array::from(vec![1])) as ArrayRef]).unwrap())
+                .unwrap();
             w.finish().unwrap();
         }
         assert!(decode(&buf).unwrap_err().contains("missing column"));
@@ -585,17 +497,10 @@ mod tests {
             assert!(!r[k].is_null(), "{k}");
         }
         assert_eq!(r["mirror_source"], MIRROR_SOURCE);
-        assert_eq!(
-            r["catalog_id"],
-            Value::Null,
-            "a local execution has no catalog id"
-        );
+        assert_eq!(r["catalog_id"], Value::Null, "a local execution has no catalog id");
         // The provider fold's first probe path is result.data.provider_fact.
         assert_eq!(r["result"]["data"]["provider_fact"]["verb"], "ensure");
-        assert!(
-            !r.to_string().contains("hunter2"),
-            "meta is sanitised like the JSON batch path"
-        );
+        assert!(!r.to_string().contains("hunter2"), "meta is sanitised like the JSON batch path");
         assert_eq!(r["created_at"], "2025-11-07T07:20:00.000000Z");
     }
 
@@ -612,10 +517,7 @@ mod tests {
                 async move {
                     let n = b["records"].as_array().map(|a| a.len()).unwrap_or(0);
                     s2.lock().unwrap().push(b);
-                    (
-                        StatusCode::from_u16(status).unwrap(),
-                        Json(json!({"outcome": "ok", "appended": n})),
-                    )
+                    (StatusCode::from_u16(status).unwrap(), Json(json!({"outcome": "ok", "appended": n})))
                 }
             }),
         );
@@ -641,36 +543,24 @@ mod tests {
     async fn flag_off_answers_501_and_contacts_nothing() {
         let (base, seen) = fake_worker(200).await;
         let bytes = feather(42, &[("provider.fact", fact())]);
-        let (st, b) =
-            body_json(arrow_branch(false, Some(base), request("42", "1", bytes)).await).await;
+        let (st, b) = body_json(arrow_branch(false, Some(base), request("42", "1", bytes)).await).await;
         assert_eq!(st, StatusCode::NOT_IMPLEMENTED);
         assert_eq!(b["outcome"], "unconfigured");
-        assert!(
-            seen.lock().unwrap().is_empty(),
-            "inert: nothing was appended"
-        );
+        assert!(seen.lock().unwrap().is_empty(), "inert: nothing was appended");
     }
 
     #[tokio::test]
     async fn enabled_appends_every_event_to_the_tier_in_order() {
         let (base, seen) = fake_worker(200).await;
-        let bytes = feather(
-            42,
-            &[("provider.fact", fact()), ("step.exit", json!({"data": 2}))],
-        );
-        let (st, b) =
-            body_json(arrow_branch(true, Some(base), request("42", "2", bytes)).await).await;
+        let bytes = feather(42, &[("provider.fact", fact()), ("step.exit", json!({"data": 2}))]);
+        let (st, b) = body_json(arrow_branch(true, Some(base), request("42", "2", bytes)).await).await;
         assert_eq!(st, StatusCode::OK, "{b}");
         assert_eq!(b["appended"], 2);
         let seen = seen.lock().unwrap();
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0]["execution_id"], "42");
-        let recs: Vec<Value> = seen[0]["records"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|r| serde_json::from_str(r.as_str().unwrap()).unwrap())
-            .collect();
+        let recs: Vec<Value> = seen[0]["records"].as_array().unwrap().iter()
+            .map(|r| serde_json::from_str(r.as_str().unwrap()).unwrap()).collect();
         assert_eq!(recs[0]["event_type"], "provider.fact");
         assert_eq!(recs[1]["event_type"], "step.exit");
         assert!(recs.iter().all(|r| r["mirror_source"] == MIRROR_SOURCE));
@@ -680,23 +570,14 @@ mod tests {
     async fn bad_upload_writes_nothing_and_worker_501_is_relayed() {
         let (base, seen) = fake_worker(200).await;
         let bytes = feather(42, &[("provider.fact", fact())]);
-        let (st, _) = body_json(
-            arrow_branch(true, Some(base.clone()), request("42", "9", bytes.clone())).await,
-        )
-        .await;
+        let (st, _) = body_json(arrow_branch(true, Some(base.clone()), request("42", "9", bytes.clone())).await).await;
         assert_eq!(st, StatusCode::BAD_REQUEST, "count mismatch");
-        let (st, _) =
-            body_json(arrow_branch(true, None, request("42", "1", bytes.clone())).await).await;
+        let (st, _) = body_json(arrow_branch(true, None, request("42", "1", bytes.clone())).await).await;
         assert_eq!(st, StatusCode::NOT_IMPLEMENTED, "no worker base configured");
         assert!(seen.lock().unwrap().is_empty());
         let (base501, _) = fake_worker(501).await;
-        let (st, b) =
-            body_json(arrow_branch(true, Some(base501), request("42", "1", bytes)).await).await;
-        assert_eq!(
-            st,
-            StatusCode::NOT_IMPLEMENTED,
-            "worker mirror source not `server` → relayed: {b}"
-        );
+        let (st, b) = body_json(arrow_branch(true, Some(base501), request("42", "1", bytes)).await).await;
+        assert_eq!(st, StatusCode::NOT_IMPLEMENTED, "worker mirror source not `server` → relayed: {b}");
         assert_eq!(b["appended"], 0);
     }
 
@@ -710,10 +591,7 @@ mod tests {
         let f = &me[me.find("pub async fn batch_dispatch").unwrap()..];
         let f = &f[..f.find("\n}\n").unwrap()];
         let json_arm = f.find("handle_batch_events").expect("JSON arm present");
-        assert!(
-            json_arm < f.find("enabled()").unwrap(),
-            "flag check must not gate the JSON path"
-        );
+        assert!(json_arm < f.find("enabled()").unwrap(), "flag check must not gate the JSON path");
         assert!(json_arm < f.find("arrow_branch(").unwrap());
         let main = include_str!("../main.rs");
         assert!(main.contains("post(handlers::events_arrow::batch_dispatch)"));
@@ -726,11 +604,7 @@ mod tests {
     fn ingest_has_no_orchestration_or_postgres_side_effects() {
         let me = include_str!("events_arrow.rs");
         let body = &me[..me.find("#[cfg(test)]").unwrap()];
-        let code: String = body
-            .lines()
-            .filter(|l| !l.trim_start().starts_with("//"))
-            .collect::<Vec<_>>()
-            .join("\n");
+        let code: String = body.lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n");
         for forbidden in [
             "trigger_orchestrator(",
             "INSERT INTO",
@@ -740,10 +614,7 @@ mod tests {
             "emit_events(",
             "pools.pool_for",
         ] {
-            assert!(
-                !code.contains(forbidden),
-                "events_arrow must not call `{forbidden}`"
-            );
+            assert!(!code.contains(forbidden), "events_arrow must not call `{forbidden}`");
         }
     }
 }

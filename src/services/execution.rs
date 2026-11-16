@@ -82,7 +82,7 @@ pub struct ExecutionFilter {
     ///
     /// ⚠ Why it exists: `offset` paging re-aggregates `offset + limit`
     /// executions per page, so walking the whole listing is quadratic. The
-    /// archive pass did exactly that in prod — 136 pages climbing to ~4 s each,
+    /// archive pass did exactly that in prod — 137 pages climbing to ~4 s each,
     /// back to back, every 5 min. With a cursor every page aggregates only
     /// `limit` executions.
     #[serde(skip)]
@@ -1286,10 +1286,7 @@ mod paging_tests {
         assert_eq!(p.limit, DEFAULT_LIMIT);
         assert_eq!(p.offset, 0);
         assert_eq!(p.requested_limit, None);
-        assert!(
-            !p.capped,
-            "an unspecified limit was not capped, it was defaulted"
-        );
+        assert!(!p.capped, "an unspecified limit was not capped, it was defaulted");
     }
 
     /// noetl/ai-meta#255 defect 1: the cap applied silently.
@@ -1327,10 +1324,7 @@ mod paging_tests {
     fn a_negative_limit_is_rejected_not_turned_into_a_server_error() {
         let e = resolve_paging(Some(-1), None).unwrap_err();
         assert!(e.contains("limit must be >= 0"), "{e}");
-        assert!(
-            e.contains("-1"),
-            "the offending value must be quoted back: {e}"
-        );
+        assert!(e.contains("-1"), "the offending value must be quoted back: {e}");
         assert!(resolve_paging(None, Some(-1)).is_err(), "offset too");
     }
 

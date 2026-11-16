@@ -551,11 +551,7 @@ mod cancelled_event_types_tests {
 
     #[test]
     fn every_known_spelling_is_listed() {
-        for t in [
-            "playbook_cancelled",
-            "playbook.cancelled",
-            "execution.cancelled",
-        ] {
+        for t in ["playbook_cancelled", "playbook.cancelled", "execution.cancelled"] {
             assert!(CANCELLED_EVENT_TYPES.contains(&t), "missing {t}");
         }
     }

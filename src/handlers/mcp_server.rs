@@ -172,10 +172,7 @@ impl Registry {
         }
         let mut by_name: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for t in &tools {
-            by_name
-                .entry(t.name.clone())
-                .or_default()
-                .push(t.playbook.clone());
+            by_name.entry(t.name.clone()).or_default().push(t.playbook.clone());
         }
         let duplicated: HashMap<&String, &Vec<String>> =
             by_name.iter().filter(|(_, v)| v.len() > 1).collect();
@@ -240,12 +237,7 @@ pub fn parse_declaration(
         .and_then(Value::as_str)
         .map(str::to_string)
         .or_else(|| fallback.map(|f| f.name.clone()))
-        .ok_or_else(|| {
-            problem(
-                playbook,
-                format!("`{name_key}` (the MCP tool name) is required"),
-            )
-        })?;
+        .ok_or_else(|| problem(playbook, format!("`{name_key}` (the MCP tool name) is required")))?;
     if !valid_tool_name(&name) {
         return Err(problem(
             playbook,
@@ -266,12 +258,7 @@ pub fn parse_declaration(
         .filter(|s| !s.is_empty())
         .map(str::to_string)
         .or_else(|| fallback.map(|f| f.description.clone()))
-        .ok_or_else(|| {
-            problem(
-                playbook,
-                format!("tool `{name}`: `description` is required"),
-            )
-        })?;
+        .ok_or_else(|| problem(playbook, format!("tool `{name}`: `description` is required")))?;
 
     // Authored only: never derived from `workload`.
     let input_schema = match obj.get("input_schema") {
@@ -420,10 +407,7 @@ pub fn check_arguments(schema: &Value, args: Option<&Value>) -> Result<Map<Strin
             .filter(|k| !args.contains_key(*k))
             .collect();
         if !missing.is_empty() {
-            return Err(format!(
-                "missing required argument(s): {}",
-                missing.join(", ")
-            ));
+            return Err(format!("missing required argument(s): {}", missing.join(", ")));
         }
     }
 
@@ -491,13 +475,8 @@ pub fn extract_step_payload(event_result: &Value) -> Value {
 /// `call.done` with a payload. Same selection as noetl-tools `return_result`.
 pub fn select_result(detail: &Value, result_step: Option<&str>) -> Option<Value> {
     let events = detail.get("events").and_then(Value::as_array)?;
-    let is_call_done =
-        |ev: &Value| ev.get("event_type").and_then(Value::as_str) == Some("call.done");
-    let node = |ev: &Value| {
-        ev.get("node_name")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-    };
+    let is_call_done = |ev: &Value| ev.get("event_type").and_then(Value::as_str) == Some("call.done");
+    let node = |ev: &Value| ev.get("node_name").and_then(Value::as_str).map(str::to_string);
     let payload = |ev: &Value| {
         ev.get("result")
             .filter(|r| !r.is_null())
@@ -516,13 +495,7 @@ pub fn select_result(detail: &Value, result_step: Option<&str>) -> Option<Value>
         .rev()
         .filter(|ev| is_call_done(ev) && node(ev).as_deref() != Some("playbook"))
         .find_map(payload)
-        .or_else(|| {
-            events
-                .iter()
-                .rev()
-                .filter(|ev| is_call_done(ev))
-                .find_map(payload)
-        })
+        .or_else(|| events.iter().rev().filter(|ev| is_call_done(ev)).find_map(payload))
 }
 
 pub(crate) fn is_terminal(status: &str) -> bool {
@@ -684,7 +657,8 @@ async fn call_exposed(
     args: Option<&Value>,
     timing: Timing,
 ) -> Result<Value, (i64, String)> {
-    let workload = check_arguments(&tool.input_schema, args).map_err(|e| (INVALID_PARAMS, e))?;
+    let workload =
+        check_arguments(&tool.input_schema, args).map_err(|e| (INVALID_PARAMS, e))?;
     let execution_id = match backend.start(&tool.playbook, workload).await {
         Ok(id) => id,
         // Failing to start is a tool error the model can see and react to, not
@@ -714,9 +688,7 @@ async fn call_exposed(
             .ok()
             .and_then(|s| s.get("status").and_then(Value::as_str).map(str::to_string));
         if let Some(s) = status.as_deref().filter(|s| is_terminal(s)) {
-            return Ok(
-                finished_result(backend, execution_id, s, tool.result_step.as_deref()).await,
-            );
+            return Ok(finished_result(backend, execution_id, s, tool.result_step.as_deref()).await);
         }
         if tokio::time::Instant::now() >= deadline {
             let running = json!({
@@ -748,11 +720,7 @@ async fn call_helper(
         }),
         HELPER_RESULT => {
             let status = match backend.status(id).await {
-                Ok(s) => s
-                    .get("status")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string(),
+                Ok(s) => s.get("status").and_then(Value::as_str).unwrap_or("").to_string(),
                 Err(e) => return Ok(tool_error(e, meta)),
             };
             if !is_terminal(&status) {
@@ -783,18 +751,10 @@ pub async fn handle_message(
 ) -> Option<Value> {
     if message.is_array() {
         // JSON-RPC batching was removed from MCP in 2025-06-18.
-        return Some(rpc_error(
-            &Value::Null,
-            INVALID_REQUEST,
-            "batch requests are not supported",
-        ));
+        return Some(rpc_error(&Value::Null, INVALID_REQUEST, "batch requests are not supported"));
     }
     let Some(obj) = message.as_object() else {
-        return Some(rpc_error(
-            &Value::Null,
-            INVALID_REQUEST,
-            "a JSON-RPC message must be an object",
-        ));
+        return Some(rpc_error(&Value::Null, INVALID_REQUEST, "a JSON-RPC message must be an object"));
     };
     let method = obj.get("method").and_then(Value::as_str);
     let id = obj.get("id").cloned();
@@ -855,11 +815,7 @@ pub async fn handle_message(
                 Err((code, msg)) => rpc_error(&id, code, msg),
             })
         }
-        other => Some(rpc_error(
-            &id,
-            METHOD_NOT_FOUND,
-            format!("method `{other}` is not supported"),
-        )),
+        other => Some(rpc_error(&id, METHOD_NOT_FOUND, format!("method `{other}` is not supported"))),
     }
 }
 
@@ -873,12 +829,8 @@ pub async fn handle_body(
     let message: Value = match serde_json::from_slice(body) {
         Ok(v) => v,
         Err(e) => {
-            return Json(rpc_error(
-                &Value::Null,
-                PARSE_ERROR,
-                format!("invalid JSON: {e}"),
-            ))
-            .into_response()
+            return Json(rpc_error(&Value::Null, PARSE_ERROR, format!("invalid JSON: {e}")))
+                .into_response()
         }
     };
     // An unknown `kind: Mcp` path is a 404 for every method, so a client
@@ -931,10 +883,9 @@ impl McpBackend for ServerBackend {
         let Some(server) = server else {
             return Ok(Some(Registry::build(declared)));
         };
-        let entry =
-            crate::db::queries::catalog::get_catalog_latest(self.state.pools.cluster(), server)
-                .await
-                .map_err(|e| e.to_string())?;
+        let entry = crate::db::queries::catalog::get_catalog_latest(self.state.pools.cluster(), server)
+            .await
+            .map_err(|e| e.to_string())?;
         let Some(entry) = entry.filter(|e| e.kind.eq_ignore_ascii_case("mcp")) else {
             return Ok(None);
         };
@@ -983,19 +934,12 @@ impl McpBackend for ServerBackend {
     }
 
     async fn detail(&self, execution_id: i64) -> Result<Value, String> {
-        let d = self
-            .executions
-            .get(execution_id)
-            .await
-            .map_err(|e| e.to_string())?;
+        let d = self.executions.get(execution_id).await.map_err(|e| e.to_string())?;
         serde_json::to_value(d).map_err(|e| e.to_string())
     }
 
     async fn cancel(&self, execution_id: i64) -> Result<(), String> {
-        self.executions
-            .cancel(execution_id)
-            .await
-            .map_err(|e| e.to_string())
+        self.executions.cancel(execution_id).await.map_err(|e| e.to_string())
     }
 }
 
@@ -1003,12 +947,7 @@ impl McpBackend for ServerBackend {
 pub fn routes_for<B: McpBackend + Clone + 'static>(backend: B, timing: Timing) -> Router {
     let root = backend.clone();
     let named = backend;
-    let not_get = || async {
-        (
-            StatusCode::METHOD_NOT_ALLOWED,
-            "POST JSON-RPC messages; this server opens no SSE stream",
-        )
-    };
+    let not_get = || async { (StatusCode::METHOD_NOT_ALLOWED, "POST JSON-RPC messages; this server opens no SSE stream") };
     Router::new()
         .route(
             "/api/mcp",
@@ -1030,10 +969,7 @@ pub fn routes_for<B: McpBackend + Clone + 'static>(backend: B, timing: Timing) -
 }
 
 /// The production routes.
-pub fn routes(
-    state: crate::state::AppState,
-    executions: crate::services::ExecutionService,
-) -> Router {
+pub fn routes(state: crate::state::AppState, executions: crate::services::ExecutionService) -> Router {
     routes_for(ServerBackend { state, executions }, Timing::default())
 }
 
@@ -1112,10 +1048,7 @@ workflow:
             if let Some(e) = &self.start_error {
                 return Err(e.clone());
             }
-            self.started
-                .lock()
-                .unwrap()
-                .push((playbook.to_string(), workload));
+            self.started.lock().unwrap().push((playbook.to_string(), workload));
             Ok(9_007_199_254_740_993) // > 2^53: must travel as a string
         }
         async fn status(&self, id: i64) -> Result<Value, String> {
@@ -1168,9 +1101,7 @@ workflow:
 
     async fn rpc(b: &Fake, method: &str, params: Value) -> Value {
         let msg = json!({"jsonrpc": "2.0", "id": 7, "method": method, "params": params});
-        handle_message(b, None, &msg, fast())
-            .await
-            .expect("a request gets a reply")
+        handle_message(b, None, &msg, fast()).await.expect("a request gets a reply")
     }
 
     // ---- flag ----
@@ -1216,48 +1147,22 @@ workflow: []
 "#;
         let err = exposure_from_playbook("p/x", doc).unwrap().unwrap_err();
         assert!(err.reason.contains("input_schema"), "{}", err.reason);
-        assert!(
-            err.reason.contains("not derived from `workload`"),
-            "{}",
-            err.reason
-        );
+        assert!(err.reason.contains("not derived from `workload`"), "{}", err.reason);
     }
 
     #[test]
     fn bad_declarations_are_reported_not_served() {
-        let base = |mcp: &str| {
-            format!("apiVersion: noetl.io/v2\nkind: Playbook\nmetadata:\n  name: x\n  expose:\n    mcp: {mcp}\nworkflow: []\n")
-        };
+        let base = |mcp: &str| format!("apiVersion: noetl.io/v2\nkind: Playbook\nmetadata:\n  name: x\n  expose:\n    mcp: {mcp}\nworkflow: []\n");
         for (mcp, want) in [
-            (
-                "{ description: d, input_schema: { type: object } }",
-                "`tool`",
-            ),
-            (
-                "{ tool: 'has space', description: d, input_schema: { type: object } }",
-                "1-64",
-            ),
-            (
-                "{ tool: noetl.execution.status, description: d, input_schema: { type: object } }",
-                "reserved",
-            ),
+            ("{ description: d, input_schema: { type: object } }", "`tool`"),
+            ("{ tool: 'has space', description: d, input_schema: { type: object } }", "1-64"),
+            ("{ tool: noetl.execution.status, description: d, input_schema: { type: object } }", "reserved"),
             ("{ tool: t, input_schema: { type: object } }", "description"),
-            (
-                "{ tool: t, description: d, input_schema: { type: string } }",
-                "type` must be `object",
-            ),
-            (
-                "{ tool: t, description: d, input_schema: { type: object }, mode: later }",
-                "mode",
-            ),
-            (
-                "{ tool: t, description: d, input_schema: { type: object }, timeout: 999 }",
-                "timeout",
-            ),
+            ("{ tool: t, description: d, input_schema: { type: string } }", "type` must be `object"),
+            ("{ tool: t, description: d, input_schema: { type: object }, mode: later }", "mode"),
+            ("{ tool: t, description: d, input_schema: { type: object }, timeout: 999 }", "timeout"),
         ] {
-            let err = exposure_from_playbook("p/x", &base(mcp))
-                .unwrap()
-                .unwrap_err();
+            let err = exposure_from_playbook("p/x", &base(mcp)).unwrap().unwrap_err();
             assert!(err.reason.contains(want), "{mcp}: {}", err.reason);
         }
     }
@@ -1268,32 +1173,22 @@ workflow: []
         let b = exposure_from_playbook("b", FINDINGS).unwrap();
         let slow = exposure_from_playbook("tools/slow", SLOW).unwrap();
         let reg = Registry::build(vec![a, b, slow]);
-        assert_eq!(
-            reg.tools
-                .iter()
-                .map(|t| t.name.as_str())
-                .collect::<Vec<_>>(),
-            ["slow_report"]
-        );
+        assert_eq!(reg.tools.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(), ["slow_report"]);
         assert_eq!(reg.problems.len(), 2);
-        assert!(
-            reg.problems[0].reason.contains("a, b"),
-            "{:?}",
-            reg.problems
-        );
+        assert!(reg.problems[0].reason.contains("a, b"), "{:?}", reg.problems);
     }
 
     #[test]
     fn mcp_resource_serves_only_with_serve_true_and_falls_back_to_playbook_declaration() {
-        let exposed: HashMap<String, ExposedTool> =
-            [
-                exposure_from_playbook("qnetmon/tools/findings_in_window", FINDINGS)
-                    .unwrap()
-                    .unwrap(),
-            ]
-            .into_iter()
-            .map(|t| (t.playbook.clone(), t))
-            .collect();
+        let exposed: HashMap<String, ExposedTool> = [exposure_from_playbook(
+            "qnetmon/tools/findings_in_window",
+            FINDINGS,
+        )
+        .unwrap()
+        .unwrap()]
+        .into_iter()
+        .map(|t| (t.playbook.clone(), t))
+        .collect();
 
         let calls_only = "apiVersion: noetl.io/v2\nkind: Mcp\nmetadata: { name: g, path: mcp/g }\nspec: { url: 'http://x' }\n";
         assert!(tools_from_mcp_resource("mcp/g", calls_only, &exposed).is_err());
@@ -1310,19 +1205,14 @@ spec:
         input_schema: { type: object, properties: { node_id: { type: string } } } }
     - { name: bare, playbook: qnetmon/tools/unexposed }
 "#;
-        let reg =
-            Registry::build(tools_from_mcp_resource("mcp/qnetmon", serving, &exposed).unwrap());
+        let reg = Registry::build(tools_from_mcp_resource("mcp/qnetmon", serving, &exposed).unwrap());
         let names: Vec<&str> = reg.tools.iter().map(|t| t.name.as_str()).collect();
         assert_eq!(names, ["findings", "neighbors"]);
         // `findings` took description + schema from the playbook's own declaration.
         assert_eq!(reg.tools[0].description, "Current findings.");
         // `bare` names a playbook with no declaration and states no schema itself.
         assert_eq!(reg.problems.len(), 1);
-        assert!(
-            reg.problems[0].reason.contains("description"),
-            "{:?}",
-            reg.problems
-        );
+        assert!(reg.problems[0].reason.contains("description"), "{:?}", reg.problems);
     }
 
     // ---- arguments ----
@@ -1330,32 +1220,16 @@ spec:
     #[test]
     fn arguments_are_an_allowlist() {
         let schema = json!({"type": "object", "properties": {"minutes": {"type": "integer"}}, "required": ["minutes"]});
-        assert_eq!(
-            check_arguments(&schema, Some(&json!({"minutes": 60}))).unwrap()["minutes"],
-            60
-        );
-        assert!(check_arguments(&schema, Some(&json!({})))
-            .unwrap_err()
-            .contains("minutes"));
-        assert!(check_arguments(&schema, Some(&json!({"minutes": "60"})))
-            .unwrap_err()
-            .contains("integer"));
-        let err = check_arguments(
-            &schema,
-            Some(&json!({"minutes": 1, "api_url": "http://evil"})),
-        )
-        .unwrap_err();
-        assert!(
-            err.contains("api_url"),
-            "an undeclared workload key must not pass: {err}"
-        );
+        assert_eq!(check_arguments(&schema, Some(&json!({"minutes": 60}))).unwrap()["minutes"], 60);
+        assert!(check_arguments(&schema, Some(&json!({}))).unwrap_err().contains("minutes"));
+        assert!(check_arguments(&schema, Some(&json!({"minutes": "60"}))).unwrap_err().contains("integer"));
+        let err = check_arguments(&schema, Some(&json!({"minutes": 1, "api_url": "http://evil"}))).unwrap_err();
+        assert!(err.contains("api_url"), "an undeclared workload key must not pass: {err}");
         assert!(check_arguments(&schema, Some(&json!([1]))).is_err());
 
         let open = json!({"type": "object", "additionalProperties": true});
         assert!(check_arguments(&open, Some(&json!({"anything": 1}))).is_ok());
-        assert!(check_arguments(&json!({"type": "object"}), None)
-            .unwrap()
-            .is_empty());
+        assert!(check_arguments(&json!({"type": "object"}), None).unwrap().is_empty());
     }
 
     // ---- result selection ----
@@ -1382,10 +1256,7 @@ spec:
         assert_eq!(r["result"]["protocolVersion"], "2025-03-26");
         assert!(r["result"]["capabilities"]["tools"].is_object());
         let r = rpc(&b, "initialize", json!({"protocolVersion": "1999-01-01"})).await;
-        assert_eq!(
-            r["result"]["protocolVersion"],
-            SUPPORTED_PROTOCOL_VERSIONS[0]
-        );
+        assert_eq!(r["result"]["protocolVersion"], SUPPORTED_PROTOCOL_VERSIONS[0]);
         assert_eq!(rpc(&b, "ping", json!({})).await["result"], json!({}));
     }
 
@@ -1394,20 +1265,11 @@ spec:
         let b = fake();
         let note = json!({"jsonrpc": "2.0", "method": "notifications/initialized"});
         assert_eq!(handle_message(&b, None, &note, fast()).await, None);
-        assert_eq!(
-            rpc(&b, "resources/list", json!({})).await["error"]["code"],
-            METHOD_NOT_FOUND
-        );
+        assert_eq!(rpc(&b, "resources/list", json!({})).await["error"]["code"], METHOD_NOT_FOUND);
         let batch = json!([{"jsonrpc": "2.0", "id": 1, "method": "ping"}]);
-        assert_eq!(
-            handle_message(&b, None, &batch, fast()).await.unwrap()["error"]["code"],
-            INVALID_REQUEST
-        );
+        assert_eq!(handle_message(&b, None, &batch, fast()).await.unwrap()["error"]["code"], INVALID_REQUEST);
         let v1 = json!({"jsonrpc": "1.0", "id": 1, "method": "ping"});
-        assert_eq!(
-            handle_message(&b, None, &v1, fast()).await.unwrap()["error"]["code"],
-            INVALID_REQUEST
-        );
+        assert_eq!(handle_message(&b, None, &v1, fast()).await.unwrap()["error"]["code"], INVALID_REQUEST);
     }
 
     #[tokio::test]
@@ -1415,31 +1277,16 @@ spec:
         let r = rpc(&fake(), "tools/list", json!({})).await;
         let tools = r["result"]["tools"].as_array().unwrap();
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert_eq!(
-            names,
-            [
-                "qnetmon_findings",
-                "slow_report",
-                HELPER_STATUS,
-                HELPER_RESULT,
-                HELPER_CANCEL
-            ]
-        );
+        assert_eq!(names, ["qnetmon_findings", "slow_report", HELPER_STATUS, HELPER_RESULT, HELPER_CANCEL]);
         assert_eq!(tools[0]["inputSchema"]["required"], json!(["minutes"]));
-        assert_eq!(
-            tools[0]["_meta"]["noetl/playbook"],
-            "qnetmon/tools/findings_in_window"
-        );
+        assert_eq!(tools[0]["_meta"]["noetl/playbook"], "qnetmon/tools/findings_in_window");
         assert_eq!(tools[1]["_meta"]["noetl/mode"], "async");
     }
 
     #[tokio::test]
     async fn tools_list_reports_what_was_not_served() {
         let mut b = fake();
-        b.registry.problems.push(Problem {
-            source: "p/x".into(),
-            reason: "why".into(),
-        });
+        b.registry.problems.push(Problem { source: "p/x".into(), reason: "why".into() });
         let r = rpc(&b, "tools/list", json!({})).await;
         assert_eq!(r["result"]["_meta"]["noetl/not_served"][0]["source"], "p/x");
     }
@@ -1447,26 +1294,12 @@ spec:
     #[tokio::test]
     async fn sync_call_waits_and_returns_the_sanitized_result() {
         let b = fake();
-        let r = rpc(
-            &b,
-            "tools/call",
-            json!({"name": "qnetmon_findings", "arguments": {"minutes": 120}}),
-        )
-        .await;
+        let r = rpc(&b, "tools/call", json!({"name": "qnetmon_findings", "arguments": {"minutes": 120}})).await;
         let res = &r["result"];
         assert_eq!(res["isError"], false, "{r}");
-        assert_eq!(
-            res["structuredContent"]["findings"][0]["rule_id"],
-            "ap_offline"
-        );
-        assert_ne!(
-            res["structuredContent"]["password"], "hunter2",
-            "results are sanitized"
-        );
-        assert!(!res["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("hunter2"));
+        assert_eq!(res["structuredContent"]["findings"][0]["rule_id"], "ap_offline");
+        assert_ne!(res["structuredContent"]["password"], "hunter2", "results are sanitized");
+        assert!(!res["content"][0]["text"].as_str().unwrap().contains("hunter2"));
         assert_eq!(res["_meta"]["noetl/execution_id"], "9007199254740993");
         assert_eq!(res["_meta"]["noetl/status"], "COMPLETED");
         let started = b.started.lock().unwrap();
@@ -1479,12 +1312,7 @@ spec:
         let mut b = fake();
         b.statuses = Arc::new(Mutex::new(vec!["FAILED"]));
         b.detail = json!({"events": [{"event_type": "command.failed", "node_name": "x", "status": "FAILED", "error": "boom"}]});
-        let r = rpc(
-            &b,
-            "tools/call",
-            json!({"name": "qnetmon_findings", "arguments": {"minutes": 1}}),
-        )
-        .await;
+        let r = rpc(&b, "tools/call", json!({"name": "qnetmon_findings", "arguments": {"minutes": 1}})).await;
         assert_eq!(r["result"]["isError"], true);
         assert_eq!(r["result"]["content"][0]["text"], "boom");
     }
@@ -1494,69 +1322,30 @@ spec:
         let mut b = fake();
         b.statuses = Arc::new(Mutex::new(vec!["RUNNING"]));
         b.registry.tools[0].timeout_secs = 1;
-        let r = rpc(
-            &b,
-            "tools/call",
-            json!({"name": "qnetmon_findings", "arguments": {"minutes": 1}}),
-        )
-        .await;
+        let r = rpc(&b, "tools/call", json!({"name": "qnetmon_findings", "arguments": {"minutes": 1}})).await;
         assert_eq!(r["result"]["isError"], false);
         assert_eq!(r["result"]["structuredContent"]["status"], "RUNNING");
-        assert_eq!(
-            r["result"]["structuredContent"]["execution_id"],
-            "9007199254740993"
-        );
+        assert_eq!(r["result"]["structuredContent"]["execution_id"], "9007199254740993");
     }
 
     #[tokio::test]
     async fn async_call_returns_at_once_and_helpers_follow_up() {
         let b = fake();
-        let r = rpc(
-            &b,
-            "tools/call",
-            json!({"name": "slow_report", "arguments": {}}),
-        )
-        .await;
+        let r = rpc(&b, "tools/call", json!({"name": "slow_report", "arguments": {}})).await;
         assert_eq!(r["result"]["structuredContent"]["status"], "started");
         let id = r["result"]["structuredContent"]["execution_id"].clone();
 
         // statuses: RUNNING then COMPLETED
-        let s = rpc(
-            &b,
-            "tools/call",
-            json!({"name": HELPER_RESULT, "arguments": {"execution_id": id}}),
-        )
-        .await;
+        let s = rpc(&b, "tools/call", json!({"name": HELPER_RESULT, "arguments": {"execution_id": id}})).await;
         assert_eq!(s["result"]["structuredContent"]["status"], "RUNNING");
-        let s = rpc(
-            &b,
-            "tools/call",
-            json!({"name": HELPER_RESULT, "arguments": {"execution_id": id}}),
-        )
-        .await;
-        assert_eq!(
-            s["result"]["structuredContent"]["findings"][0]["rule_id"],
-            "ap_offline"
-        );
+        let s = rpc(&b, "tools/call", json!({"name": HELPER_RESULT, "arguments": {"execution_id": id}})).await;
+        assert_eq!(s["result"]["structuredContent"]["findings"][0]["rule_id"], "ap_offline");
 
-        let c = rpc(
-            &b,
-            "tools/call",
-            json!({"name": HELPER_CANCEL, "arguments": {"execution_id": id}}),
-        )
-        .await;
-        assert_eq!(
-            c["result"]["structuredContent"]["status"],
-            "cancel_requested"
-        );
+        let c = rpc(&b, "tools/call", json!({"name": HELPER_CANCEL, "arguments": {"execution_id": id}})).await;
+        assert_eq!(c["result"]["structuredContent"]["status"], "cancel_requested");
         assert_eq!(*b.cancelled.lock().unwrap(), vec![9_007_199_254_740_993]);
 
-        let bad = rpc(
-            &b,
-            "tools/call",
-            json!({"name": HELPER_STATUS, "arguments": {}}),
-        )
-        .await;
+        let bad = rpc(&b, "tools/call", json!({"name": HELPER_STATUS, "arguments": {}})).await;
         assert_eq!(bad["error"]["code"], INVALID_PARAMS);
     }
 
@@ -1565,34 +1354,18 @@ spec:
         let b = fake();
         let r = rpc(&b, "tools/call", json!({"name": "nope"})).await;
         assert_eq!(r["error"]["code"], INVALID_PARAMS);
-        let r = rpc(
-            &b,
-            "tools/call",
-            json!({"name": "qnetmon_findings", "arguments": {"minutes": 1, "extra": 1}}),
-        )
-        .await;
+        let r = rpc(&b, "tools/call", json!({"name": "qnetmon_findings", "arguments": {"minutes": 1, "extra": 1}})).await;
         assert_eq!(r["error"]["code"], INVALID_PARAMS);
-        assert!(
-            b.started.lock().unwrap().is_empty(),
-            "nothing starts on bad arguments"
-        );
+        assert!(b.started.lock().unwrap().is_empty(), "nothing starts on bad arguments");
     }
 
     #[tokio::test]
     async fn a_start_failure_is_a_tool_error_the_model_can_see() {
         let mut b = fake();
         b.start_error = Some("Catalog entry 'qnetmon/tools/findings_in_window' not found".into());
-        let r = rpc(
-            &b,
-            "tools/call",
-            json!({"name": "qnetmon_findings", "arguments": {"minutes": 1}}),
-        )
-        .await;
+        let r = rpc(&b, "tools/call", json!({"name": "qnetmon_findings", "arguments": {"minutes": 1}})).await;
         assert_eq!(r["result"]["isError"], true);
-        assert!(r["result"]["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("not found"));
+        assert!(r["result"]["content"][0]["text"].as_str().unwrap().contains("not found"));
     }
 
     // ---- HTTP ----
@@ -1608,9 +1381,7 @@ spec:
             .await
             .unwrap();
         let status = res.status();
-        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
-            .await
-            .unwrap();
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
         (status, String::from_utf8(bytes.to_vec()).unwrap())
     }
 
@@ -1620,41 +1391,18 @@ spec:
         b.named = Some(("mcp/qnetmon".into(), registry_of(&[("tools/slow", SLOW)])));
         let app = routes_for(b, fast());
 
-        let (s, body) = post(
-            app.clone(),
-            "/api/mcp",
-            r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
-        )
-        .await;
+        let (s, body) = post(app.clone(), "/api/mcp", r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#).await;
         assert_eq!(s, StatusCode::OK);
         assert!(body.contains("qnetmon_findings"), "{body}");
 
-        let (s, body) = post(
-            app.clone(),
-            "/api/mcp/mcp/qnetmon",
-            r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
-        )
-        .await;
+        let (s, body) = post(app.clone(), "/api/mcp/mcp/qnetmon", r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#).await;
         assert_eq!(s, StatusCode::OK);
-        assert!(
-            body.contains("slow_report") && !body.contains("qnetmon_findings"),
-            "{body}"
-        );
+        assert!(body.contains("slow_report") && !body.contains("qnetmon_findings"), "{body}");
 
-        let (s, _) = post(
-            app.clone(),
-            "/api/mcp/mcp/missing",
-            r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
-        )
-        .await;
+        let (s, _) = post(app.clone(), "/api/mcp/mcp/missing", r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#).await;
         assert_eq!(s, StatusCode::NOT_FOUND);
 
-        let (s, body) = post(
-            app.clone(),
-            "/api/mcp",
-            r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
-        )
-        .await;
+        let (s, body) = post(app.clone(), "/api/mcp", r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#).await;
         assert_eq!((s, body.as_str()), (StatusCode::ACCEPTED, ""));
 
         let (s, body) = post(app.clone(), "/api/mcp", "{not json").await;

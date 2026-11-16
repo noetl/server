@@ -834,13 +834,7 @@ async fn call_wait(
             ask["wait_secs"] = json!(timeout);
         }
         let (status, v) = rt
-            .signed(
-                &endpoint,
-                "/api/catalog/peer/execution",
-                PURPOSE_EXECUTION,
-                &audience,
-                ask,
-            )
+            .signed(&endpoint, "/api/catalog/peer/execution", PURPOSE_EXECUTION, &audience, ask)
             .await
             .map_err(AppError::ExternalService)?;
         if status == 400 && held {
@@ -850,17 +844,11 @@ async fn call_wait(
             continue;
         }
         if !(200..300).contains(&status) {
-            return Err(AppError::ExternalService(format!(
-                "{endpoint}: HTTP {status}: {v}"
-            )));
+            return Err(AppError::ExternalService(format!("{endpoint}: HTTP {status}: {v}")));
         }
         let st = v.get("status").cloned().unwrap_or(Value::Null);
         if held || is_terminal(&st) || tokio::time::Instant::now() >= deadline {
-            crate::metrics::record_execution_wait(if held {
-                "remote_held"
-            } else {
-                "remote_polled"
-            });
+            crate::metrics::record_execution_wait(if held { "remote_held" } else { "remote_polled" });
             break st;
         }
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -925,18 +913,13 @@ pub const PUSH_ENV: &str = "NOETL_CATALOG_REMOTE_PUSH";
 pub const MAX_PEER_WAIT_SECS: u64 = 10;
 
 fn push_enabled() -> bool {
-    std::env::var(PUSH_ENV)
-        .map(|v| v.trim() == "true")
-        .unwrap_or(false)
+    std::env::var(PUSH_ENV).map(|v| v.trim() == "true").unwrap_or(false)
 }
 
 fn is_terminal(status: &Value) -> bool {
     let st = status.get("status").and_then(|v| v.as_str()).unwrap_or("");
     matches!(st, "COMPLETED" | "FAILED" | "CANCELLED")
-        || status
-            .get("is_cancelled")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false)
+        || status.get("is_cancelled").and_then(|v| v.as_bool()).unwrap_or(false)
 }
 
 fn err(status: StatusCode, msg: impl Into<String>) -> Response {

@@ -117,11 +117,7 @@ pub struct AgentDecl {
 pub fn agent_from_playbook(path: &str, content: &str) -> Option<Result<AgentDecl, Problem>> {
     let doc = yaml_to_json(content).ok()?;
     let spec = doc.pointer("/metadata/expose/agent")?;
-    Some(parse_agent(
-        path,
-        spec,
-        doc.pointer("/metadata/expose/mcp/input_schema"),
-    ))
+    Some(parse_agent(path, spec, doc.pointer("/metadata/expose/mcp/input_schema")))
 }
 
 fn parse_agent(path: &str, spec: &Value, mcp_schema: Option<&Value>) -> Result<AgentDecl, Problem> {
@@ -137,8 +133,8 @@ fn parse_agent(path: &str, spec: &Value, mcp_schema: Option<&Value>) -> Result<A
             .map(str::to_string)
     };
     let name = text("name").ok_or_else(|| problem(path, "`expose.agent.card.name` is required"))?;
-    let description = text("description")
-        .ok_or_else(|| problem(path, "`expose.agent.card.description` is required"))?;
+    let description =
+        text("description").ok_or_else(|| problem(path, "`expose.agent.card.description` is required"))?;
     let version = card.get("version").and_then(|v| match v {
         Value::String(s) => Some(s.clone()),
         Value::Number(n) => Some(n.to_string()),
@@ -151,10 +147,7 @@ fn parse_agent(path: &str, spec: &Value, mcp_schema: Option<&Value>) -> Result<A
             .map(|s| match s {
                 Value::String(id) => Ok(json!({"id": id, "name": id})),
                 Value::Object(o) if o.get("id").and_then(Value::as_str).is_some() => Ok(s.clone()),
-                _ => Err(problem(
-                    path,
-                    "each skill is a string or a mapping with an `id`",
-                )),
+                _ => Err(problem(path, "each skill is a string or a mapping with an `id`")),
             })
             .collect::<Result<_, _>>()?,
         Some(_) => return Err(problem(path, "`expose.agent.card.skills` must be a list")),
@@ -179,10 +172,7 @@ fn parse_agent(path: &str, spec: &Value, mcp_schema: Option<&Value>) -> Result<A
         version,
         skills,
         input_schema,
-        result_step: spec
-            .get("result_step")
-            .and_then(Value::as_str)
-            .map(str::to_string),
+        result_step: spec.get("result_step").and_then(Value::as_str).map(str::to_string),
     })
 }
 
@@ -248,9 +238,7 @@ impl CallbackPolicy {
         }
         let origin = u.origin().ascii_serialization();
         if !self.origins.contains(&origin) {
-            return Err(format!(
-                "callback_url origin {origin} is not in {CALLBACK_ORIGINS_ENV}"
-            ));
+            return Err(format!("callback_url origin {origin} is not in {CALLBACK_ORIGINS_ENV}"));
         }
         Ok(u)
     }
@@ -299,17 +287,9 @@ impl AgentBackend for super::mcp_server::ServerBackend {
 }
 
 /// The task as `GET /api/agents/tasks/{id}` and the callback report it.
-pub async fn task_view(
-    backend: &dyn McpBackend,
-    task_id: i64,
-    result_step: Option<&str>,
-) -> Result<Value, String> {
+pub async fn task_view(backend: &dyn McpBackend, task_id: i64, result_step: Option<&str>) -> Result<Value, String> {
     let status = backend.status(task_id).await?;
-    let raw = status
-        .get("status")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
+    let raw = status.get("status").and_then(Value::as_str).unwrap_or("").to_string();
     let mut view = json!({"task_id": task_id.to_string(), "status": task_state(&raw)});
     if !is_terminal(&raw) {
         return Ok(view);
@@ -319,16 +299,12 @@ pub async fn task_view(
         view["agent"] = json!(agent);
     }
     if raw == "COMPLETED" {
-        view["result"] =
-            sanitize_sensitive_data(&select_result(&detail, result_step).unwrap_or(Value::Null));
+        view["result"] = sanitize_sensitive_data(&select_result(&detail, result_step).unwrap_or(Value::Null));
     } else {
         let err = detail
             .get("events")
             .and_then(Value::as_array)
-            .and_then(|evs| {
-                evs.iter()
-                    .find_map(|e| e.get("error").and_then(Value::as_str))
-            })
+            .and_then(|evs| evs.iter().find_map(|e| e.get("error").and_then(Value::as_str)))
             .unwrap_or("the task did not complete");
         view["error"] = sanitize_sensitive_data(&json!(err));
     }
@@ -404,11 +380,7 @@ async fn list_cards<B: AgentBackend>(State(s): State<AgentState<B>>) -> Response
     match s.backend.agents().await {
         Ok(all) => {
             let (ok, bad): (Vec<_>, Vec<_>) = all.into_iter().partition(Result::is_ok);
-            let cards: Vec<Value> = ok
-                .into_iter()
-                .filter_map(Result::ok)
-                .map(|a| card(&a))
-                .collect();
+            let cards: Vec<Value> = ok.into_iter().filter_map(Result::ok).map(|a| card(&a)).collect();
             let not_served: Vec<Value> = bad
                 .into_iter()
                 .filter_map(Result::err)
@@ -420,10 +392,7 @@ async fn list_cards<B: AgentBackend>(State(s): State<AgentState<B>>) -> Response
     }
 }
 
-async fn get_card<B: AgentBackend>(
-    State(s): State<AgentState<B>>,
-    Path(path): Path<String>,
-) -> Response {
+async fn get_card<B: AgentBackend>(State(s): State<AgentState<B>>, Path(path): Path<String>) -> Response {
     match find_agent(&s.backend, path.trim_matches('/')).await {
         Ok(Some(a)) => Json(card(&a)).into_response(),
         Ok(None) => error(StatusCode::NOT_FOUND, "no such agent"),
@@ -431,15 +400,9 @@ async fn get_card<B: AgentBackend>(
     }
 }
 
-async fn send<B: AgentBackend + Clone + 'static>(
-    State(s): State<AgentState<B>>,
-    Json(body): Json<Value>,
-) -> Response {
+async fn send<B: AgentBackend + Clone + 'static>(State(s): State<AgentState<B>>, Json(body): Json<Value>) -> Response {
     let Some(agent_path) = body.get("agent").and_then(Value::as_str) else {
-        return error(
-            StatusCode::BAD_REQUEST,
-            "`agent` (the playbook path) is required",
-        );
+        return error(StatusCode::BAD_REQUEST, "`agent` (the playbook path) is required");
     };
     let agent = match find_agent(&s.backend, agent_path.trim_matches('/')).await {
         Ok(Some(a)) => a,
@@ -454,12 +417,7 @@ async fn send<B: AgentBackend + Clone + 'static>(
         None => DEFAULT_DEADLINE_SECS,
         Some(v) => match v.as_u64() {
             Some(d) if (1..=MAX_DEADLINE_SECS).contains(&d) => d,
-            _ => {
-                return error(
-                    StatusCode::BAD_REQUEST,
-                    format!("`deadline_secs` must be 1..={MAX_DEADLINE_SECS}"),
-                )
-            }
+            _ => return error(StatusCode::BAD_REQUEST, format!("`deadline_secs` must be 1..={MAX_DEADLINE_SECS}")),
         },
     };
 
@@ -474,10 +432,7 @@ async fn send<B: AgentBackend + Clone + 'static>(
             };
             if s.watchers.fetch_add(1, Ordering::SeqCst) >= MAX_WATCHERS {
                 s.watchers.fetch_sub(1, Ordering::SeqCst);
-                return error(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "too many pending callbacks; poll the task instead",
-                );
+                return error(StatusCode::SERVICE_UNAVAILABLE, "too many pending callbacks; poll the task instead");
             }
             Some((url, WatcherSlot(s.watchers.clone())))
         }
@@ -485,16 +440,10 @@ async fn send<B: AgentBackend + Clone + 'static>(
 
     let task_id = match s.backend.start(&agent.playbook, input).await {
         Ok(id) => id,
-        Err(e) => {
-            return error(
-                StatusCode::BAD_GATEWAY,
-                format!("could not start `{}`: {e}", agent.playbook),
-            )
-        }
+        Err(e) => return error(StatusCode::BAD_GATEWAY, format!("could not start `{}`: {e}", agent.playbook)),
     };
 
-    let mut reply =
-        json!({"task_id": task_id.to_string(), "agent": agent.playbook, "status": "submitted"});
+    let mut reply = json!({"task_id": task_id.to_string(), "agent": agent.playbook, "status": "submitted"});
     if let Some((url, slot)) = callback {
         let token = new_callback_token();
         reply["callback_token"] = json!(token);
@@ -502,15 +451,7 @@ async fn send<B: AgentBackend + Clone + 'static>(
         let step = agent.result_step.clone();
         tokio::spawn(async move {
             let _slot = slot;
-            watch_and_deliver(
-                &st,
-                task_id,
-                step.as_deref(),
-                url,
-                token,
-                Duration::from_secs(deadline_secs),
-            )
-            .await;
+            watch_and_deliver(&st, task_id, step.as_deref(), url, token, Duration::from_secs(deadline_secs)).await;
         });
     }
     (StatusCode::ACCEPTED, Json(reply)).into_response()
@@ -528,14 +469,7 @@ pub async fn watch_and_deliver<B: AgentBackend>(
     let until = tokio::time::Instant::now() + deadline;
     let view = loop {
         match task_view(&s.backend, task_id, result_step).await {
-            Ok(v)
-                if matches!(
-                    v["status"].as_str(),
-                    Some("completed" | "failed" | "canceled")
-                ) =>
-            {
-                break v
-            }
+            Ok(v) if matches!(v["status"].as_str(), Some("completed" | "failed" | "canceled")) => break v,
             _ if tokio::time::Instant::now() >= until => {
                 break json!({"task_id": task_id.to_string(), "status": "working",
                              "error": "the callback deadline passed before the task ended; poll the task"})
@@ -543,20 +477,8 @@ pub async fn watch_and_deliver<B: AgentBackend>(
             _ => tokio::time::sleep(s.timing.poll).await,
         }
     };
-    if !deliver_callback(
-        &s.http,
-        &url,
-        &token,
-        &task_id.to_string(),
-        &view,
-        &s.timing,
-    )
-    .await
-    {
-        tracing::error!(
-            task_id,
-            "agent callback not delivered; the caller must poll"
-        );
+    if !deliver_callback(&s.http, &url, &token, &task_id.to_string(), &view, &s.timing).await {
+        tracing::error!(task_id, "agent callback not delivered; the caller must poll");
     }
 }
 
@@ -601,25 +523,15 @@ pub async fn deliver_callback(
     false
 }
 
-async fn get_task<B: AgentBackend>(
-    State(s): State<AgentState<B>>,
-    Path(task_id): Path<String>,
-) -> Response {
+async fn get_task<B: AgentBackend>(State(s): State<AgentState<B>>, Path(task_id): Path<String>) -> Response {
     let Some(id) = task_id.parse::<i64>().ok().filter(|i| *i > 0) else {
-        return error(
-            StatusCode::BAD_REQUEST,
-            "task_id must be a positive integer",
-        );
+        return error(StatusCode::BAD_REQUEST, "task_id must be a positive integer");
     };
     // Read with the agent's own `result_step`, resolved from the execution's
     // playbook path, so polling and the callback report the same result.
     let step = match s.backend.detail(id).await {
         Ok(d) => match d.get("path").and_then(Value::as_str) {
-            Some(p) => find_agent(&s.backend, p)
-                .await
-                .ok()
-                .flatten()
-                .and_then(|a| a.result_step),
+            Some(p) => find_agent(&s.backend, p).await.ok().flatten().and_then(|a| a.result_step),
             None => None,
         },
         Err(_) => None,
@@ -640,10 +552,7 @@ pub fn routes_for<B: AgentBackend + Clone + 'static>(state: AgentState<B>) -> Ro
         .with_state(state)
 }
 
-pub fn routes(
-    state: crate::state::AppState,
-    executions: crate::services::ExecutionService,
-) -> Router {
+pub fn routes(state: crate::state::AppState, executions: crate::services::ExecutionService) -> Router {
     routes_for(AgentState::new(
         super::mcp_server::ServerBackend { state, executions },
         CallbackPolicy::from_env(),
@@ -706,10 +615,7 @@ workflow: []
             Ok(None)
         }
         async fn start(&self, playbook: &str, workload: Map<String, Value>) -> Result<i64, String> {
-            self.started
-                .lock()
-                .unwrap()
-                .push((playbook.into(), workload));
+            self.started.lock().unwrap().push((playbook.into(), workload));
             Ok(42)
         }
         async fn status(&self, id: i64) -> Result<Value, String> {
@@ -736,32 +642,19 @@ workflow: []
     #[async_trait]
     impl AgentBackend for Fake {
         async fn agents(&self) -> Result<Vec<Result<AgentDecl, Problem>>, String> {
-            Ok(self
-                .docs
-                .iter()
-                .filter_map(|(p, c)| agent_from_playbook(p, c))
-                .collect())
+            Ok(self.docs.iter().filter_map(|(p, c)| agent_from_playbook(p, c)).collect())
         }
     }
 
     fn fast() -> WatchTiming {
-        WatchTiming {
-            poll: Duration::from_millis(2),
-            retry_base: Duration::from_millis(2),
-            attempts: 3,
-        }
+        WatchTiming { poll: Duration::from_millis(2), retry_base: Duration::from_millis(2), attempts: 3 }
     }
 
     async fn call(app: Router, req: Request<Body>) -> (StatusCode, Value) {
         let res = app.oneshot(req).await.unwrap();
         let status = res.status();
-        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        (
-            status,
-            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
-        )
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
     }
 
     fn send_req(body: Value) -> Request<Body> {
@@ -783,20 +676,14 @@ workflow: []
         let app = Router::new()
             .route(
                 "/hook",
-                post(
-                    move |headers: axum::http::HeaderMap, Json(v): Json<Value>| {
-                        let g = g.clone();
-                        async move {
-                            let auth = headers
-                                .get("authorization")
-                                .and_then(|h| h.to_str().ok())
-                                .unwrap_or("")
-                                .to_string();
-                            g.lock().unwrap().push((auth, v));
-                            status
-                        }
-                    },
-                ),
+                post(move |headers: axum::http::HeaderMap, Json(v): Json<Value>| {
+                    let g = g.clone();
+                    async move {
+                        let auth = headers.get("authorization").and_then(|h| h.to_str().ok()).unwrap_or("").to_string();
+                        g.lock().unwrap().push((auth, v));
+                        status
+                    }
+                }),
             )
             .route(
                 "/redirect",
@@ -828,42 +715,26 @@ workflow: []
 
     #[test]
     fn declaration_and_card() {
-        let a = agent_from_playbook("qnetmon/troubleshoot/ask_agent", ASK)
-            .unwrap()
-            .unwrap();
+        let a = agent_from_playbook("qnetmon/troubleshoot/ask_agent", ASK).unwrap().unwrap();
         assert_eq!(a.version.as_deref(), Some("1"));
         assert_eq!(a.result_step.as_deref(), Some("analyze"));
         let c = card(&a);
         assert_eq!(c["name"], "qnetmon-troubleshooter");
-        assert_eq!(
-            c["skills"][0],
-            json!({"id": "network-troubleshooting", "name": "network-troubleshooting"})
-        );
+        assert_eq!(c["skills"][0], json!({"id": "network-troubleshooting", "name": "network-troubleshooting"}));
         assert_eq!(c["inputSchema"]["required"], json!(["question"]));
-        assert_eq!(
-            agent_from_playbook("x", "metadata: { name: x }\nworkflow: []\n"),
-            None
-        );
+        assert_eq!(agent_from_playbook("x", "metadata: { name: x }\nworkflow: []\n"), None);
     }
 
     #[test]
     fn schema_is_authored_or_borrowed_from_expose_mcp_never_workload() {
         let no_schema = "metadata:\n  name: x\n  expose:\n    agent:\n      card: { name: n, description: d }\nworkload: { q: 1 }\nworkflow: []\n";
         let e = agent_from_playbook("x", no_schema).unwrap().unwrap_err();
-        assert!(
-            e.reason.contains("not derived from `workload`"),
-            "{}",
-            e.reason
-        );
+        assert!(e.reason.contains("not derived from `workload`"), "{}", e.reason);
         let borrowed = "metadata:\n  name: x\n  expose:\n    mcp: { tool: t, description: d, input_schema: { type: object, properties: { q: { type: string } } } }\n    agent:\n      card: { name: n, description: d }\nworkflow: []\n";
         let a = agent_from_playbook("x", borrowed).unwrap().unwrap();
         assert!(a.input_schema["properties"]["q"].is_object());
         let no_card = "metadata:\n  name: x\n  expose:\n    agent: { input_schema: { type: object } }\nworkflow: []\n";
-        assert!(agent_from_playbook("x", no_card)
-            .unwrap()
-            .unwrap_err()
-            .reason
-            .contains("card"));
+        assert!(agent_from_playbook("x", no_card).unwrap().unwrap_err().reason.contains("card"));
     }
 
     #[test]
@@ -871,26 +742,12 @@ workflow: []
         let p = CallbackPolicy::parse("https://hooks.example.com, http://127.0.0.1:9000");
         assert!(p.check("https://hooks.example.com/a/b?x=1").is_ok());
         assert!(p.check("http://127.0.0.1:9000/hook").is_ok());
-        assert!(
-            p.check("http://hooks.example.com/a")
-                .unwrap_err()
-                .contains("not in"),
-            "scheme is part of the origin"
-        );
-        assert!(
-            p.check("https://hooks.example.com:8443/a").is_err(),
-            "port is part of the origin"
-        );
+        assert!(p.check("http://hooks.example.com/a").unwrap_err().contains("not in"), "scheme is part of the origin");
+        assert!(p.check("https://hooks.example.com:8443/a").is_err(), "port is part of the origin");
         assert!(p.check("http://169.254.169.254/latest").is_err());
-        assert!(p
-            .check("https://user:pw@hooks.example.com/")
-            .unwrap_err()
-            .contains("credentials"));
+        assert!(p.check("https://user:pw@hooks.example.com/").unwrap_err().contains("credentials"));
         assert!(p.check("file:///etc/passwd").is_err());
-        assert!(CallbackPolicy::default()
-            .check("https://hooks.example.com/")
-            .unwrap_err()
-            .contains("not enabled"));
+        assert!(CallbackPolicy::default().check("https://hooks.example.com/").unwrap_err().contains("not enabled"));
     }
 
     #[test]
@@ -902,71 +759,31 @@ workflow: []
 
     #[tokio::test]
     async fn cards_list_and_lookup() {
-        let app = routes_for(AgentState::new(
-            Fake::new(vec!["RUNNING"]),
-            CallbackPolicy::default(),
-            fast(),
-        ));
-        let (s, v) = call(
-            app.clone(),
-            Request::get("/api/agents").body(Body::empty()).unwrap(),
-        )
-        .await;
+        let app = routes_for(AgentState::new(Fake::new(vec!["RUNNING"]), CallbackPolicy::default(), fast()));
+        let (s, v) = call(app.clone(), Request::get("/api/agents").body(Body::empty()).unwrap()).await;
         assert_eq!(s, StatusCode::OK);
         assert_eq!(v["agents"][0]["agent"], "qnetmon/troubleshoot/ask_agent");
-        let (s, v) = call(
-            app.clone(),
-            Request::get("/api/agents/cards/qnetmon/troubleshoot/ask_agent")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await;
-        assert_eq!(
-            (s, v["name"].as_str()),
-            (StatusCode::OK, Some("qnetmon-troubleshooter"))
-        );
-        let (s, _) = call(
-            app,
-            Request::get("/api/agents/cards/nope")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await;
+        let (s, v) = call(app.clone(), Request::get("/api/agents/cards/qnetmon/troubleshoot/ask_agent").body(Body::empty()).unwrap()).await;
+        assert_eq!((s, v["name"].as_str()), (StatusCode::OK, Some("qnetmon-troubleshooter")));
+        let (s, _) = call(app, Request::get("/api/agents/cards/nope").body(Body::empty()).unwrap()).await;
         assert_eq!(s, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
     async fn send_validates_input_then_poll_returns_the_agents_result_step() {
         let fake = Fake::new(vec!["RUNNING", "COMPLETED"]);
-        let app = routes_for(AgentState::new(
-            fake.clone(),
-            CallbackPolicy::default(),
-            fast(),
-        ));
+        let app = routes_for(AgentState::new(fake.clone(), CallbackPolicy::default(), fast()));
 
         let (s, v) = call(app.clone(), send_req(json!({"agent": "qnetmon/troubleshoot/ask_agent", "input": {"question": "?", "endpoint": "x"}}))).await;
         assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{v}");
         assert!(fake.started.lock().unwrap().is_empty());
 
-        let (s, v) = call(
-            app.clone(),
-            send_req(
-                json!({"agent": "qnetmon/troubleshoot/ask_agent", "input": {"question": "why?"}}),
-            ),
-        )
-        .await;
+        let (s, v) = call(app.clone(), send_req(json!({"agent": "qnetmon/troubleshoot/ask_agent", "input": {"question": "why?"}}))).await;
         assert_eq!(s, StatusCode::ACCEPTED);
         assert_eq!(v["task_id"], "42");
-        assert!(
-            v.get("callback_token").is_none(),
-            "no callback asked, no token"
-        );
+        assert!(v.get("callback_token").is_none(), "no callback asked, no token");
 
-        let get = || {
-            Request::get("/api/agents/tasks/42")
-                .body(Body::empty())
-                .unwrap()
-        };
+        let get = || Request::get("/api/agents/tasks/42").body(Body::empty()).unwrap();
         let (_, v) = call(app.clone(), get()).await;
         assert_eq!(v["status"], "working");
         let (_, v) = call(app.clone(), get()).await;
@@ -975,33 +792,19 @@ workflow: []
         assert_eq!(v["result"]["answer"], "AP-3 is offline");
         assert_ne!(v["result"]["api_key"], "sk-live-123");
 
-        let (s, _) = call(
-            app,
-            Request::get("/api/agents/tasks/7")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await;
+        let (s, _) = call(app, Request::get("/api/agents/tasks/7").body(Body::empty()).unwrap()).await;
         assert_eq!(s, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
     async fn callback_is_delivered_once_with_the_minted_token() {
         let (base, got) = receiver(StatusCode::OK).await;
-        let st = AgentState::new(
-            Fake::new(vec!["RUNNING", "RUNNING", "COMPLETED"]),
-            CallbackPolicy::parse(&base),
-            fast(),
-        );
+        let st = AgentState::new(Fake::new(vec!["RUNNING", "RUNNING", "COMPLETED"]), CallbackPolicy::parse(&base), fast());
         let watchers = st.watchers.clone();
         let app = routes_for(st);
 
-        let (s, v) = call(
-            app,
-            send_req(json!({"agent": "qnetmon/troubleshoot/ask_agent",
-            "input": {"question": "why?"}, "callback_url": format!("{base}/hook")})),
-        )
-        .await;
+        let (s, v) = call(app, send_req(json!({"agent": "qnetmon/troubleshoot/ask_agent",
+            "input": {"question": "why?"}, "callback_url": format!("{base}/hook")}))).await;
         assert_eq!(s, StatusCode::ACCEPTED, "{v}");
         let token = v["callback_token"].as_str().unwrap().to_string();
 
@@ -1018,47 +821,25 @@ workflow: []
     #[tokio::test]
     async fn refused_callbacks_start_nothing() {
         let fake = Fake::new(vec!["COMPLETED"]);
-        let app = routes_for(AgentState::new(
-            fake.clone(),
-            CallbackPolicy::parse("https://hooks.example.com"),
-            fast(),
-        ));
-        let (s, v) = call(
-            app,
-            send_req(json!({"agent": "qnetmon/troubleshoot/ask_agent",
-            "input": {"question": "?"}, "callback_url": "http://10.0.0.5/internal"})),
-        )
-        .await;
+        let app = routes_for(AgentState::new(fake.clone(), CallbackPolicy::parse("https://hooks.example.com"), fast()));
+        let (s, v) = call(app, send_req(json!({"agent": "qnetmon/troubleshoot/ask_agent",
+            "input": {"question": "?"}, "callback_url": "http://10.0.0.5/internal"}))).await;
         assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
-        assert!(
-            fake.started.lock().unwrap().is_empty(),
-            "a refused callback leaves no orphan execution"
-        );
+        assert!(fake.started.lock().unwrap().is_empty(), "a refused callback leaves no orphan execution");
     }
 
     #[tokio::test]
     async fn redirects_are_not_followed_and_4xx_is_not_retried() {
         let (base, got) = receiver(StatusCode::GONE).await;
-        let st = AgentState::new(
-            Fake::new(vec!["COMPLETED"]),
-            CallbackPolicy::parse(&base),
-            fast(),
-        );
+        let st = AgentState::new(Fake::new(vec!["COMPLETED"]), CallbackPolicy::parse(&base), fast());
         let url = reqwest::Url::parse(&format!("{base}/redirect")).unwrap();
         st.watchers.fetch_add(1, Ordering::SeqCst);
         watch_and_deliver(&st, 42, None, url, "t".into(), Duration::from_secs(1)).await;
-        assert!(
-            got.lock().unwrap().is_empty(),
-            "the 307 to /hook must not be followed"
-        );
+        assert!(got.lock().unwrap().is_empty(), "the 307 to /hook must not be followed");
 
         let url = reqwest::Url::parse(&format!("{base}/hook")).unwrap();
         watch_and_deliver(&st, 42, None, url, "t".into(), Duration::from_secs(1)).await;
-        assert_eq!(
-            got.lock().unwrap().len(),
-            1,
-            "410 Gone is final: one attempt"
-        );
+        assert_eq!(got.lock().unwrap().len(), 1, "410 Gone is final: one attempt");
     }
 
     #[tokio::test]
@@ -1068,12 +849,8 @@ workflow: []
         let st = AgentState::new(fake.clone(), CallbackPolicy::parse(&base), fast());
         st.watchers.store(MAX_WATCHERS, Ordering::SeqCst);
         let app = routes_for(st);
-        let (s, _) = call(
-            app,
-            send_req(json!({"agent": "qnetmon/troubleshoot/ask_agent",
-            "input": {"question": "?"}, "callback_url": format!("{base}/hook")})),
-        )
-        .await;
+        let (s, _) = call(app, send_req(json!({"agent": "qnetmon/troubleshoot/ask_agent",
+            "input": {"question": "?"}, "callback_url": format!("{base}/hook")}))).await;
         assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
         assert!(fake.started.lock().unwrap().is_empty());
     }

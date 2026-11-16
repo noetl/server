@@ -6374,11 +6374,7 @@ mod reconcile_cap_tests {
                 break;
             }
         }
-        assert_eq!(
-            fired_at,
-            Some(8),
-            "1800 s of streak is 7 ticks after the first no-op"
-        );
+        assert_eq!(fired_at, Some(8), "1800 s of streak is 7 ticks after the first no-op");
     }
 
     /// At the designed 8 s tick the time cap never fires before the poll cap —
@@ -6400,24 +6396,9 @@ mod reconcile_cap_tests {
         use std::time::Duration;
         let forever = Duration::from_secs(10 * 24 * 3600);
         let min = MIN_POLLS_BEFORE_TIMED_GIVE_UP;
-        assert!(!reconcile_give_up_by_time(
-            225,
-            min - 1,
-            forever,
-            RECONCILE_INTERVAL
-        ));
-        assert!(reconcile_give_up_by_time(
-            225,
-            min,
-            forever,
-            RECONCILE_INTERVAL
-        ));
-        assert!(!reconcile_give_up_by_time(
-            0,
-            1000,
-            forever,
-            RECONCILE_INTERVAL
-        ));
+        assert!(!reconcile_give_up_by_time(225, min - 1, forever, RECONCILE_INTERVAL));
+        assert!(reconcile_give_up_by_time(225, min, forever, RECONCILE_INTERVAL));
+        assert!(!reconcile_give_up_by_time(0, 1000, forever, RECONCILE_INTERVAL));
     }
 
     /// The streak's start survives increments and is cleared with the budget.
