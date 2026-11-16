@@ -167,6 +167,23 @@ impl EhdbEventPublisher {
         }
         out
     }
+
+    /// Publish several events of ONE execution as one pipelined burst
+    /// (noetl/ai-meta#561 fused ingest) — see
+    /// [`EhdbCommandPublisher::publish_many`]. Same payloads, same order.
+    pub async fn publish_events(
+        &self,
+        execution_id: i64,
+        items: &[(i64, &[u8])],
+    ) -> Result<Vec<u64>, String> {
+        let out = self.inner.publish_many(execution_id, items).await;
+        if out.is_ok() {
+            if let Some(addr) = self.inner.addr_for_execution(execution_id) {
+                crate::runtime_registry::mirror_ehdb_tier_seen(addr);
+            }
+        }
+        out
+    }
 }
 
 #[cfg(test)]

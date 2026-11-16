@@ -1880,6 +1880,7 @@ dependencies = [
  "ehdb-l0",
  "ehgraph",
  "envy",
+ "futures",
  "gcp_auth",
  "hex",
  "hkdf",

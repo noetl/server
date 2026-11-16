@@ -4206,6 +4206,13 @@ async fn apply_orchestration_result(
 ) -> AppResult<i32> {
     // 4. Emit pure events (step.enter etc.) before issuing new
     //    commands so the causal chain is correct.
+    //
+    // noetl/ai-meta#561 fused ingest (`NOETL_EVENT_PUBLISH_BATCH`): instead of one
+    // acknowledged publish per event, hand them to the command batch below, which
+    // writes them AHEAD of its `command.issued` rows in one `emit_events` call —
+    // same rows, same order, one pipelined burst.
+    let fuse = state.config.event_publish_batch;
+    let mut fused: Vec<crate::handlers::event_write::EventRow> = Vec::new();
     for emit in &result.events_to_emit {
         let event_id = state.snowflake.generate()?;
         let event_status = if emit.status.is_empty() {
@@ -4239,6 +4246,10 @@ async fn apply_orchestration_result(
         if let Some(n) = emit.node_name.as_deref() {
             ev = ev.with_node(n);
         }
+        if fuse {
+            fused.push(ev);
+            continue;
+        }
         crate::handlers::event_write::emit_event(state, state.pools.pool_for(execution_id), ev)
             .await?;
     }
@@ -4256,6 +4267,7 @@ async fn apply_orchestration_result(
         &result.commands,
         playbook,
         routing,
+        fused,
     )
     .await?;
 

@@ -129,6 +129,25 @@ impl CommandRouting {
     }
 }
 
+/// Resolve a configured path-prefix → pool route (`NOETL_POOL_ROUTES`,
+/// noetl/ai-meta#562). First matching prefix wins; malformed pairs and pool
+/// names outside `[a-z0-9_-]` are ignored; `system/` paths are never rerouted
+/// (the system pool owns orchestration). `None` → the path-derived default.
+pub(crate) fn route_pool_for_path(routes: &str, path: &str) -> Option<String> {
+    if routes.trim().is_empty() || path.starts_with("system/") {
+        return None;
+    }
+    routes.split(',').find_map(|pair| {
+        let (prefix, pool) = pair.trim().split_once('=')?;
+        let (prefix, pool) = (prefix.trim(), pool.trim());
+        let valid_pool = !pool.is_empty()
+            && pool
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-');
+        (!prefix.is_empty() && valid_pool && path.starts_with(prefix)).then(|| pool.to_string())
+    })
+}
+
 impl ExecuteRequest {
     /// Validate the request.
     pub fn validate(&self) -> Result<(), String> {
@@ -506,7 +525,11 @@ pub(crate) async fn execute_one(
         _ => None,
     };
     let routing = CommandRouting {
-        pool: request.execution_pool.clone().filter(|s| !s.is_empty()),
+        pool: request
+            .execution_pool
+            .clone()
+            .filter(|s| !s.is_empty())
+            .or_else(|| route_pool_for_path(&state.config.pool_routes, &path)),
         trace,
     };
 
@@ -1368,6 +1391,7 @@ pub(crate) async fn persist_engine_command(
 /// and `cmd_meta` (iterator / trace / cursor metadata).
 ///
 /// Returns the number of commands persisted.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn persist_engine_commands_batch(
     state: &AppState,
     execution_id: i64,
@@ -1376,8 +1400,20 @@ pub(crate) async fn persist_engine_commands_batch(
     commands: &[crate::engine::commands::Command],
     playbook: &crate::playbook::types::Playbook,
     routing: &CommandRouting,
+    // noetl/ai-meta#561 fused ingest: orchestration events (step.enter, …) to
+    // write AHEAD of the `command.issued` rows in the same `emit_events` call.
+    // Empty unless `NOETL_EVENT_PUBLISH_BATCH`.
+    fused_events: Vec<crate::handlers::event_write::EventRow>,
 ) -> AppResult<i32> {
     if commands.is_empty() {
+        if !fused_events.is_empty() {
+            crate::handlers::event_write::emit_events(
+                state,
+                state.pools.pool_for(execution_id),
+                &fused_events,
+            )
+            .await?;
+        }
         return Ok(0);
     }
 
@@ -1499,14 +1535,21 @@ pub(crate) async fn persist_engine_commands_batch(
     // back at its fan-out origin (§4.4).  Fallback to `parent_event_id` only if
     // the chain head is somehow unset (no events yet — shouldn't happen after
     // playbook_started).
-    let issuing_event = state
-        .chain_heads
-        .head(execution_id)
-        .await
-        .unwrap_or(parent_event_id);
-    let event_rows: Vec<crate::handlers::event_write::EventRow> = prepared
-        .iter()
-        .map(|p| {
+    //
+    // Fused (noetl/ai-meta#561): the orchestration events ride in this same
+    // batch, so they have not advanced the head yet — the last of them is the
+    // head they WOULD have left, i.e. the same issuing event as unfused.
+    let issuing_event = match fused_events.last() {
+        Some(last) => last.event_id,
+        None => state
+            .chain_heads
+            .head(execution_id)
+            .await
+            .unwrap_or(parent_event_id),
+    };
+    let event_rows: Vec<crate::handlers::event_write::EventRow> = fused_events
+        .into_iter()
+        .chain(prepared.iter().map(|p| {
             crate::handlers::event_write::EventRow::new(
                 p.event_id,
                 execution_id,
@@ -1520,7 +1563,7 @@ pub(crate) async fn persist_engine_commands_batch(
             .with_context(p.cmd_context.clone())
             .with_meta(p.cmd_meta.clone())
             .with_parent_event_id(parent_event_id)
-        })
+        }))
         .collect();
     crate::handlers::event_write::emit_events(state, pool, &event_rows).await?;
 
@@ -2290,6 +2333,21 @@ async fn publish_command_notification(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn pool_routes_match_prefix_and_default_off() {
+        use super::route_pool_for_path as r;
+        assert_eq!(r("", "api_integration/auth0/check_playbook_access"), None);
+        let routes = "api_integration/auth0/=auth, bench/x=Bad!, =x";
+        assert_eq!(
+            r(routes, "api_integration/auth0/check_playbook_access").as_deref(),
+            Some("auth")
+        );
+        assert_eq!(r(routes, "api_integration/other/p"), None);
+        assert_eq!(r(routes, "bench/x/y"), None, "invalid pool name ignored");
+        assert_eq!(r("system/=auth", "system/orchestrate"), None, "system never rerouted");
+        assert_eq!(r("a/=one,a/b=two", "a/b/c").as_deref(), Some("one"), "first wins");
+    }
     use super::*;
     use crate::engine::commands::{CommandBuilder, IteratorMetadata};
     use crate::playbook::types::{Loop, Step, ToolDefinition, ToolKind, ToolSpec};
