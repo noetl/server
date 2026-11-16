@@ -64,10 +64,12 @@ fn build_router(
         .then(|| handlers::agent_endpoint::routes(state.clone(), execution_service.clone()));
     // NoETL instances: register, discover, hand off (build plan item 9). Both routers are
     // empty unless NOETL_INSTANCE_REGISTRY=true.
-    let (instance_routes, instance_admin_routes, instance_state) = noetl_server::instances::routes();
+    let (instance_routes, instance_admin_routes, instance_state) =
+        noetl_server::instances::routes();
     // Cross-cluster catalog discovery (noetl/ai-meta#548 Phase 2): off unless
     // NOETL_CATALOG_DISCOVERY=true with CAS, the registry and a peer key.
-    let catalog_peer_routes = noetl_server::services::catalog_peer::init(db_pool.clone(), instance_state);
+    let catalog_peer_routes =
+        noetl_server::services::catalog_peer::init(db_pool.clone(), instance_state);
     // Cross-instance execution (noetl/ai-meta#548 follow-up): delegated calls
     // and the serving side. Off unless NOETL_CATALOG_REMOTE_CALLS / _SERVE with
     // CAS, pinning and discovery; needs catalog_peer::init above.
@@ -610,7 +612,6 @@ fn build_router(
             "/api/ehdb/projection-parity/self-test",
             get(handlers::ehdb_projection_parity::self_test_endpoint),
         )
-
         .route(
             "/api/ehdb/parity/executions/{execution_id}",
             get(handlers::ehdb_parity::compare_execution_endpoint),
@@ -964,35 +965,49 @@ fn build_router(
         // change, made per group once its shadow counters have sat at zero.
         .merge(health_routes)
         .merge(catalog_routes)
-        .merge(credential_routes.layer(axum::middleware::from_fn_with_state(
-            "credentials",
-            noetl_server::auth_gate::gate,
-        )))
+        .merge(
+            credential_routes.layer(axum::middleware::from_fn_with_state(
+                "credentials",
+                noetl_server::auth_gate::gate,
+            )),
+        )
         .merge(auth_routes)
-        .merge(sealed_credential_routes.layer(axum::middleware::from_fn_with_state(
-            "credentials",
-            noetl_server::auth_gate::gate,
-        )))
-        .merge(cross_region_routes.layer(axum::middleware::from_fn_with_state(
-            "internal",
-            noetl_server::auth_gate::gate,
-        )))
-        .merge(wallet_rotate_routes.layer(axum::middleware::from_fn_with_state(
-            "internal",
-            noetl_server::auth_gate::gate,
-        )))
-        .merge(secret_audit_routes.layer(axum::middleware::from_fn_with_state(
-            "internal",
-            noetl_server::auth_gate::gate,
-        )))
-        .merge(container_callback_routes.layer(axum::middleware::from_fn_with_state(
-            "internal",
-            noetl_server::auth_gate::gate,
-        )))
-        .merge(projection_routes.layer(axum::middleware::from_fn_with_state(
-            "internal",
-            noetl_server::auth_gate::gate,
-        )))
+        .merge(
+            sealed_credential_routes.layer(axum::middleware::from_fn_with_state(
+                "credentials",
+                noetl_server::auth_gate::gate,
+            )),
+        )
+        .merge(
+            cross_region_routes.layer(axum::middleware::from_fn_with_state(
+                "internal",
+                noetl_server::auth_gate::gate,
+            )),
+        )
+        .merge(
+            wallet_rotate_routes.layer(axum::middleware::from_fn_with_state(
+                "internal",
+                noetl_server::auth_gate::gate,
+            )),
+        )
+        .merge(
+            secret_audit_routes.layer(axum::middleware::from_fn_with_state(
+                "internal",
+                noetl_server::auth_gate::gate,
+            )),
+        )
+        .merge(
+            container_callback_routes.layer(axum::middleware::from_fn_with_state(
+                "internal",
+                noetl_server::auth_gate::gate,
+            )),
+        )
+        .merge(
+            projection_routes.layer(axum::middleware::from_fn_with_state(
+                "internal",
+                noetl_server::auth_gate::gate,
+            )),
+        )
         .merge(keychain_routes.layer(axum::middleware::from_fn_with_state(
             "keychain",
             noetl_server::auth_gate::gate,
@@ -1007,28 +1022,38 @@ fn build_router(
         // project and execution ids, so enumeration is a new capability — small
         // but real — and noetl/ai-meta#312 is what happens when one of those
         // ships unauthenticated because nobody argued about it.
-        .merge(ehdb_object_parity_routes.layer(axum::middleware::from_fn_with_state(
-            "internal",
-            noetl_server::auth_gate::gate,
-        )))
+        .merge(
+            ehdb_object_parity_routes.layer(axum::middleware::from_fn_with_state(
+                "internal",
+                noetl_server::auth_gate::gate,
+            )),
+        )
         .merge(ehdb_parity_routes)
-        .merge(ehdb_equivalence_routes.layer(axum::middleware::from_fn_with_state(
-            "internal",
-            noetl_server::auth_gate::gate,
-        )))
-        .merge(runtime_topology_routes.layer(axum::middleware::from_fn_with_state(
-            "internal",
-            noetl_server::auth_gate::gate,
-        )))
+        .merge(
+            ehdb_equivalence_routes.layer(axum::middleware::from_fn_with_state(
+                "internal",
+                noetl_server::auth_gate::gate,
+            )),
+        )
+        .merge(
+            runtime_topology_routes.layer(axum::middleware::from_fn_with_state(
+                "internal",
+                noetl_server::auth_gate::gate,
+            )),
+        )
         // Enumerates NoETL instances, so gated like the topology above (item 9).
-        .merge(instance_admin_routes.layer(axum::middleware::from_fn_with_state(
-            "internal",
-            noetl_server::auth_gate::gate,
-        )))
-        .merge(archive_read_routes.layer(axum::middleware::from_fn_with_state(
-            "internal",
-            noetl_server::auth_gate::gate,
-        )))
+        .merge(
+            instance_admin_routes.layer(axum::middleware::from_fn_with_state(
+                "internal",
+                noetl_server::auth_gate::gate,
+            )),
+        )
+        .merge(
+            archive_read_routes.layer(axum::middleware::from_fn_with_state(
+                "internal",
+                noetl_server::auth_gate::gate,
+            )),
+        )
         .merge(subscription_routes)
         .merge(replay_routes)
         .merge(result_store_routes)
@@ -1040,22 +1065,28 @@ fn build_router(
             "internal",
             noetl_server::auth_gate::gate,
         )))
-        .merge(object_store_routes.layer(axum::middleware::from_fn_with_state(
-            "internal",
-            noetl_server::auth_gate::gate,
-        )))
+        .merge(
+            object_store_routes.layer(axum::middleware::from_fn_with_state(
+                "internal",
+                noetl_server::auth_gate::gate,
+            )),
+        )
         .merge(cell_routes.layer(axum::middleware::from_fn_with_state(
             "internal",
             noetl_server::auth_gate::gate,
         )))
-        .merge(result_tier_routes.layer(axum::middleware::from_fn_with_state(
-            "internal",
-            noetl_server::auth_gate::gate,
-        )))
-        .merge(sink_state_routes.layer(axum::middleware::from_fn_with_state(
-            "internal",
-            noetl_server::auth_gate::gate,
-        )))
+        .merge(
+            result_tier_routes.layer(axum::middleware::from_fn_with_state(
+                "internal",
+                noetl_server::auth_gate::gate,
+            )),
+        )
+        .merge(
+            sink_state_routes.layer(axum::middleware::from_fn_with_state(
+                "internal",
+                noetl_server::auth_gate::gate,
+            )),
+        )
         .merge(ingress_routes.layer(axum::middleware::from_fn_with_state(
             "internal",
             noetl_server::auth_gate::gate,
@@ -1432,8 +1463,7 @@ async fn main() -> anyhow::Result<()> {
     // window here too means the running value is readable off /metrics instead
     // of off the Deployment spec, which is a different representation and can
     // disagree with what the process actually parsed.
-    let projection_lag_tolerance =
-        handlers::ehdb_projection_parity::parity_lag_tolerance_secs();
+    let projection_lag_tolerance = handlers::ehdb_projection_parity::parity_lag_tolerance_secs();
     noetl_server::metrics::set_ehdb_projection_parity_lag_tolerance(projection_lag_tolerance);
     handlers::ehdb_projection_mirror_queue::init(projection_lag_tolerance);
     // Publish the comparator's window so the ops alert reads the configured
@@ -1498,7 +1528,6 @@ async fn main() -> anyhow::Result<()> {
     // CREATE TABLE IF NOT EXISTS at startup is the right shape — no
     // out-of-band migration step required for first-boot deployments.
     noetl_server::db::queries::secret_audit::ensure_table(&db_pool).await?;
-
 
     // Result-store MVP (noetl/ai-meta#70) — same idempotent startup-DDL
     // pattern as secret_audit above.  The table is server-owned end-to-end;

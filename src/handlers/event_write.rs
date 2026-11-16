@@ -630,7 +630,9 @@ async fn insert_rows(pool: &DbPool, rows: &[EventRow]) -> AppResult<()> {
     }
     // noetl/ai-meta#559: the rows are readable now; wake anyone waiting on a
     // terminal one (a no-op map check when nobody waits).
-    crate::execution_wait::notify_written(rows.iter().map(|r| (r.execution_id, r.event_type.as_str())));
+    crate::execution_wait::notify_written(
+        rows.iter().map(|r| (r.execution_id, r.event_type.as_str())),
+    );
     Ok(())
 }
 

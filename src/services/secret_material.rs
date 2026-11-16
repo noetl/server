@@ -92,8 +92,7 @@ pub fn classify(s: &str) -> Option<Marker> {
     // while containing no material at all. Any genuine service-account key JSON carries
     // the PEM inside `private_key`, so demanding it costs no true positives and removes
     // the whole class of credential-handling code.
-    if s.contains("\"private_key\"") && s.contains("\"client_email\"") && s.contains("-----BEGIN")
-    {
+    if s.contains("\"private_key\"") && s.contains("\"client_email\"") && s.contains("-----BEGIN") {
         return Some(Marker::ServiceAccountJson);
     }
     if s.contains("-----BEGIN") && s.contains("PRIVATE KEY") {
@@ -230,7 +229,8 @@ mod tests {
     /// First, because a guard that rejects the correct usage is worse than none.
     #[test]
     fn a_credential_referenced_by_alias_is_accepted() {
-        let doc = y("workflow:\n  - step: q\n    auth: \"{{ db_credential }}\"\n    kind: postgres\n");
+        let doc =
+            y("workflow:\n  - step: q\n    auth: \"{{ db_credential }}\"\n    kind: postgres\n");
         let s = scan(&doc);
         assert!(
             s.findings.is_empty(),
@@ -273,9 +273,17 @@ mod tests {
         // A realistic service-account key: the PEM lives inside `private_key`.
         let sa = r#"{"type":"service_account","private_key":"-----BEGIN PRIVATE KEY-----\nMIIB\n-----END PRIVATE KEY-----\n","client_email":"a@b.iam"}"#;
         assert_eq!(classify(sa), Some(Marker::ServiceAccountJson));
-        let jwt = format!("eyJ{}.eyJ{}.{}", "a".repeat(30), "b".repeat(30), "c".repeat(30));
+        let jwt = format!(
+            "eyJ{}.eyJ{}.{}",
+            "a".repeat(30),
+            "b".repeat(30),
+            "c".repeat(30)
+        );
         assert_eq!(classify(&jwt), Some(Marker::Jwt));
-        assert_eq!(classify("AKIAIOSFODNN7EXAMPLE"), Some(Marker::ProviderToken));
+        assert_eq!(
+            classify("AKIAIOSFODNN7EXAMPLE"),
+            Some(Marker::ProviderToken)
+        );
         // ⚠⚠ Reachability of the SPECIFIC class, not merely "something fired". Requiring a
         // PEM inside the JSON put this class behind the bare-PEM test, where it could
         // never be reached; a plain `is_some()` here would have passed on PemBlock and
@@ -285,8 +293,14 @@ mod tests {
             Some(Marker::PemBlock),
             "the service-account class is shadowed by the bare PEM test and can never fire"
         );
-        assert_eq!(classify(&format!("ghp_{}", "a".repeat(36))), Some(Marker::ProviderToken));
-        assert_eq!(classify(&format!("xoxb-{}", "1".repeat(40))), Some(Marker::ProviderToken));
+        assert_eq!(
+            classify(&format!("ghp_{}", "a".repeat(36))),
+            Some(Marker::ProviderToken)
+        );
+        assert_eq!(
+            classify(&format!("xoxb-{}", "1".repeat(40))),
+            Some(Marker::ProviderToken)
+        );
     }
 
     /// ⚠⚠ The exact false positive a real-population sweep found, kept as a regression
@@ -315,7 +329,9 @@ mod tests {
     #[test]
     fn the_message_never_echoes_the_material() {
         let secret = format!("ghp_{}", "Z".repeat(36));
-        let doc = y(&format!("workflow:\n  - step: s\n    token: \"{secret}\"\n"));
+        let doc = y(&format!(
+            "workflow:\n  - step: s\n    token: \"{secret}\"\n"
+        ));
         let s = scan(&doc);
         assert_eq!(s.findings.len(), 1, "the planted token was not found");
         let msg = describe(&s);
@@ -347,9 +363,7 @@ mod tests {
     /// a confident clean on every realistic playbook.
     #[test]
     fn the_walker_reaches_nested_sequences_and_mappings() {
-        let doc = y(
-            "a:\n  b:\n    - c:\n        d: \"AKIAIOSFODNN7EXAMPLE\"\n",
-        );
+        let doc = y("a:\n  b:\n    - c:\n        d: \"AKIAIOSFODNN7EXAMPLE\"\n");
         let s = scan(&doc);
         assert_eq!(s.findings.len(), 1, "nested material was missed");
         assert_eq!(s.findings[0].path, "$.a.b[0].c.d");

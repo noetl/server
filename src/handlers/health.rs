@@ -193,10 +193,7 @@ pub(crate) fn compose_metrics(base: String, l0: Option<String>) -> String {
 pub async fn metrics() -> Response {
     match crate::metrics::gather_text() {
         Ok(text) => {
-            let text = compose_metrics(
-                text,
-                crate::handlers::ehdb_embedded::render_l0_metrics(),
-            );
+            let text = compose_metrics(text, crate::handlers::ehdb_embedded::render_l0_metrics());
             (
                 StatusCode::OK,
                 [(
@@ -305,9 +302,15 @@ mod l0_exposition_tests {
     #[test]
     fn the_l0_block_is_appended_when_present() {
         let base = "# HELP a x\na 1\n".to_string();
-        let l0 = Some("# HELP ehdb_l0_manifest_parts y\nehdb_l0_manifest_parts{dataset=\"d1_event_log\"} 0\n".to_string());
+        let l0 = Some(
+            "# HELP ehdb_l0_manifest_parts y\nehdb_l0_manifest_parts{dataset=\"d1_event_log\"} 0\n"
+                .to_string(),
+        );
         let out = compose_metrics(base.clone(), l0);
-        assert!(out.starts_with(&base), "the registry's own text must survive");
+        assert!(
+            out.starts_with(&base),
+            "the registry's own text must survive"
+        );
         assert!(
             out.contains("ehdb_l0_manifest_parts{dataset=\"d1_event_log\"} 0"),
             "the L0 block must be appended: {out}"
@@ -328,7 +331,10 @@ mod l0_exposition_tests {
         // Prometheus parses line-wise; "a 1ehdb_l0_x 0" is one corrupt line and
         // would take the whole scrape down, not just the appended block.
         let out = compose_metrics("a 1".to_string(), Some("ehdb_l0_x 0\n".to_string()));
-        assert!(out.contains("a 1\nehdb_l0_x 0"), "lines must stay separate: {out:?}");
+        assert!(
+            out.contains("a 1\nehdb_l0_x 0"),
+            "lines must stay separate: {out:?}"
+        );
     }
 
     /// The series this process promises to expose must actually exist in the

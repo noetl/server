@@ -189,6 +189,7 @@ pub async fn list_executions(
         status: query.status,
         limit: Some(limit),
         offset: Some(offset),
+        before: None,
     };
 
     let summaries = service.list(&filter).await?;

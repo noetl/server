@@ -76,6 +76,17 @@ pub struct ExecutionFilter {
     pub status: Option<String>,
     pub limit: Option<i32>,
     pub offset: Option<i32>,
+    /// Keyset cursor: only executions strictly older than this
+    /// `(started_at, execution_id)` pair. Internal callers only (never
+    /// deserialized from a query string).
+    ///
+    /// ⚠ Why it exists: `offset` paging re-aggregates `offset + limit`
+    /// executions per page, so walking the whole listing is quadratic. The
+    /// archive pass did exactly that in prod — 136 pages climbing to ~4 s each,
+    /// back to back, every 5 min. With a cursor every page aggregates only
+    /// `limit` executions.
+    #[serde(skip)]
+    pub before: Option<(DateTime<Utc>, i64)>,
 }
 
 /// Default page size when the caller does not ask (noetl/ai-meta#255).
@@ -486,6 +497,7 @@ impl ExecutionService {
                 let catalog_id = filter.catalog_id;
                 let status = filter.status.clone();
                 let path_ids = path_catalog_ids.clone();
+                let before = filter.before;
                 async move {
                     // noetl/ai-meta#62: candidate-first.  The old query
                     // GROUP BY'd the entire `noetl.event` table (O(all events)
@@ -512,8 +524,15 @@ impl ExecutionService {
                               -- noetl/server#435: the path filter, as catalog
                               -- ids, applied BEFORE the candidate window.
                               AND ($6::BIGINT[] IS NULL OR catalog_id = ANY($6))
+                              -- Keyset cursor ($7, $8). Pre-filtering start events
+                              -- at or before the cursor is exact: an execution
+                              -- whose true MIN is below the cursor keeps the same
+                              -- MIN, and one whose MIN is above it is dropped.
+                              AND ($7::TIMESTAMPTZ IS NULL OR created_at <= ($7::TIMESTAMPTZ AT TIME ZONE 'UTC'))
                             GROUP BY execution_id, catalog_id
-                            ORDER BY started_at DESC
+                            HAVING ($7::TIMESTAMPTZ IS NULL
+                                    OR (MIN(created_at) AT TIME ZONE 'UTC', execution_id) < ($7::TIMESTAMPTZ, $8::BIGINT))
+                            ORDER BY started_at DESC, execution_id DESC
                             LIMIT $4
                         ),
                         stats AS (
@@ -566,7 +585,7 @@ impl ExecutionService {
                         FROM recent r
                         JOIN stats s ON s.execution_id = r.execution_id
                         WHERE ($2::TEXT IS NULL OR s.status = $2)
-                        ORDER BY r.started_at DESC
+                        ORDER BY r.started_at DESC, r.execution_id DESC
                         LIMIT $3
                         "#,
                     )
@@ -576,6 +595,8 @@ impl ExecutionService {
                     .bind(candidate_cap)
                     .bind(crate::db::queries::event::status_from_steps_enabled())
                     .bind(path_ids)
+                    .bind(before.map(|b| b.0))
+                    .bind(before.map(|b| b.1))
                     .fetch_all(&pool)
                     .await
                 }
@@ -587,7 +608,7 @@ impl ExecutionService {
             .into_iter()
             .flat_map(|(_idx, rows)| rows)
             .collect();
-        merged.sort_by_key(|b| std::cmp::Reverse(b.3));
+        merged.sort_by_key(|b| std::cmp::Reverse((b.3, b.0)));
 
         // Stage 3 — cluster-master catalog lookup for the
         // (deduped) catalog_id set.  One SELECT regardless of
@@ -1265,7 +1286,10 @@ mod paging_tests {
         assert_eq!(p.limit, DEFAULT_LIMIT);
         assert_eq!(p.offset, 0);
         assert_eq!(p.requested_limit, None);
-        assert!(!p.capped, "an unspecified limit was not capped, it was defaulted");
+        assert!(
+            !p.capped,
+            "an unspecified limit was not capped, it was defaulted"
+        );
     }
 
     /// noetl/ai-meta#255 defect 1: the cap applied silently.
@@ -1303,7 +1327,10 @@ mod paging_tests {
     fn a_negative_limit_is_rejected_not_turned_into_a_server_error() {
         let e = resolve_paging(Some(-1), None).unwrap_err();
         assert!(e.contains("limit must be >= 0"), "{e}");
-        assert!(e.contains("-1"), "the offending value must be quoted back: {e}");
+        assert!(
+            e.contains("-1"),
+            "the offending value must be quoted back: {e}"
+        );
         assert!(resolve_paging(None, Some(-1)).is_err(), "offset too");
     }
 

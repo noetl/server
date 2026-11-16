@@ -196,7 +196,9 @@ pub fn build(
         (
             None,
             false,
-            Some(format!("content {content_bytes} bytes exceeds cap {max_bytes}")),
+            Some(format!(
+                "content {content_bytes} bytes exceeds cap {max_bytes}"
+            )),
         )
     } else {
         (Some(content.to_string()), true, None)
@@ -300,13 +302,9 @@ pub async fn record(
         "snapshot_mode": mode.as_str(),
     }));
 
-    if crate::handlers::event_write::emit_event(
-        state,
-        state.pools.pool_for(execution_id),
-        ev,
-    )
-    .await
-    .is_err()
+    if crate::handlers::event_write::emit_event(state, state.pools.pool_for(execution_id), ev)
+        .await
+        .is_err()
     {
         crate::metrics::record_catalog_snapshot(mode.as_str(), "emit_failed");
         tracing::warn!(
@@ -362,9 +360,26 @@ mod tests {
     #[test]
     fn the_snapshot_pins_content_not_just_the_version() {
         let w = serde_json::json!({"city": "Rome"});
-        let a = build(&item(), 1, "steps: [a]", &w, Mode::Digest, DEFAULT_MAX_BYTES);
-        let b = build(&item(), 1, "steps: [b]", &w, Mode::Digest, DEFAULT_MAX_BYTES);
-        assert_eq!(a.version, b.version, "same catalog version, by construction");
+        let a = build(
+            &item(),
+            1,
+            "steps: [a]",
+            &w,
+            Mode::Digest,
+            DEFAULT_MAX_BYTES,
+        );
+        let b = build(
+            &item(),
+            1,
+            "steps: [b]",
+            &w,
+            Mode::Digest,
+            DEFAULT_MAX_BYTES,
+        );
+        assert_eq!(
+            a.version, b.version,
+            "same catalog version, by construction"
+        );
         assert_ne!(
             a.content_sha256, b.content_sha256,
             "identical digests for different content would make an ephemeral \
@@ -376,8 +391,22 @@ mod tests {
     #[test]
     fn the_same_content_pins_identically() {
         let w = serde_json::json!({});
-        let a = build(&item(), 1, "steps: [a]", &w, Mode::Digest, DEFAULT_MAX_BYTES);
-        let b = build(&item(), 2, "steps: [a]", &w, Mode::Digest, DEFAULT_MAX_BYTES);
+        let a = build(
+            &item(),
+            1,
+            "steps: [a]",
+            &w,
+            Mode::Digest,
+            DEFAULT_MAX_BYTES,
+        );
+        let b = build(
+            &item(),
+            2,
+            "steps: [a]",
+            &w,
+            Mode::Digest,
+            DEFAULT_MAX_BYTES,
+        );
         assert_eq!(a.content_sha256, b.content_sha256);
     }
 
@@ -386,12 +415,20 @@ mod tests {
     #[test]
     fn the_effective_workload_is_pinned_not_the_request_alone() {
         let a = build(
-            &item(), 1, "x", &serde_json::json!({"city": "Rome"}),
-            Mode::Digest, DEFAULT_MAX_BYTES,
+            &item(),
+            1,
+            "x",
+            &serde_json::json!({"city": "Rome"}),
+            Mode::Digest,
+            DEFAULT_MAX_BYTES,
         );
         let b = build(
-            &item(), 1, "x", &serde_json::json!({"city": "Paris"}),
-            Mode::Digest, DEFAULT_MAX_BYTES,
+            &item(),
+            1,
+            "x",
+            &serde_json::json!({"city": "Paris"}),
+            Mode::Digest,
+            DEFAULT_MAX_BYTES,
         );
         assert_ne!(
             a.workload_sha256, b.workload_sha256,
@@ -403,18 +440,36 @@ mod tests {
     /// `digest` mode omits content but the pin is still complete.
     #[test]
     fn digest_mode_omits_content_but_keeps_the_pin() {
-        let s = build(&item(), 1, "steps: [a]", &serde_json::json!({}), Mode::Digest, DEFAULT_MAX_BYTES);
+        let s = build(
+            &item(),
+            1,
+            "steps: [a]",
+            &serde_json::json!({}),
+            Mode::Digest,
+            DEFAULT_MAX_BYTES,
+        );
         assert!(s.content.is_none());
         assert!(!s.content_included);
         assert_eq!(s.content_omitted_reason.as_deref(), Some("mode=digest"));
-        assert_eq!(s.content_bytes, "steps: [a]".len(), "the size is recorded even when the bytes are not");
+        assert_eq!(
+            s.content_bytes,
+            "steps: [a]".len(),
+            "the size is recorded even when the bytes are not"
+        );
         assert_eq!(s.content_sha256.len(), 64);
     }
 
     /// `full` mode carries the content verbatim.
     #[test]
     fn full_mode_carries_the_content() {
-        let s = build(&item(), 1, "steps: [a]", &serde_json::json!({}), Mode::Full, DEFAULT_MAX_BYTES);
+        let s = build(
+            &item(),
+            1,
+            "steps: [a]",
+            &serde_json::json!({}),
+            Mode::Full,
+            DEFAULT_MAX_BYTES,
+        );
         assert_eq!(s.content.as_deref(), Some("steps: [a]"));
         assert!(s.content_included);
         assert!(s.content_omitted_reason.is_none());
@@ -428,10 +483,16 @@ mod tests {
     fn oversized_content_is_omitted_with_a_reason_never_truncated() {
         let big = "y".repeat(500);
         let s = build(&item(), 1, &big, &serde_json::json!({}), Mode::Full, 100);
-        assert!(s.content.is_none(), "content must not be carried over the cap");
+        assert!(
+            s.content.is_none(),
+            "content must not be carried over the cap"
+        );
         assert!(!s.content_included);
         let r = s.content_omitted_reason.expect("an omission must say why");
-        assert!(r.contains("500") && r.contains("100"), "reason must name both sizes: {r}");
+        assert!(
+            r.contains("500") && r.contains("100"),
+            "reason must name both sizes: {r}"
+        );
         assert_eq!(
             s.content_sha256,
             sha256_hex(big.as_bytes()),

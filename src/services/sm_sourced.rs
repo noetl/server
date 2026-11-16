@@ -223,8 +223,7 @@ mod tests {
     /// own defaults.
     #[test]
     fn project_and_version_are_optional() {
-        let s = parse_marker(&json!({MARKER: {"provider": "gcp", "secret": "s"}}))
-            .expect("marker");
+        let s = parse_marker(&json!({MARKER: {"provider": "gcp", "secret": "s"}})).expect("marker");
         assert_eq!(s.project, None);
         assert_eq!(s.version, None);
     }
@@ -235,10 +234,10 @@ mod tests {
     #[test]
     fn a_malformed_marker_falls_back_to_static_not_to_an_error() {
         for d in [
-            json!({MARKER: {"provider": "gcp"}}),              // no secret
-            json!({MARKER: {"secret": "s"}}),                  // no provider
-            json!({MARKER: {"provider": "", "secret": "s"}}),  // empty provider
-            json!({MARKER: {"provider": "gcp", "secret": ""}}),// empty secret
+            json!({MARKER: {"provider": "gcp"}}),               // no secret
+            json!({MARKER: {"secret": "s"}}),                   // no provider
+            json!({MARKER: {"provider": "", "secret": "s"}}),   // empty provider
+            json!({MARKER: {"provider": "gcp", "secret": ""}}), // empty secret
             json!({MARKER: "not an object"}),
             json!({MARKER: null}),
         ] {
