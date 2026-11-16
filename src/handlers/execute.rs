@@ -1391,6 +1391,7 @@ pub(crate) async fn persist_engine_command(
 /// and `cmd_meta` (iterator / trace / cursor metadata).
 ///
 /// Returns the number of commands persisted.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn persist_engine_commands_batch(
     state: &AppState,
     execution_id: i64,
