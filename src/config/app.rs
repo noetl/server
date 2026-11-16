@@ -158,6 +158,24 @@ pub struct AppConfig {
     /// step is never issued twice.
     #[serde(default = "default_local_drive_drive_deadline_ms")]
     pub local_drive_drive_deadline_ms: u64,
+    /// Serve the per-event `catalog_id` from the warm execute-time descriptor
+    /// under the default `event_scan` read path too (noetl/ai-meta#561 slice 2).
+    /// Envy maps `NOETL_INGEST_CATALOG_FROM_DESCRIPTOR`; default false.
+    ///
+    /// Every worker event paid a `noetl.event` read for its execution's
+    /// `catalog_id` — 12.6 ms mean in prod, 76k lookups against 8.5k written
+    /// events, because the `__orchestrate__` meta-events (whose rows are then
+    /// discarded) pay it too. An execution's `catalog_id` never changes, so a
+    /// warm descriptor is authoritative; a cold one falls through to the scan.
+    /// Unlike `NOETL_EVENT_READ_PATH=audit_only` this changes nothing else.
+    #[serde(default)]
+    pub ingest_catalog_from_descriptor: bool,
+    /// Reuse the parsed playbook (keyed by immutable `catalog_id`) on the
+    /// orchestration dispatch and apply paths (noetl/ai-meta#561 slice 2).
+    /// Envy maps `NOETL_PLAYBOOK_PARSE_CACHE`; default false. Off, every drive
+    /// re-reads `noetl.catalog.content` and re-parses the YAML.
+    #[serde(default)]
+    pub playbook_parse_cache: bool,
     /// Push completion to waiters (noetl/ai-meta#559, Stage 2a of RFC #556).
     /// Envy maps `NOETL_EXECUTION_WAIT`. When true the server serves
     /// `GET /api/executions/{id}/wait?timeout=s`, a long poll woken when a
@@ -1235,6 +1253,8 @@ impl Default for AppConfig {
             local_drive_claim_ttl_ms: default_local_drive_claim_ttl_ms(),
             local_drive_sweep: default_true_sweep(),
             local_drive_drive_deadline_ms: default_local_drive_drive_deadline_ms(),
+            ingest_catalog_from_descriptor: false,
+            playbook_parse_cache: false,
             // noetl/ai-meta#559: the wait long poll is opt-in.
             execution_wait: false,
             playbook_await_park: false,

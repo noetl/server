@@ -1724,6 +1724,35 @@ fn build_result_object(request: &EventRequest, status: &str) -> serde_json::Valu
     serde_json::Value::Object(result)
 }
 
+/// The playbook for a drive (dispatch, in-process trigger, worker apply).
+///
+/// Under `NOETL_PLAYBOOK_PARSE_CACHE` the parse is shared per immutable
+/// `catalog_id` (noetl/ai-meta#561 slice 2); off, it is read and parsed fresh,
+/// exactly as before.
+async fn load_playbook_for_drive(
+    state: &AppState,
+    catalog_id: i64,
+) -> AppResult<std::sync::Arc<crate::playbook::types::Playbook>> {
+    if state.config.playbook_parse_cache {
+        crate::metrics::record_orchestrate_drive("playbook_cache_lookup");
+        return crate::handlers::advance::load_playbook(state, catalog_id).await;
+    }
+    // Phase F R4-3: noetl.catalog is a cluster-wide table.
+    let playbook_yaml: String =
+        sqlx::query_scalar("SELECT content FROM noetl.catalog WHERE catalog_id = $1")
+            .bind(catalog_id)
+            .fetch_one(state.pools.cluster())
+            .await
+            .map_err(|e| {
+                AppError::Internal(format!(
+                    "drive: load playbook for catalog_id {catalog_id}: {e}"
+                ))
+            })?;
+    Ok(std::sync::Arc::new(
+        crate::playbook::parser::parse_playbook(&playbook_yaml)?,
+    ))
+}
+
 /// Get catalog_id for an execution.
 ///
 /// Reads `noetl.event` first (authoritative when present), then falls back to
@@ -1772,6 +1801,16 @@ async fn get_catalog_id(state: &AppState, execution_id: i64, site: &str) -> AppR
         .fetch_optional(pool)
         .await?;
         return Ok(row.map(|(id,)| id));
+    }
+    // noetl/ai-meta#561 slice 2: the same warm-descriptor read under event_scan,
+    // and nothing else from audit_only. A cold descriptor scans as before.
+    if state.config.ingest_catalog_from_descriptor {
+        if let Some(desc) = state.exec_descriptors.get(execution_id).await {
+            if desc.catalog_id != 0 {
+                crate::metrics::record_event_hotpath_read(site, "served_descriptor");
+                return Ok(Some(desc.catalog_id));
+            }
+        }
     }
     crate::metrics::record_event_hotpath_read(site, "scan");
 
@@ -3411,17 +3450,7 @@ async fn dispatch_offserver_stateless_drive(
 
     // Playbook content — PK lookup on the cluster `noetl.catalog` table (not a
     // `noetl.event` read).
-    let playbook_yaml: String =
-        sqlx::query_scalar("SELECT content FROM noetl.catalog WHERE catalog_id = $1")
-            .bind(catalog_id)
-            .fetch_one(state.pools.cluster())
-            .await
-            .map_err(|e| {
-                AppError::Internal(format!(
-                    "stateless drive: load playbook for catalog_id {catalog_id}: {e}"
-                ))
-            })?;
-    let playbook = crate::playbook::parser::parse_playbook(&playbook_yaml)?;
+    let playbook = load_playbook_for_drive(state, catalog_id).await?;
 
     // noetl/ai-meta#156: attach the per-execution event tail the server just
     // published so the worker advances its WAL index to `expected_head`
@@ -3935,17 +3964,7 @@ pub(crate) async fn trigger_orchestrator_inner(
         .await;
 
     // Phase F R4-3: noetl.catalog is a cluster-wide table.
-    let playbook_yaml: String =
-        sqlx::query_scalar("SELECT content FROM noetl.catalog WHERE catalog_id = $1")
-            .bind(catalog_id)
-            .fetch_one(state.pools.cluster())
-            .await
-            .map_err(|e| {
-                AppError::Internal(format!(
-                    "Failed to load playbook for catalog_id {catalog_id}: {e}"
-                ))
-            })?;
-    let playbook = crate::playbook::parser::parse_playbook(&playbook_yaml)?;
+    let playbook = load_playbook_for_drive(state, catalog_id).await?;
 
     // 3. Resolve over-budget cursor claim references into inline rows before the
     //    drive reads them (noetl/ai-meta#101 phase 2) — a referenced claim has
@@ -4703,15 +4722,7 @@ pub(crate) async fn apply_worker_orchestration(
     };
 
     // Phase F R4-3: noetl.catalog is a cluster-wide table.
-    let playbook_yaml: String =
-        sqlx::query_scalar("SELECT content FROM noetl.catalog WHERE catalog_id = $1")
-            .bind(catalog_id)
-            .fetch_one(state.pools.cluster())
-            .await
-            .map_err(|e| {
-                AppError::Internal(format!("worker-driven: load playbook {catalog_id}: {e}"))
-            })?;
-    let playbook = crate::playbook::parser::parse_playbook(&playbook_yaml)?;
+    let playbook = load_playbook_for_drive(state, catalog_id).await?;
 
     let commands_generated = apply_orchestration_result(
         state,
