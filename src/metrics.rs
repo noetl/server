@@ -1625,6 +1625,7 @@ pub fn init_event_ingest_phase_series() {
         "emit_should_publish",
         "emit_publish",
         "emit_publish_batch",
+        "emit_seq",
         "emit_insert",
         "trigger",
     ] {

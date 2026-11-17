@@ -497,27 +497,7 @@ pub async fn handle_event(
     // ingest (or, under publish-only, the materializer) fires for this event is
     // suppressed. The marker rides a header, not the event body, so the event
     // log is identical with the flag on and off.
-    if state.0.config.server_advance_api
-        && request.0.event_type == "command.completed"
-        && request.0.step != noetl_orchestrate_core::state::WorkflowState::ORCHESTRATE_META_STEP
-        && !state.0.affinity.active()
-        && headers
-            .get(LOCAL_DRIVE_HEADER)
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-    {
-        if let (Ok(execution_id), Some(Ok(event_id))) = (
-            request.0.execution_id.parse::<i64>(),
-            request.0.event_id.as_deref().map(str::parse::<i64>),
-        ) {
-            state.0.local_drive.claim(
-                event_id,
-                execution_id,
-                std::time::Duration::from_millis(state.0.config.local_drive_claim_ttl_ms),
-            );
-            crate::metrics::record_orchestrate_drive("local_drive_claimed");
-        }
-    }
+    claim_local_drive_if_marked(&state.0, &headers, &request.0);
 
     let result = handle_event_inner(state, request).await;
 
@@ -526,6 +506,36 @@ pub async fn handle_event(
     crate::metrics::record_event_ingest(&event_type_for_metrics, status_label, duration_seconds);
 
     result
+}
+
+/// noetl/ai-meta#558 local-drive claim for a `command.completed` that carries
+/// [`LOCAL_DRIVE_HEADER`]. Shared by `/api/events` and `/api/events/seq`.
+fn claim_local_drive_if_marked(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    request: &EventRequest,
+) {
+    if state.config.server_advance_api
+        && request.event_type == "command.completed"
+        && request.step != noetl_orchestrate_core::state::WorkflowState::ORCHESTRATE_META_STEP
+        && !state.affinity.active()
+        && headers
+            .get(LOCAL_DRIVE_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    {
+        if let (Ok(execution_id), Some(Ok(event_id))) = (
+            request.execution_id.parse::<i64>(),
+            request.event_id.as_deref().map(str::parse::<i64>),
+        ) {
+            state.local_drive.claim(
+                event_id,
+                execution_id,
+                std::time::Duration::from_millis(state.config.local_drive_claim_ttl_ms),
+            );
+            crate::metrics::record_orchestrate_drive("local_drive_claimed");
+        }
+    }
 }
 
 /// Inner body of [`handle_event`] — same logic, no instrumentation.
@@ -664,15 +674,6 @@ async fn handle_event_inner(
         .parse()
         .map_err(|_| AppError::Validation("Invalid execution_id".to_string()))?;
 
-    // Events that should NOT trigger engine processing
-    let skip_engine_events = [
-        "command.claimed",
-        "command.started",
-        "command.completed",
-        "command.failed",
-        "step.enter",
-    ];
-
     // For command.claimed, check if already claimed
     if request.event_type == "command.claimed" {
         if let Some(command_id) = get_command_id(&request) {
@@ -718,17 +719,7 @@ async fn handle_event_inner(
         // publish to noetl_events (gate on → materializer is the sole writer).
         // `catalog_id` is always Some here — the playbook_started event wrote
         // one before any worker event, and the column is NOT NULL.
-        let ev = crate::handlers::event_write::EventRow::new(
-            row.event_id,
-            row.execution_id,
-            row.catalog_id.unwrap_or(0),
-            row.event_type.clone(),
-            row.status.clone(),
-            row.created_at,
-        )
-        .with_node(row.node_name.clone())
-        .with_result(row.result.clone())
-        .with_meta(row.meta.clone());
+        let ev = event_row_from_normalized(&row);
         let __t = std::time::Instant::now();
         crate::handlers::event_write::emit_event(&state, state.pools.pool_for(execution_id), ev)
             .await?;
@@ -737,6 +728,37 @@ async fn handle_event_inner(
         crate::metrics::record_orchestrate_drive("event_suppressed");
     }
 
+    let commands_generated =
+        after_event_persisted(&state, &request, execution_id, event_id, row.catalog_id).await;
+
+    Ok(Json(EventResponse {
+        status: "ok".to_string(),
+        event_id,
+        commands_generated,
+    }))
+}
+
+/// Everything [`handle_event_inner`] does AFTER the row is written: the
+/// "persisted" log, the parked-completion signal, the meta-step apply and the
+/// orchestrator trigger. Shared by the per-event path and `/api/events/seq`
+/// (noetl/ai-meta#561) so a fused ingest runs byte-for-byte the same
+/// post-write logic per event, in order.
+async fn after_event_persisted(
+    state: &AppState,
+    request: &EventRequest,
+    execution_id: i64,
+    event_id: i64,
+    catalog_id: Option<i64>,
+) -> i32 {
+    // Events that should NOT trigger engine processing
+    let skip_engine_events = [
+        "command.claimed",
+        "command.started",
+        "command.completed",
+        "command.failed",
+        "step.enter",
+    ];
+    let row_catalog_id = catalog_id;
     info!(
         "Event persisted: event_id={}, execution_id={}, event_type={}",
         event_id, execution_id, request.event_type
@@ -798,7 +820,7 @@ async fn handle_event_inner(
         // the orchestrator. Those real commands' completions re-trigger the drive
         // — the loop continues; the meta-command's own events never do.
         if request.event_type == "call.done" {
-            match apply_worker_orchestration(&state, execution_id, event_id, &request.payload).await
+            match apply_worker_orchestration(state, execution_id, event_id, &request.payload).await
             {
                 Ok(cmds) => info!(
                     execution_id,
@@ -809,7 +831,7 @@ async fn handle_event_inner(
             }
         }
     } else if (request.event_type == "command.completed" || request.event_type == "command.failed")
-        && !crate::handlers::event_write::should_publish(&state, row.catalog_id.unwrap_or(0)).await
+        && !crate::handlers::event_write::should_publish(state, row_catalog_id.unwrap_or(0)).await
     {
         // CQRS write-path cutover (#103 2d-3): when the gate is on, this event was
         // PUBLISHED, not written — `noetl.event` doesn't have it yet, so triggering
@@ -818,7 +840,7 @@ async fn handle_event_inner(
         // the row is durably inserted (read-your-writes). Gate off (default): trigger
         // inline exactly as today.
         let __t = std::time::Instant::now();
-        let __trig = trigger_orchestrator(&state, execution_id, event_id).await;
+        let __trig = trigger_orchestrator(state, execution_id, event_id).await;
         crate::metrics::record_event_ingest_phase("trigger", __t.elapsed().as_secs_f64());
         match __trig {
             Ok(cmds) => {
@@ -833,11 +855,128 @@ async fn handle_event_inner(
         }
     }
 
-    Ok(Json(EventResponse {
-        status: "ok".to_string(),
-        event_id,
-        commands_generated,
-    }))
+    commands_generated
+}
+
+/// The `EventRow` the per-event ingest writes for a normalized request. One
+/// builder for `/api/events` and `/api/events/seq`, so both write the same row.
+fn event_row_from_normalized(row: &NormalizedEventRow) -> crate::handlers::event_write::EventRow {
+    crate::handlers::event_write::EventRow::new(
+        row.event_id,
+        row.execution_id,
+        row.catalog_id.unwrap_or(0),
+        row.event_type.clone(),
+        row.status.clone(),
+        row.created_at,
+    )
+    .with_node(row.node_name.clone())
+    .with_result(row.result.clone())
+    .with_meta(row.meta.clone())
+}
+
+/// `POST /api/events/seq` body: one tool's `call.done` + `command.completed`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct EventSeqRequest {
+    pub events: Vec<EventRequest>,
+}
+
+/// `POST /api/events/seq` response: the ids written, in request order.
+#[derive(Debug, Clone, Serialize)]
+pub struct EventSeqResponse {
+    pub status: String,
+    pub event_ids: Vec<i64>,
+    pub commands_generated: i32,
+}
+
+/// The only shape `/api/events/seq` accepts (noetl/ai-meta#561): exactly a
+/// single tool's `call.done` followed by its `command.completed` — same
+/// execution, same step, producer-stamped ids, not the orchestrate meta-step,
+/// not a parked completion. Anything else is refused BEFORE anything is
+/// written, so a worker that gets a 4xx can safely resend per event.
+pub(crate) fn validate_event_seq(events: &[EventRequest]) -> Result<i64, String> {
+    let [done, completed] = events else {
+        return Err(format!("expected 2 events, got {}", events.len()));
+    };
+    if done.event_type != "call.done" || completed.event_type != "command.completed" {
+        return Err(format!(
+            "expected [call.done, command.completed], got [{}, {}]",
+            done.event_type, completed.event_type
+        ));
+    }
+    if done.execution_id != completed.execution_id || done.step != completed.step {
+        return Err("events must share execution_id and step".to_string());
+    }
+    if done.step == noetl_orchestrate_core::state::WorkflowState::ORCHESTRATE_META_STEP {
+        return Err("the orchestrate meta-step is never fused".to_string());
+    }
+    if done.event_id.is_none() || completed.event_id.is_none() {
+        return Err("both events must carry a producer event_id".to_string());
+    }
+    if completed
+        .payload
+        .get("pending_callback")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        return Err("a parked completion is never fused".to_string());
+    }
+    done.execution_id
+        .parse::<i64>()
+        .map_err(|_| "Invalid execution_id".to_string())
+}
+
+/// Ingest one tool's `call.done` + `command.completed` in one request
+/// (noetl/ai-meta#561 worker lifecycle fusion). Each event is normalized and
+/// post-processed by exactly the per-event code; the two rows go through ONE
+/// `emit_events` (so `NOETL_EVENT_PUBLISH_BATCH` publishes them as one burst).
+/// The worker only calls this when `NOETL_WORKER_FUSE_LIFECYCLE` is on.
+pub async fn handle_event_seq(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Json(request): Json<EventSeqRequest>,
+) -> Result<Json<EventSeqResponse>, AppError> {
+    let started_at = std::time::Instant::now();
+    let execution_id = validate_event_seq(&request.events).map_err(AppError::Validation)?;
+    // Affinity forwards single events to the owning replica; the fused form is
+    // not forwarded — refuse it so the worker resends per event.
+    if state.affinity.active() {
+        return Err(AppError::Conflict(
+            "events/seq is not served under execution affinity".to_string(),
+        ));
+    }
+    let result = async {
+        claim_local_drive_if_marked(&state, &headers, &request.events[1]);
+        let __t = std::time::Instant::now();
+        let mut normalized = Vec::with_capacity(request.events.len());
+        for ev in &request.events {
+            normalized.push(normalize_event_to_row(&state, ev).await?);
+        }
+        crate::metrics::record_event_ingest_phase("normalize", __t.elapsed().as_secs_f64());
+        let rows: Vec<_> = normalized.iter().map(event_row_from_normalized).collect();
+        let __t = std::time::Instant::now();
+        crate::handlers::event_write::emit_events(&state, state.pools.pool_for(execution_id), &rows)
+            .await?;
+        crate::metrics::record_event_ingest_phase("emit_seq", __t.elapsed().as_secs_f64());
+        let mut event_ids = Vec::with_capacity(normalized.len());
+        let mut commands_generated = 0;
+        for (ev, row) in request.events.iter().zip(normalized.iter()) {
+            commands_generated =
+                after_event_persisted(&state, ev, execution_id, row.event_id, row.catalog_id).await;
+            event_ids.push(row.event_id);
+        }
+        Ok::<_, AppError>(EventSeqResponse {
+            status: "ok".to_string(),
+            event_ids,
+            commands_generated,
+        })
+    }
+    .await;
+    let status_label = if result.is_ok() { "ok" } else { "error" };
+    let duration_seconds = started_at.elapsed().as_secs_f64();
+    for ev in &request.events {
+        crate::metrics::record_event_ingest(&ev.event_type, status_label, duration_seconds);
+    }
+    result.map(Json)
 }
 
 /// Resolve an offloaded command context back to its full `{tool_config, args,
@@ -6710,5 +6849,64 @@ mod claim_cancel_check_tests {
             "claim_command must not check a single cancel spelling: the cancel \
              API writes `playbook_cancelled`"
         );
+    }
+}
+
+#[cfg(test)]
+mod event_seq_tests {
+    use super::*;
+
+    fn ev(t: &str, step: &str, id: Option<&str>, payload: serde_json::Value) -> EventRequest {
+        serde_json::from_value(serde_json::json!({
+            "execution_id": "42", "step": step, "event_type": t,
+            "payload": payload, "event_id": id,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn accepts_only_one_tools_done_then_completed() {
+        let ok = vec![
+            ev("call.done", "s", Some("1"), serde_json::json!({})),
+            ev("command.completed", "s", Some("2"), serde_json::json!({})),
+        ];
+        assert_eq!(validate_event_seq(&ok), Ok(42));
+        // order, arity, step, meta-step, ids and parked completions are refused
+        let rev = vec![ok[1].clone(), ok[0].clone()];
+        assert!(validate_event_seq(&rev).is_err());
+        assert!(validate_event_seq(&ok[..1]).is_err());
+        let three = vec![ok[0].clone(), ok[0].clone(), ok[1].clone()];
+        assert!(validate_event_seq(&three).is_err());
+        let other_step = vec![ok[0].clone(), ev("command.completed", "t", Some("2"), serde_json::json!({}))];
+        assert!(validate_event_seq(&other_step).is_err());
+        let meta = noetl_orchestrate_core::state::WorkflowState::ORCHESTRATE_META_STEP;
+        let m = vec![
+            ev("call.done", meta, Some("1"), serde_json::json!({})),
+            ev("command.completed", meta, Some("2"), serde_json::json!({})),
+        ];
+        assert!(validate_event_seq(&m).is_err());
+        let no_id = vec![ev("call.done", "s", None, serde_json::json!({})), ok[1].clone()];
+        assert!(validate_event_seq(&no_id).is_err());
+        let parked = vec![
+            ok[0].clone(),
+            ev("command.completed", "s", Some("2"), serde_json::json!({"pending_callback": true})),
+        ];
+        assert!(validate_event_seq(&parked).is_err());
+        let failed = vec![ok[0].clone(), ev("command.failed", "s", Some("2"), serde_json::json!({}))];
+        assert!(validate_event_seq(&failed).is_err());
+    }
+
+    #[test]
+    fn seq_reuses_the_per_event_row_and_post_write_code() {
+        let src = include_str!("events.rs");
+        let inner = &src[src.find("async fn handle_event_inner(").unwrap()..];
+        let inner = &inner[..inner.find("\n}\n").unwrap()];
+        assert!(inner.contains("event_row_from_normalized(&row)"));
+        assert!(inner.contains("after_event_persisted("));
+        let seq = &src[src.find("pub async fn handle_event_seq(").unwrap()..];
+        let seq = &seq[..seq.find("\n}\n").unwrap()];
+        for needle in ["normalize_event_to_row(", "event_row_from_normalized", "after_event_persisted(", "claim_local_drive_if_marked("] {
+            assert!(seq.contains(needle), "seq must reuse {needle}");
+        }
     }
 }
