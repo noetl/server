@@ -58,6 +58,7 @@ pub async fn list(
         status: query.status,
         limit: query.limit,
         offset: query.offset,
+        before: None,
     };
 
     // noetl/ai-meta#255 — the cap has to be VISIBLE.  `?limit=300` used to return

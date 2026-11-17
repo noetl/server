@@ -158,6 +158,43 @@ pub struct AppConfig {
     /// step is never issued twice.
     #[serde(default = "default_local_drive_drive_deadline_ms")]
     pub local_drive_drive_deadline_ms: u64,
+    /// Serve the per-event `catalog_id` from the warm execute-time descriptor
+    /// under the default `event_scan` read path too (noetl/ai-meta#561 slice 2).
+    /// Envy maps `NOETL_INGEST_CATALOG_FROM_DESCRIPTOR`; default false.
+    ///
+    /// Every worker event paid a `noetl.event` read for its execution's
+    /// `catalog_id` — 12.6 ms mean in prod, 76k lookups against 8.5k written
+    /// events, because the `__orchestrate__` meta-events (whose rows are then
+    /// discarded) pay it too. An execution's `catalog_id` never changes, so a
+    /// warm descriptor is authoritative; a cold one falls through to the scan.
+    /// Unlike `NOETL_EVENT_READ_PATH=audit_only` this changes nothing else.
+    #[serde(default)]
+    pub ingest_catalog_from_descriptor: bool,
+    /// Reuse the parsed playbook (keyed by immutable `catalog_id`) on the
+    /// orchestration dispatch and apply paths (noetl/ai-meta#561 slice 2).
+    /// Envy maps `NOETL_PLAYBOOK_PARSE_CACHE`; default false. Off, every drive
+    /// re-reads `noetl.catalog.content` and re-parses the YAML.
+    #[serde(default)]
+    pub playbook_parse_cache: bool,
+    /// Path-prefix → command-pool routes (noetl/ai-meta#562 auth isolation).
+    /// Envy maps `NOETL_POOL_ROUTES`: comma-separated `prefix=pool` pairs, e.g.
+    /// `api_integration/auth0/=auth`. An execution whose catalog path starts with
+    /// a prefix (and that carries no explicit `execution_pool`) is routed to
+    /// `noetl.commands.<pool>.<eid>` for its whole life, so a dedicated worker
+    /// pool serves it and it cannot queue behind the shared pool. Empty (the
+    /// default) = today's routing. `system/` paths are never rerouted.
+    #[serde(default)]
+    pub pool_routes: String,
+    /// Publish a multi-row event batch onto the EHDB events feed as ONE
+    /// pipelined burst instead of one acknowledged round-trip per row
+    /// (noetl/ai-meta#561 fused ingest). Envy maps `NOETL_EVENT_PUBLISH_BATCH`;
+    /// default false. The writer already group-commits whatever is queued on a
+    /// connection (one fsync, acks in request order — noetl/ai-meta#205), so no
+    /// writer change is needed: the rows land in the same order with the same
+    /// durable-ack contract, and a failure falls back to the per-row retry loop
+    /// from the first unacknowledged row on.
+    #[serde(default)]
+    pub event_publish_batch: bool,
     /// Push completion to waiters (noetl/ai-meta#559, Stage 2a of RFC #556).
     /// Envy maps `NOETL_EXECUTION_WAIT`. When true the server serves
     /// `GET /api/executions/{id}/wait?timeout=s`, a long poll woken when a
@@ -1235,6 +1272,10 @@ impl Default for AppConfig {
             local_drive_claim_ttl_ms: default_local_drive_claim_ttl_ms(),
             local_drive_sweep: default_true_sweep(),
             local_drive_drive_deadline_ms: default_local_drive_drive_deadline_ms(),
+            ingest_catalog_from_descriptor: false,
+            playbook_parse_cache: false,
+            pool_routes: String::new(),
+            event_publish_batch: false,
             // noetl/ai-meta#559: the wait long poll is opt-in.
             execution_wait: false,
             playbook_await_park: false,

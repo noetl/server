@@ -1576,7 +1576,8 @@ pub fn event_ingest_duration_seconds() -> &'static HistogramVec {
 /// - `emit`           — the whole `emit_event` chokepoint (sum of the four below).
 /// - `emit_mirror`    — the EHDB event-log tier mirror (`mirror_rows`).
 /// - `emit_should_publish` — the publish gate's catalog lookup.
-/// - `emit_publish`   — publishing onto the EHDB events feed.
+/// - `emit_publish`   — publishing onto the EHDB events feed (per row).
+/// - `emit_publish_batch` — one pipelined burst for a whole batch (`NOETL_EVENT_PUBLISH_BATCH`).
 /// - `emit_insert`    — the authoritative Postgres INSERT.
 /// - `trigger`        — `trigger_orchestrator` (dispatches the drive).
 ///
@@ -1623,6 +1624,8 @@ pub fn init_event_ingest_phase_series() {
         "emit_mirror",
         "emit_should_publish",
         "emit_publish",
+        "emit_publish_batch",
+        "emit_seq",
         "emit_insert",
         "trigger",
     ] {

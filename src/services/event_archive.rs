@@ -2174,14 +2174,16 @@ pub async fn collect_candidates(
     service: &crate::services::execution::ExecutionService,
 ) -> Result<CandidateSet, String> {
     let mut out = Vec::new();
-    let mut offset = 0i32;
+    // Keyset, not offset: offset paging re-aggregated `offset + 100` executions
+    // per page — quadratic over the pass, ~4 s per page at the tail in prod.
+    let mut before: Option<(chrono::DateTime<chrono::Utc>, i64)> = None;
     // Bounded so a pathological listing cannot spin the pass forever.
     const MAX_PAGES: usize = 200;
     let mut complete = false;
     for _ in 0..MAX_PAGES {
         let filter = crate::services::execution::ExecutionFilter {
             limit: Some(100),
-            offset: Some(offset),
+            before,
             ..Default::default()
         };
         let page = service.list(&filter).await.map_err(|e| e.to_string())?;
@@ -2190,6 +2192,9 @@ pub async fn collect_candidates(
             break;
         }
         let n = page.len();
+        if let Some(last) = page.last() {
+            before = Some((last.started_at, last.execution_id));
+        }
         for e in page {
             out.push(ArchiveCandidate {
                 execution_id: e.execution_id,
@@ -2198,7 +2203,6 @@ pub async fn collect_candidates(
                 started_at: e.started_at,
             });
         }
-        offset += n as i32;
         if n < 100 {
             complete = true;
             break;
