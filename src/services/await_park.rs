@@ -343,7 +343,16 @@ async fn try_resolve(state: &AppState, child: i64, expired: bool) -> AppResult<(
     let completed = !(expired && !terminal)
         && status.as_ref().map(|s| s.status == "COMPLETED").unwrap_or(false);
     let detail = if completed {
-        let d = serde_json::to_value(service.get(child).await?).unwrap_or_default();
+        // The terminal STATUS can be visible before the execution's detail read
+        // answers (the same materializer-order race as the call.done wait
+        // below): a NotFound here is "not yet", not a failure. Before this it
+        // escaped to the 5 s sweep — the await p95 tail measured under faster
+        // children (noetl/ai-meta#561, prod 2026-11-17).
+        let d = match service.get(child).await {
+            Ok(v) => serde_json::to_value(v).unwrap_or_default(),
+            Err(AppError::NotFound(_)) => serde_json::Value::Null,
+            Err(e) => return Err(e),
+        };
         if !result_ready(&d, park.result_step.as_deref()) {
             let n = {
                 let mut m = mem().lock().unwrap();
@@ -360,6 +369,13 @@ async fn try_resolve(state: &AppState, child: i64, expired: bool) -> AppResult<(
                     }
                 });
                 return Ok(());
+            }
+            // Never resume with nothing: out of settle tries and still no
+            // detail -> leave it to the sweep, exactly as before.
+            if d.is_null() {
+                return Err(AppError::NotFound(format!(
+                    "Execution not found: {child} (after {SETTLE_TRIES} settle tries)"
+                )));
             }
         }
         Some(d)
@@ -643,5 +659,21 @@ workflow:
         assert_eq!(named["node_name"], "start");
         let latest = select_result_event(&detail, None).unwrap();
         assert_eq!(latest["node_name"], "end");
+    }
+}
+
+#[cfg(test)]
+mod settle_notfound_tests {
+    use super::*;
+
+    #[test]
+    fn missing_detail_is_not_ready_and_never_resumes_empty() {
+        // NotFound maps to Null, which must take the settle wait, not resume.
+        assert!(!result_ready(&serde_json::Value::Null, None));
+        assert!(!result_ready(&serde_json::Value::Null, Some("end")));
+        let src = include_str!("await_park.rs");
+        let body = &src[src.find("async fn try_resolve(").unwrap()..];
+        assert!(body.contains("Err(AppError::NotFound(_)) => serde_json::Value::Null"));
+        assert!(body.contains("if d.is_null() {"), "an exhausted settle must not resume with Null");
     }
 }
