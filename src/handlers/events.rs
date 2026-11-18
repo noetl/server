@@ -3126,6 +3126,21 @@ pub(crate) async fn trigger_orchestrator(
 
 /// Request header a worker sets on its `command.completed` when it will drive
 /// the next step itself (noetl/ai-meta#558).
+/// Request-body cap for the execution routes (`/api/events`, `/api/events/seq`,
+/// `/api/events/batch`, `/api/execute`, `/api/executions/{id}/advance`).
+///
+/// adiona/frontend#122: these routes inherited axum's 2 MB default. The worker
+/// keeps the `__orchestrate__` drive result inline by design (worker
+/// `executor/command.rs`, noetl/ai-meta#154/#155 — offloading it wedged runs), and
+/// that result carries the accumulated context base64-encoded, so it is several
+/// times the size of the largest step result in it. A parked playbook step whose
+/// child returned ~300 KB+ (Duffel offers ~1.2 MB, HotelBeds hotels ~0.8 MB)
+/// produced a drive `call.done` over 2 MB; the server answered 413, the worker
+/// retried three times and gave up, the in-flight guard expired and re-drove, and
+/// the execution stayed RUNNING forever. Match the 64 MB cap the result-store and
+/// object-store routes already use for the same payloads.
+pub const EXECUTION_ROUTES_BODY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
+
 pub const LOCAL_DRIVE_HEADER: &str = "x-noetl-local-drive";
 
 /// Background reconcile poller (noetl/ai-meta#101 block b — small-tier
