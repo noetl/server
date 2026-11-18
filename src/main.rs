@@ -372,7 +372,14 @@ fn build_router(
     } else {
         execution_routes
     };
-    let execution_routes = execution_routes.with_state(state.clone());
+    // adiona/frontend#122: a parked step's `__orchestrate__` drive result rides
+    // inline and can exceed axum's 2 MB default; see the constant's doc comment.
+    // Layered after the optional advance route so it covers that route too.
+    let execution_routes = execution_routes
+        .layer(DefaultBodyLimit::max(
+            handlers::events::EXECUTION_ROUTES_BODY_LIMIT_BYTES,
+        ))
+        .with_state(state.clone());
 
     // Subscription lifecycle routes (noetl/ai-meta#90 Phase 2).  A
     // `kind: Subscription` is registered + activated here; the continuous
