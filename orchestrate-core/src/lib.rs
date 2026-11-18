@@ -18,6 +18,7 @@
 pub mod catalog;
 pub mod chain_cert;
 pub mod commands;
+pub mod coroutine;
 pub mod dsl;
 pub mod error;
 pub mod evaluator;
