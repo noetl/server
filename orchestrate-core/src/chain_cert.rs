@@ -619,16 +619,41 @@ impl CertifiedFoldCache {
 mod tests {
     use super::*;
 
-    /// `NOETL_CHAIN_CERT` is process-global, so tests that need it on must not
-    /// run concurrently with tests that need it off.
+    /// `NOETL_CHAIN_CERT` and the counters (OBSERVED, DECIDED, SKIPPED,
+    /// REFOLDED, DIVERGENCES) are process-global, and `cargo test` runs tests in
+    /// parallel threads of one process. So EVERY test that touches a
+    /// `CertifiedFoldCache` (any `observe`/`decide_for`/`reconcile` bumps a
+    /// counter, and a non-zero DIVERGENCES flips every `decide_for`) or the flag
+    /// must hold this lock via [`serial`]. A test that observes without it makes
+    /// the exact-count assertions in `the_skip_actually_fires` flaky.
     static FLAG: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    fn with_flag_on<T>(f: impl FnOnce() -> T) -> T {
-        let _g = FLAG.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("NOETL_CHAIN_CERT", "1");
-        let out = f();
+    /// Holds [`FLAG`] for the test's lifetime. Starts from a clean slate (flag
+    /// off, counters zero) and restores it on drop — including on panic, so a
+    /// failing test cannot leak the flag or a divergence into the next one.
+    struct Serial {
+        _g: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Drop for Serial {
+        fn drop(&mut self) {
+            // Runs before `_g` is dropped, i.e. while the lock is still held.
+            std::env::remove_var("NOETL_CHAIN_CERT");
+            reset_counters();
+        }
+    }
+
+    fn serial() -> Serial {
+        let g = FLAG.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var("NOETL_CHAIN_CERT");
-        out
+        reset_counters();
+        Serial { _g: g }
+    }
+
+    fn with_flag_on<T>(f: impl FnOnce() -> T) -> T {
+        let _s = serial();
+        std::env::set_var("NOETL_CHAIN_CERT", "1");
+        f()
     }
 
     fn body(i: u32) -> Vec<u8> {
@@ -651,6 +676,7 @@ mod tests {
 
     #[test]
     fn the_digest_matches_an_independent_implementation() {
+        let _g = serial();
         // Golden vector from a THIRD implementation (Python/hashlib) sharing no
         // code with this one or with ehdb's. `ehdb_l0::chain_cert`'s
         // `the_digest_matches_an_independent_implementation` asserts the same
@@ -777,7 +803,7 @@ mod tests {
     fn the_flag_off_can_never_skip() {
         // The ramp's safety property: with the flag off there is no path to a
         // skip, whatever the cache contains.
-        let _g = FLAG.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = serial();
         std::env::remove_var("NOETL_CHAIN_CERT");
         let mut c = CertifiedFoldCache::new();
         fill(&mut c, 1, 16);
@@ -790,6 +816,7 @@ mod tests {
 
     #[test]
     fn a_divergent_early_chunk_changes_every_later_certificate() {
+        let _g = serial();
         // Chunks must be CHAINED. If chunk N+1 did not absorb chunk N's digest,
         // a chain that diverged early but converged later would certify as
         // valid and the skip would serve wrong state.
@@ -814,6 +841,7 @@ mod tests {
 
     #[test]
     fn executions_do_not_share_chain_state() {
+        let _g = serial();
         let mut c = CertifiedFoldCache::new();
         for i in 0..CHUNK_EVENTS {
             c.observe(1, &body(i));
@@ -827,6 +855,7 @@ mod tests {
 
     #[test]
     fn interleaving_does_not_change_an_executions_digest() {
+        let _g = serial();
         // Two executions' events arrive interleaved in ingest order. Each
         // chain's digest must depend only on ITS OWN events, or the digest
         // becomes arrival-timing dependent.
@@ -846,6 +875,7 @@ mod tests {
 
     #[test]
     fn a_short_chain_still_seals_at_least_one_chunk() {
+        let _g = serial();
         // Guards CHUNK_EVENTS: set above typical chain length, short executions
         // would certify nothing and the path would be inert.
         let mut c = CertifiedFoldCache::new();
@@ -1101,7 +1131,7 @@ mod tests {
         // Holds the serialisation lock and resets the counters: `observe`
         // increments the process-global OBSERVED, which would otherwise break
         // the tests that assert exact counter values.
-        let _g = FLAG.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = serial();
         // `forget` had no callers, so with the flag on every execution the
         // process ever saw kept state forever — a leak in a server that runs for
         // days. Prove the bound holds under more executions than it allows.
@@ -1132,7 +1162,7 @@ mod tests {
         // Holds the serialisation lock and resets the counters: `observe`
         // increments the process-global OBSERVED, which would otherwise break
         // the tests that assert exact counter values.
-        let _g = FLAG.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = serial();
         // The server keeps a rebuild cache alongside this one. If evictions are
         // not reported, bounding this cache leaves that one — the one holding a
         // whole WorkflowState per execution — growing unbounded anyway.
