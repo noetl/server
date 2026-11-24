@@ -1,0 +1,11 @@
+# Not compilable: the rhai step calls http_get (I/O). build.rs must refuse it.
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata: { name: impure_rhai, path: compiled/impure_rhai }
+workflow:
+  - step: start
+    tool:
+      kind: rhai
+      code: |
+        let page = http_get("https://example.com");
+        #{ page: page }

@@ -637,10 +637,17 @@ pub fn verify_fetched(content: &str, expect: Option<&str>) -> Result<String, Cat
 // Purity: what may be compiled to WASM (RFC §7)
 // ---------------------------------------------------------------------------
 
-/// Tool kinds a compiled playbook may contain. Only `noop`: `rhai` registers
-/// `http_*`, `timestamp`, `sleep` and `random_*` (tools `rhai.rs`), so it is
-/// NOT pure as shipped, whatever `kind_is_side_effecting` says.
-pub const PURE_TOOL_KINDS: &[&str] = &["noop"];
+/// Tool kinds a compiled playbook may contain.
+///
+/// - `noop`: templates in `result`/`message`.
+/// - `rhai`: only when the script is literal (no template markers in `code`
+///   or `args`, no `auth`) and calls none of noetl-rhai-pure's
+///   `HOST_ONLY_FUNCTIONS` (http_*, timestamp*, sleep*, random_*,
+///   get_gcp_token, the credential helpers) nor reaches one indirectly
+///   (`eval`, `Fn`, `call`, `curry`, `import`). A compiled playbook runs it
+///   with noetl-rhai-pure's pure functions only, the same implementations a
+///   worker's rhai tool registers.
+pub const PURE_TOOL_KINDS: &[&str] = &["noop", "rhai"];
 
 /// Why a playbook cannot be compiled.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -690,11 +697,47 @@ pub fn purity(v: &Value) -> Result<(), Impure> {
                 "tool kind '{kind}' is not pure (allowed: {PURE_TOOL_KINDS:?})"
             )));
         }
+        if kind == "rhai" {
+            rhai_purity(s, tool).map_err(bad)?;
+        }
         if s.pointer("/loop/cursor").is_some_and(|c| !c.is_null()) {
             return Err(bad("cursor loops claim rows from a store".into()));
         }
     }
     Ok(())
+}
+
+/// The template markers a literal rhai script may not contain: a worker
+/// renders the tool config before running it, so a marker would make the
+/// script depend on the context in a way the scanner can't see.
+const TEMPLATE_MARKERS: [&str; 3] = ["{{", "{%", "{#"];
+
+fn rhai_purity(step: &Value, tool: &Value) -> Result<(), String> {
+    if step.get("auth").is_some_and(|a| !a.is_null()) || tool.get("auth").is_some_and(|a| !a.is_null()) {
+        return Err("rhai with `auth` means credentials, which means I/O".into());
+    }
+    let code = tool
+        .get("code")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "rhai needs a literal `code` string".to_string())?;
+    if let Some(m) = TEMPLATE_MARKERS.iter().find(|m| code.contains(**m)) {
+        return Err(format!(
+            "rhai `code` contains the template marker '{m}'; a compiled script must be literal (read inputs from the scope: workload, earlier steps)"
+        ));
+    }
+    match tool.get("args") {
+        None | Some(Value::Null) => {}
+        Some(Value::Object(args)) => {
+            for (k, v) in args {
+                let lit = v.as_str().ok_or_else(|| format!("rhai arg '{k}' is not a string"))?;
+                if TEMPLATE_MARKERS.iter().any(|m| lit.contains(m)) {
+                    return Err(format!("rhai arg '{k}' is a template; a compiled script's args must be literal"));
+                }
+            }
+        }
+        Some(_) => return Err("rhai `args` is not a map".into()),
+    }
+    noetl_rhai_pure::scan(code).map_err(|e| format!("rhai {e}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -1171,9 +1214,19 @@ mod tests {
         assert_eq!(purity(&ok), Ok(()));
         let looped = playbook_value("workflow:\n  - step: s\n    loop: {in: '{{ workload.xs }}', iterator: x}\n    tool: {kind: noop}\n").unwrap();
         assert_eq!(purity(&looped), Ok(()));
+        let rhai = playbook_value("workflow:\n  - step: r\n    tool:\n      kind: rhai\n      code: |\n        // http_get() in a comment is fine\n        let m = parse_json(\"{}\");\n        log(to_json(m)); sha256_hex(\"x\") + if contains_any(\"a\", [\"a\"]) { \"y\" } else { \"n\" }\n").unwrap();
+        assert_eq!(purity(&rhai), Ok(()));
         for (yaml, step, needle) in [
             ("workflow:\n  - step: a\n    tool: {kind: noop}\n  - step: b\n    tool: {kind: http, url: x}\n", Some("b"), "http"),
-            ("workflow:\n  - step: r\n    tool: {kind: rhai, code: '1'}\n", Some("r"), "rhai"),
+            ("workflow:\n  - step: r\n    tool: {kind: rhai, code: 'http_get(\"u\")'}\n", Some("r"), "http_get"),
+            ("workflow:\n  - step: r\n    tool: {kind: rhai, code: 'let t = timestamp_ms(); t'}\n", Some("r"), "timestamp_ms"),
+            ("workflow:\n  - step: r\n    tool: {kind: rhai, code: 'sleep(1)'}\n", Some("r"), "sleep"),
+            ("workflow:\n  - step: r\n    tool: {kind: rhai, code: 'random_token(8)'}\n", Some("r"), "random_token"),
+            ("workflow:\n  - step: r\n    tool: {kind: rhai, code: 'eval(\"1\")'}\n", Some("r"), "eval"),
+            ("workflow:\n  - step: r\n    tool: {kind: rhai, code: '{{ workload.x }}'}\n", Some("r"), "template marker"),
+            ("workflow:\n  - step: r\n    tool: {kind: rhai, code: 'x', args: {x: '{{ workload.x }}'}}\n", Some("r"), "literal"),
+            ("workflow:\n  - step: r\n    tool: {kind: rhai, code: '1', auth: k}\n", Some("r"), "auth"),
+            ("workflow:\n  - step: r\n    tool: {kind: rhai}\n", Some("r"), "code"),
             ("workflow:\n  - step: p\n    tool: {kind: playbook, path: x}\n", Some("p"), "playbook"),
             ("workflow:\n  - step: c\n    loop: {cursor: {kind: postgres}, iterator: r}\n    tool: {kind: noop}\n", Some("c"), "cursor"),
             ("workflow:\n  - step: t\n    tool: [{a: {kind: noop}}]\n", Some("t"), "pipeline"),

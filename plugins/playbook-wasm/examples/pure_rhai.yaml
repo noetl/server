@@ -1,0 +1,37 @@
+# A deterministic playbook with rhai steps: literal scripts that use only the
+# pure functions (noetl-rhai-pure), over the workload and earlier results.
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata: { name: pure_rhai, path: compiled/pure_rhai }
+workload: { message: "Is it snowing at the ranch?", history: [], limit: 3 }
+workflow:
+  - step: start
+    tool:
+      kind: rhai
+      code: |
+        // http_get( in a comment or "a string" is not a call.
+        let text = workload.message.to_lower();
+        let weather = contains_any(text, ["snow", "rain", "weather"]);
+        let words = text.split(" ");
+        #{
+          weather: weather,
+          words: words.len(),
+          digest: sha256_hex(workload.message),
+          request: #{ model: "m", messages: [#{ role: "user", content: workload.message }] },
+          from: node_name + "/" + action,
+          echo: parse_json(to_json(#{ a: [1, 2.5, (), true], b: "x" }))
+        }
+    next: [ { step: plan } ]
+  - step: plan
+    tool: { kind: noop, result: { weather: "{{ start.weather }}", n: "{{ start.words }}" } }
+    next: [ { step: finish } ]
+  - step: finish
+    tool:
+      kind: rhai
+      args: { greeting: "hello" }
+      code: |
+        log("finishing");
+        let n = if type_of(plan.n) == "string" { parse_int(plan.n) } else { plan.n };
+        let out = [];
+        for i in 0..n.min(workload.limit) { out.push(greeting + " " + i) }
+        #{ reply: out, weather: start.weather, json: to_json(start.request), step: step, id: execution_id }

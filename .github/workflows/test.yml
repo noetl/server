@@ -89,3 +89,28 @@ jobs:
       # fixed or scoped. An unexplained `-A` is how a gate quietly stops gating.
       - name: clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  # plugins/playbook-wasm is a standalone crate (not a workspace member), so the
+  # job above never builds it. It is the compiled-playbook runtime (ai-meta#548):
+  # its native tests include worker parity (tests/rhai_parity.rs runs every rhai
+  # step through noetl-tools' RhaiTool and compares bytes), and ci/hot_reload.sh
+  # compiles the examples to wasm32, checks the pure-rhai module has zero
+  # imports and that impure playbooks (http, rhai calling http_get) are refused.
+  playbook-wasm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    defaults:
+      run:
+        working-directory: plugins/playbook-wasm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: plugins/playbook-wasm
+      - name: test (native, incl. worker parity)
+        run: cargo test --all-targets --locked
+      - name: compile to wasm32 (purity, zero imports, hot reload)
+        run: ci/hot_reload.sh

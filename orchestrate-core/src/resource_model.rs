@@ -382,7 +382,7 @@ fn heuristics() -> Value {
 fn metrics() -> Value {
     json!({
         "events": [
-            { "type": "call.done", "fields": "result.context: status, duration_ms, error, exit_code, child_execution_id; an agent step's result data carries usage {input_tokens, output_tokens, cache_read_input_tokens, cache_creation_input_tokens}, turns, model, stop_reason", "source": src(W, "src/executor/command.rs:1097-1110") + "; " + &src(T, "src/result.rs:62-135, src/tools/agent.rs:838-851") },
+            { "type": "call.done", "fields": "result.context: status, duration_ms, error, exit_code, child_execution_id; an agent step's result data carries usage {input_tokens, output_tokens, cache_read_input_tokens, cache_creation_input_tokens}, turns, model, stop_reason", "source": src(W, "src/executor/command.rs:1097-1110") + "; " + src(T, "src/result.rs:62-135, src/tools/agent.rs:838-851").as_str() },
             { "type": "command.started / command.completed / command.failed", "fields": "created_at on each event: the difference is the step's wall clock including slot wait after claim", "source": src(W, "src/executor/command.rs:545-557, 1352-1361") },
             { "type": "agent.turn", "fields": "turn, outcome (tool_calls | final), tool_calls [{id, name}]", "source": src(W, "src/executor/agent_host.rs:226-254") },
             { "type": "agent.tool_call", "fields": "turn, tool_use_id, tool, binding, playbook, child_execution_id, is_error, duration_ms, input and result previews (2 KiB)", "source": src(W, "src/executor/agent_host.rs:307-321") },

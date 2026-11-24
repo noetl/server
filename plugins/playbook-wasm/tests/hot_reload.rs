@@ -187,3 +187,29 @@ fn compile_load_run_and_hot_reload() {
         "{starved:?}"
     );
 }
+
+/// The pure-rhai module (ci/hot_reload.sh sets PBC_RHAI) gives, in the
+/// worker-shaped host, byte-for-byte what the native drive gives.
+#[test]
+fn a_compiled_rhai_playbook_matches_the_native_drive() {
+    let Ok(p) = std::env::var("PBC_RHAI") else {
+        eprintln!("skipped: PBC_RHAI not set (run ci/hot_reload.sh)");
+        return;
+    };
+    let bytes = std::fs::read(&p).unwrap();
+    let mut host = Host::new();
+    let m = host.ensure("compiled/pure_rhai", 1, &bytes).clone();
+    let digest = String::from_utf8(host.call(&m, "digest", b"", 2_000_000_000).unwrap()).unwrap();
+    assert_eq!(digest, yaml_digest("pure_rhai.yaml"));
+    let y = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/pure_rhai.yaml")).unwrap();
+    let v = noetl_orchestrate_core::catalog::playbook_value(&y).unwrap();
+    let pb = noetl_orchestrate_core::dsl::canonical_json(&v);
+    for input in [json!({}), json!({"workload": {"message": "rain {{ x }} tomorrow?", "limit": 2}})] {
+        let wasm = host.call(&m, "run", input.to_string().as_bytes(), 2_000_000_000).unwrap();
+        let native = serde_json::to_vec(&serde_json::to_value(
+            noetl_playbook_wasm::drive(&pb, &digest, &input).unwrap(),
+        ).unwrap()).unwrap();
+        assert_eq!(String::from_utf8(wasm).unwrap(), String::from_utf8(native).unwrap(), "{input}");
+    }
+    eprintln!("pure_rhai.wasm == native drive ({digest})");
+}

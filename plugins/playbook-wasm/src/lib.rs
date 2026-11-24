@@ -4,9 +4,12 @@
 //! and runs the orchestrate-core drive **to completion** in one call:
 //!
 //! 1. Evaluate.
-//! 2. Execute every command in-module. Only `noop` is accepted: its config is
-//!    rendered against the command context, exactly as the worker's `NoopTool`
-//!    does.
+//! 2. Execute every command in-module:
+//!    - `noop`: its config is rendered against the command context, exactly
+//!      as the worker's `NoopTool` does;
+//!    - `rhai` (literal scripts only, checked by `catalog::purity`): run with
+//!      noetl-rhai-pure's pure functions, over the scope a worker's rhai tool
+//!      builds ([`rhai_scope_vars`]), result converted the same way.
 //! 3. Append the `command.issued` / `call.done` / `command.completed` events the
 //!    worker would have emitted, and loop.
 //!
@@ -78,8 +81,34 @@ fn event(
     }
 }
 
+/// One executed command, for parity tests: what a worker would have been
+/// handed (the step, its tool kind and config, the command's render context).
+#[derive(Debug, Clone, Serialize)]
+pub struct Trace {
+    pub step: String,
+    pub kind: String,
+    pub config: Value,
+    pub context: HashMap<String, Value>,
+}
+
 /// Drive `playbook_json` to completion with `input` as the workload override.
 pub fn drive(playbook_json: &str, digest: &str, input: &Value) -> Result<Outcome, String> {
+    drive_inner(playbook_json, digest, input, None)
+}
+
+/// [`drive`], also returning every command it executed.
+pub fn drive_traced(playbook_json: &str, digest: &str, input: &Value) -> Result<(Outcome, Vec<Trace>), String> {
+    let mut trace = Vec::new();
+    let out = drive_inner(playbook_json, digest, input, Some(&mut trace))?;
+    Ok((out, trace))
+}
+
+fn drive_inner(
+    playbook_json: &str,
+    digest: &str,
+    input: &Value,
+    mut trace: Option<&mut Vec<Trace>>,
+) -> Result<Outcome, String> {
     let pb_value: Value = serde_json::from_str(playbook_json).map_err(|e| e.to_string())?;
     let playbook: Playbook =
         serde_json::from_value(pb_value).map_err(|e| format!("playbook: {e}"))?;
@@ -161,22 +190,35 @@ pub fn drive(playbook_json: &str, digest: &str, input: &Value) -> Result<Outcome
             continue;
         }
         for c in r.commands {
-            if c.tool.kind != "noop" {
-                // build.rs refused impure playbooks; a non-noop here is a drive bug.
-                return Err(format!(
-                    "step '{}': tool kind '{}' cannot run in a compiled playbook",
-                    c.step_name, c.tool.kind
-                ));
-            }
             commands += 1;
             let ctx: HashMap<String, Value> = c.context.clone().unwrap_or_default();
             let config = c.tool.config.clone().unwrap_or(Value::Null);
-            let rendered = renderer
-                .render_value(&config, &ctx)
-                .map_err(|e| format!("step '{}': {e}", c.step_name))?;
-            let data = rendered.get("result").cloned().unwrap_or_else(|| {
-                json!({ "status": "ok", "message": rendered.get("message").cloned().unwrap_or(json!("noop")) })
-            });
+            if let Some(t) = trace.as_deref_mut() {
+                t.push(Trace {
+                    step: c.step_name.clone(),
+                    kind: c.tool.kind.clone(),
+                    config: config.clone(),
+                    context: ctx.clone(),
+                });
+            }
+            let data = match c.tool.kind.as_str() {
+                "noop" => {
+                    let rendered = renderer
+                        .render_value(&config, &ctx)
+                        .map_err(|e| format!("step '{}': {e}", c.step_name))?;
+                    rendered.get("result").cloned().unwrap_or_else(|| {
+                        json!({ "status": "ok", "message": rendered.get("message").cloned().unwrap_or(json!("noop")) })
+                    })
+                }
+                "rhai" => run_rhai(&c.step_name, &c.tool.kind, &config, &ctx)?,
+                // build.rs refused impure playbooks; anything else here is a drive bug.
+                other => {
+                    return Err(format!(
+                        "step '{}': tool kind '{other}' cannot run in a compiled playbook",
+                        c.step_name
+                    ))
+                }
+            };
             let cid = c.command_id.to_string();
             let node = Some(c.step_name.clone());
             events.push(event(
@@ -210,6 +252,48 @@ pub fn drive(playbook_json: &str, digest: &str, input: &Value) -> Result<Outcome
         trigger = Some("command.completed".into());
     }
     Err(format!("did not complete within {MAX_ROUNDS} rounds"))
+}
+
+/// The variables a worker's rhai tool puts in a step's scope, before
+/// `execution_id`/`step`/`server_url` (noetl/worker `executor/command.rs`):
+/// the command's render context, then the `ctx` copy and `workload` fallback
+/// (only when the context has no `ctx`), then `action` and `node_name`.
+pub fn rhai_scope_vars(ctx: &HashMap<String, Value>, kind: &str, step: &str) -> HashMap<String, Value> {
+    let mut vars = ctx.clone();
+    if !vars.contains_key("ctx") {
+        let flat = serde_json::to_value(&vars).unwrap_or(Value::Null);
+        vars.insert("ctx".to_string(), flat.clone());
+        vars.entry("workload".to_string()).or_insert(flat);
+    }
+    vars.entry("action".to_string()).or_insert_with(|| json!(kind));
+    vars.entry("node_name".to_string()).or_insert_with(|| json!(step));
+    vars
+}
+
+/// A compiled module has no execution id or server: the scope gets these.
+pub const COMPILED_EXECUTION_ID: i64 = 1;
+pub const COMPILED_SERVER_URL: &str = "";
+
+fn run_rhai(step: &str, kind: &str, config: &Value, ctx: &HashMap<String, Value>) -> Result<Value, String> {
+    thread_local! {
+        static ENGINE: noetl_rhai_pure::rhai::Engine = noetl_rhai_pure::pure_engine();
+    }
+    let code = config
+        .get("code")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("step '{step}': rhai needs `code`"))?;
+    let args: HashMap<String, String> = match config.get("args") {
+        Some(Value::Object(m)) => m
+            .iter()
+            .map(|(k, v)| (k.clone(), v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string())))
+            .collect(),
+        _ => HashMap::new(),
+    };
+    let vars = rhai_scope_vars(ctx, kind, step);
+    let mut scope = noetl_rhai_pure::scope(&args, &vars, COMPILED_EXECUTION_ID, step, COMPILED_SERVER_URL);
+    ENGINE
+        .with(|e| noetl_rhai_pure::eval(e, &mut scope, code))
+        .map_err(|e| format!("step '{step}': {e}"))
 }
 
 /// The JSON round-trip the `run` export performs; native-callable for tests.
@@ -296,6 +380,65 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out.result["answer"], json!(110));
+    }
+
+    fn example(name: &str) -> (String, String) {
+        let yaml = std::fs::read_to_string(format!("{}/examples/{name}", env!("CARGO_MANIFEST_DIR"))).unwrap();
+        let v = noetl_orchestrate_core::catalog::playbook_value(&yaml).unwrap();
+        noetl_orchestrate_core::catalog::purity(&v).unwrap();
+        (noetl_orchestrate_core::dsl::canonical_json(&v), noetl_orchestrate_core::dsl::digest(&v))
+    }
+
+    #[test]
+    fn a_pure_rhai_playbook_runs_to_completion() {
+        let (pb, d) = example("pure_rhai.yaml");
+        let out = drive(&pb, &d, &json!({})).unwrap();
+        assert_eq!(out.status, "COMPLETED", "{out:?}");
+        let s = &out.steps["start"];
+        assert_eq!(s["weather"], json!(true));
+        assert_eq!(s["words"], json!(6));
+        assert_eq!(s["from"], json!("start/rhai"));
+        assert_eq!(s["echo"], json!({"a": [1, 2.5, null, true], "b": "x"}));
+        assert_eq!(s["digest"].as_str().unwrap().len(), 64);
+        let f = &out.result;
+        assert_eq!(f["reply"], json!(["hello 0", "hello 1", "hello 2"]));
+        assert_eq!(f["step"], json!("finish"));
+        assert_eq!(f["id"], json!(COMPILED_EXECUTION_ID));
+        assert_eq!(f["json"], json!(r#"{"messages":[{"content":"Is it snowing at the ranch?","role":"user"}],"model":"m"}"#));
+        assert_eq!(out.commands, 3);
+    }
+
+    #[test]
+    fn workload_text_stays_data_in_rhai() {
+        let (pb, d) = example("pure_rhai.yaml");
+        let out = drive(&pb, &d, &json!({"workload": {"message": "{{ 7*6 }} http_get(\"x\")"}})).unwrap();
+        assert_eq!(out.steps["start"]["request"]["messages"][0]["content"], json!("{{ 7*6 }} http_get(\"x\")"));
+    }
+
+    #[test]
+    fn impure_rhai_is_refused() {
+        let yaml = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/impure_rhai.yaml")).unwrap();
+        let v = noetl_orchestrate_core::catalog::playbook_value(&yaml).unwrap();
+        let e = noetl_orchestrate_core::catalog::purity(&v).unwrap_err();
+        assert!(e.to_string().contains("http_get"), "{e}");
+    }
+
+    #[test]
+    fn a_rhai_error_fails_the_drive() {
+        let pb = r#"{"apiVersion":"noetl.io/v2","kind":"Playbook","metadata":{"name":"e","path":"e"},"workflow":[{"step":"start","tool":{"kind":"rhai","code":"throw \"no\""}}]}"#;
+        let e = drive(pb, "sha256:x", &json!({})).unwrap_err();
+        assert!(e.contains("step 'start'") && e.contains("Rhai error"), "{e}");
+    }
+
+    /// The scanner orchestrate-core uses and the engine this module runs come
+    /// from the same crate, so the lists can't drift; check the engine really
+    /// lacks every host-only function.
+    #[test]
+    fn the_compiled_engine_lacks_every_host_only_function() {
+        let e = noetl_rhai_pure::pure_engine();
+        for f in noetl_rhai_pure::HOST_ONLY_FUNCTIONS.iter().filter(|f| **f != "timestamp") {
+            assert!(e.eval::<noetl_rhai_pure::rhai::Dynamic>(&format!("{f}(\"x\")")).is_err(), "{f}");
+        }
     }
 
     #[test]
