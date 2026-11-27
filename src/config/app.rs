@@ -1213,7 +1213,20 @@ impl AppConfig {
     ///
     /// Environment variables are prefixed with `NOETL_`.
     pub fn from_env() -> Result<Self, envy::Error> {
-        envy::prefixed("NOETL_").from_env::<AppConfig>()
+        Self::from_vars(std::env::vars())
+    }
+
+    /// Load configuration from an iterator of `(name, value)` pairs.
+    ///
+    /// An empty value is treated as unset, so the field takes its default.
+    /// `NOETL_EVENT_PUBLISH_BATCH=''` once failed to parse as a bool, and
+    /// because the caller then fell back to `AppConfig::default()` for every
+    /// field, the server came up without its command bus (2026-11-16 outage).
+    pub fn from_vars(
+        vars: impl IntoIterator<Item = (String, String)>,
+    ) -> Result<Self, envy::Error> {
+        envy::prefixed("NOETL_")
+            .from_iter::<_, AppConfig>(vars.into_iter().filter(|(_, v)| !v.is_empty()))
     }
 
     /// Get the server bind address as a string suitable for `TcpListener::bind`.
@@ -1376,6 +1389,41 @@ impl Default for AppConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn vars(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    /// 2026-11-16: `NOETL_EVENT_PUBLISH_BATCH=''` failed to parse, and the whole
+    /// config fell back to defaults, which dropped `NOETL_COMMAND_BUS`. An empty
+    /// value must mean "unset" for that field only.
+    #[test]
+    fn empty_bool_var_does_not_discard_other_fields() {
+        let cfg = AppConfig::from_vars(vars(&[
+            ("NOETL_EVENT_PUBLISH_BATCH", ""),
+            ("NOETL_COMMAND_BUS", "postgres"),
+            ("NOETL_PORT", "9123"),
+        ]))
+        .expect("an empty value must not be a parse error");
+        assert_eq!(
+            cfg.event_publish_batch,
+            AppConfig::default().event_publish_batch
+        );
+        assert_eq!(cfg.command_bus.as_deref(), Some("postgres"));
+        assert_eq!(cfg.port, 9123);
+    }
+
+    /// A value that is present but malformed is still an error. main() makes it
+    /// fatal, and the message must name the variable.
+    #[test]
+    fn malformed_var_is_an_error_naming_the_variable() {
+        let err = AppConfig::from_vars(vars(&[("NOETL_EVENT_PUBLISH_BATCH", "yes please")]))
+            .expect_err("a non-bool value must not parse");
+        assert!(err.to_string().contains("EVENT_PUBLISH_BATCH"), "{err}");
+    }
 
     #[test]
     fn test_default_config() {

@@ -1315,10 +1315,15 @@ async fn main() -> anyhow::Result<()> {
     noetl_server::handlers::auth_verify::init_verify_series();
 
     // Load configuration
-    let app_config = AppConfig::from_env().unwrap_or_else(|e| {
-        tracing::warn!(error = %e, "Failed to load app config, using defaults");
-        AppConfig::default()
-    });
+    // A malformed NOETL_* value is fatal. Every field has a default, so this
+    // only fails on a value that does not parse. Falling back to
+    // `AppConfig::default()` here would silently reset EVERY field, which is
+    // how the 2026-11-16 outage started. envy names the variable without the
+    // NOETL_ prefix ("... provided by EVENT_PUBLISH_BATCH").
+    let app_config = AppConfig::from_env().map_err(|e| {
+        tracing::error!(error = %e, "Invalid NOETL_* app config; refusing to start");
+        anyhow::anyhow!("invalid NOETL_* app config (variable NOETL_<name>): {e}")
+    })?;
 
     let db_config = DatabaseConfig::from_env().unwrap_or_else(|e| {
         tracing::warn!(error = %e, "Failed to load database config, using defaults");
