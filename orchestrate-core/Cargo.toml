@@ -27,6 +27,12 @@ hex = "0.4"
 # builds for wasm32.
 serde_yaml = "0.9"
 
+# catalog::purity for `kind: rhai`: the host-only function list and the
+# build-time scanner, WITHOUT the rhai engine (default-features = false), so
+# the control plane carries no rhai. noetl/tools' lean member; switch to the
+# crates.io release (0.1) once noetl-tools publishes it.
+noetl-rhai-pure = { git = "https://github.com/noetl/tools", rev = "faf8a33f5be4848730ffb6eb4dc32fc42a222cf7", default-features = false }
+
 # DSL knowledge base (ai-meta RFC `dsl-knowledge-base.md`): derive the playbook
 # JSON Schema from the authoring types below.  OPTIONAL so the wasm32
 # `system/orchestrate` plug-in (which never emits a schema) carries none of it;

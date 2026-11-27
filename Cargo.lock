@@ -1848,6 +1848,7 @@ dependencies = [
  "chrono",
  "hex",
  "minijinja",
+ "noetl-rhai-pure",
  "schemars",
  "serde",
  "serde_json",
@@ -1856,6 +1857,11 @@ dependencies = [
  "thiserror 2.0.21",
  "tracing",
 ]
+
+[[package]]
+name = "noetl-rhai-pure"
+version = "0.1.0"
+source = "git+https://github.com/noetl/tools?rev=faf8a33f5be4848730ffb6eb4dc32fc42a222cf7#faf8a33f5be4848730ffb6eb4dc32fc42a222cf7"
 
 [[package]]
 name = "noetl-server"

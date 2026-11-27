@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Compile two versions of examples/sum to WASM, prove an impure playbook does
 # not compile, then run the hot-reload host test (noetl/ai-meta#548 Phase 3).
+# Also: a pure-rhai playbook compiles to a module with ZERO imports, and a
+# rhai step that calls a host-only function (http_get) is refused.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 OUT=${OUT:-$PWD/target/pbc}; mkdir -p "$OUT"
@@ -16,4 +18,10 @@ if NOETL_PBC_PLAYBOOK="$PWD/examples/impure.yaml" cargo build -q --release --tar
   echo "FAIL: an impure playbook compiled"; exit 1
 fi
 grep -o "cannot be compiled to WASM: .*" "$OUT/impure.log" | head -1 | sed 's/^/refused as expected: /'
-PBC_V1="$OUT/sum_v1.wasm" PBC_V2="$OUT/sum_v2.wasm" cargo test -q --test hot_reload -- --nocapture
+build examples/pure_rhai.yaml "$OUT/pure_rhai.wasm"
+python3 ci/wasm_imports.py --none "$OUT/pure_rhai.wasm"
+if NOETL_PBC_PLAYBOOK="$PWD/examples/impure_rhai.yaml" cargo build -q --release --target wasm32-unknown-unknown 2> "$OUT/impure_rhai.log"; then
+  echo "FAIL: a rhai step calling http_get compiled"; exit 1
+fi
+grep -o "cannot be compiled to WASM: .*" "$OUT/impure_rhai.log" | head -1 | cut -c1-120 | sed 's/^/refused as expected: /'
+PBC_V1="$OUT/sum_v1.wasm" PBC_V2="$OUT/sum_v2.wasm" PBC_RHAI="$OUT/pure_rhai.wasm" cargo test -q --test hot_reload -- --nocapture
