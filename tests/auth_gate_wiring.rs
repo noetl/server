@@ -14,6 +14,43 @@
 
 const EXECUTE_MAIN: &str = include_str!("../src/main.rs");
 
+/// `main.rs` with the whitespace that rustfmt inserts after an opening
+/// parenthesis removed, so the structural checks below read
+///
+/// ```text
+/// .merge(
+///     credential_routes.layer(axum::middleware::from_fn_with_state(
+/// ```
+///
+/// exactly like the one-line `.merge(credential_routes.layer(` form.
+///
+/// Without this the guards only worked while `main.rs` kept a hand-maintained
+/// layout: a `cargo fmt` (rustfmt splits these long calls) made
+/// `every_privileged_router_is_gated_in_main` report `credential_routes`,
+/// `sealed_credential_routes`, `cross_region_routes`, ... as ungated although
+/// every one still carried the layer (60c9c380 restored the layout by hand
+/// once already), and made `merge_sites` skip those routers entirely, because
+/// the name it reads right after `.merge(` became a newline.
+///
+/// Only whitespace directly after `(` is dropped, so names, string literals and
+/// comments stay where they were and nothing new can match.
+fn normalized_main() -> String {
+    collapse_after_open_paren(EXECUTE_MAIN)
+}
+
+fn collapse_after_open_paren(src: &str) -> String {
+    let mut out = String::with_capacity(src.len());
+    let mut after_paren = false;
+    for c in src.chars() {
+        if after_paren && c.is_whitespace() {
+            continue;
+        }
+        after_paren = c == '(';
+        out.push(c);
+    }
+    out
+}
+
 use axum::{
     body::Body,
     http::{Request, StatusCode},
@@ -116,7 +153,8 @@ async fn mode_is_reversible_without_a_restart() {
 /// layer fails here — which is the whole defect #303 describes, one level up.
 #[test]
 fn every_privileged_router_is_gated_in_main() {
-    let src = include_str!("../src/main.rs");
+    let normalized = normalized_main();
+    let src = normalized.as_str();
     // Router groups that expose credentials, keychain material, or the internal
     // control surface. Kept explicit so adding one is a deliberate act.
     const PRIVILEGED: [&str; 20] = [
@@ -206,6 +244,23 @@ fn the_structural_check_can_fail() {
     assert!(!doctored.contains(".merge(credential_routes.layer("));
 }
 
+/// The normalisation must make the rustfmt layout and the one-line layout read
+/// the same, and must not invent a gate that is not there.
+#[test]
+fn structural_checks_survive_rustfmt_layout() {
+    let rustfmt_layout = "        .merge(\n            credential_routes.layer(axum::middleware::from_fn_with_state(\n                \"credentials\",\n                noetl_server::auth_gate::gate,\n            )),\n        )\n";
+    let normalized = collapse_after_open_paren(rustfmt_layout);
+    assert!(normalized.contains(".merge(credential_routes.layer("));
+    let sites = merge_sites(&format!("// Combine all routes\n{normalized}"));
+    assert_eq!(sites.len(), 1);
+    assert_eq!(sites[0].0, "credential_routes");
+    assert!(sites[0].1.contains("auth_gate::gate"));
+
+    let ungated =
+        collapse_after_open_paren("        .merge(\n            credential_routes,\n        )\n");
+    assert!(!ungated.contains(".merge(credential_routes.layer("));
+}
+
 // ---- the invariant, not a list (noetl/ai-meta#312) ----
 
 /// Routers that are deliberately reachable without the internal gate.
@@ -291,7 +346,7 @@ fn merge_sites(src: &str) -> Vec<(String, String)> {
 /// nothing about what is not.
 #[test]
 fn no_router_is_merged_ungated_without_an_explicit_reason() {
-    let sites = merge_sites(EXECUTE_MAIN);
+    let sites = merge_sites(&normalized_main());
     assert!(
         sites.len() > 20,
         "only {} merge sites parsed — the parser is not reading the router chain",
@@ -322,7 +377,7 @@ fn no_router_is_merged_ungated_without_an_explicit_reason() {
 /// linger, silently pre-approving a future router that reused the name.
 #[test]
 fn every_public_by_design_entry_still_exists() {
-    let names: std::collections::HashSet<String> = merge_sites(EXECUTE_MAIN)
+    let names: std::collections::HashSet<String> = merge_sites(&normalized_main())
         .into_iter()
         .map(|(n, _)| n)
         .collect();
