@@ -59,7 +59,7 @@ pub struct IngressDeps {
 /// The verify config the gateway needs to authenticate a delivery (RFC §6).
 #[derive(Debug, Serialize)]
 pub struct VerifyConfig {
-    /// `hmac_sha256` | `bearer` | `pubsub_oidc`.
+    /// `hmac_sha256` | `stripe_signature` | `bearer` | `pubsub_oidc`.
     #[serde(rename = "type")]
     pub verify_type: String,
     /// HMAC signature header name (hmac_sha256), or the bearer header
@@ -76,6 +76,9 @@ pub struct VerifyConfig {
     /// Expected Google push service-account email (`pubsub_oidc`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service_account: Option<String>,
+    /// Replay window in seconds (`stripe_signature`; gateway default 300).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tolerance_secs: Option<u64>,
 }
 
 /// The dispatch config the gateway applies per delivery (mirrors the worker's
@@ -154,9 +157,11 @@ pub async fn get_ingress_config(
         .and_then(|v| v.as_str())
         .map(str::to_string);
 
+    let tolerance_secs = parse_tolerance_secs(verify_block)?;
+
     // Resolve the verify secret from the Wallet for the schemes that need it.
     let secret = match verify_type.as_str() {
-        "hmac_sha256" | "bearer" => {
+        "hmac_sha256" | "stripe_signature" | "bearer" => {
             let alias = verify_block
                 .get("secret")
                 .and_then(|v| v.as_str())
@@ -232,6 +237,7 @@ pub async fn get_ingress_config(
             secret,
             audience,
             service_account,
+            tolerance_secs,
         },
         dispatch: DispatchConfig {
             playbook,
@@ -295,6 +301,17 @@ fn listener_matches(gateway_path: &str, listener: &str) -> bool {
 /// string.  The credential's decrypted `data` is expected to carry the secret
 /// under `secret` (preferred), `token`, `value`, `key`, or `password`, or be a
 /// bare string.
+/// Optional `verify.tolerance_secs` (stripe_signature replay window).  Must be
+/// a positive integer when present; absent means the gateway default (300 s).
+fn parse_tolerance_secs(verify_block: &serde_yaml::Value) -> AppResult<Option<u64>> {
+    match verify_block.get("tolerance_secs") {
+        None | Some(serde_yaml::Value::Null) => Ok(None),
+        Some(v) => v.as_u64().filter(|n| *n > 0).map(Some).ok_or_else(|| {
+            AppError::Validation("ingress.verify.tolerance_secs must be a positive integer".into())
+        }),
+    }
+}
+
 async fn resolve_secret_alias(credentials: &CredentialService, alias: &str) -> AppResult<String> {
     let resolved = credentials.get(alias, true, None).await?;
     let data = resolved.data.ok_or_else(|| {
@@ -331,6 +348,43 @@ mod tests {
         assert!(listener_matches("/ingress/stripe/", "stripe"));
         assert!(listener_matches("/stripe", "stripe"));
         assert!(listener_matches("/api/hooks/billing", "billing"));
+    }
+
+    #[test]
+    fn tolerance_secs_parsing() {
+        let y = |src: &str| -> serde_yaml::Value { serde_yaml::from_str(src).unwrap() };
+        assert_eq!(
+            parse_tolerance_secs(&y("{type: stripe_signature}")).unwrap(),
+            None
+        );
+        assert_eq!(
+            parse_tolerance_secs(&y("{tolerance_secs: ~}")).unwrap(),
+            None
+        );
+        assert_eq!(
+            parse_tolerance_secs(&y("{tolerance_secs: 120}")).unwrap(),
+            Some(120)
+        );
+        assert!(parse_tolerance_secs(&y("{tolerance_secs: 0}")).is_err());
+        assert!(parse_tolerance_secs(&y("{tolerance_secs: -5}")).is_err());
+        assert!(parse_tolerance_secs(&y("{tolerance_secs: '300'}")).is_err());
+    }
+
+    #[test]
+    fn stripe_config_serializes_for_gateway() {
+        let v = serde_json::to_value(VerifyConfig {
+            verify_type: "stripe_signature".into(),
+            header: None,
+            secret: Some("whsec_x".into()),
+            audience: None,
+            service_account: None,
+            tolerance_secs: Some(300),
+        })
+        .unwrap();
+        assert_eq!(v["type"], "stripe_signature");
+        assert_eq!(v["secret"], "whsec_x");
+        assert_eq!(v["tolerance_secs"], 300);
+        assert!(v.get("header").is_none());
     }
 
     #[test]

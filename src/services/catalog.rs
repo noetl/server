@@ -1084,7 +1084,7 @@ fn validate_limits_config(limits: &serde_yaml::Value) -> AppResult<()> {
 
 /// Verify schemes a push `kind: Subscription` ingress may declare (RFC §6).
 /// `none` is intentionally absent — push ingress always verifies.
-const PUSH_VERIFY_TYPES: &[&str] = &["hmac_sha256", "bearer", "pubsub_oidc"];
+const PUSH_VERIFY_TYPES: &[&str] = &["hmac_sha256", "stripe_signature", "bearer", "pubsub_oidc"];
 
 /// Validate the push-mode `spec.ingress` block (noetl/ai-meta#90 Phase 3).
 ///
@@ -1097,6 +1097,9 @@ const PUSH_VERIFY_TYPES: &[&str] = &["hmac_sha256", "bearer", "pubsub_oidc"];
 ///
 /// Per-scheme requirements:
 /// - `hmac_sha256` — `header` (the signature header) + `secret` (Wallet alias).
+/// - `stripe_signature` — `secret` (Wallet alias for the `whsec_…` endpoint
+///   secret); `header` optional (default `stripe-signature`); optional
+///   positive-integer `tolerance_secs` replay window (default 300).
 /// - `bearer`      — `secret` (Wallet alias for the expected token).
 /// - `pubsub_oidc` — `audience` + `service_account` (Google-signed JWT check;
 ///   the JWKS is public, so no Wallet secret).
@@ -1155,6 +1158,17 @@ fn validate_push_ingress(spec: &serde_yaml::Value) -> AppResult<()> {
         "hmac_sha256" => {
             require("header")?;
             require("secret")?;
+        }
+        "stripe_signature" => {
+            require("secret")?;
+            if let Some(t) = verify.get("tolerance_secs") {
+                if !t.as_u64().is_some_and(|n| n > 0) {
+                    return Err(AppError::Validation(
+                        "subscription 'ingress.verify.tolerance_secs' must be a positive integer"
+                            .into(),
+                    ));
+                }
+            }
         }
         "bearer" => {
             require("secret")?;
@@ -1527,6 +1541,70 @@ spec:
 "#,
         );
         assert!(validate_subscription_spec(&v).is_ok());
+    }
+
+    #[test]
+    fn valid_push_subscription_stripe_signature() {
+        let v = yaml(
+            r#"
+kind: Subscription
+metadata: { name: stripe-test, path: muno/subscriptions/stripe-test }
+spec:
+  source: webhook
+  mode: push
+  ingress:
+    gateway_path: /ingress/stripe-test
+    verify:
+      type: stripe_signature
+      header: stripe-signature
+      secret: stripe_webhook_test
+      tolerance_secs: 300
+  dispatch: { playbook: muno/playbooks/payments-webhook }
+"#,
+        );
+        assert!(validate_subscription_spec(&v).is_ok());
+        // header is optional for stripe_signature (gateway defaults it).
+        let v = yaml(
+            r#"
+kind: Subscription
+spec:
+  source: webhook
+  mode: push
+  ingress: { gateway_path: /ingress/s, verify: { type: stripe_signature, secret: a } }
+  dispatch: { playbook: p }
+"#,
+        );
+        assert!(validate_subscription_spec(&v).is_ok());
+    }
+
+    #[test]
+    fn push_stripe_signature_missing_secret_or_bad_tolerance_rejected() {
+        let v = yaml(
+            r#"
+kind: Subscription
+spec:
+  source: webhook
+  mode: push
+  ingress: { gateway_path: /ingress/s, verify: { type: stripe_signature } }
+  dispatch: { playbook: p }
+"#,
+        );
+        let err = validate_subscription_spec(&v).unwrap_err();
+        assert!(format!("{err}").contains("verify.secret"));
+        let v = yaml(
+            r#"
+kind: Subscription
+spec:
+  source: webhook
+  mode: push
+  ingress:
+    gateway_path: /ingress/s
+    verify: { type: stripe_signature, secret: a, tolerance_secs: 0 }
+  dispatch: { playbook: p }
+"#,
+        );
+        let err = validate_subscription_spec(&v).unwrap_err();
+        assert!(format!("{err}").contains("tolerance_secs"));
     }
 
     #[test]
