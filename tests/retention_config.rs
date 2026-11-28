@@ -53,7 +53,10 @@ fn both_flags_default_off_and_prune_requires_archive() {
         ea::Readiness::PruneWithoutArchive,
         "pruning with archiving off must be refused, not obeyed"
     );
-    assert!(c3.prune_readiness().reason().contains("no copy being produced"));
+    assert!(c3
+        .prune_readiness()
+        .reason()
+        .contains("no copy being produced"));
 
     // Positive control: the readiness check CAN return Ready, so the refusals above are
     // measuring the conditions and not a function that always says no.
@@ -117,15 +120,25 @@ fn the_retention_boundary_is_exact_and_inclusive_of_the_window() {
         "exactly at the window is still retained"
     );
     assert!(
-        ea::archivability("COMPLETED", Some(exactly - Duration::microseconds(1)), now, r)
-            .is_archivable(),
+        ea::archivability(
+            "COMPLETED",
+            Some(exactly - Duration::microseconds(1)),
+            now,
+            r
+        )
+        .is_archivable(),
         "one microsecond past the window is archivable"
     );
     // And a 24h window must behave the same way — the spec calls 24h out as supported.
     let r24 = Duration::hours(24);
     assert!(!ea::archivability("COMPLETED", Some(now - r24), now, r24).is_archivable());
-    assert!(ea::archivability("COMPLETED", Some(now - r24 - Duration::seconds(1)), now, r24)
-        .is_archivable());
+    assert!(ea::archivability(
+        "COMPLETED",
+        Some(now - r24 - Duration::seconds(1)),
+        now,
+        r24
+    )
+    .is_archivable());
 }
 
 /// A future `completed_at` (clock skew) must not be archivable.
@@ -146,11 +159,11 @@ fn the_scan_accounts_for_every_row_it_examined() {
     let r = Duration::hours(48);
     let now = t(100);
     let rows: Vec<(i64, String, Option<chrono::DateTime<chrono::Utc>>)> = vec![
-        (1, "COMPLETED".into(), Some(t(0))),   // archivable
-        (2, "FAILED".into(), Some(t(1))),      // archivable
-        (3, "COMPLETED".into(), Some(t(99))),  // within retention
-        (4, "RUNNING".into(), None),           // not terminal
-        (5, "COMPLETED".into(), None),         // terminal, no completed_at
+        (1, "COMPLETED".into(), Some(t(0))),  // archivable
+        (2, "FAILED".into(), Some(t(1))),     // archivable
+        (3, "COMPLETED".into(), Some(t(99))), // within retention
+        (4, "RUNNING".into(), None),          // not terminal
+        (5, "COMPLETED".into(), None),        // terminal, no completed_at
     ];
     let mut scan = ea::ArchivableScan::default();
     ea::classify_into(&mut scan, &rows, now, r);
@@ -184,7 +197,10 @@ fn a_zero_window_and_a_typo_are_refused_not_silently_accepted() {
     // 0 is refused, not clamped: it would archive and prune an execution as it completed.
     let e = ea::parse_retention_hours("0").unwrap_err();
     assert!(e.contains("retain nothing"), "{e}");
-    assert!(e.contains("NOETL_EHDB_RETENTION_HOURS"), "must name the var: {e}");
+    assert!(
+        e.contains("NOETL_EHDB_RETENTION_HOURS"),
+        "must name the var: {e}"
+    );
 
     // Garbage is an error, not a fallback to the default.
     for bad in ["", " ", "forty-eight", "48h", "-1", "4.8", "0x30"] {
@@ -216,8 +232,16 @@ fn an_unrecognised_flag_value_is_an_error_not_a_silent_false() {
     // only exactly "true"/"1", so "TRUE" silently means false there; a value copied
     // between components changing meaning is a documented trap worth not repeating.
     for (v, want) in [
-        ("true", true), ("TRUE", true), (" On ", true), ("yes", true), ("1", true),
-        ("false", false), ("FALSE", false), ("off", false), ("no", false), ("0", false),
+        ("true", true),
+        ("TRUE", true),
+        (" On ", true),
+        ("yes", true),
+        ("1", true),
+        ("false", false),
+        ("FALSE", false),
+        ("off", false),
+        ("no", false),
+        ("0", false),
     ] {
         assert_eq!(
             ea::parse_flag("X", v).unwrap(),

@@ -29,7 +29,11 @@ fn cand(id: i64, status: &str, done_h: Option<i64>) -> ea::ArchiveCandidate {
 }
 
 fn hot(id: i64, min: u64, max: u64) -> ea::HotExecution {
-    ea::HotExecution { execution_id: id, min_sequence: min, max_sequence: max }
+    ea::HotExecution {
+        execution_id: id,
+        min_sequence: min,
+        max_sequence: max,
+    }
 }
 
 fn scan_of(cands: &[ea::ArchiveCandidate], now_h: i64) -> ea::ArchivableScan {
@@ -47,9 +51,9 @@ fn scan_of(cands: &[ea::ArchiveCandidate], now_h: i64) -> ea::ArchivableScan {
 #[test]
 fn a_live_execution_pins_the_floor_and_its_part_is_not_droppable() {
     let cands = vec![
-        cand(1, "COMPLETED", Some(0)),  // archivable, archived
-        cand(2, "COMPLETED", Some(1)),  // archivable, archived
-        cand(3, "RUNNING", None),       // ⚠ LIVE — started early, still going
+        cand(1, "COMPLETED", Some(0)), // archivable, archived
+        cand(2, "COMPLETED", Some(1)), // archivable, archived
+        cand(3, "RUNNING", None),      // ⚠ LIVE — started early, still going
     ];
     let scan = scan_of(&cands, 100);
     assert_eq!(scan.archivable, vec![1, 2]);
@@ -61,8 +65,14 @@ fn a_live_execution_pins_the_floor_and_its_part_is_not_droppable() {
 
     let basis = ea::compute_prune_floor(&scan, &archived, &footprint);
     match &basis {
-        ea::FloorBasis::Computed { keep_from_sequence, constrained_by } => {
-            assert_eq!(*keep_from_sequence, 120, "the floor must sit at the LIVE execution");
+        ea::FloorBasis::Computed {
+            keep_from_sequence,
+            constrained_by,
+        } => {
+            assert_eq!(
+                *keep_from_sequence, 120,
+                "the floor must sit at the LIVE execution"
+            );
             assert_eq!(*constrained_by, 1);
         }
         other => panic!("expected Computed, got {other:?}"),
@@ -73,13 +83,26 @@ fn a_live_execution_pins_the_floor_and_its_part_is_not_droppable() {
         !d.part_is_droppable(100, 200),
         "⚠⚠⚠ a part holding the LIVE execution's events must never be droppable"
     );
-    assert!(d.part_is_droppable(100, 119), "a part strictly below the floor may drop");
-    assert!(!d.part_is_droppable(119, 121), "a part straddling the floor is kept WHOLE");
+    assert!(
+        d.part_is_droppable(100, 119),
+        "a part strictly below the floor may drop"
+    );
+    assert!(
+        !d.part_is_droppable(119, 121),
+        "a part straddling the floor is kept WHOLE"
+    );
 
     // ⭐ Positive control: archive the live one too and the same part becomes droppable —
     // so the refusal above is the live execution, not a floor that always refuses.
     let all: HashSet<i64> = [1, 2, 3].into_iter().collect();
-    let scan2 = scan_of(&[cand(1, "COMPLETED", Some(0)), cand(2, "COMPLETED", Some(1)), cand(3, "COMPLETED", Some(2))], 100);
+    let scan2 = scan_of(
+        &[
+            cand(1, "COMPLETED", Some(0)),
+            cand(2, "COMPLETED", Some(1)),
+            cand(3, "COMPLETED", Some(2)),
+        ],
+        100,
+    );
     let basis2 = ea::compute_prune_floor(&scan2, &all, &footprint);
     // ⚠ This assertion read `NoFootprint` until 2026-10-09, which pinned a real defect: with
     // everything archived the floor refused, so a drained log reclaimed NOTHING while every
@@ -87,9 +110,18 @@ fn a_live_execution_pins_the_floor_and_its_part_is_not_droppable() {
     // opposite of no evidence — it is evidence that all of it is safe. The floor must clear
     // the highest sequence those executions occupy (999), not their highest first sequence.
     match basis2 {
-        ea::FloorBasis::Computed { keep_from_sequence, constrained_by } => {
-            assert_eq!(keep_from_sequence, 1000, "the floor must clear the measured tip");
-            assert_eq!(constrained_by, 0, "nothing constrains once all are archived");
+        ea::FloorBasis::Computed {
+            keep_from_sequence,
+            constrained_by,
+        } => {
+            assert_eq!(
+                keep_from_sequence, 1000,
+                "the floor must clear the measured tip"
+            );
+            assert_eq!(
+                constrained_by, 0,
+                "nothing constrains once all are archived"
+            );
         }
         other => panic!("expected the floor to advance, got {other:?}"),
     }
@@ -111,9 +143,16 @@ fn an_unarchived_backlog_refuses_to_advance_the_floor() {
 
     let basis = ea::compute_prune_floor(&scan, &archived, &footprint);
     assert_eq!(basis, ea::FloorBasis::AwaitingBacklog { unarchived: 1 });
-    assert!(!basis.may_prune(), "a single unarchived execution must block the prune");
+    assert!(
+        !basis.may_prune(),
+        "a single unarchived execution must block the prune"
+    );
     assert_eq!(basis.keep_from_sequence(), None);
-    assert!(basis.reason().contains("not yet verified-archived"), "{}", basis.reason());
+    assert!(
+        basis.reason().contains("not yet verified-archived"),
+        "{}",
+        basis.reason()
+    );
 
     // ⭐ Positive control: with the last one archived, the floor computes.
     let all: HashSet<i64> = (1..=50).collect();
@@ -123,7 +162,10 @@ fn an_unarchived_backlog_refuses_to_advance_the_floor() {
     // all 2000, so the floor clears it at 2001.
     assert_eq!(
         b2,
-        ea::FloorBasis::Computed { keep_from_sequence: 2001, constrained_by: 0 },
+        ea::FloorBasis::Computed {
+            keep_from_sequence: 2001,
+            constrained_by: 0
+        },
         "with the backlog drained the floor must advance past the measured tip"
     );
 }
@@ -137,15 +179,18 @@ fn an_empty_footprint_refuses_rather_than_pruning_everything() {
     let archived: HashSet<i64> = [1].into_iter().collect();
     let basis = ea::compute_prune_floor(&scan, &archived, &[]);
     assert_eq!(basis, ea::FloorBasis::NoFootprint);
-    assert!(!basis.may_prune(), "no footprint must never authorise a prune");
+    assert!(
+        !basis.may_prune(),
+        "no footprint must never authorise a prune"
+    );
 }
 
 /// Within-retention executions constrain too — being terminal is not enough.
 #[test]
 fn a_recently_completed_execution_still_constrains_the_floor() {
     let cands = vec![
-        cand(1, "COMPLETED", Some(0)),   // 100h old -> archivable
-        cand(2, "COMPLETED", Some(99)),  // 1h old   -> within retention, NOT archivable
+        cand(1, "COMPLETED", Some(0)),  // 100h old -> archivable
+        cand(2, "COMPLETED", Some(99)), // 1h old   -> within retention, NOT archivable
     ];
     let scan = scan_of(&cands, 100);
     assert_eq!(scan.archivable, vec![1]);
@@ -154,7 +199,9 @@ fn a_recently_completed_execution_still_constrains_the_floor() {
     let archived: HashSet<i64> = [1].into_iter().collect();
     let footprint = vec![hot(1, 500, 600), hot(2, 50, 700)];
     match ea::compute_prune_floor(&scan, &archived, &footprint) {
-        ea::FloorBasis::Computed { keep_from_sequence, .. } => assert_eq!(
+        ea::FloorBasis::Computed {
+            keep_from_sequence, ..
+        } => assert_eq!(
             keep_from_sequence, 50,
             "the recent execution's earliest event bounds the floor"
         ),
@@ -187,7 +234,11 @@ fn the_floor_only_needs_the_constraining_executions_not_the_whole_population() {
     // ⚠ And an unarchived archivable one joins the set, because a part may hold it.
     let partial: HashSet<i64> = (1..=999).collect();
     let ids2 = ea::floor_relevant_ids(&scan, &partial, &cands);
-    assert_eq!(ids2.len(), 11, "the one unarchived archivable execution must be included");
+    assert_eq!(
+        ids2.len(),
+        11,
+        "the one unarchived archivable execution must be included"
+    );
     assert!(ids2.contains(&1000));
 }
 
@@ -195,7 +246,10 @@ fn the_floor_only_needs_the_constraining_executions_not_the_whole_population() {
 #[test]
 fn every_floor_basis_reason_is_distinct_and_actionable() {
     let v = [
-        ea::FloorBasis::Computed { keep_from_sequence: 7, constrained_by: 2 },
+        ea::FloorBasis::Computed {
+            keep_from_sequence: 7,
+            constrained_by: 2,
+        },
         ea::FloorBasis::AwaitingBacklog { unarchived: 5 },
         ea::FloorBasis::NoFootprint,
     ];
@@ -206,5 +260,9 @@ fn every_floor_basis_reason_is_distinct_and_actionable() {
             assert_ne!(a, b);
         }
     }
-    assert_eq!(v.iter().filter(|b| b.may_prune()).count(), 1, "exactly one state permits a prune");
+    assert_eq!(
+        v.iter().filter(|b| b.may_prune()).count(),
+        1,
+        "exactly one state permits a prune"
+    );
 }

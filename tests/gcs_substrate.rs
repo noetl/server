@@ -177,7 +177,9 @@ fn an_empty_bucket_is_refused() {
 #[test]
 fn a_zero_length_range_is_answered_without_a_request() {
     let s = gcs("b");
-    let got = s.get_range("any/key", 100, 0).expect("len 0 must not error");
+    let got = s
+        .get_range("any/key", 100, 0)
+        .expect("len 0 must not error");
     assert!(got.is_empty());
 }
 

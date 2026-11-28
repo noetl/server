@@ -539,7 +539,10 @@ fn mode6_a_second_prefork_writer_makes_the_log_source_diverge() {
     // unresolved partition is NOT SERVABLE. That is the property that kept the prod
     // canary safe, and it is unchanged.
     match out {
-        FromLog::StaleLog { stored_len, log_len } => {
+        FromLog::StaleLog {
+            stored_len,
+            log_len,
+        } => {
             assert_eq!(stored_len, 4, "the store holds the foreign writer's t4");
             assert_eq!(log_len, 3, "while the committed log still ends at t3");
         }

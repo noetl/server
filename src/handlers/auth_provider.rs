@@ -83,7 +83,9 @@ pub(crate) enum Invalid {
 impl Invalid {
     fn message(&self) -> &'static str {
         match self {
-            Invalid::Provider => "provider must be 2-32 chars of a-z, 0-9 and '-', starting with a letter or digit",
+            Invalid::Provider => {
+                "provider must be 2-32 chars of a-z, 0-9 and '-', starting with a letter or digit"
+            }
             Invalid::Subject => "subject must be 1-200 printable characters",
             Invalid::Email => "a valid email address is required",
             Invalid::EmailNotVerified => "the provider did not verify the email address",
@@ -98,7 +100,8 @@ pub(crate) fn identity_key(req: &ProviderSessionRequest) -> Result<String, Inval
     let p = req.provider.as_bytes();
     let provider_ok = (2..=32).contains(&p.len())
         && p[0].is_ascii_alphanumeric()
-        && p.iter().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-');
+        && p.iter()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-');
     if !provider_ok {
         return Err(Invalid::Provider);
     }
@@ -176,7 +179,12 @@ async fn create(
 ) -> crate::error::AppResult<Json<LoginResponse>> {
     let pool = resolve_auth_pool(cred, &req.credential).await?;
     let email = req.email.trim();
-    let name = req.name.as_deref().map(str::trim).filter(|n| !n.is_empty()).unwrap_or(email);
+    let name = req
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .unwrap_or(email);
     let mut tx = pool.begin().await?;
 
     // Separate accounts: an email already used by another identity is refused.
@@ -226,8 +234,16 @@ async fn create(
     .bind(user_id as i64)
     .bind(&token)
     .bind(req.session_hours as i32)
-    .bind(req.client_ip.as_deref().filter(|ip| ip.parse::<std::net::IpAddr>().is_ok()))
-    .bind(req.user_agent.as_deref().map(|u| u.chars().take(500).collect::<String>()))
+    .bind(
+        req.client_ip
+            .as_deref()
+            .filter(|ip| ip.parse::<std::net::IpAddr>().is_ok()),
+    )
+    .bind(
+        req.user_agent
+            .as_deref()
+            .map(|u| u.chars().take(500).collect::<String>()),
+    )
     .fetch_one(&mut *tx)
     .await?;
 
@@ -274,18 +290,23 @@ pub async fn logout(
     }
     let result = async {
         let pool = resolve_auth_pool(&cred, &req.credential).await?;
-        let done = sqlx::query("UPDATE auth.sessions SET is_active = false WHERE session_token = $1 AND is_active")
-            .bind(req.session_token.trim())
-            .execute(&pool)
-            .await?;
+        let done = sqlx::query(
+            "UPDATE auth.sessions SET is_active = false WHERE session_token = $1 AND is_active",
+        )
+        .bind(req.session_token.trim())
+        .execute(&pool)
+        .await?;
         crate::error::AppResult::Ok(done.rows_affected() > 0)
     }
     .await;
     match result {
-        Ok(revoked) => Json(serde_json::json!({ "status": "ok", "revoked": revoked })).into_response(),
+        Ok(revoked) => {
+            Json(serde_json::json!({ "status": "ok", "revoked": revoked })).into_response()
+        }
         Err(e) => {
             tracing::warn!(error = %e, "logout failed");
-            Json(serde_json::json!({ "status": "error", "error": "Failed to end the session" })).into_response()
+            Json(serde_json::json!({ "status": "error", "error": "Failed to end the session" }))
+                .into_response()
         }
     }
 }
@@ -335,14 +356,21 @@ mod tests {
         assert_eq!(bad(|r| r.email = "a@b@example.org".into()), Invalid::Email);
         assert_eq!(bad(|r| r.email_verified = false), Invalid::EmailNotVerified);
         assert_eq!(bad(|r| r.session_hours = 0), Invalid::SessionHours);
-        assert_eq!(bad(|r| r.session_hours = MAX_SESSION_HOURS + 1), Invalid::SessionHours);
+        assert_eq!(
+            bad(|r| r.session_hours = MAX_SESSION_HOURS + 1),
+            Invalid::SessionHours
+        );
     }
 
     #[test]
     fn mint_key_gate() {
         let key = "k".repeat(32);
         assert_eq!(key_ok(None, Some("x")), None, "unset = route off");
-        assert_eq!(key_ok(Some("short"), Some("short")), None, "a short key turns the route off");
+        assert_eq!(
+            key_ok(Some("short"), Some("short")),
+            None,
+            "a short key turns the route off"
+        );
         assert_eq!(key_ok(Some(&key), None), Some(false));
         assert_eq!(key_ok(Some(&key), Some("k")), Some(false));
         assert_eq!(key_ok(Some(&key), Some(&key)), Some(true));

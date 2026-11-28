@@ -41,9 +41,13 @@ fn ehdb_pins() -> Vec<(String, String)> {
         if !line.starts_with("ehdb-") {
             continue;
         }
-        let Some((name, rest)) = line.split_once('=') else { continue };
+        let Some((name, rest)) = line.split_once('=') else {
+            continue;
+        };
         // tag = "vX.Y.Z"
-        let Some(i) = rest.find("tag = \"") else { continue };
+        let Some(i) = rest.find("tag = \"") else {
+            continue;
+        };
         let after = &rest[i + 7..];
         let Some(j) = after.find('"') else { continue };
         out.push((name.trim().to_string(), after[..j].to_string()));

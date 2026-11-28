@@ -80,9 +80,12 @@ fn two_local_substrates_on_one_device_are_one_domain_and_still_a_spof() {
 fn local_plus_gcs_is_a_genuine_second_domain() {
     let local_dir = unique_dir("objects");
     let local = LocalFsSubstrate::new(&local_dir).unwrap();
-    let remote =
-        GcsSubstrate::open(ENDPOINT, "ehdb-replica", &format!("dom-{}", std::process::id()))
-            .unwrap();
+    let remote = GcsSubstrate::open(
+        ENDPOINT,
+        "ehdb-replica",
+        &format!("dom-{}", std::process::id()),
+    )
+    .unwrap();
 
     // The declarations, read off the real implementations.
     assert!(
@@ -107,7 +110,10 @@ fn local_plus_gcs_is_a_genuine_second_domain() {
     assert!(!r.is_single_point_of_failure(), "{}", r.describe());
     // Asserted on the gauges too, not only the struct — the gauges are what an operator reads.
     assert_eq!(noetl_server::metrics::ehdb_survives_node_loss().get(), 1);
-    assert_eq!(noetl_server::metrics::ehdb_replica_domains_distinct().get(), 1);
+    assert_eq!(
+        noetl_server::metrics::ehdb_replica_domains_distinct().get(),
+        1
+    );
     assert_eq!(
         noetl_server::metrics::ehdb_replica_single_point_of_failure().get(),
         0
@@ -146,7 +152,8 @@ fn an_rf2_engine_puts_sealed_parts_in_both_domains() {
     .expect("RF=2 open with require_distinct_domains must be ACCEPTED for local+gcs");
 
     for i in 0..32u64 {
-        e.append("9100", &format!("t{i}"), format!("payload-{i}")).unwrap();
+        e.append("9100", &format!("t{i}"), format!("payload-{i}"))
+            .unwrap();
     }
     e.flush_and_wait_uploads().unwrap();
     let expected = e.replay_all().unwrap();
@@ -188,7 +195,10 @@ fn an_rf2_engine_puts_sealed_parts_in_both_domains() {
     // Sealed parts present in BOTH domains.
     let lp = local.list_prefix("parts/d1_event_log/").unwrap();
     let rp = remote.list_prefix("parts/d1_event_log/").unwrap();
-    assert!(!lp.is_empty(), "no sealed parts in the LOCAL domain: {lp:?}");
+    assert!(
+        !lp.is_empty(),
+        "no sealed parts in the LOCAL domain: {lp:?}"
+    );
     assert!(
         !rp.is_empty(),
         "⚠⚠ no sealed parts in the REMOTE domain. The engine opened RF=2 and reported two \

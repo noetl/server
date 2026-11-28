@@ -954,8 +954,12 @@ pub async fn handle_event_seq(
         crate::metrics::record_event_ingest_phase("normalize", __t.elapsed().as_secs_f64());
         let rows: Vec<_> = normalized.iter().map(event_row_from_normalized).collect();
         let __t = std::time::Instant::now();
-        crate::handlers::event_write::emit_events(&state, state.pools.pool_for(execution_id), &rows)
-            .await?;
+        crate::handlers::event_write::emit_events(
+            &state,
+            state.pools.pool_for(execution_id),
+            &rows,
+        )
+        .await?;
         crate::metrics::record_event_ingest_phase("emit_seq", __t.elapsed().as_secs_f64());
         let mut event_ids = Vec::with_capacity(normalized.len());
         let mut commands_generated = 0;
@@ -6551,7 +6555,11 @@ mod reconcile_cap_tests {
                 break;
             }
         }
-        assert_eq!(fired_at, Some(8), "1800 s of streak is 7 ticks after the first no-op");
+        assert_eq!(
+            fired_at,
+            Some(8),
+            "1800 s of streak is 7 ticks after the first no-op"
+        );
     }
 
     /// At the designed 8 s tick the time cap never fires before the poll cap —
@@ -6573,9 +6581,24 @@ mod reconcile_cap_tests {
         use std::time::Duration;
         let forever = Duration::from_secs(10 * 24 * 3600);
         let min = MIN_POLLS_BEFORE_TIMED_GIVE_UP;
-        assert!(!reconcile_give_up_by_time(225, min - 1, forever, RECONCILE_INTERVAL));
-        assert!(reconcile_give_up_by_time(225, min, forever, RECONCILE_INTERVAL));
-        assert!(!reconcile_give_up_by_time(0, 1000, forever, RECONCILE_INTERVAL));
+        assert!(!reconcile_give_up_by_time(
+            225,
+            min - 1,
+            forever,
+            RECONCILE_INTERVAL
+        ));
+        assert!(reconcile_give_up_by_time(
+            225,
+            min,
+            forever,
+            RECONCILE_INTERVAL
+        ));
+        assert!(!reconcile_give_up_by_time(
+            0,
+            1000,
+            forever,
+            RECONCILE_INTERVAL
+        ));
     }
 
     /// The streak's start survives increments and is cleared with the budget.
@@ -6892,7 +6915,10 @@ mod event_seq_tests {
         assert!(validate_event_seq(&ok[..1]).is_err());
         let three = vec![ok[0].clone(), ok[0].clone(), ok[1].clone()];
         assert!(validate_event_seq(&three).is_err());
-        let other_step = vec![ok[0].clone(), ev("command.completed", "t", Some("2"), serde_json::json!({}))];
+        let other_step = vec![
+            ok[0].clone(),
+            ev("command.completed", "t", Some("2"), serde_json::json!({})),
+        ];
         assert!(validate_event_seq(&other_step).is_err());
         let meta = noetl_orchestrate_core::state::WorkflowState::ORCHESTRATE_META_STEP;
         let m = vec![
@@ -6900,14 +6926,25 @@ mod event_seq_tests {
             ev("command.completed", meta, Some("2"), serde_json::json!({})),
         ];
         assert!(validate_event_seq(&m).is_err());
-        let no_id = vec![ev("call.done", "s", None, serde_json::json!({})), ok[1].clone()];
+        let no_id = vec![
+            ev("call.done", "s", None, serde_json::json!({})),
+            ok[1].clone(),
+        ];
         assert!(validate_event_seq(&no_id).is_err());
         let parked = vec![
             ok[0].clone(),
-            ev("command.completed", "s", Some("2"), serde_json::json!({"pending_callback": true})),
+            ev(
+                "command.completed",
+                "s",
+                Some("2"),
+                serde_json::json!({"pending_callback": true}),
+            ),
         ];
         assert!(validate_event_seq(&parked).is_err());
-        let failed = vec![ok[0].clone(), ev("command.failed", "s", Some("2"), serde_json::json!({}))];
+        let failed = vec![
+            ok[0].clone(),
+            ev("command.failed", "s", Some("2"), serde_json::json!({})),
+        ];
         assert!(validate_event_seq(&failed).is_err());
     }
 
@@ -6920,7 +6957,12 @@ mod event_seq_tests {
         assert!(inner.contains("after_event_persisted("));
         let seq = &src[src.find("pub async fn handle_event_seq(").unwrap()..];
         let seq = &seq[..seq.find("\n}\n").unwrap()];
-        for needle in ["normalize_event_to_row(", "event_row_from_normalized", "after_event_persisted(", "claim_local_drive_if_marked("] {
+        for needle in [
+            "normalize_event_to_row(",
+            "event_row_from_normalized",
+            "after_event_persisted(",
+            "claim_local_drive_if_marked(",
+        ] {
             assert!(seq.contains(needle), "seq must reuse {needle}");
         }
     }

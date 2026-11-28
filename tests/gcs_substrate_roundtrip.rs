@@ -64,8 +64,7 @@ fn sealed_parts_reach_gcs_and_the_log_cold_loads_from_it_alone() {
     let origin_root = unique_dir("origin");
     let cold_root = unique_dir("cold");
 
-    let local: Arc<dyn DurableSubstrate> =
-        Arc::new(LocalFsSubstrate::new(&local_objects).unwrap());
+    let local: Arc<dyn DurableSubstrate> = Arc::new(LocalFsSubstrate::new(&local_objects).unwrap());
     let remote = gcs("ehdb-replica", &prefix);
 
     let mut origin = L0EventLogEngine::open_replicated(
@@ -105,7 +104,8 @@ fn sealed_parts_reach_gcs_and_the_log_cold_loads_from_it_alone() {
         .expect("cold-load from the GCS replica");
     let recovered = cold.replay_all().unwrap();
     assert_eq!(
-        recovered, expected,
+        recovered,
+        expected,
         "the log did not come back from the off-box replica: {} of {} records",
         recovered.len(),
         expected.len()
@@ -127,7 +127,10 @@ fn sealed_parts_reach_gcs_and_the_log_cold_loads_from_it_alone() {
 #[ignore = "needs fake-gcs-server on 127.0.0.1:4443"]
 fn a_cold_load_from_an_untouched_bucket_recovers_nothing() {
     let cold_root = unique_dir("cold-empty");
-    let empty = gcs("ehdb-empty", &format!("never-written-{}", std::process::id()));
+    let empty = gcs(
+        "ehdb-empty",
+        &format!("never-written-{}", std::process::id()),
+    );
 
     // Either outcome is correct — a cold-load against an untouched prefix may refuse
     // outright. What must NOT happen is records appearing.
@@ -148,8 +151,12 @@ fn a_cold_load_from_an_untouched_bucket_recovers_nothing() {
 #[test]
 #[ignore = "needs fake-gcs-server on 127.0.0.1:4443"]
 fn put_if_absent_is_atomic_and_get_range_refuses_an_over_read() {
-    let s = GcsSubstrate::open(ENDPOINT, "ehdb-replica", &format!("prim-{}", std::process::id()))
-        .unwrap();
+    let s = GcsSubstrate::open(
+        ENDPOINT,
+        "ehdb-replica",
+        &format!("prim-{}", std::process::id()),
+    )
+    .unwrap();
     let key = "immutable/object";
     let body = b"0123456789";
 
@@ -190,7 +197,8 @@ fn put_if_absent_is_atomic_and_get_range_refuses_an_over_read() {
     // delete is idempotent, and list reflects it.
     s.delete(key).unwrap();
     assert!(!s.exists(key).unwrap());
-    s.delete(key).expect("deleting an absent key is not an error");
+    s.delete(key)
+        .expect("deleting an absent key is not an error");
 }
 
 /// ⭐⭐ **The prod scenario, end to end.** This is the exact operation performed on
@@ -208,8 +216,7 @@ fn a_backfill_makes_an_attached_replica_recoverable_and_it_was_not_before() {
     let local_objects = unique_dir("bf-objects");
     let origin_root = unique_dir("bf-origin");
 
-    let local: Arc<dyn DurableSubstrate> =
-        Arc::new(LocalFsSubstrate::new(&local_objects).unwrap());
+    let local: Arc<dyn DurableSubstrate> = Arc::new(LocalFsSubstrate::new(&local_objects).unwrap());
 
     // --- Phase 1: history, written with NO off-box replica (prod before the attach) ---
     let mut origin = L0EventLogEngine::open_replicated(
@@ -277,18 +284,18 @@ fn a_backfill_makes_an_attached_replica_recoverable_and_it_was_not_before() {
     // true: does the OPEN fail, or does the open succeed and the REPLAY fail? Collapsing
     // them with `unwrap_or_default()` reports "recovered 0 records", which reads as "the
     // remote is an empty log" — a claim this does not establish.
-    let (pre_opened, pre_replay_err, pre_recovered): (bool, Option<String>, Vec<String>) =
-        match pre {
-            Err(e) => (false, Some(e.to_string()), Vec::new()),
-            Ok(ref engine) => match engine.replay_all() {
-                Ok(rs) => (
-                    true,
-                    None,
-                    rs.into_iter().map(|r| r.payload).collect::<Vec<String>>(),
-                ),
-                Err(e) => (true, Some(e.to_string()), Vec::new()),
-            },
-        };
+    let (pre_opened, pre_replay_err, pre_recovered): (bool, Option<String>, Vec<String>) = match pre
+    {
+        Err(e) => (false, Some(e.to_string()), Vec::new()),
+        Ok(ref engine) => match engine.replay_all() {
+            Ok(rs) => (
+                true,
+                None,
+                rs.into_iter().map(|r| r.payload).collect::<Vec<String>>(),
+            ),
+            Err(e) => (true, Some(e.to_string()), Vec::new()),
+        },
+    };
     eprintln!(
         "PRE-BACKFILL  opened={pre_opened}  replay_err={:?}  recovered={} of {}",
         pre_replay_err,
@@ -375,8 +382,7 @@ fn tail_scenario(
     let local_objects = unique_dir(&format!("{tag}-objects"));
     let origin_root = unique_dir(&format!("{tag}-origin"));
 
-    let local: Arc<dyn DurableSubstrate> =
-        Arc::new(LocalFsSubstrate::new(&local_objects).unwrap());
+    let local: Arc<dyn DurableSubstrate> = Arc::new(LocalFsSubstrate::new(&local_objects).unwrap());
     let remote = gcs(bucket, &prefix);
 
     let mut c = cfg(&origin_root);
@@ -454,13 +460,10 @@ fn recover_from_gcs_alone(bucket: &str, prefix: &str, tag: &str) -> Vec<String> 
 #[test]
 #[ignore = "needs fake-gcs-server on 127.0.0.1:4443"]
 fn without_tail_replication_unsealed_records_do_not_reach_gcs() {
-    let (_root, prefix, sealed, tail_payloads) =
-        tail_scenario("ehdb-tail-red", "b3red", false);
+    let (_root, prefix, sealed, tail_payloads) = tail_scenario("ehdb-tail-red", "b3red", false);
 
     // Nothing under `tail/`, counted from the bucket itself.
-    let objects = gcs("ehdb-tail-red", &prefix)
-        .list_prefix("tail/")
-        .unwrap();
+    let objects = gcs("ehdb-tail-red", &prefix).list_prefix("tail/").unwrap();
     assert!(
         objects.is_empty(),
         "tail objects exist with the flag OFF: {objects:?}"
@@ -517,8 +520,7 @@ fn a_superseded_tail_object_is_reclaimed_from_gcs_and_nothing_is_lost() {
     let local_objects = unique_dir("d2-objects");
     let origin_root = unique_dir("d2-origin");
 
-    let local: Arc<dyn DurableSubstrate> =
-        Arc::new(LocalFsSubstrate::new(&local_objects).unwrap());
+    let local: Arc<dyn DurableSubstrate> = Arc::new(LocalFsSubstrate::new(&local_objects).unwrap());
     let remote = gcs("ehdb-cleanup", &prefix);
 
     let mut origin = L0EventLogEngine::open_replicated(
@@ -576,7 +578,10 @@ fn a_superseded_tail_object_is_reclaimed_from_gcs_and_nothing_is_lost() {
     let fresh = unique_dir("d2-cold");
     let revived = L0EventLogEngine::cold_load_replicated(
         cfg(&fresh),
-        vec![ReplicaTarget::new("replica-1-gcs", gcs("ehdb-cleanup", &prefix))],
+        vec![ReplicaTarget::new(
+            "replica-1-gcs",
+            gcs("ehdb-cleanup", &prefix),
+        )],
     )
     .expect("GCS alone serves the cold load after the reclaim");
     let got: Vec<String> = revived

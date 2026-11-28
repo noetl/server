@@ -177,7 +177,10 @@ pub async fn rehearse_endpoint(
     let pool = state.pools.cluster();
     let mut steps: Vec<serde_json::Value> = Vec::new();
     let mut ok = true;
-    let token = format!("rehearsal-{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0));
+    let token = format!(
+        "rehearsal-{}",
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+    );
 
     macro_rules! step {
         ($name:expr, $res:expr) => {{
@@ -224,10 +227,11 @@ pub async fn rehearse_endpoint(
     }
     let mut round_trip = false;
     if ok {
-        let read: Result<Option<(String,)>, _> =
-            sqlx::query_as(&format!("SELECT payload FROM {REHEARSAL_TABLE} WHERE id = 1"))
-                .fetch_optional(pool)
-                .await;
+        let read: Result<Option<(String,)>, _> = sqlx::query_as(&format!(
+            "SELECT payload FROM {REHEARSAL_TABLE} WHERE id = 1"
+        ))
+        .fetch_optional(pool)
+        .await;
         if let Some(v) = step!("read_back", read) {
             // The comparison is the point. A rehearsal that created a table and
             // never checked what came out would pass on a store that silently

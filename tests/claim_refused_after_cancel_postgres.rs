@@ -156,10 +156,17 @@ async fn a_queued_command_is_not_claimed_after_cancel() {
         "the cancel API's event type changed; keep CANCEL_API_EVENT_TYPE in step"
     );
     assert_refused_as_cancelled(claim(&state, cmd).await, "cancel API");
-    assert_eq!(claimed_events(&pool, eid).await, 0, "no claim may be recorded");
+    assert_eq!(
+        claimed_events(&pool, eid).await,
+        0,
+        "no claim may be recorded"
+    );
 
     // The other two spellings must refuse too.
-    for (i, spelling) in ["playbook.cancelled", "execution.cancelled"].iter().enumerate() {
+    for (i, spelling) in ["playbook.cancelled", "execution.cancelled"]
+        .iter()
+        .enumerate()
+    {
         let eid = base + 300 + (i as i64) * 100;
         let cmd = seed_queued_command(&pool, eid).await;
         sqlx::query(

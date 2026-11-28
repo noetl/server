@@ -116,7 +116,10 @@ impl CatalogAdvert {
     pub fn validate(&self) -> Result<(), String> {
         if self.families.is_empty()
             || self.families.len() > ADVERT_FAMILIES.len()
-            || self.families.iter().any(|f| !ADVERT_FAMILIES.contains(&f.as_str()))
+            || self
+                .families
+                .iter()
+                .any(|f| !ADVERT_FAMILIES.contains(&f.as_str()))
         {
             return Err("catalog.families: a non-empty subset of p, v, d".into());
         }
@@ -446,7 +449,12 @@ pub(crate) mod tests {
     fn advert(scheme: ehdb_l0::bloom::BloomScheme, keys: &[&str]) -> CatalogAdvert {
         let mut bloom = ehdb_l0::Bloom::for_expected_in(64, scheme);
         keys.iter().for_each(|k| bloom.insert(k));
-        CatalogAdvert { generation: 1, entries: 1, families: vec!["p".into(), "d".into()], bloom }
+        CatalogAdvert {
+            generation: 1,
+            entries: 1,
+            families: vec!["p".into(), "d".into()],
+            bloom,
+        }
     }
 
     #[test]
@@ -457,7 +465,10 @@ pub(crate) mod tests {
         c.validate().unwrap();
         let a = c.catalog.as_ref().unwrap();
         assert!(a.may_hold("p:a/b"));
-        assert!(!a.may_hold("v:a/b@1"), "a family that was not inserted never answers maybe");
+        assert!(
+            !a.may_hold("v:a/b@1"),
+            "a family that was not inserted never answers maybe"
+        );
         // Round-trips through the registration JSON.
         let back: Capabilities = serde_json::from_value(serde_json::to_value(&c).unwrap()).unwrap();
         assert_eq!(back, c);

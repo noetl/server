@@ -31,7 +31,10 @@ fn cand(id: i64, status: &str, done_h: Option<i64>) -> ea::ArchiveCandidate {
 }
 
 fn set(c: Vec<ea::ArchiveCandidate>) -> ea::CandidateSet {
-    ea::CandidateSet { candidates: c, complete: true }
+    ea::CandidateSet {
+        candidates: c,
+        complete: true,
+    }
 }
 
 fn cfg(prune: bool) -> ea::RetentionConfig {
@@ -62,7 +65,9 @@ struct FakeEngine {
 
 impl FakeEngine {
     fn new(parts: Vec<Part>) -> Self {
-        Self { parts: RefCell::new(parts) }
+        Self {
+            parts: RefCell::new(parts),
+        }
     }
     /// The footprint the server derives from the manifest: min/max over the parts that may
     /// hold each execution.
@@ -91,12 +96,20 @@ impl FakeEngine {
     fn prune(&self, keep_from: u64) -> Option<Result<(usize, u64), String>> {
         let mut parts = self.parts.borrow_mut();
         let before = parts.len();
-        let bytes: u64 = parts.iter().filter(|p| p.max < keep_from).map(|p| p.bytes).sum();
+        let bytes: u64 = parts
+            .iter()
+            .filter(|p| p.max < keep_from)
+            .map(|p| p.bytes)
+            .sum();
         parts.retain(|p| p.max >= keep_from);
         Some(Ok((before - parts.len(), bytes)))
     }
     fn surviving_executions(&self) -> HashSet<i64> {
-        self.parts.borrow().iter().flat_map(|p| p.holds.clone()).collect()
+        self.parts
+            .borrow()
+            .iter()
+            .flat_map(|p| p.holds.clone())
+            .collect()
     }
 }
 
@@ -108,10 +121,30 @@ impl FakeEngine {
 /// the part holding it is dropped.
 fn layout() -> Vec<Part> {
     vec![
-        Part { min: 1, max: 10, bytes: 1_000, holds: vec![1, 2] },
-        Part { min: 11, max: 20, bytes: 2_000, holds: vec![3, 4] },
-        Part { min: 21, max: 40, bytes: 4_000, holds: vec![5, 9] },
-        Part { min: 41, max: 60, bytes: 8_000, holds: vec![6, 7] },
+        Part {
+            min: 1,
+            max: 10,
+            bytes: 1_000,
+            holds: vec![1, 2],
+        },
+        Part {
+            min: 11,
+            max: 20,
+            bytes: 2_000,
+            holds: vec![3, 4],
+        },
+        Part {
+            min: 21,
+            max: 40,
+            bytes: 4_000,
+            holds: vec![5, 9],
+        },
+        Part {
+            min: 41,
+            max: 60,
+            bytes: 8_000,
+            holds: vec![6, 7],
+        },
     ]
 }
 
@@ -132,7 +165,8 @@ fn a_backlog_refuses_to_prune_anything() {
     );
 
     assert_eq!(
-        rep.parts_dropped, 0,
+        rep.parts_dropped,
+        0,
         "a backlog must block pruning entirely: {}",
         rep.describe()
     );
@@ -176,7 +210,12 @@ fn the_floor_never_crosses_a_live_execution() {
         rep.describe()
     );
     // And it must still make progress: the two parts entirely below 9 are reclaimable.
-    assert_eq!(rep.parts_dropped, 2, "expected the two parts below 21: {}", rep.describe());
+    assert_eq!(
+        rep.parts_dropped,
+        2,
+        "expected the two parts below 21: {}",
+        rep.describe()
+    );
     assert_eq!(
         rep.bytes_reclaimed, 3_000,
         "reclaimed bytes must be summed from the parts actually dropped, not estimated"
@@ -223,7 +262,10 @@ fn the_flag_off_prunes_nothing() {
         |f| eng.prune(f),
     );
     assert_eq!(rep.parts_dropped, 0);
-    assert!(rep.skipped.is_some(), "the flag being off must be reported, not silent");
+    assert!(
+        rep.skipped.is_some(),
+        "the flag being off must be reported, not silent"
+    );
     assert_eq!(eng.parts.borrow().len(), 4);
 }
 
@@ -245,7 +287,10 @@ fn an_implausible_constraining_set_refuses_rather_than_truncating() {
     );
     assert_eq!(rep.parts_dropped, 0);
     assert!(
-        rep.skipped.as_deref().unwrap_or("").contains("MAX_FOOTPRINT_IDS"),
+        rep.skipped
+            .as_deref()
+            .unwrap_or("")
+            .contains("MAX_FOOTPRINT_IDS"),
         "an oversized footprint must refuse: truncating it would place the floor above \
          live data. got {:?}",
         rep.skipped
@@ -288,7 +333,10 @@ fn an_incomplete_candidate_listing_refuses_to_prune() {
     let eng = FakeEngine::new(layout());
     let cands: Vec<_> = (1..=7).map(|i| cand(i, "COMPLETED", Some(-100))).collect();
     let archived: std::collections::HashSet<i64> = (1..=7).collect();
-    let incomplete = ea::CandidateSet { candidates: cands, complete: false };
+    let incomplete = ea::CandidateSet {
+        candidates: cands,
+        complete: false,
+    };
 
     let rep = ea::prune_pass(
         &cfg(true),
@@ -316,7 +364,10 @@ fn an_incomplete_candidate_listing_refuses_to_prune() {
 fn nothing_constraining_reclaims_up_to_the_measured_tip() {
     let eng = FakeEngine::new(layout());
     let ids = [1, 2, 3, 4, 5, 6, 7, 9];
-    let cands: Vec<_> = ids.iter().map(|i| cand(*i, "COMPLETED", Some(-100))).collect();
+    let cands: Vec<_> = ids
+        .iter()
+        .map(|i| cand(*i, "COMPLETED", Some(-100)))
+        .collect();
     let archived: std::collections::HashSet<i64> = ids.into_iter().collect();
 
     let rep = ea::prune_pass(
@@ -337,7 +388,8 @@ fn nothing_constraining_reclaims_up_to_the_measured_tip() {
     );
     assert_eq!(rep.parts_dropped, 4);
     assert_eq!(
-        rep.bytes_reclaimed, 15_000,
+        rep.bytes_reclaimed,
+        15_000,
         "reclaim must be summed from the parts actually dropped: {}",
         rep.describe()
     );

@@ -63,8 +63,14 @@ fn the_reclaimed_bytes_counter_is_fed() {
 
     // Everything archived, nothing constraining, so the floor computes and prune runs.
     let ids = [1i64, 2, 3];
-    let cands: Vec<_> = ids.iter().map(|i| cand(*i, "COMPLETED", Some(-100))).collect();
-    let set = ea::CandidateSet { candidates: cands, complete: true };
+    let cands: Vec<_> = ids
+        .iter()
+        .map(|i| cand(*i, "COMPLETED", Some(-100)))
+        .collect();
+    let set = ea::CandidateSet {
+        candidates: cands,
+        complete: true,
+    };
     let archived: HashSet<i64> = ids.into_iter().collect();
 
     let rep = ea::prune_pass(
@@ -74,9 +80,21 @@ fn the_reclaimed_bytes_counter_is_fed() {
         &archived,
         |_| {
             Some(vec![
-                ea::HotExecution { execution_id: 1, min_sequence: 10, max_sequence: 20 },
-                ea::HotExecution { execution_id: 2, min_sequence: 21, max_sequence: 30 },
-                ea::HotExecution { execution_id: 3, min_sequence: 31, max_sequence: 40 },
+                ea::HotExecution {
+                    execution_id: 1,
+                    min_sequence: 10,
+                    max_sequence: 20,
+                },
+                ea::HotExecution {
+                    execution_id: 2,
+                    min_sequence: 21,
+                    max_sequence: 30,
+                },
+                ea::HotExecution {
+                    execution_id: 3,
+                    min_sequence: 31,
+                    max_sequence: 40,
+                },
             ])
         },
         // 4 parts, 7_777 bytes freed.
@@ -106,7 +124,10 @@ fn a_refused_prune_does_not_move_the_counter() {
 
     // A backlog: 1 and 2 archived, 3 is not, so the floor refuses.
     let cands: Vec<_> = (1..=3).map(|i| cand(i, "COMPLETED", Some(-100))).collect();
-    let set = ea::CandidateSet { candidates: cands, complete: true };
+    let set = ea::CandidateSet {
+        candidates: cands,
+        complete: true,
+    };
     let archived: HashSet<i64> = [1, 2].into_iter().collect();
 
     let rep = ea::prune_pass(
@@ -114,12 +135,23 @@ fn a_refused_prune_does_not_move_the_counter() {
         &set,
         t(0),
         &archived,
-        |_| Some(vec![ea::HotExecution { execution_id: 3, min_sequence: 5, max_sequence: 9 }]),
+        |_| {
+            Some(vec![ea::HotExecution {
+                execution_id: 3,
+                min_sequence: 5,
+                max_sequence: 9,
+            }])
+        },
         // If this is ever called the test below fails, which is the point.
         |_floor| Some(Ok((99, 999_999))),
     );
 
-    assert_eq!(rep.parts_dropped, 0, "a backlog must block the prune: {}", rep.describe());
+    assert_eq!(
+        rep.parts_dropped,
+        0,
+        "a backlog must block the prune: {}",
+        rep.describe()
+    );
     assert_eq!(
         noetl_server::metrics::ehdb_prune_bytes_reclaimed_total().get(),
         before,

@@ -3,7 +3,6 @@
 //! them. Driven against a real ehdb ingest listener (same harness as
 //! `publish_retry_window.rs`).
 
-
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -89,7 +88,9 @@ async fn a_burst_lands_in_item_order_and_beats_per_row_round_trips() {
     pubr.publish(7, 1, b"{\"warm\":1}").await.unwrap();
 
     const N: i64 = 12;
-    let payloads: Vec<Vec<u8>> = (0..N).map(|i| format!("{{\"i\":{i}}}").into_bytes()).collect();
+    let payloads: Vec<Vec<u8>> = (0..N)
+        .map(|i| format!("{{\"i\":{i}}}").into_bytes())
+        .collect();
 
     let t = Instant::now();
     let mut serial = Vec::new();
@@ -132,13 +133,18 @@ async fn a_burst_with_no_writer_falls_back_to_the_retry_loop_and_keeps_order() {
         std::thread::sleep(Duration::from_millis(1_500));
         Writer::spawn(l2, o2, addr)
     });
-    let payloads: Vec<Vec<u8>> = (0..5).map(|i| format!("{{\"i\":{i}}}").into_bytes()).collect();
+    let payloads: Vec<Vec<u8>> = (0..5)
+        .map(|i| format!("{{\"i\":{i}}}").into_bytes())
+        .collect();
     let items: Vec<(i64, &[u8])> = payloads
         .iter()
         .enumerate()
         .map(|(i, p)| (300 + i as i64, p.as_slice()))
         .collect();
-    let seqs = pubr.publish_many(9, &items).await.expect("rides out the gap");
+    let seqs = pubr
+        .publish_many(9, &items)
+        .await
+        .expect("rides out the gap");
     let _w = late.await.unwrap();
     assert_eq!(seqs.len(), 5);
     assert!(seqs.windows(2).all(|w| w[0] < w[1]), "{seqs:?}");
@@ -164,5 +170,7 @@ fn step_events_are_fused_ahead_of_command_issued_only_under_the_flag() {
     // orchestration events first, then command.issued — the unfused order
     assert!(ex.contains("let event_rows: Vec<crate::handlers::event_write::EventRow> = fused_events\n        .into_iter()\n        .chain(prepared.iter()"));
     // the command row's issuing event is the one the unfused head would hold
-    assert!(ex.contains("let issuing_event = match fused_events.last() {\n        Some(last) => last.event_id,"));
+    assert!(ex.contains(
+        "let issuing_event = match fused_events.last() {\n        Some(last) => last.event_id,"
+    ));
 }

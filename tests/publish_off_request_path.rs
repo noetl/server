@@ -65,7 +65,10 @@ async fn the_full_deadline_still_exists_on_the_unbounded_path() {
     let r = p.publish(2, 2, b"{}").await;
     let waited = t0.elapsed();
 
-    assert!(r.is_err(), "an unreachable writer must eventually fail the unbounded call");
+    assert!(
+        r.is_err(),
+        "an unreachable writer must eventually fail the unbounded call"
+    );
     assert!(
         waited >= Duration::from_secs(8),
         "the unbounded publish returned after {waited:?} — the 10s PUBLISH_DEADLINE that \
@@ -106,7 +109,9 @@ async fn a_transient_failure_still_lands_the_append_exactly_once() {
     let engine =
         L0Engine::<D1EventLog>::open(L0Config::d1(&dir).with_shard_count(1), store).unwrap();
     let writer = Arc::new(FeedWriter::new(engine));
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", addr.port())).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", addr.port()))
+        .await
+        .unwrap();
     tokio::spawn(serve_ingest(listener, writer.clone()));
 
     // The deferred retry should find it within the remaining deadline.
@@ -115,7 +120,10 @@ async fn a_transient_failure_still_lands_the_append_exactly_once() {
         tokio::time::sleep(Duration::from_millis(250)).await;
         let eng = writer.engine();
         let g = eng.read();
-        found = g.read_execution_after("4242", 0).map(|v| v.len()).unwrap_or(0);
+        found = g
+            .read_execution_after("4242", 0)
+            .map(|v| v.len())
+            .unwrap_or(0);
         drop(g);
         if found > 0 {
             break;

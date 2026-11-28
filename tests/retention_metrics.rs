@@ -54,7 +54,8 @@ fn every_retention_series_is_pinned_at_zero_before_anything_runs() {
         );
     }
     assert!(
-        text.lines().any(|l| l.starts_with("noetl_ehdb_prune_bytes_reclaimed_total")),
+        text.lines()
+            .any(|l| l.starts_with("noetl_ehdb_prune_bytes_reclaimed_total")),
         "the reclaimed-bytes counter must be present at 0"
     );
 
@@ -91,8 +92,16 @@ fn the_blocking_execution_id_is_cleared_when_nothing_blocks() {
     let _g = serialised();
     noetl_server::metrics::init_ehdb_retention_series();
     let hot = vec![
-        ea::HotExecution { execution_id: 4242, min_sequence: 7, max_sequence: 90 },
-        ea::HotExecution { execution_id: 4243, min_sequence: 50, max_sequence: 99 },
+        ea::HotExecution {
+            execution_id: 4242,
+            min_sequence: 7,
+            max_sequence: 90,
+        },
+        ea::HotExecution {
+            execution_id: 4243,
+            min_sequence: 50,
+            max_sequence: 99,
+        },
     ];
 
     // Blocked: the id and the age are published.
@@ -132,7 +141,11 @@ fn the_blocking_execution_id_is_cleared_when_nothing_blocks() {
 fn a_negative_age_is_clamped_rather_than_published() {
     let _g = serialised();
     noetl_server::metrics::init_ehdb_retention_series();
-    let hot = vec![ea::HotExecution { execution_id: 5, min_sequence: 1, max_sequence: 2 }];
+    let hot = vec![ea::HotExecution {
+        execution_id: 5,
+        min_sequence: 1,
+        max_sequence: 2,
+    }];
     ea::export_floor(&ea::retention_floor(&hot, &[]), Some(-9_999));
     assert_eq!(
         noetl_server::metrics::ehdb_retention_oldest_non_archivable_age_seconds().get(),
@@ -151,15 +164,31 @@ fn the_scan_gauges_carry_the_denominator() {
         .map(|i| {
             (
                 i,
-                if i < 3 { "RUNNING".to_string() } else { "COMPLETED".to_string() },
-                if i < 3 { None } else { Some(chrono::Utc::now() - chrono::Duration::days(5)) },
+                if i < 3 {
+                    "RUNNING".to_string()
+                } else {
+                    "COMPLETED".to_string()
+                },
+                if i < 3 {
+                    None
+                } else {
+                    Some(chrono::Utc::now() - chrono::Duration::days(5))
+                },
             )
         })
         .collect();
-    ea::classify_into(&mut scan, &rows, chrono::Utc::now(), chrono::Duration::hours(48));
+    ea::classify_into(
+        &mut scan,
+        &rows,
+        chrono::Utc::now(),
+        chrono::Duration::hours(48),
+    );
     ea::export_scan(&scan);
     assert_eq!(noetl_server::metrics::ehdb_archive_scan_examined().get(), 7);
-    assert_eq!(noetl_server::metrics::ehdb_archive_scan_archivable().get(), 4);
+    assert_eq!(
+        noetl_server::metrics::ehdb_archive_scan_archivable().get(),
+        4
+    );
 }
 
 /// ⚠ A huge sequence must saturate rather than wrap into a plausible negative.

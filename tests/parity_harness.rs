@@ -49,10 +49,9 @@ const EXPECTED_PATH: &str = "tests/parity_harness/expected.json";
 /// would produce in production, just sourced from JSON instead
 /// of a Postgres rowset.
 fn load_events_fixture() -> Vec<ReplayEventRow> {
-    let raw = fs::read_to_string(EVENTS_PATH)
-        .unwrap_or_else(|e| panic!("read {EVENTS_PATH}: {e}"));
-    let parsed: Vec<Value> = serde_json::from_str(&raw)
-        .unwrap_or_else(|e| panic!("parse {EVENTS_PATH}: {e}"));
+    let raw = fs::read_to_string(EVENTS_PATH).unwrap_or_else(|e| panic!("read {EVENTS_PATH}: {e}"));
+    let parsed: Vec<Value> =
+        serde_json::from_str(&raw).unwrap_or_else(|e| panic!("parse {EVENTS_PATH}: {e}"));
     parsed
         .into_iter()
         .map(|v| ReplayEventRow {
@@ -61,7 +60,10 @@ fn load_events_fixture() -> Vec<ReplayEventRow> {
                 .as_str()
                 .expect("event_type str")
                 .to_string(),
-            node_name: v.get("node_name").and_then(|x| x.as_str()).map(String::from),
+            node_name: v
+                .get("node_name")
+                .and_then(|x| x.as_str())
+                .map(String::from),
             status: v
                 .get("status")
                 .and_then(|x| x.as_str())
@@ -71,7 +73,10 @@ fn load_events_fixture() -> Vec<ReplayEventRow> {
             stage_id: v.get("stage_id").and_then(|x| x.as_str()).map(String::from),
             frame_id: v.get("frame_id").and_then(|x| x.as_str()).map(String::from),
             command_id: v.get("command_id").and_then(|x| x.as_i64()),
-            worker_id: v.get("worker_id").and_then(|x| x.as_str()).map(String::from),
+            worker_id: v
+                .get("worker_id")
+                .and_then(|x| x.as_str())
+                .map(String::from),
             aggregate_type: v
                 .get("aggregate_type")
                 .and_then(|x| x.as_str())
@@ -80,21 +85,15 @@ fn load_events_fixture() -> Vec<ReplayEventRow> {
                 .get("aggregate_id")
                 .and_then(|x| x.as_str())
                 .map(String::from),
-            meta: v
-                .get("meta")
-                .filter(|m| !m.is_null())
-                .cloned(),
-            result: v
-                .get("result")
-                .filter(|m| !m.is_null())
-                .cloned(),
+            meta: v.get("meta").filter(|m| !m.is_null()).cloned(),
+            result: v.get("result").filter(|m| !m.is_null()).cloned(),
         })
         .collect()
 }
 
 fn load_expected() -> Value {
-    let raw = fs::read_to_string(EXPECTED_PATH)
-        .unwrap_or_else(|e| panic!("read {EXPECTED_PATH}: {e}"));
+    let raw =
+        fs::read_to_string(EXPECTED_PATH).unwrap_or_else(|e| panic!("read {EXPECTED_PATH}: {e}"));
     serde_json::from_str(&raw).unwrap_or_else(|e| panic!("parse {EXPECTED_PATH}: {e}"))
 }
 
@@ -108,10 +107,7 @@ fn parity_top_level_counts_match() {
     let state = rust_fold();
     let expected = load_expected();
     assert_eq!(state.event_count, expected["event_count"].as_u64().unwrap());
-    assert_eq!(
-        state.last_event_id,
-        expected["last_event_id"].as_i64(),
-    );
+    assert_eq!(state.last_event_id, expected["last_event_id"].as_i64(),);
     assert_eq!(
         state.last_event_type.as_deref(),
         expected["last_event_type"].as_str(),
@@ -177,12 +173,16 @@ fn parity_stage_projection() {
         );
         assert_eq!(
             rust_stage.opened_event_id,
-            expected_stage.get("opened_event_id").and_then(|v| v.as_i64()),
+            expected_stage
+                .get("opened_event_id")
+                .and_then(|v| v.as_i64()),
             "stage `{key}` opened_event_id mismatch",
         );
         assert_eq!(
             rust_stage.closed_event_id,
-            expected_stage.get("closed_event_id").and_then(|v| v.as_i64()),
+            expected_stage
+                .get("closed_event_id")
+                .and_then(|v| v.as_i64()),
             "stage `{key}` closed_event_id mismatch",
         );
     }
@@ -257,7 +257,9 @@ fn parity_command_projection() {
         );
         assert_eq!(
             rust_cmd.terminal_event_id,
-            expected_cmd.get("terminal_event_id").and_then(|v| v.as_i64()),
+            expected_cmd
+                .get("terminal_event_id")
+                .and_then(|v| v.as_i64()),
         );
     }
 }
@@ -276,8 +278,14 @@ fn parity_business_object_projection() {
             .get(key)
             .unwrap_or_else(|| panic!("BO `{key}` missing in Rust fold"));
         assert_eq!(rust_bo.object_key, key.as_str());
-        assert_eq!(rust_bo.object_type, expected_bo["object_type"].as_str().unwrap());
-        assert_eq!(rust_bo.object_id, expected_bo["object_id"].as_str().unwrap());
+        assert_eq!(
+            rust_bo.object_type,
+            expected_bo["object_type"].as_str().unwrap()
+        );
+        assert_eq!(
+            rust_bo.object_id,
+            expected_bo["object_id"].as_str().unwrap()
+        );
         assert_eq!(
             rust_bo.status,
             expected_bo["status"].as_str().unwrap(),
@@ -296,8 +304,7 @@ fn parity_business_object_projection() {
         // Attributes match.
         let rust_attrs: Value = serde_json::to_value(&rust_bo.attributes).unwrap();
         assert_eq!(
-            &rust_attrs,
-            &expected_bo["attributes"],
+            &rust_attrs, &expected_bo["attributes"],
             "BO `{key}` attributes mismatch",
         );
         // payload_refs count + per-entry reference equality.
