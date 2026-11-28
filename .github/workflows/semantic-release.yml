@@ -59,7 +59,11 @@ jobs:
       # noetl-server 2.0.0 was tagged but not published to crates.io
       # (release-server had to be dispatched manually).
       - name: Trigger release-server workflow
-        if: ${{ steps.semantic.outputs.new_release_published == 'true' }}
+        # Repo variable RELEASE_BUILDS_ON_MERGE=false stops the automatic release
+        # build (multi-arch images / binaries on GHA runners) after every merge;
+        # the tag + notes are still created and the build is run on our machines
+        # (ops scripts/local-build) or dispatched by hand. Unset = old behaviour.
+        if: ${{ steps.semantic.outputs.new_release_published == 'true' && vars.RELEASE_BUILDS_ON_MERGE != 'false' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
@@ -76,3 +80,9 @@ jobs:
             exit 1
           fi
           gh workflow run release.yml --ref main -f version="${VERSION}"
+
+      - name: Release build left to the local build hosts
+        if: ${{ steps.semantic.outputs.new_release_published == 'true' && vars.RELEASE_BUILDS_ON_MERGE == 'false' }}
+        run: |
+          echo "::notice::v${{ steps.semantic.outputs.new_release_version }} tagged; release build NOT dispatched (RELEASE_BUILDS_ON_MERGE=false)."
+          echo "Build it on the AMD box / Mac Studio (noetl/ops scripts/local-build) or run: gh workflow run release.yml -f version=${{ steps.semantic.outputs.new_release_version }}"

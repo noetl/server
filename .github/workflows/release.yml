@@ -223,8 +223,50 @@ jobs:
   # service-account key in GitHub secrets.
   publish-ar:
     runs-on: ubuntu-latest
+    # Same shape as noetl/worker (noetl/ai-meta#515): COPY the multi-arch manifest
+    # publish-manifest pushed to GHCR into Artifact Registry instead of compiling the
+    # image a second time on Cloud Build. A copy takes seconds and puts the exact
+    # digest CI built (and tested) into AR, which is what prod pulls.
+    # Set the repo variable SERVER_AR_SOURCE=cloudbuild to go back to the Cloud Build
+    # compile (job publish-ar-cloudbuild below).
+    needs: [verify-version, publish-manifest]
+    if: ${{ needs.verify-version.outputs.has_dockerfile == 'true' && vars.GCP_WIF_PROVIDER != '' && vars.GCP_CLOUDBUILD_SA != '' && vars.SERVER_AR_SOURCE != 'cloudbuild' }}
+    permissions:
+      contents: read
+      # Required for the OIDC token that WIF exchanges for GCP creds.
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_CLOUDBUILD_SA }}
+      - uses: google-github-actions/setup-gcloud@v2
+      - name: Copy the GHCR release image to Artifact Registry
+        env:
+          VERSION: ${{ needs.verify-version.outputs.version }}
+          PROJECT_ID: ${{ vars.GCP_PROJECT_ID || 'shastaratech-noetl-prod' }}
+        run: |
+          set -euo pipefail
+          # Quota project + explicit staging dir: see noetl/ai-meta#211.
+          gcloud config set billing/quota_project "${PROJECT_ID}"
+          # --no-source: nothing is uploaded or compiled; gcrane copies the
+          # already-stamped GHCR image (built by publish-image from the stamped tree).
+          gcloud builds submit --no-source \
+            --gcs-source-staging-dir="gs://${PROJECT_ID}_cloudbuild/source" \
+            --project="${PROJECT_ID}" \
+            --region=us-central1 \
+            --config=cloudbuild-copy.yaml \
+            --substitutions=_VERSION="${VERSION}"
+          # cloudbuild-copy.yaml reads both digests back and fails unless AR == GHCR.
+
+  publish-ar-cloudbuild:
+    runs-on: ubuntu-latest
     needs: [verify-version]
-    if: ${{ needs.verify-version.outputs.has_dockerfile == 'true' && vars.GCP_WIF_PROVIDER != '' && vars.GCP_CLOUDBUILD_SA != '' }}
+    # Fallback only: a SECOND full compile of the same image on Cloud Build
+    # (E2_HIGHCPU_8, ~17-22 min, and this GHA job waits on it the whole time).
+    # Runs only when the repo variable SERVER_AR_SOURCE=cloudbuild.
+    if: ${{ needs.verify-version.outputs.has_dockerfile == 'true' && vars.GCP_WIF_PROVIDER != '' && vars.GCP_CLOUDBUILD_SA != '' && vars.SERVER_AR_SOURCE == 'cloudbuild' }}
     permissions:
       contents: read
       # Required for the OIDC token that WIF exchanges for GCP creds.

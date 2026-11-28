@@ -1,0 +1,32 @@
+# Copy a released server image from GHCR to Artifact Registry (no compile).
+# Used by .github/workflows/release.yml job publish-ar; mirrors noetl/worker's
+# cloudbuild-copy.yaml (noetl/ai-meta#515). Moves :latest like cloudbuild.yaml did.
+steps:
+  - id: copy
+    name: gcr.io/go-containerregistry/gcrane:latest
+    args:
+      - cp
+      - ghcr.io/noetl/server:${_VERSION}
+      - us-central1-docker.pkg.dev/${PROJECT_ID}/noetl/server-rust:${_VERSION}
+  - id: latest
+    name: gcr.io/go-containerregistry/gcrane:latest
+    args:
+      - cp
+      - us-central1-docker.pkg.dev/${PROJECT_ID}/noetl/server-rust:${_VERSION}
+      - us-central1-docker.pkg.dev/${PROJECT_ID}/noetl/server-rust:latest
+  - id: verify
+    name: gcr.io/go-containerregistry/gcrane:debug
+    entrypoint: /busybox/sh
+    args:
+      - -c
+      - |
+        set -e
+        src=$$(gcrane digest ghcr.io/noetl/server:${_VERSION})
+        dst=$$(gcrane digest us-central1-docker.pkg.dev/${PROJECT_ID}/noetl/server-rust:${_VERSION})
+        echo "ghcr=$$src ar=$$dst"
+        test "$$src" = "$$dst"
+substitutions:
+  _VERSION: ""
+options:
+  logging: CLOUD_LOGGING_ONLY
+timeout: 600s
