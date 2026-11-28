@@ -41,6 +41,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Save the cache only from main. PR runs still RESTORE main's cache, but no
+          # longer write per-PR caches that evict it (10 GB repo limit) and force cold
+          # builds. Build placement policy: noetl/ai-meta agents/rules/build-placement.md
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # --all-targets, not the default. `cargo build`/`cargo test` alone skip
       # integration tests and `cfg(test)`-only code, so a binary can be broken

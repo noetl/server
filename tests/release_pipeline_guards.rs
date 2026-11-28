@@ -66,7 +66,10 @@ fn every_building_or_publishing_job_stamps_the_version() {
                 .join("\n");
             code.contains("cargo publish")
                 || code.contains("docker/build-push-action")
-                || code.contains("gcloud builds submit")
+                // `gcloud builds submit --no-source` uploads no tree and compiles
+                // nothing (publish-ar copies the already-stamped GHCR image), so
+                // there is nothing for it to stamp.
+                || (code.contains("gcloud builds submit") && !code.contains("--no-source"))
         })
         .collect();
     assert!(
