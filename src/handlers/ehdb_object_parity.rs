@@ -506,7 +506,10 @@ pub async fn object_parity(
         Some(p) => match deps.backend.list(&deps.pool, p, limit).await {
             Ok(k) => k,
             Err(e) => {
-                crate::metrics::record_ehdb_crossstore_parity(tier_label, "authoritative_unreadable");
+                crate::metrics::record_ehdb_crossstore_parity(
+                    tier_label,
+                    "authoritative_unreadable",
+                );
                 return (
                     StatusCode::SERVICE_UNAVAILABLE,
                     Json(serde_json::json!({
@@ -538,7 +541,10 @@ pub async fn object_parity(
             // `missing_object` for a key the shadow claims.
             Ok(None) => {}
             Err(e) => {
-                crate::metrics::record_ehdb_crossstore_parity(tier_label, "authoritative_unreadable");
+                crate::metrics::record_ehdb_crossstore_parity(
+                    tier_label,
+                    "authoritative_unreadable",
+                );
                 return (
                     StatusCode::SERVICE_UNAVAILABLE,
                     Json(serde_json::json!({
@@ -561,7 +567,8 @@ pub async fn object_parity(
         o.insert(
             "scope".to_string(),
             serde_json::json!(match prefix {
-                Some(p) => format!("authoritative listing under {p:?} plus every key the shadow names"),
+                Some(p) =>
+                    format!("authoritative listing under {p:?} plus every key the shadow names"),
                 None => "exactly the keys the shadow names".to_string(),
             }),
         );
@@ -569,9 +576,15 @@ pub async fn object_parity(
             // Do not publish a 0 that only means "we never looked".
             o.remove("unmirrored");
         }
-        o.insert("action".to_string(), serde_json::json!("ehdb.object_parity"));
+        o.insert(
+            "action".to_string(),
+            serde_json::json!("ehdb.object_parity"),
+        );
         o.insert("outcome".to_string(), serde_json::json!(report.outcome()));
-        o.insert("shadow_records".to_string(), serde_json::json!(shadow.len()));
+        o.insert(
+            "shadow_records".to_string(),
+            serde_json::json!(shadow.len()),
+        );
     }
     (StatusCode::OK, Json(body))
 }

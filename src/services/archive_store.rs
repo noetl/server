@@ -114,7 +114,13 @@ impl ArchiveStore for FakeArchiveStore {
             return Ok(None);
         }
         let got = self.objects.lock().unwrap().get(key).cloned();
-        if self.corrupt_on_read.lock().unwrap().iter().any(|k| k == key) {
+        if self
+            .corrupt_on_read
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|k| k == key)
+        {
             // Flip one byte: the length is unchanged, so a size check would pass and only a
             // digest can catch it. That is the point of the control.
             return Ok(got.map(|mut b| {

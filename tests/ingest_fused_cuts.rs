@@ -24,7 +24,9 @@ fn both_flags_default_off() {
 #[test]
 fn descriptor_catalog_id_is_tried_before_the_scan_and_only_under_the_flag() {
     let src = code_only(EVENTS_RS);
-    let start = src.find("async fn get_catalog_id(").expect("get_catalog_id");
+    let start = src
+        .find("async fn get_catalog_id(")
+        .expect("get_catalog_id");
     let body = &src[start..];
     let flag = body
         .find("if state.config.ingest_catalog_from_descriptor {")
@@ -39,7 +41,8 @@ fn descriptor_catalog_id_is_tried_before_the_scan_and_only_under_the_flag() {
 fn every_drive_playbook_load_goes_through_the_gated_helper() {
     let src = code_only(EVENTS_RS);
     assert_eq!(
-        src.matches("load_playbook_for_drive(state, catalog_id).await?").count(),
+        src.matches("load_playbook_for_drive(state, catalog_id).await?")
+            .count(),
         3,
         "dispatch, in-process trigger and worker apply"
     );

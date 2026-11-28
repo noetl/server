@@ -85,26 +85,73 @@ async fn the_drain_progresses_past_a_block_of_out_of_coverage_executions() {
     };
 
     // Budget exactly equals the dead block, which is the prod shape.
-    let p1 = ea::archive_pass(&store, &cfg(5), &cands, t(100), &mut archived_set, &mut ooc, &mut Default::default(), read).await;
+    let p1 = ea::archive_pass(
+        &store,
+        &cfg(5),
+        &cands,
+        t(100),
+        &mut archived_set,
+        &mut ooc,
+        &mut Default::default(),
+        read,
+    )
+    .await;
     assert_eq!(p1.out_of_coverage, 5, "{}", p1.describe());
-    assert_eq!(p1.archived, 0, "pass 1 spends its whole budget discovering the dead ones");
+    assert_eq!(
+        p1.archived, 0,
+        "pass 1 spends its whole budget discovering the dead ones"
+    );
 
     // ⭐ Pass 2 must not repeat that work.
-    let p2 = ea::archive_pass(&store, &cfg(5), &cands, t(100), &mut archived_set, &mut ooc, &mut Default::default(), read).await;
+    let p2 = ea::archive_pass(
+        &store,
+        &cfg(5),
+        &cands,
+        t(100),
+        &mut archived_set,
+        &mut ooc,
+        &mut Default::default(),
+        read,
+    )
+    .await;
     assert_eq!(
-        p2.archived, 5,
+        p2.archived,
+        5,
         "⚠⚠ THE DRAIN IS BLOCKED: pass 2 archived {} instead of 5. The out-of-coverage \
          executions were re-decided and consumed the budget again, which is exactly the prod \
          failure — archived=0 forever while every gauge reads healthy. {}",
         p2.archived,
         p2.describe()
     );
-    assert_eq!(p2.out_of_coverage, 5, "they are still counted, just for free");
+    assert_eq!(
+        p2.out_of_coverage, 5,
+        "they are still counted, just for free"
+    );
 
     // And it keeps going.
-    let p3 = ea::archive_pass(&store, &cfg(5), &cands, t(100), &mut archived_set, &mut ooc, &mut Default::default(), read).await;
+    let p3 = ea::archive_pass(
+        &store,
+        &cfg(5),
+        &cands,
+        t(100),
+        &mut archived_set,
+        &mut ooc,
+        &mut Default::default(),
+        read,
+    )
+    .await;
     assert_eq!(p3.archived, 5, "{}", p3.describe());
-    let p4 = ea::archive_pass(&store, &cfg(5), &cands, t(100), &mut archived_set, &mut ooc, &mut Default::default(), read).await;
+    let p4 = ea::archive_pass(
+        &store,
+        &cfg(5),
+        &cands,
+        t(100),
+        &mut archived_set,
+        &mut ooc,
+        &mut Default::default(),
+        read,
+    )
+    .await;
     assert_eq!(p4.archived, 1, "the last live one; {}", p4.describe());
     assert_eq!(archived_set.len(), 11, "every live execution archived");
 }
@@ -116,15 +163,41 @@ async fn a_remembered_out_of_coverage_id_costs_no_budget() {
     let cands: Vec<_> = (1..=3).map(cand).chain(std::iter::once(cand(99))).collect();
     let mut archived_set: HashSet<i64> = HashSet::new();
     let mut ooc: HashSet<i64> = HashSet::new();
-    let read = |id: i64| if id < 10 { Some(Vec::new()) } else { Some(recs(2, 500)) };
+    let read = |id: i64| {
+        if id < 10 {
+            Some(Vec::new())
+        } else {
+            Some(recs(2, 500))
+        }
+    };
 
     // Budget 3: pass 1 burns it on the three dead ones and never reaches 99.
-    let p1 = ea::archive_pass(&store, &cfg(3), &cands, t(100), &mut archived_set, &mut ooc, &mut Default::default(), read).await;
+    let p1 = ea::archive_pass(
+        &store,
+        &cfg(3),
+        &cands,
+        t(100),
+        &mut archived_set,
+        &mut ooc,
+        &mut Default::default(),
+        read,
+    )
+    .await;
     assert_eq!(p1.out_of_coverage, 3);
     assert_eq!(p1.archived, 0, "{}", p1.describe());
 
     // Pass 2, same budget of 3 — the three are free now, so 99 is reached.
-    let p2 = ea::archive_pass(&store, &cfg(3), &cands, t(100), &mut archived_set, &mut ooc, &mut Default::default(), read).await;
+    let p2 = ea::archive_pass(
+        &store,
+        &cfg(3),
+        &cands,
+        t(100),
+        &mut archived_set,
+        &mut ooc,
+        &mut Default::default(),
+        read,
+    )
+    .await;
     assert_eq!(p2.archived, 1, "{}", p2.describe());
     assert!(archived_set.contains(&99));
 }
@@ -146,8 +219,16 @@ fn the_floor_is_not_blocked_by_out_of_coverage_executions() {
     let archived: HashSet<i64> = [1, 2].into_iter().collect();
     let ooc: HashSet<i64> = [3, 4].into_iter().collect();
     let footprint = vec![
-        ea::HotExecution { execution_id: 1, min_sequence: 10, max_sequence: 20 },
-        ea::HotExecution { execution_id: 2, min_sequence: 21, max_sequence: 30 },
+        ea::HotExecution {
+            execution_id: 1,
+            min_sequence: 10,
+            max_sequence: 20,
+        },
+        ea::HotExecution {
+            execution_id: 2,
+            min_sequence: 21,
+            max_sequence: 30,
+        },
     ];
 
     // Archived alone: blocked, which is the bug.

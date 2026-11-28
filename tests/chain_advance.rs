@@ -593,7 +593,9 @@ fn every_with_flag_async_block_is_awaited() {
     // that actually bit: a `})` closing one of these, then `;` with no `.await`.
     let unawaited = body.matches("})\n}").count() + body.matches("});\n}").count();
 
-    eprintln!("denominator: {calls} with_flag_async call sites, {unawaited} closing without .await");
+    eprintln!(
+        "denominator: {calls} with_flag_async call sites, {unawaited} closing without .await"
+    );
     assert_eq!(
         unawaited, 0,
         "a with_flag_async block closes without `.await`, so its assertions never \

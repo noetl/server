@@ -143,7 +143,11 @@ fn a363_materialize_outcomes_are_pinned() {
     noetl_server::metrics::init_materialize_outcome_series();
     let g = noetl_server::metrics::materialize_outcome_total();
     for o in noetl_server::metrics::MATERIALIZE_OUTCOMES {
-        assert_eq!(g.with_label_values(&[o]).get(), 0, "{o} must be pinned at 0");
+        assert_eq!(
+            g.with_label_values(&[o]).get(),
+            0,
+            "{o} must be pinned at 0"
+        );
     }
     assert_eq!(noetl_server::metrics::MATERIALIZE_OUTCOMES.len(), 2);
 }

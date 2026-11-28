@@ -199,7 +199,9 @@ pub async fn execute(
         match crate::services::await_park::register(&state, child, park).await {
             Ok(true) => response.parked = Some(true),
             Ok(false) => {}
-            Err(e) => tracing::warn!(child, %e, "await-park: register failed; the tool waits as today"),
+            Err(e) => {
+                tracing::warn!(child, %e, "await-park: register failed; the tool waits as today")
+            }
         }
     }
     Ok(Json(response))
@@ -2345,8 +2347,16 @@ mod tests {
         );
         assert_eq!(r(routes, "api_integration/other/p"), None);
         assert_eq!(r(routes, "bench/x/y"), None, "invalid pool name ignored");
-        assert_eq!(r("system/=auth", "system/orchestrate"), None, "system never rerouted");
-        assert_eq!(r("a/=one,a/b=two", "a/b/c").as_deref(), Some("one"), "first wins");
+        assert_eq!(
+            r("system/=auth", "system/orchestrate"),
+            None,
+            "system never rerouted"
+        );
+        assert_eq!(
+            r("a/=one,a/b=two", "a/b/c").as_deref(),
+            Some("one"),
+            "first wins"
+        );
     }
     use super::*;
     use crate::engine::commands::{CommandBuilder, IteratorMetadata};

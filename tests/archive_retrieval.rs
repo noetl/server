@@ -46,9 +46,13 @@ fn meta(id: i64) -> ea::ExecutionMeta {
 async fn a_hot_execution_is_served_from_the_hot_store() {
     let store = FakeArchiveStore::new();
     let hot = recs(12, 1);
-    ea::archive_execution_indexed(&store, &meta(1), &hot, Utc::now()).await.unwrap();
+    ea::archive_execution_indexed(&store, &meta(1), &hot, Utc::now())
+        .await
+        .unwrap();
 
-    let r = ea::read_with_fallthrough(&store, 1, || Some(hot.clone())).await.unwrap();
+    let r = ea::read_with_fallthrough(&store, 1, || Some(hot.clone()))
+        .await
+        .unwrap();
     assert_eq!(r.source, ea::ReadSource::Hot { records: 12 });
     assert_eq!(r.records.len(), 12);
 }
@@ -64,10 +68,14 @@ async fn a_pruned_execution_is_still_fully_readable_from_the_archive() {
         .unwrap();
 
     // The prune happened: the hot store is open and holds NOTHING for this execution.
-    let r = ea::read_with_fallthrough(&store, 2, || Some(Vec::new())).await.unwrap();
+    let r = ea::read_with_fallthrough(&store, 2, || Some(Vec::new()))
+        .await
+        .unwrap();
 
     match &r.source {
-        ea::ReadSource::Archive { records, data_key, .. } => {
+        ea::ReadSource::Archive {
+            records, data_key, ..
+        } => {
             assert_eq!(*records, 64);
             assert!(data_key.starts_with("execution_id=2/"), "{data_key}");
         }
@@ -75,12 +83,21 @@ async fn a_pruned_execution_is_still_fully_readable_from_the_archive() {
     }
 
     // ⭐ Set equality against the pre-prune set, not a count.
-    let mut want: Vec<(u64, Option<String>)> =
-        before_prune.iter().map(|x| (x.global_sequence, x.event_id.clone())).collect();
-    let mut got: Vec<(u64, Option<String>)> = r.records.iter().map(|x| (x.global_sequence, x.event_id.clone())).collect();
+    let mut want: Vec<(u64, Option<String>)> = before_prune
+        .iter()
+        .map(|x| (x.global_sequence, x.event_id.clone()))
+        .collect();
+    let mut got: Vec<(u64, Option<String>)> = r
+        .records
+        .iter()
+        .map(|x| (x.global_sequence, x.event_id.clone()))
+        .collect();
     want.sort();
     got.sort();
-    assert_eq!(got, want, "the archive must return exactly the pre-prune event set");
+    assert_eq!(
+        got, want,
+        "the archive must return exactly the pre-prune event set"
+    );
     // And byte-for-byte on the bodies, so a lossy encode would fail here.
     assert_eq!(r.records, {
         let mut s = before_prune.clone();
@@ -95,10 +112,14 @@ async fn a_pruned_execution_is_still_fully_readable_from_the_archive() {
 #[tokio::test]
 async fn an_empty_hot_result_falls_through_instead_of_answering_empty() {
     let store = FakeArchiveStore::new();
-    ea::archive_execution_indexed(&store, &meta(3), &recs(5, 1), Utc::now()).await.unwrap();
+    ea::archive_execution_indexed(&store, &meta(3), &recs(5, 1), Utc::now())
+        .await
+        .unwrap();
 
     // Hot returns Some(empty) — the post-prune state.
-    let r = ea::read_with_fallthrough(&store, 3, || Some(Vec::new())).await.unwrap();
+    let r = ea::read_with_fallthrough(&store, 3, || Some(Vec::new()))
+        .await
+        .unwrap();
     assert!(
         matches!(r.source, ea::ReadSource::Archive { .. }),
         "Some(empty) from hot must fall through, got {:?}",
@@ -115,7 +136,9 @@ async fn an_empty_hot_result_falls_through_instead_of_answering_empty() {
 #[tokio::test]
 async fn a_never_existing_execution_is_not_found_not_an_empty_success() {
     let store = FakeArchiveStore::new();
-    let r = ea::read_with_fallthrough(&store, 404_404, || Some(Vec::new())).await.unwrap();
+    let r = ea::read_with_fallthrough(&store, 404_404, || Some(Vec::new()))
+        .await
+        .unwrap();
     assert_eq!(r.source, ea::ReadSource::NotFound);
     assert!(r.records.is_empty());
     // ⭐ And it is DISTINGUISHABLE from the pruned case above: different variant, so a
@@ -136,7 +159,9 @@ async fn a_broken_archive_behind_a_pruned_hot_store_errors_rather_than_reading_e
 
     // Positive control FIRST: it reads cleanly from the archive before the fault, so the
     // failure below is the fault and not a broken reader.
-    let ok = ea::read_with_fallthrough(&store, 4, || Some(Vec::new())).await.unwrap();
+    let ok = ea::read_with_fallthrough(&store, 4, || Some(Vec::new()))
+        .await
+        .unwrap();
     assert!(matches!(ok.source, ea::ReadSource::Archive { .. }));
 
     // Fault 1 — the data object vanishes while the manifest remains.
@@ -175,7 +200,10 @@ fn the_three_read_sources_serialise_distinguishably() {
         },
         ea::ReadSource::NotFound,
     ];
-    let json: Vec<String> = v.iter().map(|s| serde_json::to_string(s).unwrap()).collect();
+    let json: Vec<String> = v
+        .iter()
+        .map(|s| serde_json::to_string(s).unwrap())
+        .collect();
     for (i, a) in json.iter().enumerate() {
         for b in json.iter().skip(i + 1) {
             assert_ne!(a, b);
@@ -192,10 +220,21 @@ fn the_three_read_sources_serialise_distinguishably() {
 fn the_date_validator_refuses_anything_that_is_not_an_iso_date() {
     use noetl_server::handlers::archive_read::is_iso_date;
     assert!(is_iso_date("2026-09-03"));
-    assert!(is_iso_date("2024-02-29"), "a real leap day must be accepted");
+    assert!(
+        is_iso_date("2024-02-29"),
+        "a real leap day must be accepted"
+    );
     for bad in [
-        "", "2026-9-3", "2026/09/03", "26-09-03", "2026-09-03T00:00:00Z",
-        "2026-13-01", "2026-02-30", "2023-02-29", "yyyy-mm-dd", "2026-09-032",
+        "",
+        "2026-9-3",
+        "2026/09/03",
+        "26-09-03",
+        "2026-09-03T00:00:00Z",
+        "2026-13-01",
+        "2026-02-30",
+        "2023-02-29",
+        "yyyy-mm-dd",
+        "2026-09-032",
     ] {
         assert!(!is_iso_date(bad), "{bad:?} must be refused");
     }
@@ -222,9 +261,7 @@ async fn retrieval_round_trips_by_id_and_by_date_against_the_emulator() {
     // A unique day + id block per run.
     let tag = (Utc::now().timestamp_subsec_micros() % 27 + 1) as i64;
     let day = format!("2028-03-{tag:02}");
-    let started = Utc
-        .with_ymd_and_hms(2028, 3, tag as u32, 8, 0, 0)
-        .unwrap();
+    let started = Utc.with_ymd_and_hms(2028, 3, tag as u32, 8, 0, 0).unwrap();
 
     let mut truth: std::collections::BTreeMap<i64, Vec<(u64, Option<String>)>> = Default::default();
     for k in 0..6i64 {
@@ -232,14 +269,23 @@ async fn retrieval_round_trips_by_id_and_by_date_against_the_emulator() {
         let r = recs(20 + k as usize, 50_000 + k as u64 * 1_000);
         let m = ea::ExecutionMeta {
             execution_id: id,
-            status: if k == 3 { "FAILED".into() } else { "COMPLETED".into() },
+            status: if k == 3 {
+                "FAILED".into()
+            } else {
+                "COMPLETED".into()
+            },
             started_at: started,
             completed_at: Some(started + Duration::hours(1)),
         };
         ea::archive_execution_indexed(&store, &m, &r, Utc::now())
             .await
             .expect("archive+index");
-        truth.insert(id, r.iter().map(|x| (x.global_sequence, x.event_id.clone())).collect());
+        truth.insert(
+            id,
+            r.iter()
+                .map(|x| (x.global_sequence, x.event_id.clone()))
+                .collect(),
+        );
     }
     println!("  archived {} executions for date={day}", truth.len());
 
@@ -256,18 +302,26 @@ async fn retrieval_round_trips_by_id_and_by_date_against_the_emulator() {
             }
             other => panic!("execution {id} must be served from the archive, got {other:?}"),
         }
-        let mut got: Vec<(u64, Option<String>)> =
-            r.records.iter().map(|x| (x.global_sequence, x.event_id.clone())).collect();
+        let mut got: Vec<(u64, Option<String>)> = r
+            .records
+            .iter()
+            .map(|x| (x.global_sequence, x.event_id.clone()))
+            .collect();
         let mut w = want.clone();
         got.sort();
         w.sort();
         assert_eq!(got, w, "execution {id} must round-trip set-equal");
     }
-    println!("  served from archive: {served_from_archive} of {}", truth.len());
+    println!(
+        "  served from archive: {served_from_archive} of {}",
+        truth.len()
+    );
     assert_eq!(served_from_archive, truth.len());
 
     // 2. Discovery BY DATE, then fetch each discovered id — the read-side path.
-    let listing = ea::list_executions_for_date(&store, &day, 1_000).await.expect("list");
+    let listing = ea::list_executions_for_date(&store, &day, 1_000)
+        .await
+        .expect("list");
     println!(
         "  date={day} keys_seen={} ids={} unrecognised={} truncated={}",
         listing.keys_seen,
@@ -288,7 +342,10 @@ async fn retrieval_round_trips_by_id_and_by_date_against_the_emulator() {
         assert_eq!(r.records.len(), truth[id].len());
         fetched += 1;
     }
-    println!("  fetched {fetched} of {} discovered ids", listing.execution_ids.len());
+    println!(
+        "  fetched {fetched} of {} discovered ids",
+        listing.execution_ids.len()
+    );
     assert_eq!(fetched, want_ids.len());
 
     // 3. Negative controls over HTTP: an unarchived id is NotFound, and a day with nothing
@@ -297,7 +354,9 @@ async fn retrieval_round_trips_by_id_and_by_date_against_the_emulator() {
         .await
         .expect("absent read must not error");
     assert_eq!(absent.source, ea::ReadSource::NotFound);
-    let quiet = ea::list_executions_for_date(&store, "2028-12-31", 100).await.unwrap();
+    let quiet = ea::list_executions_for_date(&store, "2028-12-31", 100)
+        .await
+        .unwrap();
     println!("  control day 2028-12-31: keys_seen={}", quiet.keys_seen);
     assert!(quiet.execution_ids.is_empty());
 }

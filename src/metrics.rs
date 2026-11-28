@@ -3844,14 +3844,18 @@ pub fn record_floor_refinement(r: &crate::services::event_archive::FloorRefineme
     let c = ehdb_floor_refinement_total();
     c.with_label_values(&["refined"]).inc_by(r.refined as u64);
     c.with_label_values(&["absent"]).inc_by(r.absent as u64);
-    c.with_label_values(&["unreadable"]).inc_by(u64::from(r.unreadable));
-    c.with_label_values(&["bounded"]).inc_by(u64::from(r.bounded));
+    c.with_label_values(&["unreadable"])
+        .inc_by(u64::from(r.unreadable));
+    c.with_label_values(&["bounded"])
+        .inc_by(u64::from(r.bounded));
 }
 
 /// Pinned unconditionally, so "never refined" reads 0 rather than absent.
 pub fn init_floor_refinement_series() {
     for o in FLOOR_REFINEMENT_OUTCOMES {
-        ehdb_floor_refinement_total().with_label_values(&[o]).inc_by(0);
+        ehdb_floor_refinement_total()
+            .with_label_values(&[o])
+            .inc_by(0);
     }
 }
 
@@ -4285,7 +4289,9 @@ pub fn init_replica_reality_series() {
     // "replication is re-sending work" from "replication is not running".
     for outcome in ["ok", "failed", "already_present"] {
         for backend in ["gcs", "postgres"] {
-            object_store_put_total().with_label_values(&[backend, outcome]).inc_by(0);
+            object_store_put_total()
+                .with_label_values(&[backend, outcome])
+                .inc_by(0);
         }
     }
 }
@@ -4460,8 +4466,13 @@ pub const EHDB_ARCHIVE_OUTCOMES: [&str; 15] = [
 /// every one of these must read 0, which is a fact; absent is not.
 /// The persisted archived set (noetl/ai-meta#506 RFC question 5): what happened to the
 /// snapshot that lets a restart skip re-verifying the whole archived backlog.
-pub const EHDB_ARCHIVE_KNOWN_PERSIST_OUTCOMES: [&str; 5] =
-    ["loaded", "load_failed", "bucket_mismatch", "written", "write_failed"];
+pub const EHDB_ARCHIVE_KNOWN_PERSIST_OUTCOMES: [&str; 5] = [
+    "loaded",
+    "load_failed",
+    "bucket_mismatch",
+    "written",
+    "write_failed",
+];
 
 pub fn ehdb_archive_known_persist_total() -> &'static prometheus::IntCounterVec {
     static M: std::sync::OnceLock<prometheus::IntCounterVec> = std::sync::OnceLock::new();
@@ -4511,10 +4522,14 @@ pub fn init_ehdb_retention_series() {
     ehdb_archive_scan_archivable().set(0);
     ehdb_prune_bytes_reclaimed_total().inc_by(0);
     for o in EHDB_ARCHIVE_KNOWN_PERSIST_OUTCOMES {
-        ehdb_archive_known_persist_total().with_label_values(&[o]).inc_by(0);
+        ehdb_archive_known_persist_total()
+            .with_label_values(&[o])
+            .inc_by(0);
     }
     for st in ["confirmed", "unconfirmed"] {
-        ehdb_archive_persisted_known().with_label_values(&[st]).set(0);
+        ehdb_archive_persisted_known()
+            .with_label_values(&[st])
+            .set(0);
     }
 }
 

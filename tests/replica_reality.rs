@@ -53,14 +53,20 @@ fn remote(bucket: &str) -> ReplicaDomain {
 fn a_single_replica_is_evaluated_and_reported_as_a_single_point_of_failure() {
     let r = rr::evaluate(&[local(66320, "/data/ehdb-embedded/substrate")]);
     assert_eq!(r.replica_set_size, 1);
-    assert!(!r.survives_node_loss, "a local device cannot survive node loss");
+    assert!(
+        !r.survives_node_loss,
+        "a local device cannot survive node loss"
+    );
     assert!(
         r.is_single_point_of_failure(),
         "RF=1 on local storage MUST report as a single point of failure — a 0 here is the \
          defect this module exists to remove"
     );
     // ⚠ And the vacuous half is labelled as vacuous rather than presented as reassurance.
-    assert!(r.domains_distinct, "one replica trivially does not collide with itself");
+    assert!(
+        r.domains_distinct,
+        "one replica trivially does not collide with itself"
+    );
     assert!(
         r.describe().contains("vacuous at RF=1"),
         "the distinctness answer must be marked vacuous at RF=1: {}",
@@ -97,7 +103,10 @@ fn two_replicas_on_one_device_are_not_two_failure_domains() {
 #[test]
 fn two_distinct_local_devices_still_do_not_survive_node_loss() {
     let r = rr::evaluate(&[local(1, "/a"), local(2, "/b")]);
-    assert!(r.domains_distinct, "different devices are different domains");
+    assert!(
+        r.domains_distinct,
+        "different devices are different domains"
+    );
     assert!(
         !r.survives_node_loss,
         "distinct devices on one node still both die with the node"
@@ -173,7 +182,10 @@ fn the_domain_labels_are_distinct_and_carry_the_device() {
         instance: "i".into(),
     });
     let d = rr::domain_label(&FailureDomain::Undeclared);
-    assert!(a.contains("66320"), "the device id is the thing that collides: {a}");
+    assert!(
+        a.contains("66320"),
+        "the device id is the thing that collides: {a}"
+    );
     for (i, x) in [&a, &b, &c, &d].iter().enumerate() {
         for y in [&a, &b, &c, &d].iter().skip(i + 1) {
             assert_ne!(x, y);
@@ -240,14 +252,23 @@ fn the_put_histogram_separates_outcomes() {
     noetl_server::metrics::observe_object_store_put("gcs", "ok", 0.012);
     noetl_server::metrics::observe_object_store_put("gcs", "failed", 3.5);
     let text = noetl_server::metrics::gather_text().unwrap();
-    assert!(text.contains(r#"backend="gcs",outcome="ok""#), "missing ok series");
+    assert!(
+        text.contains(r#"backend="gcs",outcome="ok""#),
+        "missing ok series"
+    );
     assert!(
         text.contains(r#"backend="gcs",outcome="failed""#),
         "missing failed series"
     );
     // Buckets must span the range the question needs: ms to seconds.
-    assert!(text.contains("le=\"0.001\""), "no 1ms bucket — cannot see a fast local put");
-    assert!(text.contains("le=\"8\""), "no 8s bucket — a clipped top answers with its own ceiling");
+    assert!(
+        text.contains("le=\"0.001\""),
+        "no 1ms bucket — cannot see a fast local put"
+    );
+    assert!(
+        text.contains("le=\"8\""),
+        "no 8s bucket — a clipped top answers with its own ceiling"
+    );
 }
 
 /// ⚠⚠ A histogram must never be "pinned" by observing into it.
