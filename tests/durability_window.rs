@@ -57,7 +57,10 @@ fn the_unsealed_gauge_and_the_window_gauge_are_distinct_series() {
     noetl_server::metrics::init_age_seal_series();
     noetl_server::metrics::ehdb_oldest_unsealed_age_seconds().set(60);
     noetl_server::metrics::ehdb_unreplicated_oldest_age_seconds().set(3600);
-    assert_eq!(noetl_server::metrics::ehdb_oldest_unsealed_age_seconds().get(), 60);
+    assert_eq!(
+        noetl_server::metrics::ehdb_oldest_unsealed_age_seconds().get(),
+        60
+    );
     assert_eq!(
         noetl_server::metrics::ehdb_unreplicated_oldest_age_seconds().get(),
         3600,

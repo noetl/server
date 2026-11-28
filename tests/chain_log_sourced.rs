@@ -30,7 +30,6 @@
 //! So the first test asserts the fixture is the one expected, and the harness that
 //! ran it killed the forward and confirmed the probe died.
 
-
 use noetl_server::chain_advance::{decide, AdvanceDecision, ChainSource};
 use noetl_server::state::{ChainHeadHydrator, HydrateOutcome};
 
@@ -284,10 +283,10 @@ async fn a362_a_post_restart_multi_root_execution_is_REFUSED_not_recovered() {
 
     // ⭐ And the positive control: a cleanly linked execution IS served, so the
     // refusal above is about the fork and not about the source being broken.
-    let ok = view_for(&p, 2002)
-        .await
-        .expect("2002 is cleanly linked and MUST be served; if this is None the \
-                 source is broken rather than discriminating");
+    let ok = view_for(&p, 2002).await.expect(
+        "2002 is cleanly linked and MUST be served; if this is None the \
+                 source is broken rather than discriminating",
+    );
     assert_eq!(ok.events.len(), 6, "2002 has 6 events");
     let roots = ok
         .events
@@ -839,14 +838,26 @@ async fn a360_a_real_content_conflict_is_still_caught_against_postgres() {
     // populator directly: three synthetic events.
     {
         use ehdb_l0::chain_populator::LogEvent;
-        let src = noetl_server::handlers::chain_populate::LogSourcedChainSource::new(p.clone(), 1000);
+        let src =
+            noetl_server::handlers::chain_populate::LogSourcedChainSource::new(p.clone(), 1000);
         let _ = src.chain_for(exec).await; // establishes/confirms an empty partition
         let planted = vec![
-            LogEvent { event_id: "9001".into(), parent_execution_id: None, payload: "{}".into(), prev_event_id: None },
-            LogEvent { event_id: "9002".into(), parent_execution_id: None, payload: "{}".into(), prev_event_id: Some("9001".into()) },
+            LogEvent {
+                event_id: "9001".into(),
+                parent_execution_id: None,
+                payload: "{}".into(),
+                prev_event_id: None,
+            },
+            LogEvent {
+                event_id: "9002".into(),
+                parent_execution_id: None,
+                payload: "{}".into(),
+                prev_event_id: Some("9001".into()),
+            },
         ];
-        let out = noetl_server::handlers::chain_populate::populate_from_log_for_test(exec, &planted)
-            .expect("plant");
+        let out =
+            noetl_server::handlers::chain_populate::populate_from_log_for_test(exec, &planted)
+                .expect("plant");
         assert!(out.is_healthy(), "planting must succeed, got {out:?}");
     }
 
@@ -854,11 +865,22 @@ async fn a360_a_real_content_conflict_is_still_caught_against_postgres() {
     {
         use ehdb_l0::chain_populator::LogEvent;
         let conflicting = vec![
-            LogEvent { event_id: "9001".into(), parent_execution_id: None, payload: "{}".into(), prev_event_id: None },
-            LogEvent { event_id: "7777".into(), parent_execution_id: None, payload: "{}".into(), prev_event_id: Some("9001".into()) },
+            LogEvent {
+                event_id: "9001".into(),
+                parent_execution_id: None,
+                payload: "{}".into(),
+                prev_event_id: None,
+            },
+            LogEvent {
+                event_id: "7777".into(),
+                parent_execution_id: None,
+                payload: "{}".into(),
+                prev_event_id: Some("9001".into()),
+            },
         ];
-        let out = noetl_server::handlers::chain_populate::populate_from_log_for_test(exec, &conflicting)
-            .expect("no error");
+        let out =
+            noetl_server::handlers::chain_populate::populate_from_log_for_test(exec, &conflicting)
+                .expect("no error");
         assert!(
             !out.is_healthy(),
             "a CONTENT conflict must still be reported as divergence, got {out:?}. If \
@@ -971,7 +993,10 @@ async fn a360_a_store_ahead_of_a_log_that_does_not_catch_up_still_reports_diverg
         .with_label_values(&["length_disagreement"])
         .get()
         - before_len;
-    eprintln!("  store=4 log=3 -> served={:?} diverged+{d} length_disagreement+{l}", got.is_some());
+    eprintln!(
+        "  store=4 log=3 -> served={:?} diverged+{d} length_disagreement+{l}",
+        got.is_some()
+    );
 
     assert!(
         got.is_none(),

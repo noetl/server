@@ -341,7 +341,10 @@ async fn try_resolve(state: &AppState, child: i64, expired: bool) -> AppResult<(
     // answer, not a slow one (kind 2026-11-14, a nested import park). Wait for
     // the `call.done` (250 ms steps, ~5 s); the tool's 2 s poll hid this race.
     let completed = !(expired && !terminal)
-        && status.as_ref().map(|s| s.status == "COMPLETED").unwrap_or(false);
+        && status
+            .as_ref()
+            .map(|s| s.status == "COMPLETED")
+            .unwrap_or(false);
     let detail = if completed {
         // The terminal STATUS can be visible before the execution's detail read
         // answers (the same materializer-order race as the call.done wait
@@ -475,7 +478,12 @@ async fn try_resolve(state: &AppState, child: i64, expired: bool) -> AppResult<(
             "context": {"call_index": 0, "command_id": park.parent_command_id, "result": inner},
         });
         let ev = crate::handlers::event_write::EventRow::new(
-            event_id, parent, catalog_id, "call.done", status_label, chrono::Utc::now(),
+            event_id,
+            parent,
+            catalog_id,
+            "call.done",
+            status_label,
+            chrono::Utc::now(),
         )
         .with_node(&park.parent_step)
         .with_result(result_obj)
@@ -486,10 +494,18 @@ async fn try_resolve(state: &AppState, child: i64, expired: bool) -> AppResult<(
         // A failed await is what the worker emits when the tool errors:
         // `call.error` then `command.failed`, which fails the step (a FAILED
         // `call.done` would let the DAG advance past it — found on kind).
-        let error = inner["context"]["error"].as_str().unwrap_or("child failed").to_string();
+        let error = inner["context"]["error"]
+            .as_str()
+            .unwrap_or("child failed")
+            .to_string();
         let err_id = mk_id()?;
         let ev = crate::handlers::event_write::EventRow::new(
-            err_id, parent, catalog_id, "call.error", "FAILED", chrono::Utc::now(),
+            err_id,
+            parent,
+            catalog_id,
+            "call.error",
+            "FAILED",
+            chrono::Utc::now(),
         )
         .with_node(&park.parent_step)
         .with_result(json!({"status": "FAILED", "context": {
@@ -499,7 +515,12 @@ async fn try_resolve(state: &AppState, child: i64, expired: bool) -> AppResult<(
         crate::handlers::event_write::emit_event(state, pool, ev).await?;
         let failed_id = mk_id()?;
         let ev = crate::handlers::event_write::EventRow::new(
-            failed_id, parent, catalog_id, "command.failed", "FAILED", chrono::Utc::now(),
+            failed_id,
+            parent,
+            catalog_id,
+            "command.failed",
+            "FAILED",
+            chrono::Utc::now(),
         )
         .with_node(&park.parent_step)
         .with_result(json!({"status": "FAILED", "context": {
@@ -511,7 +532,8 @@ async fn try_resolve(state: &AppState, child: i64, expired: bool) -> AppResult<(
     crate::metrics::record_await_park(&format!("resumed_{outcome_label}"));
     info!(parent, child, step = %park.parent_step, outcome = %outcome_label, "await-park: resumed parent");
     if let Err(e) =
-        crate::handlers::events::trigger_orchestrator_inner(state, parent, trigger_event_id, false).await
+        crate::handlers::events::trigger_orchestrator_inner(state, parent, trigger_event_id, false)
+            .await
     {
         warn!(parent, %e, "await-park: drive after resume failed; reconcile re-drives");
     }
@@ -604,7 +626,10 @@ mod tests {
             {"event_type": "command.completed", "node_name": "start", "result": {"context": {"status": "success"}}},
             {"event_type": "playbook.completed", "node_name": "playbook"}
         ]});
-        assert!(!result_ready(&early, Some("start")), "terminal before call.done: not ready");
+        assert!(
+            !result_ready(&early, Some("start")),
+            "terminal before call.done: not ready"
+        );
         assert!(!result_ready(&early, None));
         let late = json!({"events": [
             {"event_type": "call.done", "node_name": "start", "result": {"context": {"data": {"leaf": "v2"}}}}
@@ -674,6 +699,9 @@ mod settle_notfound_tests {
         let src = include_str!("await_park.rs");
         let body = &src[src.find("async fn try_resolve(").unwrap()..];
         assert!(body.contains("Err(AppError::NotFound(_)) => serde_json::Value::Null"));
-        assert!(body.contains("if d.is_null() {"), "an exhausted settle must not resume with Null");
+        assert!(
+            body.contains("if d.is_null() {"),
+            "an exhausted settle must not resume with Null"
+        );
     }
 }

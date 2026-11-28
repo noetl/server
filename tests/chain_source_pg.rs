@@ -516,7 +516,12 @@ async fn a362_two_tips_report_ambiguous_and_still_link() {
     };
     let exec = 3102i64;
     // 1 -> 2, and 5 -> 6 : two chains, so two tips (2 and 6).
-    seed_linked(&p, exec, &[(1, None), (2, Some(1)), (5, None), (6, Some(5))]).await;
+    seed_linked(
+        &p,
+        exec,
+        &[(1, None), (2, Some(1)), (5, None), (6, Some(5))],
+    )
+    .await;
 
     let h = noetl_server::db::queries::event_chain::PgChainHeadHydrator::new(p.clone());
     match noetl_server::state::ChainHeadHydrator::head_of(&h, exec).await {
@@ -607,7 +612,12 @@ async fn a362_invariant_counts_classify_one_multi_and_none() {
     let forked = 5202i64;
     seed_linked(&p, healthy, &[(1, None), (2, Some(1)), (3, Some(2))]).await;
     // Two roots: 1 and 5.
-    seed_linked(&p, forked, &[(1, None), (2, Some(1)), (5, None), (6, Some(5))]).await;
+    seed_linked(
+        &p,
+        forked,
+        &[(1, None), (2, Some(1)), (5, None), (6, Some(5))],
+    )
+    .await;
 
     let got = noetl_server::handlers::chain_populate::root_invariant_counts_for_test(&p, 1)
         .await

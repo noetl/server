@@ -73,9 +73,15 @@ async fn discovery_by_date_returns_exactly_the_executions_that_started_that_date
     }
 
     for day in ["2026-09-01", "2026-09-02", "2026-09-03"] {
-        let mut want: Vec<i64> = truth.iter().filter(|(d, _)| *d == day).map(|(_, i)| *i).collect();
+        let mut want: Vec<i64> = truth
+            .iter()
+            .filter(|(d, _)| *d == day)
+            .map(|(_, i)| *i)
+            .collect();
         want.sort_unstable();
-        let listing = ea::list_executions_for_date(&store, day, 1000).await.unwrap();
+        let listing = ea::list_executions_for_date(&store, day, 1000)
+            .await
+            .unwrap();
         assert_eq!(
             listing.execution_ids, want,
             "{day}: listing must set-equal ground truth"
@@ -88,7 +94,9 @@ async fn discovery_by_date_returns_exactly_the_executions_that_started_that_date
 
     // Negative control: a day with nothing archived is EMPTY, and that is distinguishable
     // from a day that was never asked about because `keys_seen` is 0 too.
-    let empty = ea::list_executions_for_date(&store, "2026-09-04", 1000).await.unwrap();
+    let empty = ea::list_executions_for_date(&store, "2026-09-04", 1000)
+        .await
+        .unwrap();
     assert!(empty.execution_ids.is_empty());
     assert_eq!(empty.keys_seen, 0);
 }
@@ -119,9 +127,12 @@ async fn many_executions_on_one_date_all_survive_concurrent_archiving() {
     done.sort_unstable();
     assert_eq!(done, ids, "every concurrent archive must have succeeded");
 
-    let listing = ea::list_executions_for_date(&*store, day, 10_000).await.unwrap();
+    let listing = ea::list_executions_for_date(&*store, day, 10_000)
+        .await
+        .unwrap();
     assert_eq!(
-        listing.execution_ids, ids,
+        listing.execution_ids,
+        ids,
         "⚠⚠ the by-date index LOST entries under concurrency — {} of {} survived",
         listing.execution_ids.len(),
         ids.len()
@@ -133,12 +144,24 @@ async fn many_executions_on_one_date_all_survive_concurrent_archiving() {
 async fn re_indexing_the_same_execution_does_not_duplicate_the_reference() {
     let store = FakeArchiveStore::new();
     let m = meta(77, at("2026-09-05", 3));
-    ea::archive_execution_indexed(&store, &m, &recs(4), Utc::now()).await.unwrap();
-    let first = ea::list_executions_for_date(&store, "2026-09-05", 100).await.unwrap();
-    ea::archive_execution_indexed(&store, &m, &recs(4), Utc::now()).await.unwrap();
-    let second = ea::list_executions_for_date(&store, "2026-09-05", 100).await.unwrap();
+    ea::archive_execution_indexed(&store, &m, &recs(4), Utc::now())
+        .await
+        .unwrap();
+    let first = ea::list_executions_for_date(&store, "2026-09-05", 100)
+        .await
+        .unwrap();
+    ea::archive_execution_indexed(&store, &m, &recs(4), Utc::now())
+        .await
+        .unwrap();
+    let second = ea::list_executions_for_date(&store, "2026-09-05", 100)
+        .await
+        .unwrap();
     assert_eq!(first.execution_ids, vec![77]);
-    assert_eq!(second.execution_ids, vec![77], "a re-index must not duplicate");
+    assert_eq!(
+        second.execution_ids,
+        vec![77],
+        "a re-index must not duplicate"
+    );
     assert_eq!(second.keys_seen, 1);
 }
 
@@ -155,14 +178,26 @@ async fn a_stray_object_under_the_prefix_is_counted_not_invented() {
         .await
         .unwrap();
     store
-        .put("date=2026-09-06/execution_id=notanumber.json", "application/json", b"{}")
+        .put(
+            "date=2026-09-06/execution_id=notanumber.json",
+            "application/json",
+            b"{}",
+        )
         .await
         .unwrap();
 
-    let l = ea::list_executions_for_date(&store, "2026-09-06", 100).await.unwrap();
+    let l = ea::list_executions_for_date(&store, "2026-09-06", 100)
+        .await
+        .unwrap();
     assert_eq!(l.execution_ids, vec![9], "only real references become ids");
-    assert_eq!(l.keys_seen, 3, "the denominator must include what was skipped");
-    assert_eq!(l.unrecognised, 2, "skipped keys must be COUNTED, not silently dropped");
+    assert_eq!(
+        l.keys_seen, 3,
+        "the denominator must include what was skipped"
+    );
+    assert_eq!(
+        l.unrecognised, 2,
+        "skipped keys must be COUNTED, not silently dropped"
+    );
 }
 
 /// ⚠ A truncated listing must say so. Silence would read exactly like a quiet day.
@@ -174,11 +209,15 @@ async fn a_capped_listing_reports_that_it_was_truncated() {
             .await
             .unwrap();
     }
-    let full = ea::list_executions_for_date(&store, "2026-09-07", 100).await.unwrap();
+    let full = ea::list_executions_for_date(&store, "2026-09-07", 100)
+        .await
+        .unwrap();
     assert_eq!(full.execution_ids.len(), 10);
     assert!(!full.truncated);
 
-    let capped = ea::list_executions_for_date(&store, "2026-09-07", 4).await.unwrap();
+    let capped = ea::list_executions_for_date(&store, "2026-09-07", 4)
+        .await
+        .unwrap();
     assert_eq!(capped.execution_ids.len(), 4);
     assert!(
         capped.truncated,
@@ -233,7 +272,10 @@ async fn the_reference_round_trips_with_the_fields_a_caller_needs() {
     assert_eq!(r.data_key, manifest.data_key);
     assert_eq!(r.started_at, m.started_at);
     // Absent reads as absent.
-    assert!(ea::read_date_reference(&store, "2026-09-08", 556).await.unwrap().is_none());
+    assert!(ea::read_date_reference(&store, "2026-09-08", 556)
+        .await
+        .unwrap()
+        .is_none());
 }
 
 /// The real client, against the emulator: the date index works over HTTP too.
@@ -256,7 +298,9 @@ async fn the_date_index_works_against_the_emulator() {
             .await
             .expect("archive+index to the emulator");
     }
-    let listing = ea::list_executions_for_date(&store, &day, 1000).await.unwrap();
+    let listing = ea::list_executions_for_date(&store, &day, 1000)
+        .await
+        .unwrap();
     println!(
         "  date={day} keys_seen={} ids={} unrecognised={} truncated={}",
         listing.keys_seen,
@@ -270,7 +314,9 @@ async fn the_date_index_works_against_the_emulator() {
     assert_eq!(listing.unrecognised, 0);
 
     // Negative control: a day nothing was written for must be empty, not a stray hit.
-    let other = ea::list_executions_for_date(&store, "2027-02-28", 1000).await.unwrap();
+    let other = ea::list_executions_for_date(&store, "2027-02-28", 1000)
+        .await
+        .unwrap();
     println!("  control day 2027-02-28: keys_seen={}", other.keys_seen);
     assert!(other.execution_ids.is_empty());
 }

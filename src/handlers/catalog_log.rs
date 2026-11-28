@@ -504,9 +504,8 @@ pub async fn verify_endpoint(
 pub async fn read_and_fold(
     limit: usize,
 ) -> Result<crate::handlers::catalog_relation::CatalogRelation, String> {
-    let base = relay_base().ok_or_else(|| {
-        format!("{} is unset", crate::handlers::ehdb::WORKER_QUERY_URL_ENV)
-    })?;
+    let base = relay_base()
+        .ok_or_else(|| format!("{} is unset", crate::handlers::ehdb::WORKER_QUERY_URL_ENV))?;
     let client = reqwest::Client::new();
     let mut all: Vec<serde_json::Value> = Vec::new();
     let mut after: u64 = 0;
@@ -525,7 +524,10 @@ pub async fn read_and_fold(
         // "stream sequence must be greater than zero" — starting from the
         // beginning is the ABSENCE of a cursor, not a zero one.
         let url = if after == 0 {
-            format!("{}/ehdb/tiers/{TIER}?limit={page}", base.trim_end_matches('/'))
+            format!(
+                "{}/ehdb/tiers/{TIER}?limit={page}",
+                base.trim_end_matches('/')
+            )
         } else {
             format!(
                 "{}/ehdb/tiers/{TIER}?limit={page}&after={after}",
@@ -576,7 +578,9 @@ pub async fn read_and_fold(
             break;
         }
     }
-    Ok(crate::handlers::catalog_relation::CatalogRelation::fold(&all))
+    Ok(crate::handlers::catalog_relation::CatalogRelation::fold(
+        &all,
+    ))
 }
 
 /// Upper bound on records a single fold will accumulate.
@@ -758,7 +762,11 @@ mod tests {
     #[test]
     fn a_typo_does_not_start_writing_to_a_tier() {
         for junk in ["shadwo", "SHADOW!", "on", "true", "1", "tier", "serve"] {
-            assert_eq!(parse_mode(Some(junk)), Mode::Off, "{junk} must not enable writes");
+            assert_eq!(
+                parse_mode(Some(junk)),
+                Mode::Off,
+                "{junk} must not enable writes"
+            );
         }
         assert_eq!(parse_mode(Some(" Shadow ")), Mode::Shadow);
     }
@@ -862,13 +870,19 @@ mod tests {
     /// reported every one of them as `recorded`.
     #[test]
     fn a_two_hundred_with_a_failure_body_is_not_a_landed_record() {
-        assert_eq!(classify_append_reply(r#"{"outcome":"ok","appended":1}"#), "recorded");
+        assert_eq!(
+            classify_append_reply(r#"{"outcome":"ok","appended":1}"#),
+            "recorded"
+        );
         assert_eq!(
             classify_append_reply(r#"{"outcome":"unconfigured"}"#),
             "append_failed",
             "an unconfigured mirror reported as recorded is a silently lost record"
         );
-        assert_eq!(classify_append_reply(r#"{"outcome":"ok","appended":0}"#), "append_failed");
+        assert_eq!(
+            classify_append_reply(r#"{"outcome":"ok","appended":0}"#),
+            "append_failed"
+        );
         assert_eq!(
             classify_append_reply("not json at all"),
             "append_failed",

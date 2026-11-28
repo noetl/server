@@ -630,7 +630,9 @@ pub enum LocalDrivePhase {
 /// - `Done` suppresses for [`LocalDriveClaims::DONE_TTL`], then is collected.
 #[derive(Default)]
 pub struct LocalDriveClaims {
-    map: std::sync::Mutex<std::collections::HashMap<i64, (i64, LocalDrivePhase, std::time::Instant)>>,
+    map: std::sync::Mutex<
+        std::collections::HashMap<i64, (i64, LocalDrivePhase, std::time::Instant)>,
+    >,
 }
 
 impl LocalDriveClaims {
@@ -648,7 +650,11 @@ impl LocalDriveClaims {
         }
         map.insert(
             trigger_event_id,
-            (execution_id, LocalDrivePhase::Claimed, std::time::Instant::now()),
+            (
+                execution_id,
+                LocalDrivePhase::Claimed,
+                std::time::Instant::now(),
+            ),
         );
     }
 
@@ -687,7 +693,11 @@ impl LocalDriveClaims {
     pub fn done(&self, trigger_event_id: i64, execution_id: i64) {
         self.map.lock().unwrap().insert(
             trigger_event_id,
-            (execution_id, LocalDrivePhase::Done, std::time::Instant::now()),
+            (
+                execution_id,
+                LocalDrivePhase::Done,
+                std::time::Instant::now(),
+            ),
         );
     }
 
@@ -1120,7 +1130,11 @@ impl DriveTombstones {
     /// give-up out of the slot was necessary but insufficient while the *budget*
     /// that triggers it still lived inside.
     pub fn noops(&self, execution_id: i64) -> u32 {
-        self.budgets.lock().unwrap().get(&execution_id).map_or(0, |b| b.0)
+        self.budgets
+            .lock()
+            .unwrap()
+            .get(&execution_id)
+            .map_or(0, |b| b.0)
     }
 
     /// How long this execution's no-progress streak has lasted, in wall-clock
@@ -1481,7 +1495,10 @@ mod tests {
         assert_eq!(c.begin(1), None, "a claim is taken once");
         assert!(c.suppresses(1, ttl), "a driving entry suppresses");
         c.done(1, 77);
-        assert!(c.suppresses(1, ttl), "a done entry suppresses a late trigger");
+        assert!(
+            c.suppresses(1, ttl),
+            "a done entry suppresses a late trigger"
+        );
         assert_eq!(c.phase(1), Some(LocalDrivePhase::Done));
     }
 

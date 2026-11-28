@@ -71,6 +71,10 @@ fn main() {
     println!("perturbed_digest={perturbed_digest}");
     println!(
         "negative_control={}",
-        if perturbed_digest == canonical { "FAILED-identical" } else { "ok-differs" }
+        if perturbed_digest == canonical {
+            "FAILED-identical"
+        } else {
+            "ok-differs"
+        }
     );
 }

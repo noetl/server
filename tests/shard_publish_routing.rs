@@ -39,8 +39,8 @@ fn subject_matches_filter(subject: &str, filter: &str) -> bool {
         match filt[i] {
             ">" => return i < subj.len(), // `>` matches one-or-more remaining tokens
             _ if i >= subj.len() => return false,
-            "*" => {}                     // matches exactly this one token
-            tok if tok == subj[i] => {}   // literal token match
+            "*" => {}                   // matches exactly this one token
+            tok if tok == subj[i] => {} // literal token match
             _ => return false,
         }
         i += 1;
@@ -108,7 +108,11 @@ fn owner_first_means_zero_redirects_across_the_fleet() {
         }
     }
     assert_eq!(misroutes, 0, "no command may land on a non-owner shard");
-    assert_eq!(owner_hits, sample_eids().len(), "every command reaches its owner");
+    assert_eq!(
+        owner_hits,
+        sample_eids().len(),
+        "every command reaches its owner"
+    );
 }
 
 #[test]
@@ -159,7 +163,10 @@ fn non_system_pool_is_never_shard_routed() {
 #[test]
 fn subject_matches_filter_model_is_correct() {
     // Guard the model itself so the proofs above rest on correct matching.
-    assert!(subject_matches_filter("noetl.commands.system.shard.2.325", "noetl.commands.system.>"));
+    assert!(subject_matches_filter(
+        "noetl.commands.system.shard.2.325",
+        "noetl.commands.system.>"
+    ));
     assert!(subject_matches_filter(
         "noetl.commands.system.shard.2.325",
         "noetl.commands.system.shard.2.>"
@@ -168,10 +175,22 @@ fn subject_matches_filter_model_is_correct() {
         "noetl.commands.system.shard.2.325",
         "noetl.commands.system.shard.3.>"
     ));
-    assert!(subject_matches_filter("noetl.commands.system.325", "noetl.commands.system.>"));
+    assert!(subject_matches_filter(
+        "noetl.commands.system.325",
+        "noetl.commands.system.>"
+    ));
     // `>` requires at least one trailing token.
-    assert!(!subject_matches_filter("noetl.commands.system", "noetl.commands.system.>"));
+    assert!(!subject_matches_filter(
+        "noetl.commands.system",
+        "noetl.commands.system.>"
+    ));
     // `*` matches exactly one token.
-    assert!(subject_matches_filter("noetl.commands.system.325", "noetl.commands.*.325"));
-    assert!(!subject_matches_filter("noetl.commands.system.a.325", "noetl.commands.*.325"));
+    assert!(subject_matches_filter(
+        "noetl.commands.system.325",
+        "noetl.commands.*.325"
+    ));
+    assert!(!subject_matches_filter(
+        "noetl.commands.system.a.325",
+        "noetl.commands.*.325"
+    ));
 }

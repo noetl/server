@@ -44,7 +44,14 @@ fn a_registered_server_is_discoverable_and_a_silent_one_expires_by_lease() {
     let t0 = 1_000 * SEC;
     let ttl = 180 * SEC;
 
-    reg::register_in(&mut st, RuntimeKind::Server, "srv-a", "noetl-server/test", t0).unwrap();
+    reg::register_in(
+        &mut st,
+        RuntimeKind::Server,
+        "srv-a",
+        "noetl-server/test",
+        t0,
+    )
+    .unwrap();
 
     // Live immediately, and found BY KIND — not by inferring kind from the id's shape.
     let found = reg::discover_in(&st, RuntimeKind::Server, t0, ttl).unwrap();
@@ -54,7 +61,11 @@ fn a_registered_server_is_discoverable_and_a_silent_one_expires_by_lease() {
 
     // Still live just inside the lease.
     let inside = reg::discover_in(&st, RuntimeKind::Server, t0 + ttl - SEC, ttl).unwrap();
-    assert_eq!(inside.len(), 1, "must still be live one second inside the lease");
+    assert_eq!(
+        inside.len(),
+        1,
+        "must still be live one second inside the lease"
+    );
 
     // ⭐ THE PROOF: past the lease it is gone, and NOTHING marked it dead. No
     // deregister, no flag, no reaper — only the absence of a renewal.
@@ -90,7 +101,10 @@ fn a_heartbeat_renews_the_lease_so_a_live_server_does_not_expire() {
             "heartbeat must find a registration to renew"
         );
     }
-    assert!(now > t0 + ttl, "the test must actually cross the lease window");
+    assert!(
+        now > t0 + ttl,
+        "the test must actually cross the lease window"
+    );
 
     let live = reg::discover_in(&st, RuntimeKind::Server, now, ttl).unwrap();
     assert_eq!(
@@ -240,7 +254,10 @@ fn the_self_id_is_constrained_to_the_substrate_key_charset() {
     // `self_id` reads the environment, so assert the property on its output rather than
     // trying to control HOSTNAME from a test that shares a process with others.
     let id = reg::self_id();
-    assert!(!id.is_empty(), "an empty id would register nothing findable");
+    assert!(
+        !id.is_empty(),
+        "an empty id would register nothing findable"
+    );
     for c in id.chars() {
         assert!(
             c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'),
@@ -282,9 +299,14 @@ fn upsert_registers_once_then_renews() {
     let fresh = reg::upsert_in(&mut st, RuntimeKind::Worker, "wk-1", "noetl-worker/1", t0).unwrap();
     assert!(fresh, "the first call must be a fresh registration");
 
-    let again =
-        reg::upsert_in(&mut st, RuntimeKind::Worker, "wk-1", "noetl-worker/1", t0 + 60 * SEC)
-            .unwrap();
+    let again = reg::upsert_in(
+        &mut st,
+        RuntimeKind::Worker,
+        "wk-1",
+        "noetl-worker/1",
+        t0 + 60 * SEC,
+    )
+    .unwrap();
     assert!(
         !again,
         "the second call must RENEW, not re-register — otherwise every heartbeat reads as \
@@ -304,8 +326,14 @@ fn upsert_preserves_the_kind_across_a_renewal() {
     let t0 = 1_000 * SEC;
     let ttl = 180 * SEC;
     reg::upsert_in(&mut st, RuntimeKind::Gateway, "gw-9", "noetl-gateway/1", t0).unwrap();
-    reg::upsert_in(&mut st, RuntimeKind::Gateway, "gw-9", "noetl-gateway/1", t0 + 60 * SEC)
-        .unwrap();
+    reg::upsert_in(
+        &mut st,
+        RuntimeKind::Gateway,
+        "gw-9",
+        "noetl-gateway/1",
+        t0 + 60 * SEC,
+    )
+    .unwrap();
 
     assert_eq!(
         reg::discover_in(&st, RuntimeKind::Gateway, t0 + 60 * SEC, ttl)
@@ -387,11 +415,16 @@ fn deregister_is_a_shortcut_and_the_lease_is_still_the_guarantee() {
     let ttl = 180 * SEC;
     reg::upsert_in(&mut st, RuntimeKind::Worker, "wk-bye", "c", t0).unwrap();
     assert_eq!(
-        reg::discover_in(&st, RuntimeKind::Worker, t0, ttl).unwrap().len(),
+        reg::discover_in(&st, RuntimeKind::Worker, t0, ttl)
+            .unwrap()
+            .len(),
         1
     );
 
-    assert!(st.deregister("wk-bye").unwrap(), "a clean departure removes it");
+    assert!(
+        st.deregister("wk-bye").unwrap(),
+        "a clean departure removes it"
+    );
     assert!(
         reg::discover_in(&st, RuntimeKind::Worker, t0 + SEC, ttl)
             .unwrap()
@@ -452,7 +485,11 @@ fn sanitise_id_derives_a_legal_substrate_key_and_refuses_the_rest() {
     assert_eq!(reg::sanitise_id("a/b").as_deref(), Some("a-b"));
     assert_eq!(reg::sanitise_id("a b").as_deref(), Some("a-b"));
     // Refused rather than normalised into something meaningless.
-    assert_eq!(reg::sanitise_id(""), None, "an empty id registers nothing findable");
+    assert_eq!(
+        reg::sanitise_id(""),
+        None,
+        "an empty id registers nothing findable"
+    );
     assert_eq!(
         reg::sanitise_id(".."),
         None,
@@ -656,7 +693,14 @@ fn an_execution_is_discoverable_while_running_and_removed_when_it_finishes() {
     let t0 = 1_000 * SEC;
     let exec_ttl = 300 * SEC;
 
-    reg::register_in(&mut st, RuntimeKind::Execution, "exec-12345", "execution", t0).unwrap();
+    reg::register_in(
+        &mut st,
+        RuntimeKind::Execution,
+        "exec-12345",
+        "execution",
+        t0,
+    )
+    .unwrap();
     let live = reg::discover_in(&st, RuntimeKind::Execution, t0 + 5 * SEC, exec_ttl).unwrap();
     assert_eq!(live.len(), 1, "a running execution must be discoverable");
     assert_eq!(live[0].id(), "exec-12345");
@@ -671,7 +715,14 @@ fn an_execution_is_discoverable_while_running_and_removed_when_it_finishes() {
     );
 
     // ⭐ The backstop: one that crashes without a terminal event still goes away.
-    reg::register_in(&mut st, RuntimeKind::Execution, "exec-crashed", "execution", t0).unwrap();
+    reg::register_in(
+        &mut st,
+        RuntimeKind::Execution,
+        "exec-crashed",
+        "execution",
+        t0,
+    )
+    .unwrap();
     assert_eq!(
         reg::discover_in(&st, RuntimeKind::Execution, t0 + 10 * SEC, exec_ttl)
             .unwrap()

@@ -58,11 +58,27 @@ fn meta(id: i64) -> ea::ExecutionMeta {
 #[test]
 fn a_live_execution_pins_the_floor_below_its_earliest_events() {
     let hot = vec![
-        ea::HotExecution { execution_id: 1, min_sequence: 100, max_sequence: 100+1000 }, // archived
-        ea::HotExecution { execution_id: 2, min_sequence: 150, max_sequence: 150+1000 }, // archived
+        ea::HotExecution {
+            execution_id: 1,
+            min_sequence: 100,
+            max_sequence: 100 + 1000,
+        }, // archived
+        ea::HotExecution {
+            execution_id: 2,
+            min_sequence: 150,
+            max_sequence: 150 + 1000,
+        }, // archived
         // ⚠ Started early, STILL RUNNING: its first events are in the oldest part.
-        ea::HotExecution { execution_id: 3, min_sequence: 120, max_sequence: 120+1000 },
-        ea::HotExecution { execution_id: 4, min_sequence: 900, max_sequence: 900+1000 }, // archived
+        ea::HotExecution {
+            execution_id: 3,
+            min_sequence: 120,
+            max_sequence: 120 + 1000,
+        },
+        ea::HotExecution {
+            execution_id: 4,
+            min_sequence: 900,
+            max_sequence: 900 + 1000,
+        }, // archived
     ];
     let d = ea::retention_floor(&hot, &[1, 2, 4]);
     assert_eq!(
@@ -99,8 +115,16 @@ fn a_live_execution_pins_the_floor_below_its_earliest_events() {
 #[test]
 fn nothing_archived_means_prune_nothing() {
     let hot = vec![
-        ea::HotExecution { execution_id: 1, min_sequence: 10, max_sequence: 10+1000 },
-        ea::HotExecution { execution_id: 2, min_sequence: 20, max_sequence: 20+1000 },
+        ea::HotExecution {
+            execution_id: 1,
+            min_sequence: 10,
+            max_sequence: 10 + 1000,
+        },
+        ea::HotExecution {
+            execution_id: 2,
+            min_sequence: 20,
+            max_sequence: 20 + 1000,
+        },
     ];
     let d = ea::retention_floor(&hot, &[]);
     assert_eq!(d.keep_from_sequence, Some(10));
@@ -122,14 +146,25 @@ fn an_empty_hot_set_drops_nothing() {
 #[test]
 fn the_pinning_execution_is_named_in_the_decision() {
     let hot = vec![
-        ea::HotExecution { execution_id: 77, min_sequence: 5, max_sequence: 5+1000 },
-        ea::HotExecution { execution_id: 88, min_sequence: 50_000, max_sequence: 60_000 },
+        ea::HotExecution {
+            execution_id: 77,
+            min_sequence: 5,
+            max_sequence: 5 + 1000,
+        },
+        ea::HotExecution {
+            execution_id: 88,
+            min_sequence: 50_000,
+            max_sequence: 60_000,
+        },
     ];
     let d = ea::retention_floor(&hot, &[88]);
     let s = d.describe();
     assert!(s.contains("pinned by execution 77"), "{s}");
     assert!(s.contains("sequence 5"), "{s}");
-    assert!(s.contains("1 of 2"), "the denominator must be in the message: {s}");
+    assert!(
+        s.contains("1 of 2"),
+        "the denominator must be in the message: {s}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -140,7 +175,9 @@ fn the_pinning_execution_is_named_in_the_decision() {
 async fn an_indexed_durable_archive_is_safe_to_prune() {
     let store = FakeArchiveStore::new();
     let recs: Vec<_> = (0..10).map(|i| arec(100 + i, 1 + i as i64)).collect();
-    ea::archive_execution_indexed(&store, &meta(5), &recs, Utc::now()).await.unwrap();
+    ea::archive_execution_indexed(&store, &meta(5), &recs, Utc::now())
+        .await
+        .unwrap();
     match ea::archive_state(&store, 5).await.unwrap() {
         ea::ArchiveState::SafeToPrune { record_count, .. } => assert_eq!(record_count, 10),
         other => panic!("expected SafeToPrune, got {other:?}"),
@@ -153,18 +190,29 @@ async fn an_indexed_durable_archive_is_safe_to_prune() {
 async fn a_corrupt_archive_is_never_safe_to_prune() {
     let store = FakeArchiveStore::new();
     let recs: Vec<_> = (0..8).map(|i| arec(1 + i, 1 + i as i64)).collect();
-    let (m, _) = ea::archive_execution_indexed(&store, &meta(6), &recs, Utc::now()).await.unwrap();
+    let (m, _) = ea::archive_execution_indexed(&store, &meta(6), &recs, Utc::now())
+        .await
+        .unwrap();
 
     // Positive control first.
-    assert!(ea::archive_state(&store, 6).await.unwrap().is_safe_to_prune());
+    assert!(ea::archive_state(&store, 6)
+        .await
+        .unwrap()
+        .is_safe_to_prune());
 
     store.corrupt(&m.data_key);
     let st = ea::archive_state(&store, 6).await.unwrap();
-    assert!(!st.is_safe_to_prune(), "corrupt archive must block the prune");
-    assert!(matches!(
-        st,
-        ea::ArchiveState::NotDurable(ea::Durability::DigestMismatch { .. })
-    ), "got {st:?}");
+    assert!(
+        !st.is_safe_to_prune(),
+        "corrupt archive must block the prune"
+    );
+    assert!(
+        matches!(
+            st,
+            ea::ArchiveState::NotDurable(ea::Durability::DigestMismatch { .. })
+        ),
+        "got {st:?}"
+    );
 }
 
 /// ⚠⚠ RED: a vanished data object must NOT be safe to prune.
@@ -172,11 +220,16 @@ async fn a_corrupt_archive_is_never_safe_to_prune() {
 async fn a_vanished_data_object_is_never_safe_to_prune() {
     let store = FakeArchiveStore::new();
     let recs: Vec<_> = (0..4).map(|i| arec(1 + i, 1 + i as i64)).collect();
-    let (m, _) = ea::archive_execution_indexed(&store, &meta(7), &recs, Utc::now()).await.unwrap();
+    let (m, _) = ea::archive_execution_indexed(&store, &meta(7), &recs, Utc::now())
+        .await
+        .unwrap();
     store.vanish(&m.data_key);
     let st = ea::archive_state(&store, 7).await.unwrap();
     assert!(!st.is_safe_to_prune());
-    assert!(matches!(st, ea::ArchiveState::NotDurable(ea::Durability::DataMissing { .. })));
+    assert!(matches!(
+        st,
+        ea::ArchiveState::NotDurable(ea::Durability::DataMissing { .. })
+    ));
 }
 
 /// ⚠⚠ RED: durable but NOT indexed must block the prune. Pruning behind it would leave
@@ -186,15 +239,25 @@ async fn a_durable_but_unindexed_archive_blocks_the_prune() {
     let store = FakeArchiveStore::new();
     let recs: Vec<_> = (0..6).map(|i| arec(1 + i, 1 + i as i64)).collect();
     // Archive WITHOUT the date reference.
-    ea::archive_execution(&store, &meta(8), &recs, Utc::now()).await.unwrap();
+    ea::archive_execution(&store, &meta(8), &recs, Utc::now())
+        .await
+        .unwrap();
     assert!(
         ea::verify_archived(&store, 8).await.unwrap().is_durable(),
         "the data is durable — only the index is missing"
     );
     let st = ea::archive_state(&store, 8).await.unwrap();
-    assert!(!st.is_safe_to_prune(), "unindexed must block: {}", st.reason());
+    assert!(
+        !st.is_safe_to_prune(),
+        "unindexed must block: {}",
+        st.reason()
+    );
     assert!(matches!(st, ea::ArchiveState::DurableButUnindexed { .. }));
-    assert!(st.reason().contains("unfindable by date"), "{}", st.reason());
+    assert!(
+        st.reason().contains("unfindable by date"),
+        "{}",
+        st.reason()
+    );
 
     // And writing the reference makes it safe — the control that this is the index and not
     // something else.
@@ -206,7 +269,10 @@ async fn a_durable_but_unindexed_archive_blocks_the_prune() {
     )
     .unwrap();
     ea::write_date_reference(&store, &m).await.unwrap();
-    assert!(ea::archive_state(&store, 8).await.unwrap().is_safe_to_prune());
+    assert!(ea::archive_state(&store, 8)
+        .await
+        .unwrap()
+        .is_safe_to_prune());
 }
 
 #[tokio::test]
@@ -223,7 +289,12 @@ async fn an_unarchived_execution_is_not_safe_to_prune() {
 // ---------------------------------------------------------------------------
 
 fn erec(seq: u64, execution: &str) -> EventRecord {
-    EventRecord::new(seq, execution, format!("tx-{seq}"), format!("{{\"seq\":{seq}}}"))
+    EventRecord::new(
+        seq,
+        execution,
+        format!("tx-{seq}"),
+        format!("{{\"seq\":{seq}}}"),
+    )
 }
 
 /// ⭐⭐ The whole phase, end to end on a real engine: archive the expired executions, verify
@@ -232,12 +303,17 @@ fn erec(seq: u64, execution: &str) -> EventRecord {
 #[tokio::test]
 async fn archived_executions_are_reclaimed_while_a_live_execution_survives() {
     let root = dir("e2e");
-    let sub = Arc::new(LocalFsSubstrate::new(root.join("substrate").to_string_lossy().to_string()).unwrap());
+    let sub = Arc::new(
+        LocalFsSubstrate::new(root.join("substrate").to_string_lossy().to_string()).unwrap(),
+    );
     let mut e = L0Engine::<D1EventLog>::open(
-        L0Config::for_dataset("d1_event_log", root.join("local").to_string_lossy().to_string())
-            // Small parts so the 100-record workload produces SEVERAL, which is what makes
-            // "a part entirely below the floor" vs "a part straddling it" distinguishable.
-            .with_seal_max_records(12),
+        L0Config::for_dataset(
+            "d1_event_log",
+            root.join("local").to_string_lossy().to_string(),
+        )
+        // Small parts so the 100-record workload produces SEVERAL, which is what makes
+        // "a part entirely below the floor" vs "a part straddling it" distinguishable.
+        .with_seal_max_records(12),
         sub,
     )
     .expect("open engine");
@@ -261,9 +337,17 @@ async fn archived_executions_are_reclaimed_while_a_live_execution_survives() {
     e.flush_and_wait_uploads().ok();
     e.seal_aged_parts().ok();
     let parts_before = e.manifest_snapshot().parts.len();
-    let bytes_before: u64 = e.manifest_snapshot().parts.iter().map(|p| p.byte_size).sum();
+    let bytes_before: u64 = e
+        .manifest_snapshot()
+        .parts
+        .iter()
+        .map(|p| p.byte_size)
+        .sum();
     println!("  BEFORE: parts={parts_before} bytes={bytes_before}");
-    assert!(parts_before >= 1, "the engine must have produced parts to prune");
+    assert!(
+        parts_before >= 1,
+        "the engine must have produced parts to prune"
+    );
 
     // Archive the two terminal executions (not "live").
     let store = FakeArchiveStore::new();
@@ -276,16 +360,33 @@ async fn archived_executions_are_reclaimed_while_a_live_execution_survives() {
             .map(|(j, s)| arec(*s, j as i64))
             .collect();
         let id = 1000 + i as i64;
-        ea::archive_execution_indexed(&store, &meta(id), &recs, Utc::now()).await.unwrap();
-        assert!(ea::archive_state(&store, id).await.unwrap().is_safe_to_prune());
+        ea::archive_execution_indexed(&store, &meta(id), &recs, Utc::now())
+            .await
+            .unwrap();
+        assert!(ea::archive_state(&store, id)
+            .await
+            .unwrap()
+            .is_safe_to_prune());
         safe.push(id);
     }
 
     // The floor, over the hot footprint.
     let hot = vec![
-        ea::HotExecution { execution_id: 1000, min_sequence: per_exec["done-a"][0], max_sequence: *per_exec["done-a"].last().unwrap() },
-        ea::HotExecution { execution_id: 1001, min_sequence: per_exec["done-b"][0], max_sequence: *per_exec["done-b"].last().unwrap() },
-        ea::HotExecution { execution_id: 1002, min_sequence: per_exec["live"][0], max_sequence: *per_exec["live"].last().unwrap() },
+        ea::HotExecution {
+            execution_id: 1000,
+            min_sequence: per_exec["done-a"][0],
+            max_sequence: *per_exec["done-a"].last().unwrap(),
+        },
+        ea::HotExecution {
+            execution_id: 1001,
+            min_sequence: per_exec["done-b"][0],
+            max_sequence: *per_exec["done-b"].last().unwrap(),
+        },
+        ea::HotExecution {
+            execution_id: 1002,
+            min_sequence: per_exec["live"][0],
+            max_sequence: *per_exec["live"].last().unwrap(),
+        },
     ];
     let live_min = per_exec["live"][0];
 
@@ -296,7 +397,9 @@ async fn archived_executions_are_reclaimed_while_a_live_execution_survives() {
     assert_eq!(pinned.keep_from_sequence, Some(live_min));
     assert_eq!(pinned.blocked_by.as_ref().unwrap().execution_id, 1002);
 
-    let dropped_pinned = e.apply_retention(pinned.keep_from_sequence.unwrap()).expect("retention");
+    let dropped_pinned = e
+        .apply_retention(pinned.keep_from_sequence.unwrap())
+        .expect("retention");
     let after_pinned = e.manifest_snapshot().parts.len();
     println!("  after PINNED retention: dropped={dropped_pinned} parts={after_pinned}");
 
@@ -308,7 +411,11 @@ async fn archived_executions_are_reclaimed_while_a_live_execution_survives() {
         .into_iter()
         .map(|r| r.global_sequence)
         .collect();
-    println!("  live events: {} of {} survive", still.len(), live_seqs.len());
+    println!(
+        "  live events: {} of {} survive",
+        still.len(),
+        live_seqs.len()
+    );
     assert_eq!(
         still, live_seqs,
         "⚠⚠⚠ a pruned part destroyed events of a STILL-RUNNING execution — this is the \
@@ -323,15 +430,24 @@ async fn archived_executions_are_reclaimed_while_a_live_execution_survives() {
         .enumerate()
         .map(|(j, s)| arec(*s, j as i64))
         .collect();
-    ea::archive_execution_indexed(&store, &meta(1002), &lrecs, Utc::now()).await.unwrap();
+    ea::archive_execution_indexed(&store, &meta(1002), &lrecs, Utc::now())
+        .await
+        .unwrap();
     let all_safe = vec![1000, 1001, 1002];
     let open = ea::retention_floor(&hot, &all_safe);
     println!("  open floor: {}", open.describe());
     assert!(open.blocked_by.is_none());
 
-    let dropped_open = e.apply_retention(open.keep_from_sequence.unwrap()).expect("retention");
+    let dropped_open = e
+        .apply_retention(open.keep_from_sequence.unwrap())
+        .expect("retention");
     let parts_after = e.manifest_snapshot().parts.len();
-    let bytes_after: u64 = e.manifest_snapshot().parts.iter().map(|p| p.byte_size).sum();
+    let bytes_after: u64 = e
+        .manifest_snapshot()
+        .parts
+        .iter()
+        .map(|p| p.byte_size)
+        .sum();
     println!(
         "  AFTER: dropped={dropped_open} parts={parts_before}->{parts_after} \
          bytes={bytes_before}->{bytes_after} reclaimed={}",
@@ -351,8 +467,14 @@ async fn archived_executions_are_reclaimed_while_a_live_execution_survives() {
     );
 
     // And the archive still serves the pruned execution.
-    let (_, back) = ea::read_archived(&store, 1000).await.unwrap().expect("archived");
+    let (_, back) = ea::read_archived(&store, 1000)
+        .await
+        .unwrap()
+        .expect("archived");
     let want: std::collections::BTreeSet<u64> = per_exec["done-a"].iter().copied().collect();
     let got: std::collections::BTreeSet<u64> = back.iter().map(|r| r.global_sequence).collect();
-    assert_eq!(got, want, "the archive must serve what the hot store no longer holds");
+    assert_eq!(
+        got, want,
+        "the archive must serve what the hot store no longer holds"
+    );
 }

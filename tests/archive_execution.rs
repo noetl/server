@@ -51,7 +51,10 @@ fn the_keys_match_the_required_execution_id_partition() {
         "the data object must live under the execution partition: {dk}"
     );
     // Zero-padded so lexicographic listing is sequence order — GCS lists lexicographically.
-    assert!(dk.contains("events-00000000000000000007-00000000000000000099"), "{dk}");
+    assert!(
+        dk.contains("events-00000000000000000007-00000000000000000099"),
+        "{dk}"
+    );
     // Negative control: a different execution never shares a prefix.
     assert!(!ea::data_key(43, 7, 99).starts_with(&ea::execution_prefix(42)));
 }
@@ -86,15 +89,25 @@ async fn an_archived_execution_round_trips_by_execution_id() {
 
     // ⭐ SET EQUALITY against ground truth, not a count. A count matches when the wrong 50
     // records are stored.
-    let mut want: Vec<(u64, Option<String>)> = records.iter().map(|r| (r.global_sequence, r.event_id.clone())).collect();
-    let mut got: Vec<(u64, Option<String>)> = back.iter().map(|r| (r.global_sequence, r.event_id.clone())).collect();
+    let mut want: Vec<(u64, Option<String>)> = records
+        .iter()
+        .map(|r| (r.global_sequence, r.event_id.clone()))
+        .collect();
+    let mut got: Vec<(u64, Option<String>)> = back
+        .iter()
+        .map(|r| (r.global_sequence, r.event_id.clone()))
+        .collect();
     want.sort();
     got.sort();
-    assert_eq!(got, want, "the archived record set must equal the input set");
+    assert_eq!(
+        got, want,
+        "the archived record set must equal the input set"
+    );
 
     // And ordered ascending, because a replay reads the archive in order.
     assert!(
-        back.windows(2).all(|w| w[0].global_sequence <= w[1].global_sequence),
+        back.windows(2)
+            .all(|w| w[0].global_sequence <= w[1].global_sequence),
         "archived records must be in ascending sequence order"
     );
 }
@@ -217,9 +230,13 @@ async fn an_empty_execution_is_refused_rather_than_archived_empty() {
 async fn archiving_twice_is_idempotent() {
     let store = FakeArchiveStore::new();
     let records = recs(30, 77);
-    let a = ea::archive_execution(&store, &meta(13), &records, ts(2)).await.unwrap();
+    let a = ea::archive_execution(&store, &meta(13), &records, ts(2))
+        .await
+        .unwrap();
     let keys_after_first = store.keys();
-    let b = ea::archive_execution(&store, &meta(13), &records, ts(3)).await.unwrap();
+    let b = ea::archive_execution(&store, &meta(13), &records, ts(3))
+        .await
+        .unwrap();
     assert_eq!(a.data_key, b.data_key);
     assert_eq!(a.data_sha256, b.data_sha256, "same records => same digest");
     assert_eq!(
@@ -237,7 +254,9 @@ async fn archiving_twice_is_idempotent() {
 async fn a_count_mismatch_is_caught_independently_of_the_digest() {
     let store = FakeArchiveStore::new();
     let records = recs(10, 1);
-    let mut m = ea::archive_execution(&store, &meta(14), &records, ts(2)).await.unwrap();
+    let mut m = ea::archive_execution(&store, &meta(14), &records, ts(2))
+        .await
+        .unwrap();
     // Rewrite the manifest claiming more records than the object holds, keeping its digest
     // honest — so only the count check can fail.
     m.record_count = 99;
@@ -265,8 +284,14 @@ fn every_durability_reason_is_distinct() {
         ea::Durability::Durable { record_count: 1 },
         ea::Durability::ManifestMissing,
         ea::Durability::DataMissing { key: "k".into() },
-        ea::Durability::DigestMismatch { expected: "a".into(), actual: "b".into() },
-        ea::Durability::CountMismatch { expected: 1, actual: 2 },
+        ea::Durability::DigestMismatch {
+            expected: "a".into(),
+            actual: "b".into(),
+        },
+        ea::Durability::CountMismatch {
+            expected: 1,
+            actual: 2,
+        },
         ea::Durability::Undecodable("x".into()),
     ];
     let msgs: Vec<String> = v.iter().map(|d| d.reason()).collect();
@@ -306,11 +331,18 @@ async fn the_real_gcs_client_archives_and_round_trips_against_the_emulator() {
     let m = ea::archive_execution(&store, &meta(id), &records, Utc::now())
         .await
         .expect("archive to the emulator");
-    println!("  wrote execution_id={id} records={} key={}", m.record_count, m.data_key);
+    println!(
+        "  wrote execution_id={id} records={} key={}",
+        m.record_count, m.data_key
+    );
 
     let d = ea::verify_archived(&store, id).await.expect("verify call");
     println!("  durability: {}", d.reason());
-    assert!(d.is_durable(), "emulator archive must verify durable: {}", d.reason());
+    assert!(
+        d.is_durable(),
+        "emulator archive must verify durable: {}",
+        d.reason()
+    );
 
     let (m2, back) = ea::read_archived(&store, id)
         .await
@@ -319,13 +351,23 @@ async fn the_real_gcs_client_archives_and_round_trips_against_the_emulator() {
     assert_eq!(m2.data_sha256, m.data_sha256);
 
     // ⭐ Set equality against ground truth, and the denominator printed.
-    let mut want: Vec<(u64, Option<String>)> = records.iter().map(|r| (r.global_sequence, r.event_id.clone())).collect();
-    let mut got: Vec<(u64, Option<String>)> = back.iter().map(|r| (r.global_sequence, r.event_id.clone())).collect();
+    let mut want: Vec<(u64, Option<String>)> = records
+        .iter()
+        .map(|r| (r.global_sequence, r.event_id.clone()))
+        .collect();
+    let mut got: Vec<(u64, Option<String>)> = back
+        .iter()
+        .map(|r| (r.global_sequence, r.event_id.clone()))
+        .collect();
     want.sort();
     got.sort();
     println!("  round-tripped {} of {} records", got.len(), want.len());
     assert_eq!(got, want);
-    assert!(got.len() == 120, "denominator: expected 120, got {}", got.len());
+    assert!(
+        got.len() == 120,
+        "denominator: expected 120, got {}",
+        got.len()
+    );
 
     // The listing must see exactly this execution's two objects under its prefix.
     let keys = store
@@ -337,7 +379,9 @@ async fn the_real_gcs_client_archives_and_round_trips_against_the_emulator() {
 
     // Negative control: a never-written execution must be absent, not an error and not a
     // stray hit from a shared bucket.
-    let absent = ea::read_archived(&store, id + 1).await.expect("absent read");
+    let absent = ea::read_archived(&store, id + 1)
+        .await
+        .expect("absent read");
     assert!(absent.is_none(), "an unarchived id must read as absent");
 }
 
@@ -359,11 +403,17 @@ fn the_unauthenticated_constructor_refuses_real_gcs() {
             Ok(_) => panic!("{host} must be refused by the unauthenticated constructor"),
         };
         assert!(e.contains("refuses"), "{host} must be refused: {e}");
-        assert!(e.contains("from_env"), "the error must name the right path: {e}");
+        assert!(
+            e.contains("from_env"),
+            "the error must name the right path: {e}"
+        );
     }
     // Positive control: an emulator endpoint IS accepted, so the refusals above measure
     // the host check and not a constructor that rejects everything.
-    assert!(GcsBackend::open_unauthenticated("http://127.0.0.1:4443", "b").is_ok(), "an emulator endpoint must be accepted");
+    assert!(
+        GcsBackend::open_unauthenticated("http://127.0.0.1:4443", "b").is_ok(),
+        "an emulator endpoint must be accepted"
+    );
     assert!(GcsBackend::open_unauthenticated("http://fake-gcs-server:4443", "b").is_ok());
     // And empties are refused.
     assert!(GcsBackend::open_unauthenticated("", "b").is_err());

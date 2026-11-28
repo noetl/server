@@ -162,7 +162,10 @@ fn the_log_cold_loads_from_the_off_box_replica_alone() {
     let records = engine
         .replay_all()
         .expect("every part is reachable from the replica alone");
-    eprintln!("DRILL  replayed {} records from the replica alone", records.len());
+    eprintln!(
+        "DRILL  replayed {} records from the replica alone",
+        records.len()
+    );
 
     assert_eq!(
         records.len() as u64,
